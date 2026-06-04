@@ -1,9 +1,11 @@
-use crate::config::{Capability, EffectiveConfig};
+use crate::config::{AgentProfile, Capability, EffectiveConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const JSON_START: &str = "<<<MULTIAGENT_JSON_START>>>";
 pub const JSON_END: &str = "<<<MULTIAGENT_JSON_END>>>";
+pub const COUNCIL_WORKFLOW_AGENT_ID: &str = "council";
 const JSON_START_PREFIX: &str = "<<<MULTIAGENT_JSON_START";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -233,6 +235,21 @@ pub fn validate_orchestrator_decision(
                 .next_agent
                 .as_ref()
                 .ok_or_else(|| anyhow!("continue decision is missing next_agent"))?;
+            if next_agent == COUNCIL_WORKFLOW_AGENT_ID {
+                if config
+                    .council
+                    .presets
+                    .get(&config.council.default_preset)
+                    .map(BTreeMap::is_empty)
+                    .unwrap_or(true)
+                {
+                    bail!("council workflow has no configured councillors");
+                }
+                if decision.stop_condition.trim().is_empty() {
+                    bail!("continue decision is missing stop_condition");
+                }
+                return Ok(());
+            }
             let agent = config
                 .agents
                 .get(next_agent)
@@ -282,6 +299,96 @@ pub fn validate_orchestrator_decision(
     }
 
     Ok(())
+}
+
+pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
+    let base = config
+        .agents
+        .get("orchestrator")
+        .map(|agent| agent.instructions.trim())
+        .filter(|instructions| !instructions.is_empty())
+        .unwrap_or("Own the run plan and route work through enabled specialized agents.");
+    let mut lines = vec![
+        base.to_string(),
+        String::new(),
+        "Enabled specialized agents:".to_string(),
+    ];
+
+    let mut enabled_agents = config
+        .agents
+        .values()
+        .filter(|agent| agent.enabled && agent.id != "orchestrator")
+        .collect::<Vec<_>>();
+    enabled_agents.sort_by(|left, right| left.id.cmp(&right.id));
+
+    if enabled_agents.is_empty() {
+        lines.push("- none; ask the user to enable an agent before delegating.".to_string());
+    } else {
+        for agent in enabled_agents {
+            lines.push(agent_routing_line(agent));
+        }
+    }
+
+    lines.extend([
+        String::new(),
+        "Available harness workflows:".to_string(),
+        format!(
+            "- {COUNCIL_WORKFLOW_AGENT_ID}: serial council review using preset `{}`. Use only for architecture, security, data integrity, difficult review, high-risk decisions, or when the user explicitly asks for council review.",
+            config.council.default_preset
+        ),
+    ]);
+
+    lines.extend([
+        String::new(),
+        "Routing rules:".to_string(),
+        "- Delegate only to enabled agents listed above.".to_string(),
+        "- Route to council only for high-risk decisions or explicit user council requests."
+            .to_string(),
+        "- Do not route to disabled or unknown agents.".to_string(),
+        "- Keep required_capabilities no broader than the next step needs.".to_string(),
+        "- Ask a clarifying question when the next safe step is ambiguous.".to_string(),
+        "- Mark the run complete only when the original user request is satisfied.".to_string(),
+    ]);
+
+    lines.join("\n")
+}
+
+fn agent_routing_line(agent: &AgentProfile) -> String {
+    let capabilities = agent
+        .capabilities
+        .iter()
+        .map(|capability| format!("{capability:?}").to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(",");
+    let guidance = agent
+        .orchestrator_description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or_else(|| default_delegation_guidance(agent));
+    format!(
+        "- {id} ({name}): capabilities=[{capabilities}], runtime={runtime}, model={model}. Use when: {guidance}",
+        id = agent.id,
+        name = agent.name,
+        runtime = agent.runtime,
+        model = agent.model,
+    )
+}
+
+fn default_delegation_guidance(agent: &AgentProfile) -> &'static str {
+    if agent.has_capability(&Capability::Review) {
+        "review completed work, verification evidence, and regressions; do not edit files"
+    } else if agent.has_capability(&Capability::Edit) {
+        "apply scoped implementation changes and verify them through harness-owned actions"
+    } else if agent.has_capability(&Capability::Challenge) {
+        "challenge architecture, security, data integrity, and high-risk decisions before implementation"
+    } else if agent.has_capability(&Capability::Answer) {
+        "answer focused questions or research requests from available context"
+    } else if agent.has_capability(&Capability::Read) {
+        "gather repository context and summarize findings without changing files"
+    } else {
+        "perform only the explicitly configured capability-bounded work"
+    }
 }
 
 #[cfg(test)]
@@ -387,5 +494,140 @@ mod tests {
         let result = AgentResult::completed("explorer", "03", "Found files.");
         let wrapped = wrap_json_contract(&result).unwrap();
         assert_eq!(parse_agent_result(&wrapped).unwrap(), result);
+    }
+
+    #[test]
+    fn generated_orchestrator_prompt_lists_enabled_custom_agents() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+enabled = false
+
+[agents.docs]
+runtime = "fake"
+model = "docs-model"
+capabilities = ["read", "answer"]
+instructions = "Answer documentation questions."
+orchestrator_description = "Use for official documentation and API lookup."
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let prompt = build_orchestrator_prompt(&config);
+
+        assert!(prompt.contains("- docs (Docs):"));
+        assert!(prompt.contains("Use for official documentation and API lookup."));
+        assert!(!prompt.contains("- explorer (Explorer):"));
+    }
+
+    #[test]
+    fn generated_orchestrator_prompt_lists_council_workflow_with_routing_limit() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        let prompt = build_orchestrator_prompt(&config);
+
+        assert!(prompt.contains("- council: serial council review"));
+        assert!(prompt.contains("only for high-risk decisions"));
+    }
+
+    #[test]
+    fn validates_council_as_workflow_target() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+        let decision = OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: Vec::new(),
+            next_agent: Some(COUNCIL_WORKFLOW_AGENT_ID.to_string()),
+            reason: "High-risk architecture decision needs council review.".to_string(),
+            required_capabilities: vec![Capability::Read, Capability::Challenge],
+            stop_condition: "Council returns a recommendation.".to_string(),
+            clarifying_question: None,
+            final_summary: None,
+        };
+
+        validate_orchestrator_decision(&decision, &config).unwrap();
+    }
+
+    #[test]
+    fn generated_orchestrator_prompt_excludes_disabled_librarian_by_default() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        let prompt = build_orchestrator_prompt(&config);
+
+        assert!(!prompt.contains("- librarian (Librarian):"));
+    }
+
+    #[test]
+    fn generated_orchestrator_prompt_excludes_disabled_designer_by_default() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        let prompt = build_orchestrator_prompt(&config);
+
+        assert!(!prompt.contains("- designer (Designer):"));
+    }
+
+    #[test]
+    fn generated_orchestrator_prompt_includes_designer_guidance_when_enabled() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.designer]
+runtime = "fake"
+enabled = true
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let prompt = build_orchestrator_prompt(&config);
+
+        assert!(prompt.contains("- designer (Designer):"));
+        assert!(prompt.contains("do not use for backend-only"));
     }
 }

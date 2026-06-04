@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod app;
 pub mod cli;
+pub mod codemap;
 pub mod config;
 pub mod diagnostics;
 pub mod doctor;

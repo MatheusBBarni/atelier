@@ -556,11 +556,12 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
 
     let input_layout = input_layout(outer[1], &state.input, ui_state.input_cursor);
     ui_state.input_width = input_layout.width;
+    let input_title = format!(" Input Composer | {} ", state.config_status.summary);
     let input = Paragraph::new(wrapped_input_lines(&state.input, input_layout.width))
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
-                .title(" Input Composer ")
+                .title(input_title)
                 .title_style(Style::default().fg(Color::Yellow))
                 .border_style(Style::default().fg(Color::Yellow))
                 .borders(Borders::ALL),
@@ -580,7 +581,7 @@ fn render_event_stream(
     state: &AppState,
     ui_state: &mut TuiUiState,
 ) {
-    let event_lines = if let Some(pending) = &state.pending_approval {
+    let mut event_lines = if let Some(pending) = &state.pending_approval {
         vec![
             Line::from(format!(
                 "Approval required for {} action {}.",
@@ -602,6 +603,35 @@ fn render_event_stream(
             .map(|event| event_stream_line(event))
             .collect::<Vec<_>>()
     };
+    if let Some(live_step) = &state.live_step {
+        let mut live_lines = vec![Line::from(vec![
+            Span::styled("Active step ", Style::default().fg(Color::LightGreen)),
+            Span::styled(
+                format!("{} ", live_step.agent),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("run:{} step:{}", live_step.run_id, live_step.step_id),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])];
+        if live_step.streams.is_empty() {
+            live_lines.push(Line::from("  waiting for runtime output"));
+        } else {
+            for stream in &live_step.streams {
+                let marker = if stream.final_delta { "final" } else { "live" };
+                live_lines.push(Line::from(format!(
+                    "  [{}:{}] {}",
+                    stream.stream, marker, stream.content
+                )));
+            }
+        }
+        live_lines.push(Line::from(""));
+        live_lines.extend(event_lines);
+        event_lines = live_lines;
+    }
     let block = Block::default()
         .title(" Event Stream ")
         .title_style(Style::default().fg(Color::Green))
@@ -652,7 +682,7 @@ fn wrapped_event_line_count(lines: &[Line<'_>], width: u16) -> usize {
 }
 
 fn render_help_modal(frame: &mut Frame) {
-    let area = centered_rect(78, 72, frame.area());
+    let area = centered_rect(78, 100, frame.area());
     let lines = vec![
         Line::from(vec![
             Span::styled(
@@ -664,6 +694,9 @@ fn render_help_modal(frame: &mut Frame) {
             Span::styled(" commands", Style::default().fg(Color::White)),
         ]),
         Line::from("/help + Enter        toggle this help"),
+        Line::from("/goal <text> | /goal | /goal clear   manage session goal"),
+        Line::from("/subtask <agent> <task>              run bounded child task"),
+        Line::from("/config              show config files, preset, warnings"),
         Line::from("Esc                  close this help"),
         Line::from("Enter                submit prompt or answer approval"),
         Line::from("Ctrl-L               show or hide Agent Roster"),
@@ -689,6 +722,7 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("multiagent --doctor [--json]       check runtimes and history"),
         Line::from("multiagent --print-config          print merged config"),
         Line::from("multiagent --init-config           create config files"),
+        Line::from("multiagent --codemap init|changes|update manage repo maps"),
         Line::from("multiagent --clean-sessions [--yes] delete local history"),
         Line::from("multiagent --debug                 write debug events"),
         Line::from("multiagent --help                  print CLI help"),
@@ -850,7 +884,7 @@ fn set_input_cursor(frame: &mut Frame, input_area: Rect, input_layout: InputLayo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::AgentView;
+    use crate::app::{AgentView, ConfigStatusView, LiveStepView, LiveStreamView};
     use crate::orchestrator::RunState;
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
     use ratatui::backend::TestBackend;
@@ -861,6 +895,9 @@ mod tests {
             session_id: "session".to_string(),
             run_state: RunState::Idle,
             active_run_id: None,
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
             pending_approval: None,
             agents: Vec::new(),
             events: Vec::new(),
@@ -879,6 +916,9 @@ mod tests {
             session_id: "session".to_string(),
             run_state: RunState::Running,
             active_run_id: Some("run".to_string()),
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
             pending_approval: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
@@ -912,11 +952,57 @@ mod tests {
     }
 
     #[test]
+    fn renders_live_step_stream_detail_above_events() {
+        let mut state = state_with_input("", false);
+        state.live_step = Some(LiveStepView {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            agent: "fixer".to_string(),
+            streams: vec![LiveStreamView {
+                stream: "stdout".to_string(),
+                content: "compiling target".to_string(),
+                final_delta: false,
+            }],
+        });
+        state.events = vec!["Fixer step started.".to_string()];
+
+        let text = render_to_text(&state, 100, 24);
+
+        assert!(text.contains("Active step"));
+        assert!(text.contains("fixer"));
+        assert!(text.contains("[stdout:live] compiling target"));
+        assert!(text.contains("Fixer step started."));
+    }
+
+    #[test]
+    fn renders_config_status_footer_at_80x24_and_120x40() {
+        let mut state = state_with_input("", false);
+        state.config_status = ConfigStatusView {
+            summary: "Config: sources=2 preset=research warnings=1".to_string(),
+            sources: vec![
+                "/home/user/.config/.multiagent/multiagent.toml".to_string(),
+                "multiagent.toml".to_string(),
+            ],
+            preset: Some("research".to_string()),
+            warnings: vec!["enabled agents without model_fallbacks: explorer".to_string()],
+        };
+
+        let small = render_to_text(&state, 80, 24);
+        let large = render_to_text(&state, 120, 40);
+
+        assert!(small.contains("Config: sources=2 preset=research warnings=1"));
+        assert!(large.contains("Config: sources=2 preset=research warnings=1"));
+    }
+
+    #[test]
     fn renders_user_prompt_events_with_message_text() {
         let state = AppState {
             session_id: "session".to_string(),
             run_state: RunState::Running,
             active_run_id: Some("run".to_string()),
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
             pending_approval: None,
             agents: Vec::new(),
             events: vec!["You: build a feature".to_string()],
@@ -976,6 +1062,9 @@ mod tests {
             session_id: "session".to_string(),
             run_state: RunState::WaitingForUser,
             active_run_id: Some("run".to_string()),
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
             pending_approval: Some(crate::app::PendingApprovalView {
                 run_id: "run".to_string(),
                 step_id: "step".to_string(),
@@ -1063,6 +1152,10 @@ mod tests {
 
         assert!(text.contains("Help"));
         assert!(text.contains("/help + Enter"));
+        assert!(text.contains("/goal <text>"));
+        assert!(text.contains("/goal clear"));
+        assert!(text.contains("/subtask <agent>"));
+        assert!(text.contains("/config"));
         assert!(text.contains("Esc"));
         assert!(text.contains("close this help"));
         assert!(text.contains("Ctrl-L"));
@@ -1411,6 +1504,9 @@ mod tests {
             session_id: "session".to_string(),
             run_state: RunState::Running,
             active_run_id: Some("run".to_string()),
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
             pending_approval: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
@@ -1486,6 +1582,9 @@ mod tests {
                 RunState::Idle
             },
             active_run_id: pending_approval.then(|| "run".to_string()),
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
             pending_approval: pending_approval.then(|| crate::app::PendingApprovalView {
                 run_id: "run".to_string(),
                 step_id: "step".to_string(),
@@ -1539,5 +1638,14 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    fn default_config_status() -> ConfigStatusView {
+        ConfigStatusView {
+            summary: "Config: sources=1 preset=none warnings=0".to_string(),
+            sources: vec!["built-in defaults".to_string()],
+            preset: None,
+            warnings: Vec::new(),
+        }
     }
 }

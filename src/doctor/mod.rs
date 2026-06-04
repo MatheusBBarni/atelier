@@ -57,6 +57,10 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
     checks.push(working_directory_check(config));
     checks.push(history_writability_check(config));
     checks.extend(permission_checks(config));
+    checks.push(selected_preset_check(config));
+    checks.push(prompt_files_check(config));
+    checks.push(model_fallback_check(config));
+    checks.push(tool_access_check(config));
 
     for runtime in config.runtimes.values() {
         let availability = check_runtime_availability(runtime).await;
@@ -91,6 +95,119 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         working_directory: config.working_directory.display().to_string(),
         checks,
+    }
+}
+
+fn selected_preset_check(config: &EffectiveConfig) -> DoctorCheck {
+    match &config.active_preset {
+        Some(preset) => DoctorCheck {
+            id: "config.preset".to_string(),
+            title: "Selected Preset".to_string(),
+            status: DoctorStatus::Ok,
+            severity: DoctorSeverity::Info,
+            message: format!("active preset: {preset}"),
+            remediation: None,
+            context: Some(serde_json::json!({ "preset": preset })),
+        },
+        None => DoctorCheck {
+            id: "config.preset".to_string(),
+            title: "Selected Preset".to_string(),
+            status: DoctorStatus::Skipped,
+            severity: DoctorSeverity::Info,
+            message: "no preset selected".to_string(),
+            remediation: None,
+            context: None,
+        },
+    }
+}
+
+fn prompt_files_check(config: &EffectiveConfig) -> DoctorCheck {
+    let agents = config
+        .agents
+        .values()
+        .filter_map(|agent| {
+            let metadata = &agent.prompt_metadata;
+            if metadata.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "agent": agent.id.clone(),
+                "instructions_file": metadata.instructions_file.clone(),
+                "instructions_append_file": metadata.instructions_append_file.clone(),
+                "orchestrator_description_file": metadata.orchestrator_description_file.clone(),
+            }))
+        })
+        .collect::<Vec<_>>();
+    DoctorCheck {
+        id: "config.prompt_files".to_string(),
+        title: "Prompt Files".to_string(),
+        status: DoctorStatus::Ok,
+        severity: DoctorSeverity::Info,
+        message: if agents.is_empty() {
+            "no prompt files configured".to_string()
+        } else {
+            format!("{} agent prompt file configuration(s) active", agents.len())
+        },
+        remediation: None,
+        context: Some(serde_json::json!({ "agents": agents })),
+    }
+}
+
+fn model_fallback_check(config: &EffectiveConfig) -> DoctorCheck {
+    let missing = config
+        .agents
+        .values()
+        .filter(|agent| agent.enabled && agent.model_fallbacks.is_empty())
+        .map(|agent| agent.id.clone())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        DoctorCheck {
+            id: "config.model_fallbacks".to_string(),
+            title: "Model Fallbacks".to_string(),
+            status: DoctorStatus::Ok,
+            severity: DoctorSeverity::Info,
+            message: "enabled agents have fallback models configured".to_string(),
+            remediation: None,
+            context: None,
+        }
+    } else {
+        DoctorCheck {
+            id: "config.model_fallbacks".to_string(),
+            title: "Model Fallbacks".to_string(),
+            status: DoctorStatus::Warn,
+            severity: DoctorSeverity::Warning,
+            message: format!(
+                "enabled agents without model_fallbacks: {}",
+                missing.join(", ")
+            ),
+            remediation: Some(
+                "Set model_fallbacks on agents that should retry provider failures.".to_string(),
+            ),
+            context: Some(serde_json::json!({ "agents": missing })),
+        }
+    }
+}
+
+fn tool_access_check(config: &EffectiveConfig) -> DoctorCheck {
+    let agents = config
+        .agents
+        .values()
+        .map(|agent| {
+            serde_json::json!({
+                "agent": agent.id.clone(),
+                "enabled": agent.enabled,
+                "tools": agent.effective_tools(),
+            })
+        })
+        .collect::<Vec<_>>();
+    DoctorCheck {
+        id: "config.tool_access".to_string(),
+        title: "Tool Access".to_string(),
+        status: DoctorStatus::Ok,
+        severity: DoctorSeverity::Info,
+        message: "effective tool access computed from capabilities and tool allowlists".to_string(),
+        remediation: None,
+        context: Some(serde_json::json!({ "agents": agents })),
     }
 }
 
@@ -354,5 +471,55 @@ mod tests {
 
         assert_eq!(check.status, DoctorStatus::Warn);
         assert!(check.message.contains("broader than recommended"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_preset_prompt_paths_fallbacks_and_tools() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("agents")).unwrap();
+        fs::write(dir.path().join("agents/explorer.md"), "secret prompt").unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+preset = "research"
+
+[runtimes.fake]
+type = "fake"
+
+[presets.research.agents.explorer]
+runtime = "fake"
+model_fallbacks = ["fallback-model"]
+tools = ["read_file"]
+instructions_file = "agents/explorer.md"
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let report = run_doctor(&config).await;
+        let json = render_json(&report).unwrap();
+
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.id == "config.preset" && check.message.contains("research")));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.id == "config.prompt_files"));
+        assert!(report.checks.iter().any(
+            |check| check.id == "config.model_fallbacks" && check.status == DoctorStatus::Warn
+        ));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.id == "config.tool_access"));
+        assert!(json.contains("agents/explorer.md"));
+        assert!(!json.contains("secret prompt"));
     }
 }
