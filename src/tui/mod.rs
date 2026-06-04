@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 const USER_EVENT_BG: Color = Color::Rgb(18, 52, 71);
+const INPUT_COMPOSER_HEIGHT: u16 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TuiCommand {
@@ -29,16 +30,25 @@ enum TuiCommand {
     ToggleRoster,
     ToggleHelp,
     ScrollEvents(EventScrollCommand),
+    MoveInputCursor(InputCursorCommand),
+    InputCharacter(char),
+    InputBackspace,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum EventScrollCommand {
-    LineUp,
-    LineDown,
     PageUp,
     PageDown,
     Top,
     Bottom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputCursorCommand {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 #[derive(Debug)]
@@ -55,6 +65,9 @@ struct TuiUiState {
     event_follow: bool,
     event_content_lines: usize,
     event_viewport_lines: usize,
+    input_cursor: usize,
+    input_preferred_col: Option<usize>,
+    input_width: usize,
 }
 
 impl Default for TuiUiState {
@@ -66,6 +79,9 @@ impl Default for TuiUiState {
             event_follow: true,
             event_content_lines: 0,
             event_viewport_lines: 1,
+            input_cursor: 0,
+            input_preferred_col: None,
+            input_width: 1,
         }
     }
 }
@@ -112,6 +128,7 @@ async fn run_loop(
     let mut ui_state = TuiUiState::default();
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
+        clamp_input_cursor(&mut ui_state, &state.input);
         terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
 
         if event::poll(Duration::from_millis(50))? {
@@ -142,25 +159,29 @@ async fn execute_tui_command(
         }
         TuiCommand::ToggleHelp => {
             ui_state.help_visible = !ui_state.help_visible;
-            state.input.clear();
+            clear_input(state, ui_state);
             Ok(true)
         }
         TuiCommand::ScrollEvents(command) => {
             scroll_events(ui_state, command);
             Ok(true)
         }
-        TuiCommand::Dispatch(AppEvent::InputCharacter(ch)) => {
-            state.input.push(ch);
+        TuiCommand::MoveInputCursor(command) => {
+            move_input_cursor(ui_state, &state.input, command);
             Ok(true)
         }
-        TuiCommand::Dispatch(AppEvent::InputBackspace) => {
-            state.input.pop();
+        TuiCommand::InputCharacter(ch) => {
+            insert_input_character(state, ui_state, ch);
+            Ok(true)
+        }
+        TuiCommand::InputBackspace => {
+            remove_input_character_before_cursor(state, ui_state);
             Ok(true)
         }
         TuiCommand::Dispatch(event) => {
             if matches_help_command(&event) {
                 ui_state.help_visible = !ui_state.help_visible;
-                state.input.clear();
+                clear_input(state, ui_state);
                 return Ok(true);
             }
             let clears_input = matches!(
@@ -169,7 +190,7 @@ async fn execute_tui_command(
             );
             queue_app_event(command_sender, event).await?;
             if clears_input {
-                state.input.clear();
+                clear_input(state, ui_state);
             }
             Ok(true)
         }
@@ -281,11 +302,19 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
         } => Some(TuiCommand::ToggleRoster),
         KeyEvent {
             code: KeyCode::Up, ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::LineUp)),
+        } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up)),
         KeyEvent {
             code: KeyCode::Down,
             ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::LineDown)),
+        } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Down)),
+        KeyEvent {
+            code: KeyCode::Left,
+            ..
+        } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Left)),
+        KeyEvent {
+            code: KeyCode::Right,
+            ..
+        } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Right)),
         KeyEvent {
             code: KeyCode::PageUp,
             ..
@@ -320,13 +349,13 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
         KeyEvent {
             code: KeyCode::Backspace,
             ..
-        } => Some(TuiCommand::Dispatch(AppEvent::InputBackspace)),
+        } => Some(TuiCommand::InputBackspace),
         KeyEvent {
             code: KeyCode::Char(ch),
             modifiers,
             ..
         } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
-            Some(TuiCommand::Dispatch(AppEvent::InputCharacter(ch)))
+            Some(TuiCommand::InputCharacter(ch))
         }
         _ => None,
     }
@@ -339,18 +368,95 @@ fn approval_input_is_yes(input: &str) -> bool {
     )
 }
 
+fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
+    state.input.clear();
+    ui_state.input_cursor = 0;
+    ui_state.input_preferred_col = None;
+}
+
+fn clamp_input_cursor(ui_state: &mut TuiUiState, input: &str) {
+    ui_state.input_cursor = ui_state.input_cursor.min(input_char_count(input));
+}
+
+fn input_char_count(input: &str) -> usize {
+    input.chars().count()
+}
+
+fn byte_index_for_char(input: &str, char_index: usize) -> usize {
+    input
+        .char_indices()
+        .nth(char_index)
+        .map(|(byte_index, _)| byte_index)
+        .unwrap_or(input.len())
+}
+
+fn insert_input_character(state: &mut AppState, ui_state: &mut TuiUiState, ch: char) {
+    clamp_input_cursor(ui_state, &state.input);
+    let byte_index = byte_index_for_char(&state.input, ui_state.input_cursor);
+    state.input.insert(byte_index, ch);
+    ui_state.input_cursor += 1;
+    ui_state.input_preferred_col = None;
+}
+
+fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut TuiUiState) {
+    clamp_input_cursor(ui_state, &state.input);
+    if ui_state.input_cursor == 0 {
+        return;
+    }
+
+    let removed_char_index = ui_state.input_cursor - 1;
+    let start = byte_index_for_char(&state.input, removed_char_index);
+    let end = byte_index_for_char(&state.input, ui_state.input_cursor);
+    state.input.replace_range(start..end, "");
+    ui_state.input_cursor = removed_char_index;
+    ui_state.input_preferred_col = None;
+}
+
+fn move_input_cursor(ui_state: &mut TuiUiState, input: &str, command: InputCursorCommand) {
+    clamp_input_cursor(ui_state, input);
+    let input_len = input_char_count(input);
+    match command {
+        InputCursorCommand::Left => {
+            ui_state.input_cursor = ui_state.input_cursor.saturating_sub(1);
+            ui_state.input_preferred_col = None;
+        }
+        InputCursorCommand::Right => {
+            ui_state.input_cursor = ui_state.input_cursor.saturating_add(1).min(input_len);
+            ui_state.input_preferred_col = None;
+        }
+        InputCursorCommand::Up | InputCursorCommand::Down => {
+            move_input_cursor_vertically(ui_state, input_len, command);
+        }
+    }
+}
+
+fn move_input_cursor_vertically(
+    ui_state: &mut TuiUiState,
+    input_len: usize,
+    command: InputCursorCommand,
+) {
+    let width = ui_state.input_width.max(1);
+    let current_line = ui_state.input_cursor / width;
+    let current_col = ui_state.input_cursor % width;
+    let preferred_col = ui_state.input_preferred_col.unwrap_or(current_col);
+    let target_line = match command {
+        InputCursorCommand::Up if current_line > 0 => current_line - 1,
+        InputCursorCommand::Down if current_line < input_len / width => current_line + 1,
+        _ => {
+            ui_state.input_preferred_col = Some(preferred_col);
+            return;
+        }
+    };
+    let line_start = target_line * width;
+    let line_end = line_start.saturating_add(width).min(input_len);
+    ui_state.input_cursor = line_start.saturating_add(preferred_col).min(line_end);
+    ui_state.input_preferred_col = Some(preferred_col);
+}
+
 fn scroll_events(ui_state: &mut TuiUiState, command: EventScrollCommand) {
     let max_scroll = event_max_scroll(ui_state);
     let page = ui_state.event_viewport_lines.saturating_sub(1).max(1);
     match command {
-        EventScrollCommand::LineUp => {
-            ui_state.event_scroll = ui_state.event_scroll.saturating_sub(1);
-            ui_state.event_follow = false;
-        }
-        EventScrollCommand::LineDown => {
-            ui_state.event_scroll = ui_state.event_scroll.saturating_add(1).min(max_scroll);
-            ui_state.event_follow = ui_state.event_scroll == max_scroll;
-        }
         EventScrollCommand::PageUp => {
             ui_state.event_scroll = ui_state.event_scroll.saturating_sub(page);
             ui_state.event_follow = false;
@@ -379,7 +485,10 @@ fn event_max_scroll(ui_state: &TuiUiState) -> usize {
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(3)])
+        .constraints([
+            Constraint::Min(6),
+            Constraint::Length(INPUT_COMPOSER_HEIGHT),
+        ])
         .split(frame.area());
     let event_area = if ui_state.roster_visible {
         let main = Layout::default()
@@ -445,7 +554,9 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
 
     render_event_stream(frame, event_area, state, ui_state);
 
-    let input = Paragraph::new(state.input.as_str())
+    let input_layout = input_layout(outer[1], &state.input, ui_state.input_cursor);
+    ui_state.input_width = input_layout.width;
+    let input = Paragraph::new(wrapped_input_lines(&state.input, input_layout.width))
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
@@ -453,12 +564,13 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
                 .title_style(Style::default().fg(Color::Yellow))
                 .border_style(Style::default().fg(Color::Yellow))
                 .borders(Borders::ALL),
-        );
+        )
+        .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
     frame.render_widget(input, outer[1]);
     if ui_state.help_visible {
         render_help_modal(frame);
     } else {
-        set_input_cursor(frame, outer[1], state);
+        set_input_cursor(frame, outer[1], input_layout);
     }
 }
 
@@ -555,7 +667,7 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("Esc                  close this help"),
         Line::from("Enter                submit prompt or answer approval"),
         Line::from("Ctrl-L               show or hide Agent Roster"),
-        Line::from("Up/Down             scroll Event Stream one line"),
+        Line::from("Arrow keys           move input cursor"),
         Line::from("PageUp/PageDown     scroll Event Stream by page"),
         Line::from("Home/End            jump Event Stream to top/latest"),
         Line::from("Ctrl-C               interrupt active run and exit"),
@@ -681,12 +793,57 @@ fn availability_label(availability: &Option<crate::runtime::RuntimeAvailability>
     }
 }
 
-fn set_input_cursor(frame: &mut Frame, input_area: ratatui::layout::Rect, state: &AppState) {
-    let inner_width = input_area.width.saturating_sub(2);
-    let cursor_offset = state.input.chars().count().min(usize::from(inner_width)) as u16;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputLayout {
+    width: usize,
+    cursor_col: u16,
+    cursor_row: u16,
+    scroll: usize,
+}
+
+fn input_layout(input_area: Rect, input: &str, cursor: usize) -> InputLayout {
+    let width = usize::from(input_area.width.saturating_sub(2).max(1));
+    let visible_rows = usize::from(input_area.height.saturating_sub(2).max(1));
+    let cursor_cells = cursor.min(input_char_count(input));
+    let cursor_line = cursor_cells / width;
+    let cursor_col = cursor_cells % width;
+    let scroll = cursor_line.saturating_sub(visible_rows.saturating_sub(1));
+    let visible_cursor_row = cursor_line.saturating_sub(scroll);
+    InputLayout {
+        width,
+        cursor_col: cursor_col.min(width.saturating_sub(1)) as u16,
+        cursor_row: visible_cursor_row.min(visible_rows.saturating_sub(1)) as u16,
+        scroll,
+    }
+}
+
+fn wrapped_input_lines(input: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    if input.is_empty() {
+        return vec![Line::from("")];
+    }
+
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_len = 0usize;
+    for ch in input.chars() {
+        line.push(ch);
+        line_len += 1;
+        if line_len == width {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            line_len = 0;
+        }
+    }
+    if !line.is_empty() || input.chars().count().is_multiple_of(width) {
+        lines.push(Line::from(line));
+    }
+    lines
+}
+
+fn set_input_cursor(frame: &mut Frame, input_area: Rect, input_layout: InputLayout) {
     frame.set_cursor_position(Position::new(
-        input_area.x + 1 + cursor_offset,
-        input_area.y + 1,
+        input_area.x + 1 + input_layout.cursor_col,
+        input_area.y + 1 + input_layout.cursor_row,
     ));
 }
 
@@ -777,7 +934,7 @@ mod tests {
         let state = state_with_input("edit", false);
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut ui_state = TuiUiState::default();
+        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
 
         terminal
             .draw(|frame| render(frame, &state, &mut ui_state))
@@ -785,7 +942,32 @@ mod tests {
 
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(5, 22));
+            .assert_cursor_position(Position::new(5, 20));
+    }
+
+    #[test]
+    fn long_input_wraps_and_moves_cursor_to_wrapped_row() {
+        let state = state_with_input("abcdefghijklmnopqrstuvwxyz1234", false);
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
+
+        terminal
+            .draw(|frame| render(frame, &state, &mut ui_state))
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("abcdefghijklmnopqrstuv"));
+        assert!(text.contains("wxyz1234"));
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(9, 9));
     }
 
     #[test]
@@ -827,7 +1009,7 @@ mod tests {
     async fn prompt_submission_is_queued_for_app_worker_and_clears_local_input() {
         let (sender, mut receiver) = mpsc::channel(1);
         let mut state = state_with_input("slow prompt", false);
-        let mut ui_state = TuiUiState::default();
+        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
 
         let keep_running = execute_tui_command(
             &mut state,
@@ -840,6 +1022,7 @@ mod tests {
 
         assert!(keep_running);
         assert!(state.input.is_empty());
+        assert_eq!(ui_state.input_cursor, 0);
         assert!(matches!(
             receiver.try_recv().unwrap(),
             AppWorkerCommand::Event(AppEvent::PromptSubmitted(prompt)) if prompt == "slow prompt"
@@ -850,7 +1033,7 @@ mod tests {
     async fn help_command_toggles_modal_without_app_event() {
         let (sender, mut receiver) = mpsc::channel(1);
         let mut state = state_with_input("/help", false);
-        let mut ui_state = TuiUiState::default();
+        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
 
         assert_eq!(
             key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -864,6 +1047,7 @@ mod tests {
 
         assert!(keep_running);
         assert!(state.input.is_empty());
+        assert_eq!(ui_state.input_cursor, 0);
         assert!(ui_state.help_visible);
         assert!(receiver.try_recv().is_err());
     }
@@ -882,6 +1066,7 @@ mod tests {
         assert!(text.contains("Esc"));
         assert!(text.contains("close this help"));
         assert!(text.contains("Ctrl-L"));
+        assert!(text.contains("Arrow keys"));
         assert!(text.contains("PageUp/PageDown"));
         assert!(text.contains("Home/End"));
         assert!(text.contains("multiagent --doctor"));
@@ -898,7 +1083,7 @@ mod tests {
             &mut state,
             &mut ui_state,
             &sender,
-            TuiCommand::Dispatch(AppEvent::InputCharacter('x')),
+            TuiCommand::InputCharacter('x'),
         )
         .await
         .unwrap();
@@ -906,18 +1091,57 @@ mod tests {
             &mut state,
             &mut ui_state,
             &sender,
-            TuiCommand::Dispatch(AppEvent::InputBackspace),
+            TuiCommand::InputBackspace,
         )
         .await
         .unwrap();
 
         assert!(state.input.is_empty());
+        assert_eq!(ui_state.input_cursor, 0);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn input_editing_inserts_and_deletes_at_cursor() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("abcd", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: 2,
+            ..TuiUiState::default()
+        };
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::InputCharacter('X'),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "abXcd");
+        assert_eq!(ui_state.input_cursor, 3);
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::InputBackspace,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.input, "abcd");
+        assert_eq!(ui_state.input_cursor, 2);
         assert!(receiver.try_recv().is_err());
     }
 
     #[test]
     fn worker_state_sync_preserves_local_input() {
         let mut local_state = state_with_input("draft prompt", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: 5,
+            ..TuiUiState::default()
+        };
         let worker_state = AppState {
             events: vec!["Run started.".to_string()],
             ..state_with_input("", false)
@@ -926,8 +1150,10 @@ mod tests {
 
         sender.send(worker_state).unwrap();
         sync_worker_state(&mut local_state, &mut receiver);
+        clamp_input_cursor(&mut ui_state, &local_state.input);
 
         assert_eq!(local_state.input, "draft prompt");
+        assert_eq!(ui_state.input_cursor, 5);
         assert_eq!(local_state.events, vec!["Run started."]);
     }
 
@@ -957,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_keys_become_input_app_events() {
+    fn edit_keys_become_local_input_commands() {
         let state = state_with_input("abc", false);
 
         assert_eq!(
@@ -965,15 +1191,130 @@ mod tests {
                 &state,
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
             ),
-            Some(TuiCommand::Dispatch(AppEvent::InputCharacter('x')))
+            Some(TuiCommand::InputCharacter('x'))
         );
         assert_eq!(
             key_event_to_tui_command(
                 &state,
                 KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
             ),
-            Some(TuiCommand::Dispatch(AppEvent::InputBackspace))
+            Some(TuiCommand::InputBackspace)
         );
+        assert_eq!(
+            key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Left))
+        );
+        assert_eq!(
+            key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Right))
+        );
+        assert_eq!(
+            key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up))
+        );
+        assert_eq!(
+            key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Down))
+        );
+    }
+
+    #[tokio::test]
+    async fn arrow_commands_move_input_cursor_without_app_event() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("abcd", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: 2,
+            ..TuiUiState::default()
+        };
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::MoveInputCursor(InputCursorCommand::Left),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ui_state.input_cursor, 1);
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::MoveInputCursor(InputCursorCommand::Right),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ui_state.input_cursor, 2);
+        assert_eq!(state.input, "abcd");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn wrapped_input_arrow_keys_move_visible_cursor_and_edit_position() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("abcdefghijklmnopqrstuvwxyz1234", false);
+        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &state, &mut ui_state))
+            .unwrap();
+        assert_eq!(ui_state.input_width, 22);
+
+        for key in [
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        ] {
+            let command = key_event_to_tui_command(&state, key).unwrap();
+            execute_tui_command(&mut state, &mut ui_state, &sender, command)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(state.input, "abcdefgXhijklmnopqrstuvwxyz1234");
+        assert_eq!(ui_state.input_cursor, 8);
+        assert!(receiver.try_recv().is_err());
+
+        terminal
+            .draw(|frame| render(frame, &state, &mut ui_state))
+            .unwrap();
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(9, 8));
+    }
+
+    #[test]
+    fn up_down_move_cursor_across_wrapped_input_lines() {
+        let state = state_with_input("abcdefghij", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: 7,
+            input_width: 5,
+            ..TuiUiState::default()
+        };
+
+        move_input_cursor(&mut ui_state, &state.input, InputCursorCommand::Up);
+        assert_eq!(ui_state.input_cursor, 2);
+
+        move_input_cursor(&mut ui_state, &state.input, InputCursorCommand::Down);
+        assert_eq!(ui_state.input_cursor, 7);
+    }
+
+    #[test]
+    fn down_cursor_movement_clamps_to_short_wrapped_line() {
+        let state = state_with_input("abcdefg", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: 3,
+            input_width: 5,
+            ..TuiUiState::default()
+        };
+
+        move_input_cursor(&mut ui_state, &state.input, InputCursorCommand::Down);
+
+        assert_eq!(ui_state.input_cursor, 7);
     }
 
     #[test]
@@ -985,7 +1326,7 @@ mod tests {
                 &state,
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
             ),
-            Some(TuiCommand::Dispatch(AppEvent::InputCharacter('q')))
+            Some(TuiCommand::InputCharacter('q'))
         );
         assert_eq!(
             key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -1161,6 +1502,13 @@ mod tests {
 
     fn render_to_text(state: &AppState, width: u16, height: u16) -> String {
         render_to_text_with_ui(state, &TuiUiState::default(), width, height)
+    }
+
+    fn ui_state_with_cursor_at_end(input: &str) -> TuiUiState {
+        TuiUiState {
+            input_cursor: input_char_count(input),
+            ..TuiUiState::default()
+        }
     }
 
     fn render_to_text_with_ui(
