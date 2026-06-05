@@ -222,7 +222,7 @@ https://developers.openai.com/api/docs/guides/streaming-responses
 
 Initial TUI changes:
 
-- Event Stream shows a live block for the active agent below existing durable
+- Chat shows a live block for the active agent below existing durable
   events.
 - The live block updates in place while streaming.
 - The roster highlights the active agent.
