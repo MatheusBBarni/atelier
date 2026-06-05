@@ -1,6 +1,6 @@
 use super::{
-    prompt_envelope_json, Runtime, RuntimeAvailability, RuntimeAvailabilityStatus, RuntimeOutput,
-    RuntimeRequest, RuntimeStepResult, RuntimeStreamDelta,
+    prompt_envelope_json, Runtime, RuntimeAvailability, RuntimeAvailabilityStatus,
+    RuntimeEventSink, RuntimeOutput, RuntimeRequest,
 };
 use crate::config::RuntimeConfig;
 use crate::orchestrator::{parse_agent_result, parse_contract, parse_orchestrator_decision};
@@ -9,9 +9,10 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
 pub struct CodexRuntime {
@@ -155,7 +156,12 @@ impl Runtime for CodexRuntime {
             .await
     }
 
-    async fn stream_step(&self, request: RuntimeRequest) -> Result<RuntimeStepResult> {
+    async fn stream_step(
+        &self,
+        request: RuntimeRequest,
+        events: RuntimeEventSink,
+        cancellation: CancellationToken,
+    ) -> Result<RuntimeOutput> {
         let command = self
             .config
             .command
@@ -181,22 +187,52 @@ impl Runtime for CodexRuntime {
         }
         drop(child.stdin.take());
 
-        let output = timeout(Duration::from_secs(600), child.wait_with_output())
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to capture codex stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("failed to capture codex stderr")?;
+        let stdout_events = events.clone();
+        let stderr_events = events.clone();
+        let stdout_reader = tokio::spawn(async move {
+            read_process_stream(stdout, stdout_events, "stdout", false).await
+        });
+        let stderr_reader = tokio::spawn(async move {
+            read_process_stream(stderr, stderr_events, "stderr", true).await
+        });
+
+        let status = tokio::select! {
+            _ = cancellation.cancelled() => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                anyhow::bail!("codex runtime cancelled");
+            }
+            status = timeout(Duration::from_secs(600), child.wait()) => {
+                status
+                    .context("codex runtime timed out")?
+                    .context("failed to wait for codex runtime")?
+            }
+        };
+        let stdout = stdout_reader
             .await
-            .context("codex runtime timed out")?
-            .context("failed to wait for codex runtime")?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+            .context("codex stdout reader task failed")??;
+        let stderr = stderr_reader
+            .await
+            .context("codex stderr reader task failed")??;
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
         let combined = if stderr.trim().is_empty() {
             stdout.to_string()
         } else {
             format!("{stdout}\n{stderr}")
         };
-        if !output.status.success() {
+        if !status.success() {
             bail!(
                 "codex runtime exited with {}: {}",
-                output
-                    .status
+                status
                     .code()
                     .map(|code| format!("status {code}"))
                     .unwrap_or_else(|| "signal".to_string()),
@@ -205,16 +241,44 @@ impl Runtime for CodexRuntime {
         }
 
         let stdout = stdout.to_string();
-        let output = parse_runtime_output(&request.agent_profile.id, stdout.clone())?;
-        Ok(RuntimeStepResult::new(output)
-            .with_delta(RuntimeStreamDelta::final_delta(1, "stdout", stdout)))
+        parse_runtime_output(&request.agent_profile.id, stdout)
     }
+}
+
+async fn read_process_stream<R>(
+    mut reader: R,
+    events: RuntimeEventSink,
+    stream: &'static str,
+    diagnostic: bool,
+) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("failed to read codex {stream}"))?;
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..read]);
+        let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+        if diagnostic {
+            events.diagnostic(stream, chunk).await?;
+        } else {
+            events.delta(stream, chunk).await?;
+        }
+    }
+    Ok(output)
 }
 
 fn codex_prompt_text(request: &RuntimeRequest) -> Result<String> {
     let envelope = prompt_envelope_json(request)?;
     Ok(format!(
-        r#"You are running inside multiagent-harness as a structured runtime adapter, not as a standalone coding agent.
+        r#"You are running inside atelier as a structured runtime adapter, not as a standalone coding agent.
 
 Follow this protocol exactly:
 - Use the JSON envelope below as the only task input.
@@ -437,6 +501,7 @@ mod tests {
     use crate::orchestrator::{
         wrap_json_contract, AgentResult, DecisionStatus, OrchestratorDecision,
     };
+    use crate::runtime::{collect_runtime_step_result, RuntimeEvent, CODEX_ENV_MUTEX};
     use std::fs;
     use tempfile::tempdir;
 
@@ -473,8 +538,12 @@ mod tests {
             api_key_env: None,
         });
         let request = runtime_request(dir.path().to_path_buf(), "explorer");
-        let result = runtime.stream_step(request).await.unwrap();
-        assert_eq!(result.stream_deltas.len(), 1);
+        let result = collect_runtime_step_result(|events, cancellation| {
+            runtime.stream_step(request, events, cancellation)
+        })
+        .await
+        .unwrap();
+        assert!(!result.stream_deltas.is_empty());
 
         match result.output {
             RuntimeOutput::AgentResult { result } => {
@@ -535,6 +604,7 @@ exit 64
 
     #[tokio::test]
     async fn codex_availability_is_unavailable_when_login_status_fails() {
+        let _env_lock = CODEX_ENV_MUTEX.lock().await;
         let _env_guard = clear_codex_exec_env_auth();
         let dir = tempdir().unwrap();
         let script_path = dir.path().join("codex-status.sh");
@@ -708,7 +778,11 @@ exit 65
         });
 
         let error = runtime
-            .stream_step(runtime_request(dir.path().to_path_buf(), "explorer"))
+            .stream_step(
+                runtime_request(dir.path().to_path_buf(), "explorer"),
+                RuntimeEventSink::channel(1).0,
+                CancellationToken::new(),
+            )
             .await
             .unwrap_err();
 
@@ -792,14 +866,82 @@ exit 65
             api_key_env: None,
         });
 
-        let result = runtime
-            .stream_step(runtime_request(dir.path().to_path_buf(), "explorer"))
-            .await
-            .unwrap();
+        let request = runtime_request(dir.path().to_path_buf(), "explorer");
+        let result = collect_runtime_step_result(|events, cancellation| {
+            runtime.stream_step(request, events, cancellation)
+        })
+        .await
+        .unwrap();
+        assert!(result
+            .stream_deltas
+            .iter()
+            .any(|delta| delta.stream == "stderr"
+                && delta.content.contains("progress with invalid contract")));
+        assert!(result
+            .stream_deltas
+            .iter()
+            .any(|delta| delta.stream == "stdout"
+                && delta.content.contains("stdout contract parsed")));
 
         match result.output {
             RuntimeOutput::AgentResult { result } => {
                 assert_eq!(result.summary, "stdout contract parsed");
+            }
+            other => panic!("unexpected runtime output: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_adapter_emits_stdout_before_process_exit() {
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("streaming-codex.sh");
+        let result = AgentResult::completed("explorer", "step", "streamed stdout parsed");
+        let wrapped = wrap_json_contract(&result).unwrap();
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\n/bin/echo early stdout\nsleep 1\ncat <<'JSON'\n{wrapped}\nJSON\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let runtime = CodexRuntime::new(RuntimeConfig {
+            id: "codex".to_string(),
+            kind: RuntimeKind::Codex,
+            command: Some(script_path.display().to_string()),
+            args: Vec::new(),
+            prompt_mode: PromptMode::Stdin,
+            base_url: None,
+            api_key_env: None,
+        });
+        let request = runtime_request(dir.path().to_path_buf(), "explorer");
+        let (events, mut receiver) = RuntimeEventSink::channel(8);
+        let cancellation = CancellationToken::new();
+        let runtime_step =
+            tokio::spawn(async move { runtime.stream_step(request, events, cancellation).await });
+
+        let event = tokio::time::timeout(Duration::from_millis(750), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            event,
+            RuntimeEvent::Delta {
+                stream,
+                content,
+                ..
+            } if stream == "stdout" && content.contains("early stdout")
+        ));
+        assert!(!runtime_step.is_finished());
+
+        match runtime_step.await.unwrap().unwrap() {
+            RuntimeOutput::AgentResult { result } => {
+                assert_eq!(result.summary, "streamed stdout parsed");
             }
             other => panic!("unexpected runtime output: {other:?}"),
         }

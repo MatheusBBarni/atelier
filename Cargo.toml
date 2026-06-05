@@ -2,11 +2,11 @@
 name = "multiagent"
 version = "0.1.0"
 edition = "2021"
-description = "Terminal-native multiagent harness"
+description = "Terminal-native agent orchestration harness"
 license = "MIT"
 
 [[bin]]
-name = "multiagent"
+name = "atelier"
 path = "src/main.rs"
 
 [dependencies]

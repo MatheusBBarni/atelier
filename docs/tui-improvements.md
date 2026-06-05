@@ -44,7 +44,7 @@ Limitations:
 Use a persistent multi-panel layout with a transcript-first center:
 
 ```text
-+ multiagent /path/to/repo ------------------------- running: fixer ----+
++ atelier /path/to/repo ------------------------- running: fixer ----+
 | Agents / Plan       | Transcript                                      |
 | > orchestrator idle | You: add stream mode                           |
 |   explorer    done  | Orchestrator plan ...                          |

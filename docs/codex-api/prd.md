@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-Developers want `multiagent` agents to use the same Codex access they already
+Developers want `atelier` agents to use the same Codex access they already
 have through the Codex CLI and ChatGPT subscription login. The previous
 OpenAI Responses runtime plan solved a different problem: direct OpenAI
 Platform API execution with `OPENAI_API_KEY`. That path is useful only when the
@@ -32,7 +32,7 @@ and a `codex app-server` JSON-RPC driver for richer product integration.
 
 1. As a developer, I want agents using runtime `codex` to reuse my existing Codex CLI login, so that my ChatGPT/Codex subscription can back local harness work.
 2. As a developer, I want the harness to work without `OPENAI_API_KEY` when I am using the `codex` runtime, so that subscription-backed usage is not confused with Platform API usage.
-3. As a developer, I want `multiagent --doctor` to show whether Codex is installed and logged in, so that setup problems are obvious before a run starts.
+3. As a developer, I want `atelier --doctor` to show whether Codex is installed and logged in, so that setup problems are obvious before a run starts.
 4. As a developer, I want missing Codex login to point me to `codex login`, `codex login --device-auth`, or access-token setup when appropriate, so that I can fix auth using supported Codex flows.
 5. As a developer, I want the harness to avoid reading `~/.codex/auth.json`, so that Codex credentials remain owned by Codex.
 6. As a developer, I want trusted enterprise automation to be able to use `CODEX_ACCESS_TOKEN` or `codex login --with-access-token`, so that Codex workspace identity can be used without browser login when allowed.

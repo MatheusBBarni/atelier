@@ -4,7 +4,7 @@ use super::{
     ChatDetailRef, ChatItemKind, ChatItemStatus, ChatItemView, ChatLifecycleKey, ChatLineStyle,
     ChatLineView, ChatSeverity, ChatSourceRef,
 };
-use crate::app::{LiveStepView, PendingApprovalView};
+use crate::app::{LiveStepStatus, LiveStepView, PendingApprovalView};
 use crate::history::HistoryEvent;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -101,23 +101,32 @@ impl ChatProjection {
         }
         let mut body = Vec::new();
         if live_step.streams.is_empty() {
-            body.push(ChatLineView::muted("waiting for runtime output"));
+            body.push(ChatLineView::muted(live_step_status_label(
+                &live_step.status,
+            )));
         } else {
             for stream in live_step.streams.iter().rev().take(4).rev() {
                 let marker = if stream.final_delta { "final" } else { "live" };
                 body.push(ChatLineView::muted(format!(
-                    "[{}:{marker}] {}",
+                    "[{}:{marker}:#{}] {}",
                     stream.stream,
+                    stream.sequence_end,
                     concise(&stream.content, MAX_SUMMARY_CHARS)
                 )));
             }
         }
+        let status = chat_status_for_live_step(&live_step.status);
+        let severity = chat_severity_for_live_step(&live_step.status);
         self.upsert(ItemInput {
             lifecycle_key: Some(key),
             kind: ChatItemKind::AgentProgress,
-            status: ChatItemStatus::Running,
-            severity: ChatSeverity::Info,
-            title: format!("{} is working", live_step.agent),
+            status,
+            severity,
+            title: format!(
+                "{} {}",
+                live_step.agent,
+                live_step_status_title_suffix(&live_step.status)
+            ),
             summary: Some(format!(
                 "run:{} step:{}",
                 live_step.run_id, live_step.step_id
@@ -327,22 +336,43 @@ impl ChatProjection {
         let Some(agent) = string_field(&event.payload, "agent") else {
             return;
         };
-        let Some(content) = string_field(&event.payload, "content") else {
-            return;
-        };
         let Some(key) = step_key(event, ChatItemKind::AgentProgress) else {
             return;
         };
         let stream =
             string_field(&event.payload, "stream").unwrap_or_else(|| "runtime".to_string());
+        let content = string_field(&event.payload, "content")
+            .unwrap_or_else(|| "large stream content stored as artifact".to_string());
+        let final_delta = event
+            .payload
+            .get("final_delta")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let sequence = runtime_stream_sequence_label(&event.payload);
+        let marker = if final_delta { "final" } else { "live" };
         self.upsert(ItemInput {
             lifecycle_key: Some(key),
             kind: ChatItemKind::AgentProgress,
-            status: ChatItemStatus::Running,
-            severity: ChatSeverity::Info,
-            title: format!("{agent} is working"),
-            summary: Some(format!("{stream}: {}", message_summary(&content))),
-            body: message_body_lines(&content, ChatLineStyle::Muted),
+            status: if final_delta {
+                ChatItemStatus::Completed
+            } else {
+                ChatItemStatus::Running
+            },
+            severity: if final_delta {
+                ChatSeverity::Success
+            } else {
+                ChatSeverity::Info
+            },
+            title: if final_delta {
+                format!("{agent} completed runtime output")
+            } else {
+                format!("{agent} is working")
+            },
+            summary: Some(format!(
+                "{stream}:{marker}{sequence}: {}",
+                message_summary(&content)
+            )),
+            body: runtime_stream_body_lines(&stream, marker, &sequence, &content),
             details: history_detail(event, "runtime stream"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
@@ -717,6 +747,9 @@ impl ChatProjection {
             .unwrap_or("Action");
         let diagnostic = string_field(&event.payload, "diagnostic");
         let mut body = Vec::new();
+        if matches!(context.kind.as_deref(), Some("search_text")) {
+            body.extend(search_text_result_lines(&event.payload));
+        }
         if let Some(diagnostic) = diagnostic.as_deref() {
             let line = if status == "failed" {
                 ChatLineView::error(concise(diagnostic, MAX_SUMMARY_CHARS))
@@ -1410,6 +1443,39 @@ fn message_body_lines(text: &str, fallback_style: ChatLineStyle) -> Vec<ChatLine
         })
 }
 
+fn runtime_stream_body_lines(
+    stream: &str,
+    marker: &str,
+    sequence: &str,
+    content: &str,
+) -> Vec<ChatLineView> {
+    let label = format!("[{stream}:{marker}{sequence}] ");
+    message_body_lines(content, ChatLineStyle::Muted)
+        .into_iter()
+        .map(|mut line| {
+            line.text = format!("{label}{}", line.text);
+            line
+        })
+        .collect()
+}
+
+fn runtime_stream_sequence_label(payload: &Value) -> String {
+    if let (Some(start), Some(end)) = (
+        payload.get("sequence_start").and_then(Value::as_u64),
+        payload.get("sequence_end").and_then(Value::as_u64),
+    ) {
+        if start == end {
+            return format!(":#{start}");
+        }
+        return format!(":#{start}-{end}");
+    }
+    payload
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .map(|sequence| format!(":#{sequence}"))
+        .unwrap_or_default()
+}
+
 fn json_value_from_text(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1691,6 +1757,106 @@ fn action_kind_label(kind: &str) -> &'static str {
     }
 }
 
+fn search_text_result_lines(payload: &Value) -> Vec<ChatLineView> {
+    let Some(matches) = payload
+        .get("content")
+        .and_then(|content| content.get("matches"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut first_locations_by_path = Vec::new();
+    let mut seen_paths = Vec::new();
+    for entry in matches {
+        let Some(path) = string_field(entry, "path") else {
+            continue;
+        };
+        if seen_paths.contains(&path) {
+            continue;
+        }
+        let line = entry.get("line").and_then(Value::as_u64);
+        seen_paths.push(path.clone());
+        first_locations_by_path.push((path, line));
+        if first_locations_by_path.len() >= 6 {
+            break;
+        }
+    }
+    if first_locations_by_path.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    if first_locations_by_path.len() == 1 {
+        let (path, line) = &first_locations_by_path[0];
+        lines.push(ChatLineView::plain(format!(
+            "Found it in {}",
+            search_text_location(path, *line)
+        )));
+    } else {
+        let paths = first_locations_by_path
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        lines.push(ChatLineView::plain(format!(
+            "Found matches in {}",
+            format_search_path_list(&paths, 3)
+        )));
+        for (index, (path, line)) in first_locations_by_path.iter().take(4).enumerate() {
+            let label = if index == 0 {
+                "first match"
+            } else {
+                "also matched"
+            };
+            lines.push(ChatLineView::muted(format!(
+                "{label}: {}",
+                search_text_location(path, *line)
+            )));
+        }
+    }
+
+    if let Some(total) = payload
+        .get("content")
+        .and_then(|content| content.get("total_matches"))
+        .and_then(Value::as_u64)
+        .and_then(|total| usize::try_from(total).ok())
+        .filter(|total| *total > first_locations_by_path.len())
+    {
+        lines.push(ChatLineView::muted(format!(
+            "showing {} files from {total} matches",
+            first_locations_by_path.len()
+        )));
+    }
+    lines
+}
+
+fn search_text_location(path: &str, line: Option<u64>) -> String {
+    line.map(|line| format!("{path}:{line}"))
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn format_search_path_list(paths: &[String], limit: usize) -> String {
+    let visible = paths
+        .iter()
+        .take(limit)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let rendered = match visible.as_slice() {
+        [] => String::new(),
+        [single] => (*single).to_string(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let last = visible.last().copied().unwrap_or_default();
+            let rest = visible[..visible.len() - 1].join(", ");
+            format!("{rest}, and {last}")
+        }
+    };
+    if paths.len() > limit {
+        format!("{rendered}, +{} more", paths.len() - limit)
+    } else {
+        rendered
+    }
+}
+
 fn summarize_items(items: &[String], limit: usize) -> String {
     let visible = items
         .iter()
@@ -1736,6 +1902,53 @@ fn concise(text: &str, max_chars: usize) -> String {
             .take(max_chars.saturating_sub(3))
             .collect::<String>()
     )
+}
+
+fn live_step_status_label(status: &LiveStepStatus) -> &'static str {
+    match status {
+        LiveStepStatus::Starting => "starting runtime work",
+        LiveStepStatus::Running => "runtime is running",
+        LiveStepStatus::Streaming => "runtime is running",
+        LiveStepStatus::WaitingForAction => "waiting for harness action",
+        LiveStepStatus::WaitingForApproval => "waiting for action approval",
+        LiveStepStatus::Cancelling => "cancelling runtime work",
+        LiveStepStatus::Interrupted => "runtime work interrupted",
+        LiveStepStatus::Completed => "runtime work completed",
+        LiveStepStatus::Failed => "runtime work failed",
+    }
+}
+
+fn live_step_status_title_suffix(status: &LiveStepStatus) -> &'static str {
+    match status {
+        LiveStepStatus::Starting => "is starting",
+        LiveStepStatus::Running => "is running",
+        LiveStepStatus::Streaming => "is running",
+        LiveStepStatus::WaitingForAction => "is waiting for action",
+        LiveStepStatus::WaitingForApproval => "is waiting for approval",
+        LiveStepStatus::Cancelling => "is cancelling",
+        LiveStepStatus::Interrupted => "was interrupted",
+        LiveStepStatus::Completed => "completed runtime output",
+        LiveStepStatus::Failed => "failed",
+    }
+}
+
+fn chat_status_for_live_step(status: &LiveStepStatus) -> ChatItemStatus {
+    match status {
+        LiveStepStatus::WaitingForApproval => ChatItemStatus::WaitingApproval,
+        LiveStepStatus::Interrupted => ChatItemStatus::Interrupted,
+        LiveStepStatus::Completed => ChatItemStatus::Completed,
+        LiveStepStatus::Failed => ChatItemStatus::Failed,
+        _ => ChatItemStatus::Running,
+    }
+}
+
+fn chat_severity_for_live_step(status: &LiveStepStatus) -> ChatSeverity {
+    match status {
+        LiveStepStatus::WaitingForApproval | LiveStepStatus::Cancelling => ChatSeverity::Warning,
+        LiveStepStatus::Interrupted | LiveStepStatus::Failed => ChatSeverity::Error,
+        LiveStepStatus::Completed => ChatSeverity::Success,
+        _ => ChatSeverity::Info,
+    }
 }
 
 #[cfg(test)]
@@ -1796,6 +2009,39 @@ mod tests {
 
         assert_eq!(projection.items().len(), 1);
         assert_eq!(projection.items()[0].kind, ChatItemKind::AgentProgress);
+    }
+
+    #[test]
+    fn coalesced_runtime_stream_delta_renders_sequence_range_and_final_marker() {
+        let events = vec![event(
+            "runtime_stream_delta",
+            Some("run"),
+            Some("step"),
+            json!({
+                "agent": "fixer",
+                "sequence_start": 3,
+                "sequence_end": 5,
+                "stream": "stdout",
+                "content": "checking\nverified",
+                "final_delta": true,
+                "coalesced": true
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.severity, ChatSeverity::Success);
+        assert!(item
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("stdout:final:#3-5"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text.contains("[stdout:final:#3-5]")));
     }
 
     #[test]
@@ -1973,6 +2219,77 @@ mod tests {
     }
 
     #[test]
+    fn search_text_completion_surfaces_match_locations() {
+        let events = vec![
+            event(
+                "action_requested",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "action",
+                    "step_id": "step",
+                    "kind": "search_text",
+                    "params": {
+                        "query": "npm distribution plan",
+                        "path": "."
+                    }
+                }),
+            ),
+            event(
+                "action_completed",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "action",
+                    "status": "completed",
+                    "summary": "Found 200 matches for \"npm distribution plan\".",
+                    "content": {
+                        "query": "npm distribution plan",
+                        "path": ".",
+                        "matches": [
+                            { "path": "docs/npm-distribution-plan.md", "line": 1, "text": "# npm distribution plan" },
+                            { "path": "README.md", "line": 12, "text": "See npm distribution plan." }
+                        ],
+                        "total_matches": 200,
+                        "truncated": true
+                    },
+                    "artifact": {
+                        "artifact_id": "artifact",
+                        "path": "sessions/session/artifacts/artifact.json"
+                    },
+                    "diagnostic": null
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.title, "Search text completed");
+        assert!(item.body.iter().any(
+            |line| line.text == "Found matches in docs/npm-distribution-plan.md and README.md"
+        ));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "first match: docs/npm-distribution-plan.md:1"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "also matched: README.md:12"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "showing 2 files from 200 matches"));
+        assert!(!item
+            .body
+            .iter()
+            .any(|line| line.text.starts_with("match: ")));
+    }
+
+    #[test]
     fn agent_result_json_summary_is_rendered_as_human_lines() {
         let events = vec![event(
             "agent_result",
@@ -2021,11 +2338,14 @@ mod tests {
         let projection = ChatProjection::rebuild(&events);
 
         let item = &projection.items()[0];
-        assert_eq!(item.summary.as_deref(), Some("stdout: Ready to ship"));
+        assert_eq!(item.summary.as_deref(), Some("stdout:final: Ready to ship"));
         assert!(item
             .body
             .iter()
-            .any(|line| line.text == "final summary: Ready to ship"));
-        assert!(item.body.iter().any(|line| line.text == "plan: verify"));
+            .any(|line| line.text == "[stdout:final] final summary: Ready to ship"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "[stdout:final] plan: verify"));
     }
 }

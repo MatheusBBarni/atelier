@@ -17,26 +17,32 @@ use crate::orchestrator::{
     DecisionStatus, RunState, COUNCIL_WORKFLOW_AGENT_ID,
 };
 use crate::runtime::{
-    check_all_runtime_availability, execute_runtime_step, RuntimeAvailability,
-    RuntimeAvailabilityStatus, RuntimeHistoryEvent, RuntimeOutput, RuntimeRecentAction,
-    RuntimeRecentContext, RuntimeRecentFile, RuntimeRequest, RuntimeStreamDelta,
+    check_all_runtime_availability, execute_runtime_step, execute_runtime_step_streaming,
+    RuntimeAvailability, RuntimeAvailabilityStatus, RuntimeEvent, RuntimeEventSink,
+    RuntimeHistoryEvent, RuntimeOutput, RuntimeRecentAction, RuntimeRecentContext,
+    RuntimeRecentFile, RuntimeRequest, RuntimeStreamDelta, RUNTIME_EVENT_CHANNEL_CAPACITY,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::env;
-use std::future::Future;
+use std::future::{pending, Future};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 const LARGE_ACTION_CONTENT_BYTES: usize = 8 * 1024;
+const SEARCH_TEXT_HISTORY_PREVIEW_MATCHES: usize = 8;
 const RUNTIME_HISTORY_EVENT_LIMIT: usize = 100;
 const RUNTIME_HISTORY_PAYLOAD_DEPTH: usize = 3;
 const RUNTIME_HISTORY_PAYLOAD_FIELDS: usize = 20;
 const RUNTIME_HISTORY_PAYLOAD_ITEMS: usize = 20;
 const RUNTIME_HISTORY_STRING_CHARS: usize = 512;
 const RUNTIME_RECENT_CONTEXT_LIMIT: usize = 20;
+const LIVE_STREAM_CONTENT_LIMIT: usize = 16 * 1024;
+const STREAM_COALESCE_BYTES: usize = 2 * 1024;
+const STREAM_COALESCE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentView {
@@ -71,13 +77,29 @@ pub struct LiveStepView {
     pub run_id: String,
     pub step_id: String,
     pub agent: String,
+    pub status: LiveStepStatus,
     pub streams: Vec<LiveStreamView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveStepStatus {
+    Starting,
+    Running,
+    Streaming,
+    WaitingForAction,
+    WaitingForApproval,
+    Cancelling,
+    Interrupted,
+    Completed,
+    Failed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveStreamView {
     pub stream: String,
     pub content: String,
+    pub sequence_end: u32,
     pub final_delta: bool,
 }
 
@@ -97,6 +119,18 @@ pub struct PendingApprovalView {
     pub agent: String,
     pub summary: String,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InterruptHandle {
+    sender: watch::Sender<u64>,
+}
+
+impl InterruptHandle {
+    pub fn request_interrupt(&self) {
+        let next = sender_next_interrupt_value(&self.sender);
+        let _ = self.sender.send(next);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +155,8 @@ pub struct App {
     debug_enabled: bool,
     session_ended: bool,
     state_sender: Option<watch::Sender<AppState>>,
+    interrupt_sender: watch::Sender<u64>,
+    interrupt_receiver: watch::Receiver<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +248,7 @@ enum StepOutcome {
     Output(Box<RuntimeOutput>),
     Paused,
     LimitReached,
+    Interrupted,
 }
 
 #[derive(Debug)]
@@ -256,6 +293,7 @@ impl App {
     pub async fn new_with_debug(config: EffectiveConfig, debug_enabled: bool) -> Result<Self> {
         let history = HistoryStore::create(&config.working_directory)?;
         let availability = check_all_runtime_availability(&config).await;
+        let (interrupt_sender, interrupt_receiver) = watch::channel(0);
         let state = AppState {
             session_id: history.session_id().to_string(),
             run_state: RunState::Idle,
@@ -281,6 +319,8 @@ impl App {
             debug_enabled: debug_enabled || debug_enabled_from_env(),
             session_ended: false,
             state_sender: None,
+            interrupt_sender,
+            interrupt_receiver,
         };
         app.record_event(
             None,
@@ -303,6 +343,12 @@ impl App {
     pub fn attach_state_sender(&mut self, sender: watch::Sender<AppState>) {
         self.state_sender = Some(sender);
         self.publish_state();
+    }
+
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            sender: self.interrupt_sender.clone(),
+        }
     }
 
     pub fn record_diagnostic(&mut self, message: impl Into<String>) -> Result<()> {
@@ -991,6 +1037,7 @@ impl App {
                 self.clear_active_step(&step_id);
                 Ok(OrchestratorStepOutcome::Stop)
             }
+            Ok(StepOutcome::Interrupted) => Ok(OrchestratorStepOutcome::Stop),
             Err(error) => {
                 self.state.run_state = RunState::Failed;
                 self.record_event(
@@ -1119,6 +1166,7 @@ impl App {
                 self.clear_active_step(&step_id);
                 Ok(AgentStepOutcome::Stop)
             }
+            Ok(StepOutcome::Interrupted) => Ok(AgentStepOutcome::Stop),
             Err(error) => {
                 self.state.run_state = RunState::Failed;
                 self.record_event(
@@ -1450,6 +1498,7 @@ impl App {
             run_id: run_id.to_string(),
             step_id: step_id.to_string(),
             agent: agent.to_string(),
+            status: LiveStepStatus::Starting,
             streams: Vec::new(),
         });
         self.sync_chat_items();
@@ -1495,6 +1544,7 @@ impl App {
         let Some(step) = self.active_step.clone() else {
             return Ok(());
         };
+        self.set_live_step_status(&step.step_id, LiveStepStatus::Interrupted);
         self.set_agent_status(&step.agent, "interrupted");
         let payload = json!({ "agent": step.agent });
         self.record_event(
@@ -1510,6 +1560,32 @@ impl App {
             "step_cancelled",
             payload,
             "Step cancelled.",
+        )
+    }
+
+    fn record_step_cancel_failed_if_active(&mut self, diagnostic: &str) -> Result<()> {
+        let Some(step) = self.active_step.clone() else {
+            return Ok(());
+        };
+        self.set_live_step_status(&step.step_id, LiveStepStatus::Failed);
+        self.set_agent_status(&step.agent, "failed");
+        let payload = json!({
+            "agent": step.agent,
+            "diagnostic": diagnostic
+        });
+        self.record_event(
+            Some(step.run_id.clone()),
+            Some(step.step_id.clone()),
+            "step_cancel_requested",
+            json!({ "agent": step.agent }),
+            "Step cancellation requested.",
+        )?;
+        self.record_event(
+            Some(step.run_id),
+            Some(step.step_id),
+            "step_cancel_failed",
+            payload,
+            "Step cancellation failed.",
         )
     }
 
@@ -1703,6 +1779,106 @@ impl App {
         Ok(runtime_recent_context(&events))
     }
 
+    async fn drive_runtime_step_streaming(
+        &mut self,
+        request: RuntimeRequest,
+        run: &RunDriveContext,
+        step_id: &str,
+        step_started_at: Instant,
+        first_sequence: u32,
+    ) -> Result<(Option<RuntimeOutput>, u32)> {
+        if time_limit_reached(&self.config.limits.max_step_minutes, step_started_at) {
+            self.stop_for_step_time_limit(run, step_id, step_started_at)?;
+            return Ok((None, first_sequence));
+        }
+
+        let agent_id = request.agent_profile.id.clone();
+        self.set_live_step_status(step_id, LiveStepStatus::Running);
+        self.set_agent_status(&agent_id, "running");
+
+        let (events, mut receiver) =
+            RuntimeEventSink::channel_from(RUNTIME_EVENT_CHANNEL_CAPACITY, first_sequence);
+        let cancellation = CancellationToken::new();
+        let config = self.config.clone();
+        let runtime_step =
+            execute_runtime_step_streaming(&config, request, events, cancellation.clone());
+        tokio::pin!(runtime_step);
+        let interrupt_start = *self.interrupt_receiver.borrow();
+        let interrupt_requested =
+            wait_for_interrupt(self.interrupt_receiver.clone(), interrupt_start);
+        tokio::pin!(interrupt_requested);
+
+        let step_limit = self.config.limits.max_step_minutes.clone();
+        let limit_reached = async move {
+            match remaining_limit_duration(&step_limit, step_started_at) {
+                Some(remaining) => tokio::time::sleep(remaining).await,
+                None => pending::<()>().await,
+            }
+        };
+        tokio::pin!(limit_reached);
+
+        let mut coalescer = RuntimeStreamCoalescer::new(agent_id.clone());
+        let mut next_sequence = first_sequence;
+        let mut flush_interval = tokio::time::interval(STREAM_COALESCE_INTERVAL);
+        flush_interval.tick().await;
+
+        loop {
+            tokio::select! {
+                output = &mut runtime_step => {
+                    while let Ok(event) = receiver.try_recv() {
+                        next_sequence = next_sequence.max(event.sequence().saturating_add(1));
+                        self.record_runtime_event(run, step_id, &mut coalescer, event)?;
+                    }
+                    self.set_live_step_status(
+                        step_id,
+                        if output.is_ok() {
+                            LiveStepStatus::Completed
+                        } else {
+                            LiveStepStatus::Failed
+                        },
+                    );
+                    self.flush_runtime_stream_coalescer(run, step_id, &mut coalescer, true)?;
+                    return output.map(|output| (Some(output), next_sequence));
+                }
+                event = receiver.recv() => {
+                    if let Some(event) = event {
+                        next_sequence = next_sequence.max(event.sequence().saturating_add(1));
+                        self.record_runtime_event(run, step_id, &mut coalescer, event)?;
+                    }
+                }
+                _ = flush_interval.tick() => {
+                    self.flush_runtime_stream_coalescer(run, step_id, &mut coalescer, false)?;
+                }
+                _ = &mut limit_reached => {
+                    self.set_live_step_status(step_id, LiveStepStatus::Cancelling);
+                    self.set_agent_status(&agent_id, "cancelling");
+                    cancellation.cancel();
+                    self.flush_runtime_stream_coalescer(run, step_id, &mut coalescer, true)?;
+                    self.stop_for_step_time_limit(run, step_id, step_started_at)?;
+                    return Ok((None, next_sequence));
+                }
+                _ = &mut interrupt_requested => {
+                    self.set_live_step_status(step_id, LiveStepStatus::Cancelling);
+                    self.set_agent_status(&agent_id, "cancelling");
+                    cancellation.cancel();
+                    let stopped = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        &mut runtime_step,
+                    )
+                    .await;
+                    while let Ok(event) = receiver.try_recv() {
+                        next_sequence = next_sequence.max(event.sequence().saturating_add(1));
+                        self.record_runtime_event(run, step_id, &mut coalescer, event)?;
+                    }
+                    self.set_live_step_status(step_id, LiveStepStatus::Interrupted);
+                    self.flush_runtime_stream_coalescer(run, step_id, &mut coalescer, true)?;
+                    self.finish_streaming_interrupt(run, step_id, stopped)?;
+                    return Ok((None, next_sequence));
+                }
+            }
+        }
+    }
+
     async fn execute_runtime_step_with_actions(
         &mut self,
         mut request: RuntimeRequest,
@@ -1712,29 +1888,27 @@ impl App {
     ) -> Result<StepOutcome> {
         let run_id = run.run_id.as_str();
         let step_id = step.step_id().to_string();
+        let mut next_runtime_sequence = 1;
         loop {
-            let runtime_step = execute_runtime_step(&self.config, request.clone());
-            let step_result = match await_with_step_limit(
-                runtime_step,
-                &self.config.limits.max_step_minutes,
-                step_started_at,
-            )
-            .await
+            let (output, next_sequence) = match self
+                .drive_runtime_step_streaming(
+                    request.clone(),
+                    run,
+                    &step_id,
+                    step_started_at,
+                    next_runtime_sequence,
+                )
+                .await?
             {
-                Some(output) => output?,
-                None => {
-                    self.stop_for_step_time_limit(run, &step_id, step_started_at)?;
-                    return Ok(StepOutcome::LimitReached);
+                (Some(output), next_sequence) => (output, next_sequence),
+                (None, _) if matches!(self.state.run_state, RunState::Interrupted) => {
+                    return Ok(StepOutcome::Interrupted);
                 }
+                (None, _) => return Ok(StepOutcome::LimitReached),
             };
-            self.record_runtime_stream_deltas(
-                run,
-                &step_id,
-                &request.agent_profile.id,
-                &step_result.stream_deltas,
-            )?;
+            next_runtime_sequence = next_sequence;
 
-            match step_result.output {
+            match output {
                 RuntimeOutput::ActionRequest {
                     request: action_request,
                 } => {
@@ -1756,6 +1930,8 @@ impl App {
                         serde_json::to_value(&action_request)?,
                         action_requested_display(&action_request),
                     )?;
+                    self.set_live_step_status(&step_id, LiveStepStatus::WaitingForAction);
+                    self.set_agent_status(&request.agent_profile.id, "waiting_action");
                     let context = ActionExecutionContext {
                         working_directory: self.config.working_directory.clone(),
                         workspace: self.config.workspace.clone(),
@@ -1787,6 +1963,7 @@ impl App {
                     };
                     self.record_action_specific_events(run_id, &step_id, &action_request, &result)?;
                     if matches!(result.status, ActionStatus::ApprovalRequired) {
+                        self.set_live_step_status(&step_id, LiveStepStatus::WaitingForApproval);
                         self.set_agent_status(&request.agent_profile.id, "waiting_approval");
                         let view = PendingApprovalView {
                             run_id: run_id.to_string(),
@@ -1982,22 +2159,117 @@ impl App {
         agent_id: &str,
         deltas: &[RuntimeStreamDelta],
     ) -> Result<()> {
+        let mut coalescer = RuntimeStreamCoalescer::new(agent_id.to_string());
         for delta in deltas {
             self.push_live_stream_delta(step_id, delta);
-            let payload = self.runtime_stream_delta_payload(agent_id, delta)?;
+            coalescer.push_delta(delta);
+            if coalescer.should_flush() {
+                self.flush_runtime_stream_coalescer(run, step_id, &mut coalescer, false)?;
+            }
+        }
+        self.flush_runtime_stream_coalescer(run, step_id, &mut coalescer, true)?;
+        Ok(())
+    }
+
+    fn record_runtime_event(
+        &mut self,
+        run: &RunDriveContext,
+        step_id: &str,
+        coalescer: &mut RuntimeStreamCoalescer,
+        event: RuntimeEvent,
+    ) -> Result<()> {
+        self.push_live_runtime_event(step_id, &event);
+        coalescer.push_event(event);
+        if coalescer.should_flush() {
+            self.flush_runtime_stream_coalescer(run, step_id, coalescer, false)?;
+        }
+        Ok(())
+    }
+
+    fn finish_streaming_interrupt(
+        &mut self,
+        run: &RunDriveContext,
+        step_id: &str,
+        runtime_stop: std::result::Result<Result<RuntimeOutput>, tokio::time::error::Elapsed>,
+    ) -> Result<()> {
+        self.state.run_state = RunState::Interrupted;
+        match runtime_stop {
+            Ok(_) => self.record_step_cancelled_if_active()?,
+            Err(error) => self.record_step_cancel_failed_if_active(&error.to_string())?,
+        }
+        self.record_event(
+            Some(run.run_id.clone()),
+            None,
+            "run_interrupted",
+            json!({}),
+            "Run interrupted.",
+        )?;
+        self.state.active_run_id = None;
+        self.state.pending_approval = None;
+        self.pending_approval = None;
+        self.pending_clarification = None;
+        if self
+            .active_step
+            .as_ref()
+            .is_some_and(|step| step.step_id == step_id)
+        {
+            self.active_step = None;
+        }
+        self.sync_chat_items();
+        self.publish_state();
+        Ok(())
+    }
+
+    fn flush_runtime_stream_coalescer(
+        &mut self,
+        run: &RunDriveContext,
+        step_id: &str,
+        coalescer: &mut RuntimeStreamCoalescer,
+        final_delta: bool,
+    ) -> Result<()> {
+        let records = coalescer.flush(final_delta);
+        for record in records {
+            let stream = record.stream.clone();
+            let payload = self.runtime_stream_record_payload(&record)?;
             self.record_event(
                 Some(run.run_id.clone()),
                 Some(step_id.to_string()),
                 "runtime_stream_delta",
                 payload,
-                format!("Runtime stream: {}", delta.stream),
+                format!("Runtime stream: {stream}"),
             )?;
         }
         Ok(())
     }
 
+    fn push_live_runtime_event(&mut self, step_id: &str, event: &RuntimeEvent) {
+        self.push_live_stream_content(
+            step_id,
+            event.stream_name(),
+            event.content(),
+            event.sequence(),
+            false,
+        );
+    }
+
     fn push_live_stream_delta(&mut self, step_id: &str, delta: &RuntimeStreamDelta) {
-        const LIVE_STREAM_LIMIT: usize = 8;
+        self.push_live_stream_content(
+            step_id,
+            delta.stream.clone(),
+            delta.content.clone(),
+            delta.sequence,
+            delta.final_delta,
+        );
+    }
+
+    fn push_live_stream_content(
+        &mut self,
+        step_id: &str,
+        stream: String,
+        content: String,
+        sequence: u32,
+        final_delta: bool,
+    ) {
         let Some(live_step) = self
             .state
             .live_step
@@ -2006,30 +2278,68 @@ impl App {
         else {
             return;
         };
-        live_step.streams.push(LiveStreamView {
-            stream: delta.stream.clone(),
-            content: concise_diagnostic(&delta.content),
-            final_delta: delta.final_delta,
-        });
-        if live_step.streams.len() > LIVE_STREAM_LIMIT {
-            let overflow = live_step.streams.len() - LIVE_STREAM_LIMIT;
-            live_step.streams.drain(0..overflow);
+        live_step.status = LiveStepStatus::Streaming;
+        if let Some(existing) = live_step
+            .streams
+            .iter_mut()
+            .find(|existing| existing.stream == stream)
+        {
+            existing.content.push_str(&content);
+            trim_live_stream_content(&mut existing.content);
+            existing.sequence_end = sequence;
+            existing.final_delta = final_delta;
+        } else {
+            let mut content = content;
+            trim_live_stream_content(&mut content);
+            live_step.streams.push(LiveStreamView {
+                stream,
+                content,
+                sequence_end: sequence,
+                final_delta,
+            });
         }
+        let agent = live_step.agent.clone();
+        self.sync_chat_items();
+        self.set_agent_status(&agent, "running");
     }
 
-    fn runtime_stream_delta_payload(
+    fn set_live_step_status(&mut self, step_id: &str, status: LiveStepStatus) {
+        let Some(live_step) = self
+            .state
+            .live_step
+            .as_mut()
+            .filter(|live_step| live_step.step_id == step_id)
+        else {
+            return;
+        };
+        let final_delta = matches!(
+            status,
+            LiveStepStatus::Completed | LiveStepStatus::Interrupted | LiveStepStatus::Failed
+        );
+        live_step.status = status;
+        if final_delta {
+            for stream in &mut live_step.streams {
+                stream.final_delta = true;
+            }
+        }
+        self.sync_chat_items();
+        self.publish_state();
+    }
+
+    fn runtime_stream_record_payload(
         &mut self,
-        agent_id: &str,
-        delta: &RuntimeStreamDelta,
+        record: &RuntimeStreamRecord,
     ) -> Result<serde_json::Value> {
         let mut payload = json!({
-            "agent": agent_id,
-            "sequence": delta.sequence,
-            "stream": delta.stream,
-            "final_delta": delta.final_delta,
-            "content": delta.content
+            "agent": record.agent,
+            "sequence_start": record.sequence_start,
+            "sequence_end": record.sequence_end,
+            "stream": record.stream,
+            "final_delta": record.final_delta,
+            "coalesced": true,
+            "content": record.content
         });
-        let bytes = delta.content.as_bytes();
+        let bytes = record.content.as_bytes();
         if bytes.len() <= LARGE_ACTION_CONTENT_BYTES {
             return Ok(payload);
         }
@@ -2201,10 +2511,128 @@ impl App {
                 action_target_display(request)
             ),
         )?;
-        durable_result.content = None;
+        durable_result.content = action_content_preview_for_history(request, content);
         durable_result.artifact = Some(serde_json::to_value(artifact)?);
         Ok(durable_result)
     }
+}
+
+fn action_content_preview_for_history(request: &ActionRequest, content: &Value) -> Option<Value> {
+    match request.kind {
+        ActionKind::SearchText => search_text_content_preview(content),
+        _ => None,
+    }
+}
+
+fn search_text_content_preview(content: &Value) -> Option<Value> {
+    let matches = content.get("matches").and_then(Value::as_array)?;
+    let preview = matches
+        .iter()
+        .take(SEARCH_TEXT_HISTORY_PREVIEW_MATCHES)
+        .cloned()
+        .collect::<Vec<_>>();
+    Some(json!({
+        "query": content.get("query").cloned().unwrap_or(Value::Null),
+        "path": content.get("path").cloned().unwrap_or(Value::Null),
+        "matches": preview,
+        "total_matches": matches.len(),
+        "truncated": matches.len() > SEARCH_TEXT_HISTORY_PREVIEW_MATCHES
+    }))
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeStreamRecord {
+    agent: String,
+    sequence_start: u32,
+    sequence_end: u32,
+    stream: String,
+    content: String,
+    final_delta: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeStreamCoalescer {
+    agent: String,
+    buffers: BTreeMap<String, StreamBuffer>,
+    last_flush_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct StreamBuffer {
+    sequence_start: u32,
+    sequence_end: u32,
+    content: String,
+}
+
+impl RuntimeStreamCoalescer {
+    fn new(agent: String) -> Self {
+        Self {
+            agent,
+            buffers: BTreeMap::new(),
+            last_flush_at: Instant::now(),
+        }
+    }
+
+    fn push_event(&mut self, event: RuntimeEvent) {
+        self.push(event.stream_name(), event.sequence(), event.content());
+    }
+
+    fn push_delta(&mut self, delta: &RuntimeStreamDelta) {
+        self.push(delta.stream.clone(), delta.sequence, delta.content.clone());
+    }
+
+    fn push(&mut self, stream: String, sequence: u32, content: String) {
+        self.buffers
+            .entry(stream)
+            .and_modify(|buffer| {
+                buffer.sequence_end = sequence;
+                buffer.content.push_str(&content);
+            })
+            .or_insert_with(|| StreamBuffer {
+                sequence_start: sequence,
+                sequence_end: sequence,
+                content,
+            });
+    }
+
+    fn should_flush(&self) -> bool {
+        self.buffers
+            .values()
+            .any(|buffer| buffer.content.len() >= STREAM_COALESCE_BYTES)
+            || (!self.buffers.is_empty()
+                && self.last_flush_at.elapsed() >= STREAM_COALESCE_INTERVAL)
+    }
+
+    fn flush(&mut self, final_delta: bool) -> Vec<RuntimeStreamRecord> {
+        if self.buffers.is_empty() {
+            return Vec::new();
+        }
+        self.last_flush_at = Instant::now();
+        std::mem::take(&mut self.buffers)
+            .into_iter()
+            .map(|(stream, buffer)| RuntimeStreamRecord {
+                agent: self.agent.clone(),
+                sequence_start: buffer.sequence_start,
+                sequence_end: buffer.sequence_end,
+                stream,
+                content: buffer.content,
+                final_delta,
+            })
+            .collect()
+    }
+}
+
+fn trim_live_stream_content(content: &mut String) {
+    if content.len() <= LIVE_STREAM_CONTENT_LIMIT {
+        return;
+    }
+    let keep_from = content.len().saturating_sub(LIVE_STREAM_CONTENT_LIMIT);
+    let keep_from = content
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= keep_from)
+        .unwrap_or(content.len());
+    content.drain(..keep_from);
 }
 
 fn runtime_history_event(event: &HistoryEvent) -> RuntimeHistoryEvent {
@@ -2321,7 +2749,16 @@ fn compact_runtime_stream_delta_payload(payload: &Value) -> (Value, bool) {
     };
 
     let mut compacted = Map::new();
-    for key in ["agent", "sequence", "stream", "final_delta", "artifact"] {
+    for key in [
+        "agent",
+        "sequence",
+        "sequence_start",
+        "sequence_end",
+        "stream",
+        "final_delta",
+        "coalesced",
+        "artifact",
+    ] {
         if let Some(value) = object.get(key) {
             compacted.insert(key.to_string(), value.clone());
         }
@@ -2804,6 +3241,21 @@ where
     }
 }
 
+fn sender_next_interrupt_value(sender: &watch::Sender<u64>) -> u64 {
+    (*sender.borrow()).wrapping_add(1)
+}
+
+async fn wait_for_interrupt(mut receiver: watch::Receiver<u64>, initial_value: u64) {
+    loop {
+        if *receiver.borrow_and_update() != initial_value {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            pending::<()>().await;
+        }
+    }
+}
+
 fn review_fix_cycle_count(results: &[AgentResult]) -> u32 {
     let mut saw_review_since_last_fix = false;
     let mut cycles = 0;
@@ -3217,12 +3669,290 @@ prompt = "{reviewer_prompt}"
 
         let live_step = app.state.live_step.as_ref().unwrap();
         assert_eq!(live_step.agent, "fixer");
-        assert_eq!(live_step.streams.len(), 2);
-        assert!(live_step.streams[1].final_delta);
+        assert_eq!(live_step.status, LiveStepStatus::Streaming);
+        assert_eq!(live_step.streams.len(), 1);
+        assert_eq!(live_step.streams[0].content, "firstdone");
+        assert_eq!(live_step.streams[0].sequence_end, 2);
+        assert!(live_step.streams[0].final_delta);
 
         app.clear_active_step("step");
 
         assert!(app.state.live_step.is_none());
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_publishes_running_state_before_first_stream_delta() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let interrupt_handle = app.interrupt_handle();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("/subtask explorer slow stream inspect README")
+                .await
+                .unwrap();
+            app
+        });
+
+        let mut saw_running_before_stream = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let state = receiver.borrow_and_update().clone();
+                    if state.live_step.as_ref().is_some_and(|live_step| {
+                        live_step.agent == "explorer"
+                            && live_step.status == LiveStepStatus::Running
+                            && live_step.streams.is_empty()
+                    }) {
+                        saw_running_before_stream = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        interrupt_handle.request_interrupt();
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(saw_running_before_stream);
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_publishes_live_state_before_final_completion() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("/subtask explorer inspect README only")
+                .await
+                .unwrap();
+            app
+        });
+
+        let mut saw_live_stream_before_completion = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let state = receiver.borrow_and_update().clone();
+                    if state.run_state != RunState::Completed
+                        && state.live_step.as_ref().is_some_and(|live_step| {
+                            live_step.status == LiveStepStatus::Streaming
+                                && live_step.streams.iter().any(|stream| !stream.content.is_empty())
+                        })
+                    {
+                        saw_live_stream_before_completion = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let app = run.await.unwrap();
+
+        assert!(saw_live_stream_before_completion);
+        assert_eq!(app.state.run_state, RunState::Completed);
+    }
+
+    #[tokio::test]
+    async fn runtime_stream_history_uses_coalesced_sequence_ranges() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/subtask explorer inspect README only")
+            .await
+            .unwrap();
+
+        let stream_events = app
+            .history
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "runtime_stream_delta")
+            .collect::<Vec<_>>();
+
+        assert_eq!(stream_events.len(), 2);
+        assert!(stream_events.iter().all(|event| {
+            event.payload["agent"] == "explorer"
+                && event.payload["coalesced"] == true
+                && event.payload.get("sequence").is_none()
+                && event.payload.get("sequence_start").is_some()
+                && event.payload.get("sequence_end").is_some()
+        }));
+    }
+
+    #[tokio::test]
+    async fn runtime_stream_sequences_continue_after_harness_actions() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("README.md"), "action context\n").unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("use action to create a feature")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let action_step_id = events
+            .iter()
+            .find(|event| event.kind == "action_requested")
+            .and_then(|event| event.step_id.clone())
+            .unwrap();
+        let sequence_starts = events
+            .iter()
+            .filter(|event| {
+                event.kind == "runtime_stream_delta"
+                    && event.step_id.as_deref() == Some(action_step_id.as_str())
+            })
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("sequence_start")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(sequence_starts.contains(&1));
+        assert!(sequence_starts.iter().any(|sequence| *sequence > 3));
+    }
+
+    #[tokio::test]
+    async fn interrupt_signal_cancels_active_streaming_runtime() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let interrupt_handle = app.interrupt_handle();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("/subtask explorer slow stream inspect README")
+                .await
+                .unwrap();
+            app
+        });
+
+        let deadline = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => panic!("runtime did not start streaming before test deadline"),
+                changed = receiver.changed() => {
+                    changed.unwrap();
+                    let state = receiver.borrow_and_update().clone();
+                    if state.live_step.as_ref().is_some_and(|live_step| {
+                        live_step.status == LiveStepStatus::Streaming
+                            && live_step.agent == "explorer"
+                    }) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        interrupt_handle.request_interrupt();
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        assert!(app.active_step.is_none());
+        assert_eq!(agent_status(&app, "explorer"), "interrupted");
+        assert_eq!(
+            app.state.live_step.as_ref().map(|live| &live.status),
+            Some(&LiveStepStatus::Interrupted)
+        );
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "step_cancel_requested"));
+        assert!(events.iter().any(|event| event.kind == "step_cancelled"));
+        assert!(events.iter().any(|event| event.kind == "run_interrupted"));
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_cancellation_records_visible_failure() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.state.active_run_id = Some("run".to_string());
+        app.set_active_step("run", "step", "explorer");
+        let run = RunDriveContext {
+            run_id: "run".to_string(),
+            parent_run_id: None,
+            prompt: "slow stream".to_string(),
+            subtask: None,
+            previous_results: Vec::new(),
+            step_count: 1,
+            started_at: Instant::now(),
+            parse_repair_attempts: 0,
+        };
+        let elapsed = tokio::time::timeout(Duration::ZERO, pending::<Result<RuntimeOutput>>())
+            .await
+            .unwrap_err();
+
+        app.finish_streaming_interrupt(&run, "step", Err(elapsed))
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        assert_eq!(agent_status(&app, "explorer"), "failed");
+        assert_eq!(
+            app.state.live_step.as_ref().map(|live| &live.status),
+            Some(&LiveStepStatus::Failed)
+        );
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "step_cancel_requested"));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "step_cancel_failed"));
+        assert!(events.iter().any(|event| event.kind == "run_interrupted"));
+    }
+
+    #[tokio::test]
+    async fn large_runtime_stream_records_are_spilled_to_history_artifacts() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let record = RuntimeStreamRecord {
+            agent: "explorer".to_string(),
+            sequence_start: 1,
+            sequence_end: 2,
+            stream: "stdout".to_string(),
+            content: "x".repeat(LARGE_ACTION_CONTENT_BYTES + 1),
+            final_delta: true,
+        };
+
+        let payload = app.runtime_stream_record_payload(&record).unwrap();
+
+        assert!(payload["content"].is_null());
+        assert_eq!(payload["coalesced"], true);
+        assert_eq!(payload["sequence_start"], 1);
+        assert_eq!(payload["sequence_end"], 2);
+        assert!(payload.get("artifact").is_some());
     }
 
     #[tokio::test]
@@ -4642,6 +5372,72 @@ runtime = "fake"
         let artifact_path = action_completed
             .payload
             .get("artifact")
+            .and_then(|artifact| artifact.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(dir.path().join(".multiagent").join(artifact_path).exists());
+    }
+
+    #[tokio::test]
+    async fn large_search_results_keep_history_preview_when_spilled() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "action".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::SearchText,
+            params: json!({ "query": "npm distribution plan", "path": "." }),
+        };
+        let matches = (0..240)
+            .map(|index| {
+                json!({
+                    "path": format!("docs/file-{index}.md"),
+                    "line": index + 1,
+                    "text": "npm distribution plan ".repeat(8)
+                })
+            })
+            .collect::<Vec<_>>();
+        let result = ActionResult {
+            schema_version: 1,
+            action_id: "action".to_string(),
+            status: ActionStatus::Completed,
+            summary: "Found 240 matches for \"npm distribution plan\".".to_string(),
+            content: Some(json!({
+                "query": "npm distribution plan",
+                "path": ".",
+                "matches": matches
+            })),
+            artifact: None,
+            diagnostic: None,
+        };
+
+        let durable = app
+            .action_result_for_history("run", "step", &request, &result)
+            .unwrap();
+
+        assert!(durable.artifact.is_some());
+        let preview = durable.content.unwrap();
+        assert_eq!(
+            preview
+                .get("matches")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .len(),
+            SEARCH_TEXT_HISTORY_PREVIEW_MATCHES
+        );
+        assert_eq!(
+            preview.get("total_matches").and_then(Value::as_u64),
+            Some(240)
+        );
+        assert_eq!(
+            preview.get("truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+        let artifact_path = durable
+            .artifact
+            .as_ref()
             .and_then(|artifact| artifact.get("path"))
             .and_then(serde_json::Value::as_str)
             .unwrap();

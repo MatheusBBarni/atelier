@@ -1,6 +1,6 @@
-# Multiagent Harness
+# Atelier
 
-`multiagent` is a terminal-native Rust harness that routes each user prompt through
+`atelier` is a terminal-native Rust harness that routes each user prompt through
 an orchestrator and a sequence of specialized agent profiles.
 
 ## Features
@@ -34,28 +34,28 @@ cargo install --path .
 ## Quick Start
 
 ```bash
-multiagent --doctor
-multiagent
+atelier --doctor
+atelier
 ```
 
-`multiagent` opens an interactive TUI in the selected working directory.
+`atelier` opens an interactive TUI in the selected working directory.
 
 ## CLI
 
 ```bash
-multiagent
-multiagent --config <path>
-multiagent --cwd <path>
-multiagent --doctor
-multiagent --doctor --json
-multiagent --print-config
-multiagent --init-config
-multiagent --codemap init
-multiagent --codemap changes
-multiagent --codemap update
-multiagent --clean-sessions
-multiagent --clean-sessions --yes
-multiagent --debug
+atelier
+atelier --config <path>
+atelier --cwd <path>
+atelier --doctor
+atelier --doctor --json
+atelier --print-config
+atelier --init-config
+atelier --codemap init
+atelier --codemap changes
+atelier --codemap update
+atelier --clean-sessions
+atelier --clean-sessions --yes
+atelier --debug
 ```
 
 Notes:
@@ -68,10 +68,10 @@ Notes:
 
 ## Codemaps
 
-Codemaps are visible repository docs for agents and users. `multiagent --codemap
+Codemaps are visible repository docs for agents and users. `atelier --codemap
 init` writes folder-level `codemap.md` files and stores hashes in
-`.multiagent/codemap.json`. `multiagent --codemap changes` compares current file
-hashes with that state and reports stale map paths. `multiagent --codemap update`
+`.multiagent/codemap.json`. `atelier --codemap changes` compares current file
+hashes with that state and reports stale map paths. `atelier --codemap update`
 regenerates maps and refreshes the state.
 
 Codemap generation excludes `.git`, `.multiagent`, `target`, and common build or

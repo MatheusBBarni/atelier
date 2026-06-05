@@ -5,19 +5,19 @@ Date: 2026-06-03
 
 ## Summary
 
-This document captures improvements worth bringing into `multiagent` after
+This document captures improvements worth bringing into `atelier` after
 reading `../oh-my-opencode-slim`. The sibling project is an OpenCode plugin, so
 most implementation details cannot be copied directly. The useful parts are the
 product patterns: stronger agent role definitions, preset-based model routing,
 per-agent tool access, prompt override files, resumable delegated context,
 council-style review, subtasks, and richer terminal visibility.
 
-The immediate goal is not to turn `multiagent` into an OpenCode plugin. The goal
+The immediate goal is not to turn `atelier` into an OpenCode plugin. The goal
 is to evolve the Rust harness while preserving its current architecture:
 runtimes produce typed outputs or action requests, and the Rust harness owns
 actions, permissions, limits, history, and UI state.
 
-## Current multiagent baseline
+## Current atelier baseline
 
 Relevant current files:
 
@@ -41,7 +41,7 @@ Relevant current files:
 ### 1. Presets and model fallback chains
 
 Slim supports named presets, model arrays, runtime preset switching, and fallback
-chains per agent. `multiagent` already has per-agent `runtime`, `model`,
+chains per agent. `atelier` already has per-agent `runtime`, `model`,
 `effort`, and `thinking`, but no named preset layer or fallback chain.
 
 Plan:
@@ -53,7 +53,7 @@ Plan:
   fallback table.
 - Add optional `display_name` for UI-friendly labels without changing stable
   agent IDs.
-- Add `multiagent --print-config` coverage showing the active preset after merge.
+- Add `atelier --print-config` coverage showing the active preset after merge.
 - Defer in-session `/preset` switching until the TUI command layer exists.
 
 Acceptance checks:
@@ -68,7 +68,7 @@ Acceptance checks:
 ### 2. Dynamic orchestrator prompt from enabled agents
 
 Slim builds its orchestrator prompt from only the enabled agents and injects
-role-specific delegation rules. `multiagent` currently gives the Orchestrator a
+role-specific delegation rules. `atelier` currently gives the Orchestrator a
 short static instruction string.
 
 Plan:
@@ -88,7 +88,7 @@ Acceptance checks:
 
 ### 3. Prompt override files and append instructions
 
-Slim supports project-local prompt overrides and append files. `multiagent`
+Slim supports project-local prompt overrides and append files. `atelier`
 already has `instructions` and `instructions_file`, but it does not have a
 layered convention for per-agent prompt customization.
 
@@ -135,7 +135,7 @@ Acceptance checks:
 
 ### 5. Per-agent tool and MCP policy
 
-Slim has per-agent skills and MCP allowlists. `multiagent` has capabilities but
+Slim has per-agent skills and MCP allowlists. `atelier` has capabilities but
 not named tool groups or MCPs.
 
 Plan:
@@ -208,12 +208,12 @@ Acceptance checks:
 ### 8. Codemap-style repository mapping
 
 Slim ships a codemap skill that maintains folder-level `codemap.md` files and a
-hash state file. `multiagent` can use the same idea as a harness command or
+hash state file. `atelier` can use the same idea as a harness command or
 agent workflow.
 
 Plan:
 
-- Add `multiagent --codemap init|changes|update` only after core runtime work,
+- Add `atelier --codemap init|changes|update` only after core runtime work,
   or expose it as a `record_note`/artifact workflow first.
 - Store state under `.multiagent/codemap.json` instead of `.slim`.
 - Generate concise folder maps for active agents to read.
@@ -228,7 +228,7 @@ Acceptance checks:
 
 ### 9. Multiplexer-like visibility
 
-Slim mirrors child sessions into tmux/zellij panes. Since `multiagent` already
+Slim mirrors child sessions into tmux/zellij panes. Since `atelier` already
 owns the TUI, the first implementation should improve in-app visibility before
 spawning external panes.
 
@@ -247,7 +247,7 @@ Acceptance checks:
 
 ### 10. Config diagnostics and validation visibility
 
-Slim surfaces invalid configuration quickly in the UI. `multiagent` already has
+Slim surfaces invalid configuration quickly in the UI. `atelier` already has
 validation and doctor paths, but the TUI should expose enough status to avoid
 running with surprising defaults.
 

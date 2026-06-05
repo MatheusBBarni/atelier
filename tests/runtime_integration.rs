@@ -5,7 +5,9 @@ use multiagent::config::{
 };
 use multiagent::runtime::codex::CodexRuntime;
 use multiagent::runtime::zai::ZaiRuntime;
-use multiagent::runtime::{Runtime, RuntimeOutput, RuntimeRecentContext, RuntimeRequest};
+use multiagent::runtime::{
+    collect_runtime_step_result, Runtime, RuntimeOutput, RuntimeRecentContext, RuntimeRequest,
+};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -30,14 +32,11 @@ async fn codex_runtime_executes_real_agent_step() -> Result<()> {
         api_key_env: None,
     });
 
-    let result = runtime
-        .stream_step(agent_request(
-            dir.path().to_path_buf(),
-            "explorer",
-            "codex",
-            "default",
-        ))
-        .await?;
+    let request = agent_request(dir.path().to_path_buf(), "explorer", "codex", "default");
+    let result = collect_runtime_step_result(|events, cancellation| {
+        runtime.stream_step(request, events, cancellation)
+    })
+    .await?;
 
     assert_agent_result(result.output, "explorer")?;
     assert!(!result.stream_deltas.is_empty());
@@ -73,14 +72,11 @@ async fn zai_runtime_executes_real_agent_step() -> Result<()> {
     });
     let model = std::env::var("MULTIAGENT_ZAI_MODEL").unwrap_or_else(|_| "glm-5.1".to_string());
 
-    let result = runtime
-        .stream_step(agent_request(
-            dir.path().to_path_buf(),
-            "oracle",
-            "zai",
-            &model,
-        ))
-        .await?;
+    let request = agent_request(dir.path().to_path_buf(), "oracle", "zai", &model);
+    let result = collect_runtime_step_result(|events, cancellation| {
+        runtime.stream_step(request, events, cancellation)
+    })
+    .await?;
 
     assert_agent_result(result.output, "oracle")?;
     assert!(!result.stream_deltas.is_empty());
