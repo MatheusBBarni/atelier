@@ -31,12 +31,13 @@ export function writeJson(path, data) {
 }
 
 export function run(command, args, options = {}) {
+  const shell = options.shell ?? defaultShellForCommand(command);
   const result = spawnSync(command, args, {
     cwd: options.cwd ?? repoRoot,
     env: options.env ?? process.env,
     stdio: options.stdio ?? "inherit",
     encoding: options.encoding ?? "utf8",
-    shell: options.shell ?? false,
+    shell,
   });
   if (result.error) {
     throw result.error;
@@ -45,6 +46,10 @@ export function run(command, args, options = {}) {
     throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}`);
   }
   return result;
+}
+
+export function defaultShellForCommand(command, platform = process.platform) {
+  return platform === "win32" && /^(npm|npx)$/.test(command);
 }
 
 export function capture(command, args, options = {}) {
