@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 
 const USER_EVENT_BG: Color = Color::Rgb(18, 52, 71);
 const INPUT_COMPOSER_HEIGHT: u16 = 5;
-const ACTIVE_INPUT_BOX_HEIGHT: u16 = 3;
+const INPUT_BOX_HEIGHT: u16 = 4;
 const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
 const WORK_HINT: &str = "/help";
@@ -647,7 +647,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     render_chat(frame, event_area, state, ui_state);
 
     let work_active = work_indicator_active(state);
-    let input_areas = input_areas(outer[1], work_active);
+    let input_areas = input_areas(outer[1]);
     let input_layout = input_layout(input_areas.input, &state.input, ui_state.input_cursor);
     ui_state.input_width = input_layout.width;
     let input = Paragraph::new(wrapped_input_lines(&state.input, input_layout.width))
@@ -659,11 +659,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         )
         .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
     frame.render_widget(input, input_areas.input);
-    if let Some(status_area) = input_areas.work_status {
-        render_work_indicator(frame, status_area, ui_state);
-    } else {
-        ui_state.work_spinner_frame = 0;
-    }
+    render_input_status(frame, input_areas.status, ui_state, work_active);
     if ui_state.help_visible {
         render_help_modal(frame);
     } else {
@@ -1080,21 +1076,21 @@ fn work_indicator_active(state: &AppState) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InputAreas {
     input: Rect,
-    work_status: Option<Rect>,
+    status: Rect,
 }
 
-fn input_areas(composer_area: Rect, work_active: bool) -> InputAreas {
-    if !work_active || composer_area.height <= ACTIVE_INPUT_BOX_HEIGHT {
+fn input_areas(composer_area: Rect) -> InputAreas {
+    if composer_area.height <= WORK_INDICATOR_HEIGHT {
         return InputAreas {
             input: composer_area,
-            work_status: None,
+            status: Rect::ZERO,
         };
     }
 
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(ACTIVE_INPUT_BOX_HEIGHT),
+            Constraint::Length(INPUT_BOX_HEIGHT),
             Constraint::Length(WORK_INDICATOR_HEIGHT),
             Constraint::Min(0),
         ])
@@ -1102,16 +1098,19 @@ fn input_areas(composer_area: Rect, work_active: bool) -> InputAreas {
 
     InputAreas {
         input: areas[0],
-        work_status: Some(areas[1]),
+        status: areas[1],
     }
 }
 
-fn render_work_indicator(frame: &mut Frame, status_area: Rect, ui_state: &mut TuiUiState) {
+fn render_input_status(
+    frame: &mut Frame,
+    status_area: Rect,
+    ui_state: &mut TuiUiState,
+    work_active: bool,
+) {
     if status_area.width == 0 || status_area.height == 0 {
         return;
     }
-    let spinner = WORK_SPINNER_FRAMES[ui_state.work_spinner_frame % WORK_SPINNER_FRAMES.len()];
-    ui_state.work_spinner_frame = ui_state.work_spinner_frame.wrapping_add(1);
     let line_area = Rect {
         x: status_area.x + 1,
         y: status_area.y,
@@ -1119,18 +1118,29 @@ fn render_work_indicator(frame: &mut Frame, status_area: Rect, ui_state: &mut Tu
         height: 1,
     };
     let line_width = usize::from(line_area.width);
-    let left_width = spinner.chars().count() + 1 + WORK_LABEL.chars().count();
+    let left_width = if work_active {
+        1 + 1 + WORK_LABEL.chars().count()
+    } else {
+        0
+    };
     let hint_width = WORK_HINT.chars().count();
-    let mut spans = vec![
-        Span::styled(spinner, Style::default().fg(Color::Yellow)),
-        Span::raw(" "),
-        Span::styled(
-            WORK_LABEL,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let mut spans = Vec::new();
+    if work_active {
+        let spinner = WORK_SPINNER_FRAMES[ui_state.work_spinner_frame % WORK_SPINNER_FRAMES.len()];
+        ui_state.work_spinner_frame = ui_state.work_spinner_frame.wrapping_add(1);
+        spans.extend([
+            Span::styled(spinner, Style::default().fg(Color::Yellow)),
+            Span::raw(" "),
+            Span::styled(
+                WORK_LABEL,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    } else {
+        ui_state.work_spinner_frame = 0;
+    }
     if line_width >= left_width.saturating_add(hint_width) {
         spans.push(Span::raw(
             " ".repeat(line_width.saturating_sub(left_width + hint_width)),
@@ -1324,6 +1334,44 @@ mod tests {
         let text = render_to_text(&state, 100, 24);
 
         assert!(!text.contains("Working"));
+        assert!(text.contains("/help"));
+    }
+
+    #[test]
+    fn input_area_height_is_stable_between_idle_and_running() {
+        let idle = state_with_input("stable", false);
+        let mut running = state_with_input("stable", false);
+        running.run_state = RunState::Running;
+        running.active_run_id = Some("run".to_string());
+        let mut idle_ui = TuiUiState::default();
+        let mut running_ui = TuiUiState::default();
+        let idle_lines = render_to_lines_with_ui_mut(&idle, &mut idle_ui, 100, 24);
+        let running_lines = render_to_lines_with_ui_mut(&running, &mut running_ui, 100, 24);
+        let idle_prompt_row = idle_lines
+            .iter()
+            .position(|line| line.contains("> stable"))
+            .unwrap();
+        let running_prompt_row = running_lines
+            .iter()
+            .position(|line| line.contains("> stable"))
+            .unwrap();
+        let idle_border_row = idle_lines
+            .iter()
+            .enumerate()
+            .skip(idle_prompt_row)
+            .find_map(|(index, line)| line.contains("└").then_some(index))
+            .unwrap();
+        let running_border_row = running_lines
+            .iter()
+            .enumerate()
+            .skip(running_prompt_row)
+            .find_map(|(index, line)| line.contains("└").then_some(index))
+            .unwrap();
+
+        assert_eq!(
+            idle_border_row.saturating_sub(idle_prompt_row),
+            running_border_row.saturating_sub(running_prompt_row)
+        );
     }
 
     #[test]
