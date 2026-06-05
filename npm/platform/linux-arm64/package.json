@@ -1,0 +1,24 @@
+{
+  "name": "@matheusbbarni/atelier-linux-arm64",
+  "version": "0.1.0",
+  "description": "glibc Linux arm64 native binary for Atelier",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MatheusBBarni/atelier.git"
+  }
+}

@@ -1,0 +1,356 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable release version to dry-run, with or without leading v"
+        required: true
+        type: string
+      publish:
+        description: "Reserved for a future workflow revision; workflow_dispatch is dry-run only"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.event.inputs.version || github.ref_name || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  validate-release:
+    name: Validate release inputs
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve release version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.publish }}" == "true" ]]; then
+              echo "::error::workflow_dispatch publish is not supported in v1"
+              exit 1
+            fi
+            VERSION="${{ inputs.version }}"
+            VERSION="${VERSION#v}"
+            TAG="v${VERSION}"
+            PUBLISH=false
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+            PUBLISH=true
+          fi
+
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::expected stable semver tag vMAJOR.MINOR.PATCH, got ${TAG}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "publish=${PUBLISH}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved release ${TAG}; publish=${PUBLISH}"
+      - name: Install npm workspace
+        run: npm ci --prefix npm --ignore-scripts --force
+      - name: Check npm target map
+        run: npm --prefix npm run check:targets
+      - name: Check version consistency
+        env:
+          ATELIER_VERSION: ${{ steps.release.outputs.version }}
+        run: npm --prefix npm run check:versions
+
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+
+  build-native:
+    name: Build ${{ matrix.target }}
+    needs:
+      - validate-release
+      - rust-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Standard GitHub-hosted runner labels verified against GitHub's runner reference.
+          - target: darwin-arm64
+            runner: macos-15
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: linux-x64
+            runner: ubuntu-24.04
+          - target: win32-arm64
+            runner: windows-11-arm
+          - target: win32-x64
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET_KEY: ${{ matrix.target }}
+      VERSION: ${{ needs.validate-release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --locked --release --bin atelier
+      - name: Smoke release binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION_OUTPUT="$(./target/release/atelier --version)"
+          echo "${VERSION_OUTPUT}"
+          [[ "${VERSION_OUTPUT}" == *"atelier"* ]]
+          [[ "${VERSION_OUTPUT}" == *"${VERSION}"* ]]
+          ./target/release/atelier --help
+          : > "${RUNNER_TEMP}/multiagent.toml"
+          MULTIAGENT_CONFIG="${RUNNER_TEMP}/multiagent.toml" ./target/release/atelier --doctor --json > "${RUNNER_TEMP}/doctor.json"
+          node -e 'const fs=require("fs"); const report=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if (report.schema_version !== 1 || !Array.isArray(report.checks)) process.exit(1)' "${RUNNER_TEMP}/doctor.json"
+      - name: Smoke release binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $versionOutput = .\target\release\atelier.exe --version
+          Write-Output $versionOutput
+          if (-not $versionOutput.Contains("atelier")) { throw "version output did not include atelier" }
+          if (-not $versionOutput.Contains($env:VERSION)) { throw "version output did not include $env:VERSION" }
+          .\target\release\atelier.exe --help
+          New-Item -ItemType File -Force -Path "$env:RUNNER_TEMP\multiagent.toml" | Out-Null
+          $env:MULTIAGENT_CONFIG = "$env:RUNNER_TEMP\multiagent.toml"
+          .\target\release\atelier.exe --doctor --json | Out-File -Encoding utf8 "$env:RUNNER_TEMP\doctor.json"
+          node -e "const fs=require('fs'); const report=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); if (report.schema_version !== 1 || !Array.isArray(report.checks)) process.exit(1)" "$env:RUNNER_TEMP\doctor.json"
+      - name: Archive native binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="${RUNNER_TEMP}/atelier-stage"
+          rm -rf "${STAGE}"
+          mkdir -p "${STAGE}" target/npm-dist/archives
+          cp target/release/atelier README.md LICENSE "${STAGE}/"
+          tar -czf "target/npm-dist/archives/atelier-v${VERSION}-${TARGET_KEY}.tar.gz" -C "${STAGE}" .
+          shasum -a 256 "target/npm-dist/archives/atelier-v${VERSION}-${TARGET_KEY}.tar.gz"
+      - name: Archive native binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "atelier-stage"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          New-Item -ItemType Directory -Force "target\npm-dist\archives" | Out-Null
+          Copy-Item "target\release\atelier.exe" $stage
+          Copy-Item "README.md" $stage
+          Copy-Item "LICENSE" $stage
+          $archive = "target\npm-dist\archives\atelier-v$env:VERSION-$env:TARGET_KEY.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $archive -Force
+          Get-FileHash -Algorithm SHA256 $archive
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: target/npm-dist/archives/*
+          if-no-files-found: error
+
+  package-npm:
+    name: Assemble and pack npm packages
+    needs:
+      - validate-release
+      - build-native
+    runs-on: ubuntu-24.04
+    env:
+      ATELIER_VERSION: ${{ needs.validate-release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: target/npm-dist/archives
+          merge-multiple: true
+      - run: npm ci --prefix npm --ignore-scripts --force
+      - run: npm --prefix npm test
+      - run: npm --prefix npm run check:targets
+      - run: npm --prefix npm run check:versions
+      - run: npm --prefix npm run assemble
+      - run: npm --prefix npm run check:metadata
+      - run: npm --prefix npm run pack
+      - run: npm --prefix npm run checksum
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-dist
+          path: |
+            target/npm-dist/*.tgz
+            target/npm-dist/npm-packages.json
+            target/npm-dist/SHA256SUMS
+          if-no-files-found: error
+
+  verify-local-install:
+    name: Verify local npm install on ${{ matrix.target }}
+    needs:
+      - validate-release
+      - package-npm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-15
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: linux-x64
+            runner: ubuntu-24.04
+          - target: win32-arm64
+            runner: windows-11-arm
+          - target: win32-x64
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    env:
+      ATELIER_VERSION: ${{ needs.validate-release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-dist
+          path: target/npm-dist
+      - run: npm --prefix npm run verify:installed
+
+  publish-npm:
+    name: Publish npm packages
+    needs:
+      - validate-release
+      - verify-local-install
+    if: needs.validate-release.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    environment: release
+    env:
+      VERSION: ${{ needs.validate-release.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-dist
+          path: target/npm-dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Publish verified tarballs
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE' > /tmp/atelier-publish-order.txt
+          const fs = require("fs");
+          const manifest = JSON.parse(fs.readFileSync("target/npm-dist/npm-packages.json", "utf8"));
+          if (manifest.length !== 7) {
+            throw new Error(`expected 7 npm tarballs, got ${manifest.length}`);
+          }
+          const top = manifest.find((entry) => entry.package === "@matheusbbarni/atelier");
+          const platforms = manifest.filter((entry) => entry.package !== "@matheusbbarni/atelier");
+          if (!top || platforms.length !== 6) {
+            throw new Error("manifest must include six platform packages and the top-level package");
+          }
+          for (const entry of [...platforms, top]) {
+            console.log(entry.filename);
+          }
+          NODE
+
+          while IFS= read -r filename; do
+            echo "Publishing ${filename}"
+            npm publish "target/npm-dist/${filename}" --access public --provenance
+          done < /tmp/atelier-publish-order.txt
+
+          node <<'NODE' > /tmp/atelier-view-order.txt
+          const fs = require("fs");
+          const manifest = JSON.parse(fs.readFileSync("target/npm-dist/npm-packages.json", "utf8"));
+          for (const entry of manifest) {
+            console.log(`${entry.package}@${entry.version}`);
+          }
+          NODE
+
+          while IFS= read -r package_version; do
+            npm view "${package_version}" version dist.integrity
+          done < /tmp/atelier-view-order.txt
+
+  verify-registry-install:
+    name: Verify registry install
+    needs:
+      - validate-release
+      - publish-npm
+    if: needs.validate-release.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      ATELIER_VERIFY_REGISTRY: "1"
+      ATELIER_VERSION: ${{ needs.validate-release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm --prefix npm run verify:installed
+
+  create-github-release:
+    name: Create GitHub Release
+    needs:
+      - validate-release
+      - verify-registry-install
+    if: needs.validate-release.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.validate-release.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: target/npm-dist/archives
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-dist
+          path: target/npm-dist
+      - name: Create or update release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" target/npm-dist/archives/* target/npm-dist/*.tgz target/npm-dist/SHA256SUMS --clobber
+          else
+            gh release create "${TAG}" \
+              target/npm-dist/archives/* \
+              target/npm-dist/*.tgz \
+              target/npm-dist/SHA256SUMS \
+              --verify-tag \
+              --generate-notes
+          fi

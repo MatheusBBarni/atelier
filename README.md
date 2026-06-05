@@ -21,15 +21,35 @@ an orchestrator and a sequence of specialized agent profiles.
 
 ## Requirements
 
-- Rust toolchain (to build from source).
+- Node.js 20+ and npm 10+ for the recommended npm install path.
+- Rust toolchain only if you build from source.
 - Optional: `codex` CLI with `codex login` completed if you plan to use the Codex runtime.
 - Optional: `ZAI_API_KEY` (or another env var configured as `api_key_env`) for Z.ai runtime.
 
 ## Install
 
+Recommended user install:
+
+```bash
+npm install -g @matheusbbarni/atelier
+atelier --doctor
+atelier
+```
+
+The npm package installs a prebuilt native binary for supported platforms and
+does not initialize configuration, probe credentials, or start the TUI during
+installation. Supported npm targets are macOS arm64/x64, glibc Linux arm64/x64,
+and Windows arm64/x64. Alpine/musl Linux is not supported by the v1 npm
+packages.
+
+Developer/source install:
+
 ```bash
 cargo install --path .
 ```
+
+GitHub Releases provide standalone native binary archives and checksum
+manifests for release traceability.
 
 ## Quick Start
 

@@ -1,0 +1,34 @@
+{
+  "name": "@matheusbbarni/atelier",
+  "version": "0.1.0",
+  "description": "Terminal-native agent orchestration harness",
+  "license": "MIT",
+  "bin": {
+    "atelier": "bin/atelier.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MatheusBBarni/atelier.git"
+  },
+  "homepage": "https://github.com/MatheusBBarni/atelier#readme",
+  "bugs": {
+    "url": "https://github.com/MatheusBBarni/atelier/issues"
+  },
+  "optionalDependencies": {
+    "@matheusbbarni/atelier-darwin-arm64": "0.1.0",
+    "@matheusbbarni/atelier-darwin-x64": "0.1.0",
+    "@matheusbbarni/atelier-linux-arm64": "0.1.0",
+    "@matheusbbarni/atelier-linux-x64": "0.1.0",
+    "@matheusbbarni/atelier-win32-arm64": "0.1.0",
+    "@matheusbbarni/atelier-win32-x64": "0.1.0"
+  }
+}

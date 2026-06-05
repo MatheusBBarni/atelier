@@ -1,0 +1,24 @@
+{
+  "name": "@matheusbbarni/atelier-linux-x64",
+  "version": "0.1.0",
+  "description": "glibc Linux x64 native binary for Atelier",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MatheusBBarni/atelier.git"
+  }
+}
