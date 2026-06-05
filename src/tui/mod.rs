@@ -29,6 +29,8 @@ use tokio::task::JoinHandle;
 
 const USER_EVENT_BG: Color = Color::Rgb(18, 52, 71);
 const INPUT_COMPOSER_HEIGHT: u16 = 5;
+const INPUT_PROMPT: &str = "> ";
+const INPUT_PROMPT_WIDTH: usize = 2;
 const MOUSE_SCROLL_LINES: usize = 3;
 const WORK_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
@@ -643,13 +645,10 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     let work_active = work_indicator_active(state);
     let input_layout = input_layout(outer[1], &state.input, ui_state.input_cursor, work_active);
     ui_state.input_width = input_layout.width;
-    let input_title = format!(" Input Composer | {} ", state.config_status.summary);
     let input = Paragraph::new(wrapped_input_lines(&state.input, input_layout.width))
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
-                .title(input_title)
-                .title_style(Style::default().fg(Color::Yellow))
                 .border_style(Style::default().fg(Color::Yellow))
                 .borders(Borders::ALL),
         )
@@ -1113,7 +1112,8 @@ fn input_layout(
     cursor: usize,
     reserve_status_line: bool,
 ) -> InputLayout {
-    let width = usize::from(input_area.width.saturating_sub(2).max(1));
+    let inner_width = usize::from(input_area.width.saturating_sub(2).max(1));
+    let width = inner_width.saturating_sub(INPUT_PROMPT_WIDTH).max(1);
     let inner_rows = input_area.height.saturating_sub(2).max(1);
     let visible_rows = if reserve_status_line {
         inner_rows.saturating_sub(1).max(1)
@@ -1128,7 +1128,9 @@ fn input_layout(
     let visible_cursor_row = cursor_line.saturating_sub(scroll);
     InputLayout {
         width,
-        cursor_col: cursor_col.min(width.saturating_sub(1)) as u16,
+        cursor_col: INPUT_PROMPT_WIDTH
+            .saturating_add(cursor_col)
+            .min(inner_width.saturating_sub(1)) as u16,
         cursor_row: visible_cursor_row.min(visible_rows.saturating_sub(1)) as u16,
         scroll,
     }
@@ -1137,7 +1139,7 @@ fn input_layout(
 fn wrapped_input_lines(input: &str, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     if input.is_empty() {
-        return vec![Line::from("")];
+        return vec![prompted_input_line("", true)];
     }
 
     let mut lines = Vec::new();
@@ -1147,14 +1149,23 @@ fn wrapped_input_lines(input: &str, width: usize) -> Vec<Line<'static>> {
         line.push(ch);
         line_len += 1;
         if line_len == width {
-            lines.push(Line::from(std::mem::take(&mut line)));
+            lines.push(prompted_input_line(&line, lines.is_empty()));
+            line.clear();
             line_len = 0;
         }
     }
     if !line.is_empty() || input.chars().count().is_multiple_of(width) {
-        lines.push(Line::from(line));
+        lines.push(prompted_input_line(&line, lines.is_empty()));
     }
     lines
+}
+
+fn prompted_input_line(input: &str, first_line: bool) -> Line<'static> {
+    let prefix = if first_line { INPUT_PROMPT } else { "  " };
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(Color::Cyan)),
+        Span::raw(input.to_string()),
+    ])
 }
 
 fn set_input_cursor(frame: &mut Frame, input_area: Rect, input_layout: InputLayout) {
@@ -1193,7 +1204,8 @@ mod tests {
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Agent Roster"));
         assert!(text.contains("Chat"));
-        assert!(text.contains("Input Composer"));
+        assert!(text.contains(">"));
+        assert!(!text.contains("Input Composer"));
         assert!(text.contains("No chat yet."));
     }
 
@@ -1332,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_config_status_footer_at_80x24_and_120x40() {
+    fn omits_config_status_from_input_prompt_at_80x24_and_120x40() {
         let mut state = state_with_input("", false);
         state.config_status = ConfigStatusView {
             summary: "Config: sources=2 preset=research warnings=1".to_string(),
@@ -1347,8 +1359,10 @@ mod tests {
         let small = render_to_text(&state, 80, 24);
         let large = render_to_text(&state, 120, 40);
 
-        assert!(small.contains("Config: sources=2 preset=research warnings=1"));
-        assert!(large.contains("Config: sources=2 preset=research warnings=1"));
+        assert!(small.contains(">"));
+        assert!(large.contains(">"));
+        assert!(!small.contains("Config: sources=2 preset=research warnings=1"));
+        assert!(!large.contains("Config: sources=2 preset=research warnings=1"));
     }
 
     #[test]
@@ -1410,7 +1424,7 @@ mod tests {
 
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(5, 20));
+            .assert_cursor_position(Position::new(7, 20));
     }
 
     #[test]
@@ -1431,11 +1445,11 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("abcdefghijklmnopqrstuv"));
-        assert!(text.contains("wxyz1234"));
+        assert!(text.contains("> abcdefghijklmnopqrst"));
+        assert!(text.contains("  uvwxyz1234"));
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(9, 9));
+            .assert_cursor_position(Position::new(13, 9));
     }
 
     #[test]
@@ -1810,7 +1824,7 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &state, &mut ui_state))
             .unwrap();
-        assert_eq!(ui_state.input_width, 22);
+        assert_eq!(ui_state.input_width, 20);
 
         for key in [
             KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
@@ -1823,8 +1837,8 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(state.input, "abcdefgXhijklmnopqrstuvwxyz1234");
-        assert_eq!(ui_state.input_cursor, 8);
+        assert_eq!(state.input, "abcdefghiXjklmnopqrstuvwxyz1234");
+        assert_eq!(ui_state.input_cursor, 10);
         assert!(receiver.try_recv().is_err());
 
         terminal
@@ -1832,7 +1846,7 @@ mod tests {
             .unwrap();
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(9, 8));
+            .assert_cursor_position(Position::new(13, 8));
     }
 
     #[test]
