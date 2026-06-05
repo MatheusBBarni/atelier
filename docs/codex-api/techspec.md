@@ -1,67 +1,67 @@
-# Technical Specification: OpenAI Responses Runtime
+# Technical Specification: Codex Subscription Runtime
 
 Status: Draft
 Version: 1.0
 Date: 2026-06-04
-Source PRD: `docs/prd/codex-api-prd.md`
+Source PRD: `docs/codex-api/prd.md`
 
 ## Executive Summary
 
-This specification defines the implementation plan for an optional `openai_responses` execution runtime in `multiagent`. The runtime will call the OpenAI Responses API with an environment-variable credential reference, map results into the existing runtime output contract, and keep file edits, shell commands, approvals, and history persistence owned by the Rust harness.
+This specification replaces the direct OpenAI Responses runtime plan with a
+subscription-backed Codex local integration plan. The harness should use the
+installed Codex CLI and its supported auth/session surfaces. It should not
+create a direct Platform API runtime when the user asks to use a Codex
+subscription.
 
-The first implementation is a schema-compatible, non-streaming HTTP adapter modeled after the existing Z.ai runtime. Native Responses function tools, response state, streaming, background mode, and migration ADR work are deferred into explicit later phases.
+Phase 1 improves the existing `codex` runtime: availability checks include
+login status, doctor output explains the active Codex setup, and execution
+continues through `codex exec`. Later phases add machine-readable `codex exec
+--json` event parsing and a `codex app-server` JSON-RPC driver.
 
 ## References
 
-- Product requirements: `docs/prd/codex-api-prd.md`
+- Product requirements: `docs/codex-api/prd.md`
 - Source planning doc: `docs/codex-api.md`
-- Stream-mode planning doc: `docs/stream-mode.md`
 - Domain glossary: `CONTEXT.md`
 - Current Codex runtime ADR: `docs/adr/0001-codex-runtime-uses-cli-subscription.md`
-- OpenAI Structured Outputs: https://developers.openai.com/api/docs/guides/structured-outputs
-- OpenAI Function Calling: https://developers.openai.com/api/docs/guides/function-calling
-- OpenAI Streaming Responses: https://developers.openai.com/api/docs/guides/streaming-responses
-- OpenAI GPT-5.2-Codex model page: https://developers.openai.com/api/docs/models/gpt-5.2-codex
+- Codex authentication: https://developers.openai.com/codex/auth
+- Codex non-interactive mode: https://developers.openai.com/codex/noninteractive
+- Codex app-server: https://developers.openai.com/codex/app-server
+- Codex access tokens: https://developers.openai.com/codex/enterprise/access-tokens
 
 ## 1. Background
 
-`multiagent` currently supports three execution runtimes:
+`multiagent` currently supports:
 
 - `codex`: launches the Codex CLI as a child process.
-- `zai`: posts to a Z.ai chat-completions HTTP endpoint with API-key auth.
+- `zai`: posts to Z.ai with API-key auth.
 - `fake`: deterministic local runtime for tests and simulation.
 
-The `codex` runtime keeps subscription-backed Codex behavior isolated from direct OpenAI Platform API calls. It also has costs: each agent step starts a child process, waits for complete stdout/stderr, and cannot directly use Responses API features such as structured outputs, response IDs, function calling, streaming, or background mode.
-
-The new runtime is not a replacement for the Codex CLI runtime. It is a separate OpenAI Platform API-key runtime for users who explicitly configure agent profiles to use it.
+The `codex` runtime is already the correct subscription-auth boundary because
+Codex owns ChatGPT login, API-key login, token refresh, cached credentials, and
+workspace policy. The gap is not "add a direct OpenAI API provider"; the gap is
+"make the Codex local integration first-class enough for this harness."
 
 ## 2. Goals
 
-- Add `openai_responses` as a first-class execution runtime type.
-- Keep `codex`, `zai`, and `fake` behavior unchanged.
-- Use OpenAI Platform API keys through `api_key_env`, defaulting to `OPENAI_API_KEY`.
-- Do not read Codex CLI auth files, Codex access tokens, or ChatGPT session state.
-- Map OpenAI Responses output into existing `RuntimeOutput` variants.
-- Keep harness actions centralized in the app/action layer.
-- Keep default tests offline and credential-free.
-- Add docs and diagnostics that distinguish Platform API-key auth from Codex CLI subscription auth.
+- Keep runtime kind `codex` as the subscription-backed Codex path.
+- Verify both Codex CLI installation and Codex login status.
+- Keep the harness independent from Codex credential storage internals.
+- Preserve harness-owned action policy for file edits and command execution.
+- Make future streaming and structured event work use documented Codex local surfaces.
+- Keep normal tests offline and credential-free.
 
 ## 3. Non-Goals
 
-- Replacing or renaming the `codex` runtime.
-- Implementing a private Codex subscription HTTP endpoint.
-- Reading `~/.codex/auth.json`, `CODEX_ACCESS_TOKEN`, or ChatGPT login state.
-- Enabling hosted shell, local shell, or hosted apply-patch tools by default.
-- Implementing native function tools in phase 1.
-- Implementing app-level streaming before the stream sink contract exists.
-- Implementing background mode in phase 1.
-- Hardcoding a long-term built-in Codex model without refreshing official docs.
+- Adding `openai_responses` for this feature.
+- Calling private or undocumented subscription HTTP endpoints.
+- Reading `~/.codex/auth.json` from harness code.
+- Persisting Codex access tokens in harness config.
+- Replacing the existing runtime/action contract in phase 1.
 
-## 4. Current Architecture
+## 4. Current Runtime Contract
 
-### Runtime Contract
-
-The runtime boundary is:
+The runtime boundary remains:
 
 ```rust
 #[async_trait]
@@ -71,507 +71,186 @@ pub trait Runtime: Send + Sync {
 }
 ```
 
-`RuntimeRequest` carries the prompt, session goal, working directory, agent profile, session history, recent context, previous agent results, action results, output schema, capability constraints, and run limits.
+`RuntimeRequest` carries the prompt envelope and policy context. The `codex`
+runtime writes the prompt protocol to `codex exec` stdin, waits for stdout, and
+parses the final stdout into one of the existing `RuntimeOutput` variants.
 
-`RuntimeStepResult` returns:
+## 5. Phase 1 Target Architecture: Harden `codex exec`
 
-- one `RuntimeOutput`;
-- zero or more `RuntimeStreamDelta` records.
+### Availability
 
-`RuntimeOutput` already supports:
+`CodexRuntime::check_availability` should:
 
-- `OrchestratorDecision`
-- `AgentResult`
-- `ActionRequest`
-- `ParseError`
+1. Resolve the configured command.
+2. Run `<command> --version` with a short timeout.
+3. Run `<command> login status` with a short timeout.
+4. Return `Available` only when the command is present and login status succeeds.
+5. Return `Unknown` when the command exists but `CODEX_API_KEY` or
+   `CODEX_ACCESS_TOKEN` is present and login status reports no saved login.
+   These variables are consumed by `codex exec`, so the login-status probe must
+   not block execution before `exec` can inherit them.
+6. Return `Unavailable` when the command is missing or login status reports a known non-success state that needs user action and no exec-scoped auth environment is present.
+7. Return `Unknown` when the command exists but login status cannot be determined, such as a timeout or probe execution failure.
 
-### Config Contract
+The status message should include the version and a concise login-status
+summary. Remediation should point to `codex login`, and can mention
+`codex login --device-auth` for remote/headless environments.
 
-Runtime config is represented by `RuntimeKind`, `RuntimeConfig`, `RawRuntimeConfig`, and `MergedRuntimeConfig`.
+### Execution
 
-Existing credential handling uses `api_key_env` plus `validate_env_reference`, which rejects empty values, malformed environment variable names, and raw-looking secrets such as strings beginning with `sk-` or `zai-`.
-
-### HTTP Runtime Prior Art
-
-`ZaiRuntime` already provides the closest implementation template:
-
-- read `api_key_env` from config;
-- check credential presence in `check_availability`;
-- build a JSON request from `RuntimeRequest`;
-- use `reqwest` with a timeout;
-- send bearer auth;
-- classify retryable HTTP statuses;
-- parse final text into action requests, orchestrator decisions, agent results, or parse errors;
-- emit one final stream delta.
-
-### Harness Action Boundary
-
-The action module owns `ActionRequest`, `ActionResult`, capability checks, tool allowlists, path policy, command classification, VCS action gating, approval handling, and execution. The OpenAI runtime must not bypass this boundary.
-
-## 5. Target Architecture
-
-Add a new runtime adapter module:
+Continue using the current compatibility command:
 
 ```text
-src/runtime/openai_responses.rs
+codex exec --skip-git-repo-check --color never
 ```
 
-The adapter will implement the existing `Runtime` trait and be dispatched from the same availability and execution paths as the other runtimes.
+Model assignment remains appended through `--model <model>` unless the user
+already supplied a model flag or the agent model is `default`.
 
-Phase 1 flow:
+The prompt protocol continues to instruct Codex not to directly edit files,
+run commands, or inspect the repository outside the harness contract. If the
+agent needs local data or mutation, it must return one Harness Action request.
 
-1. App constructs a `RuntimeRequest`.
-2. Runtime dispatch selects `OpenAiResponsesRuntime`.
-3. Adapter reads the configured API key environment variable.
-4. Adapter builds a Responses API request from the prompt envelope and agent profile.
-5. Adapter posts to `{base_url}/responses`.
-6. Adapter extracts final output text from the response.
-7. Adapter parses the text into the existing harness output contract.
-8. App continues existing orchestration, action, approval, and history behavior.
+### Login Workflow
 
-No new app state machine behavior is required in phase 1.
+Phase 1 does not need to implement interactive login inside the TUI. The
+doctor and runtime availability messages should provide exact external commands:
 
-## 6. Configuration Design
+- `codex login`
+- `codex login --device-auth`
+- `printf '%s' "$CODEX_ACCESS_TOKEN" | codex login --with-access-token`
 
-### Runtime Type
+For single non-interactive runs, `CODEX_API_KEY` is supported only by
+`codex exec`; `codex login status` does not prove whether that env-only path
+will work. Availability should surface the saved-login failure as `Unknown` and
+let the runtime attempt `codex exec` when the env var is present.
 
-Add a `RuntimeKind` variant with an explicit serde rename:
+A later TUI `/login` command can suspend raw-mode UI, run a selected Codex
+login command in the user's terminal, and refresh runtime availability after
+the process exits.
 
-```rust
-#[serde(rename = "openai_responses")]
-OpenAiResponses,
-```
+## 6. Phase 2: `codex exec --json`
 
-The explicit rename is required because the repo uses `rename_all = "snake_case"` and the PRD requires the user-facing value `openai_responses`, not `open_ai_responses`.
+`codex exec --json` emits JSONL events on stdout. Add this only after the
+runtime can distinguish progress events from the final contract cleanly.
 
-### Runtime Config
+Implementation outline:
 
-Phase 1 reuses the existing `RuntimeConfig` fields:
+1. Add an opt-in Codex runtime mode or internal capability probe.
+2. Spawn `codex exec --json` with the current prompt protocol.
+3. Parse each stdout JSONL frame.
+4. Map agent-message deltas and item lifecycle events into runtime stream deltas.
+5. Extract the final agent message for existing contract parsing.
+6. Preserve stderr as diagnostic-only output.
 
-- `id`
-- `kind`
-- `base_url`
-- `api_key_env`
-- `args` unused and normalized to an empty vector
-- `prompt_mode` normalized to `stdin`
-- `command` unused and normalized to `None`
+This phase improves progress visibility without changing runtime selection,
+auth, or action policy.
 
-Example config:
+## 7. Phase 3: `codex app-server`
+
+Use `codex app-server` when the harness needs a deep Codex integration:
+authentication, Codex-owned thread history, approvals, streamed events, and
+turn lifecycle control.
+
+Protocol outline:
+
+1. Spawn `codex app-server` with stdio transport by default.
+2. Send `initialize`, then `initialized`.
+3. Start or resume a thread with the configured model and working directory.
+4. Send `turn/start` with the harness prompt protocol.
+5. Read notifications until `turn/completed`.
+6. Map item events into harness runtime stream events.
+7. Extract the final agent message and parse the existing harness contract.
+
+Security constraints:
+
+- Default to stdio or local Unix socket transports.
+- Do not use unauthenticated non-loopback WebSocket listeners.
+- Do not let app-server mutate local files independently until the harness has
+  an explicit policy mapping for Codex approvals and Harness Actions.
+
+## 8. Configuration Design
+
+No new runtime kind is required for phase 1. Existing config remains:
 
 ```toml
-[runtimes.openai]
-type = "openai_responses"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
+[runtimes.codex]
+type = "codex"
+command = "codex"
+args = ["exec", "--skip-git-repo-check", "--color", "never"]
 
 [agents.fixer]
-runtime = "openai"
-model = "gpt-5.2-codex"
-effort = "high"
+runtime = "codex"
+model = "default"
 ```
 
-`gpt-5.2-codex` is an example model assignment, not a permanent built-in default. Model guidance must be refreshed from official docs before adding any built-in OpenAI agent profile defaults.
+Future app-server support can be modeled as either:
 
-### Built-In Defaults
+- additional fields on the `codex` runtime, such as `mode = "exec" | "app_server"`; or
+- a separate runtime kind only if the lifecycle and policy behavior diverges enough to justify it.
 
-Do not add a built-in `openai` runtime in phase 1. Users should opt in through home or local config. This avoids showing a new unavailable runtime warning to users who never configured OpenAI.
+Do not add credential fields for Codex subscription auth. Codex already owns
+credentials through its CLI configuration, credential store, and supported
+environment variables.
 
-### Config Merge and Validation
+Do not persist `CODEX_API_KEY` or `CODEX_ACCESS_TOKEN` in harness config.
+Automation can provide those variables in the process environment for the
+specific `codex exec` invocation.
 
-Add `OpenAiResponses` handling in effective config construction:
+## 9. Doctor Output
 
-- require `api_key_env`, defaulting to `OPENAI_API_KEY` if omitted;
-- validate `api_key_env` with existing credential-reference validation;
-- default `base_url` to `https://api.openai.com/v1`;
-- trim trailing slashes from `base_url` using existing merge behavior;
-- set `command = None`;
-- set `args = Vec::new()`;
-- set `prompt_mode = PromptMode::Stdin`.
-
-Future config fields should not be added until their behavior exists:
-
-- `store`
-- `background`
-- `stream`
-- `response_state`
-
-When these are added, validation must reject impossible combinations such as `store = false` with `response_state = "previous_response_id"`.
-
-## 7. Runtime Request Design
-
-### Endpoint
-
-Phase 1 sends:
-
-```text
-POST {base_url}/responses
-Authorization: Bearer <api-key>
-Content-Type: application/json
-```
-
-With the default base URL, the full endpoint is:
-
-```text
-https://api.openai.com/v1/responses
-```
-
-### Request Body
-
-The request body should be built with `serde_json::json!` and must include:
-
-- `model`: `request.agent_profile.model`
-- `instructions`: agent instructions plus the runtime contract
-- `input`: serialized prompt envelope from `prompt_envelope_json`
-- `stream`: `false`
-- `store`: `false` for phase 1 stateless no-storage mode, if supported by the current API contract
-- `reasoning.effort`: mapped from `AgentEffort` when supported by the selected model/API
-- `text.format`: JSON Schema for final result output when practical
-
-The structured-output field should be verified against current OpenAI docs during implementation. Current docs describe Responses structured output through `text.format` with `type = "json_schema"`, `strict = true`, and a schema body.
-
-### Output Schema Selection
-
-`request.output_schema` determines the expected final schema:
-
-- `orchestrator_decision` for orchestrator steps;
-- `agent_result` for specialized agent steps.
-
-Action requests remain compatibility text contracts in phase 1. The runtime first attempts to parse an action request contract, matching current `ZaiRuntime` behavior.
-
-### Prompt Contract
-
-The runtime instructions must preserve the current harness policy:
-
-- Return only a structured contract.
-- Do not claim to edit files, run commands, or inspect the repository directly.
-- If repository data or mutation is needed, return one action request.
-- If the current step is complete, return the requested output schema.
-
-The OpenAI runtime can share a helper with the Codex/Z.ai prompt contract only if doing so reduces duplication without changing existing behavior. Otherwise, keep a local helper in the new adapter.
-
-## 8. Response Parsing Design
-
-### Content Extraction
-
-Implement a helper that extracts final text from common Responses output shapes. It should accept the stable shape documented by OpenAI and be defensive around missing fields.
-
-Preferred extraction order:
-
-1. Top-level `output_text` string, if present.
-2. Concatenation of text items inside `output[]`, when item/content shapes expose text.
-3. Provider diagnostic failure if no text can be found.
-
-The helper should return a non-retryable provider error for unexpected successful response JSON that does not contain usable text.
-
-### Runtime Output Mapping
-
-The adapter maps content using this order:
-
-1. `parse_contract::<ActionRequest>(content)`
-2. `parse_orchestrator_decision(content)` if `agent_profile.id == "orchestrator"`
-3. `parse_agent_result(content)` otherwise
-4. `RuntimeOutput::ParseError`
-
-The parse-error path should mirror current runtime behavior: it is a runtime output, not a provider transport error, so model fallback should not trigger.
-
-### Stream Delta
-
-Phase 1 emits exactly one final delta:
-
-```rust
-RuntimeStreamDelta::final_delta(1, "message", content)
-```
-
-Do not attempt token streaming until the app-level stream sink contract from `docs/stream-mode.md` exists.
-
-## 9. Error Handling
-
-Add OpenAI-specific error messages, but reuse `RuntimeProviderError` for retry behavior.
-
-### Retryable Provider Errors
-
-Treat these as retryable:
-
-- request timeout;
-- network connection failure;
-- HTTP 408;
-- HTTP 429;
-- HTTP 5xx.
-
-Retryable errors can trigger existing model fallback behavior in `execute_runtime_step`.
-
-### Non-Retryable Provider Errors
-
-Treat these as non-retryable:
-
-- missing `api_key_env`;
-- unset or empty credential environment variable;
-- invalid `base_url`;
-- HTTP 400 request validation failure;
-- HTTP 401 or 403 auth failure;
-- successful response with no extractable output text;
-- JSON response parse failure caused by provider shape mismatch.
-
-### Redaction
-
-Never include these in diagnostics, history, or artifacts:
-
-- bearer token values;
-- complete Authorization headers;
-- raw API key environment values.
-
-Diagnostic response bodies should be parsed as JSON when possible and redacted before formatting. Non-JSON bodies should be whitespace-normalized and truncated, following the current HTTP runtime style.
-
-## 10. Doctor and Config Output
-
-### Doctor
-
-Add `OpenAiResponses` handling in doctor title rendering:
-
-```text
-OpenAI Responses Runtime
-```
-
-Doctor context may include:
+Doctor should include:
 
 - runtime id;
-- runtime type;
-- base URL;
-- credential environment variable name.
-
-Doctor context must not include:
-
-- credential environment variable value;
-- Authorization header;
-- raw response bodies containing secrets.
-
-Availability behavior:
-
-- missing `api_key_env`: unavailable;
-- unset env var: unavailable;
-- set non-empty env var: unknown, because network/API validation is deferred until a step runs.
-
-### Print Config
-
-`to_redacted_toml` should render:
-
-- `type = "openai_responses"`
-- `base_url`
-- `api_key_env`
-
-It should not render command/prompt-mode fields for the OpenAI runtime unless those fields become meaningful later.
-
-## 11. Native Function Tools, Deferred
-
-Phase 1 does not send function tools.
-
-Phase 2 should expose strict custom function tools that map to the existing harness actions:
-
-- `read_file`
-- `list_files`
-- `search_text`
-- `run_command`
-- `apply_patch`
-- `write_file`
-- `record_note`
-
-Responses function-call items should be converted into `ActionRequest` and returned as `RuntimeOutput::ActionRequest`. The app then executes the action through existing validation and approval behavior.
-
-After an action result exists, the runtime should send `function_call_output` items back to Responses and continue until it receives a final structured result.
-
-The implementation must reject:
-
-- unknown function names;
-- malformed arguments;
-- tool calls outside the agent's effective tool list;
-- multiple parallel tool calls unless the app loop supports them.
-
-For deterministic phase 2 behavior, set provider tool choice to allow zero or one function call per turn where the current API supports that constraint.
-
-## 12. Streaming and Background Mode, Deferred
-
-### Streaming
-
-Streaming depends on the app-level runtime event sink planned in `docs/stream-mode.md`.
-
-When implemented:
-
-- send `stream = true`;
-- map `response.output_text.delta` events into runtime text deltas;
-- map `response.created`, `response.completed`, and `error` events into status/error runtime events;
-- buffer full content for final structured parsing;
-- coalesce small chunks before durable history writes.
-
-### Background Mode
-
-Background mode is opt-in and should be introduced only after phase 1 is stable.
-
-When implemented:
-
-- send `background = true` for configured long-running steps;
-- persist response IDs in run/step history;
-- poll response retrieval for status;
-- cancel active background responses on user interrupt when supported;
-- require storage-enabled config for response ID recovery.
-
-## 13. Security and Privacy
-
-- Platform API-key auth is separate from Codex CLI subscription auth.
-- The OpenAI runtime must not inspect Codex CLI auth state.
-- The OpenAI runtime must not execute local actions directly.
-- Hosted provider tools are disabled by default.
-- Local file and command effects continue through harness actions.
-- VCS actions remain gated by explicit user prompts.
-- Raw secrets are rejected in config and redacted in diagnostics.
-- `store = false` is the phase 1 privacy default when supported by the current API contract.
-- Response state and background mode require explicit storage semantics before implementation.
-
-## 14. Implementation Plan
-
-### Phase 1: Runtime Skeleton and Config
-
-- Add `OpenAiResponses` to `RuntimeKind` with explicit serde rename.
-- Add `pub mod openai_responses`.
-- Add runtime dispatch in availability and step execution.
-- Add effective config construction for `openai_responses`.
-- Add doctor title and context handling.
-- Add README runtime docs and an example config.
-
-### Phase 2: Non-Streaming Responses Call
-
-- Implement `OpenAiResponsesRuntime`.
-- Implement availability checks from `api_key_env`.
-- Implement request body construction.
-- Implement `POST {base_url}/responses`.
-- Implement response text extraction.
-- Implement output parsing into existing `RuntimeOutput`.
-- Implement retryable/non-retryable provider error classification.
-- Implement conservative redaction.
-
-### Phase 3: Mock and Integration Testing
-
-- Add unit tests for config merge, serde name, env validation, and redacted TOML.
-- Add mock HTTP tests for request shape and response parsing.
-- Add mock HTTP tests for auth failures, rate limits, server failures, missing output text, and redaction.
-- Add ignored real OpenAI smoke test gated behind explicit environment variables.
-
-Suggested integration gates:
-
-```text
-MULTIAGENT_RUN_OPENAI_INTEGRATION=1
-MULTIAGENT_OPENAI_API_KEY_ENV=OPENAI_API_KEY
-MULTIAGENT_OPENAI_BASE_URL=https://api.openai.com/v1
-MULTIAGENT_OPENAI_MODEL=<model>
-```
-
-### Phase 4: Native Function Tools
-
-- Add custom function tool schema builders.
-- Map function calls to `ActionRequest`.
-- Map `ActionResult` to `function_call_output`.
-- Preserve response items required for continuation.
-- Add tests for allowed and denied action calls.
-
-### Phase 5: Streaming and Background
-
-- Wait for runtime event sink contract.
-- Implement SSE streaming parser.
-- Add live-delta tests.
-- Add background response polling, persistence, and cancellation.
-
-### Phase 6: Migration Documentation and ADR
-
-- Add docs comparing `codex`, `zai`, and `openai_responses`.
-- Add an ADR extending or superseding the Codex CLI subscription-auth ADR.
-
-## 15. Test Plan
-
-### Unit Tests
-
-- `RuntimeKind` deserializes `openai_responses`.
-- Redacted TOML prints `type = "openai_responses"` and credential reference names only.
-- Raw secret-looking `api_key_env` values are rejected.
-- OpenAI runtime defaults are applied correctly.
-- OpenAI runtime cannot change type across merged config sources.
-- Doctor reports missing, unset, and set credential-reference states correctly.
-
-### Runtime Mock Tests
-
-Use a local `TcpListener` mock server, matching the existing Z.ai test style.
-
-Verify successful requests include:
-
-- `POST /responses`;
-- bearer auth header;
-- configured model;
-- prompt envelope input;
-- agent instructions;
-- `stream = false`;
-- expected storage flag;
-- structured output settings when enabled.
-
-Verify successful responses parse into:
-
-- `RuntimeOutput::OrchestratorDecision`;
-- `RuntimeOutput::AgentResult`;
-- `RuntimeOutput::ActionRequest`;
-- `RuntimeOutput::ParseError`.
-
-Verify provider failures:
-
-- 401/403 are non-retryable;
-- 429 and 5xx are retryable;
-- network errors are retryable;
-- missing output text is non-retryable;
-- diagnostics redact bearer tokens.
-
-### Integration Tests
-
-Add one ignored smoke test in `tests/runtime_integration.rs` after the adapter is implemented. It should mirror existing Codex and Z.ai integration tests and require explicit environment gates.
-
-Default `cargo test` must not require OpenAI credentials or network access.
-
-## 16. Acceptance Criteria
-
-- `cargo test` passes without network access or API credentials.
-- `type = "openai_responses"` is accepted in runtime config.
-- A configured OpenAI runtime appears in `--doctor` output with no secret leakage.
-- Missing `OPENAI_API_KEY` marks the runtime unavailable without breaking unrelated runtimes.
-- A mock Responses server verifies request path, auth, body shape, and parsing.
-- Successful mock orchestrator and agent responses produce the expected runtime outputs.
-- Mock action-request output uses the existing action-request contract.
-- Retryable provider failures can use model fallbacks.
-- Non-retryable OpenAI request/auth/schema failures do not trigger model fallback.
-- Existing `codex`, `zai`, and `fake` runtime tests continue to pass.
-- README or runtime docs explain auth differences between Codex CLI and OpenAI Platform API.
-- No OpenAI runtime path reads local Codex login files or Codex access tokens.
-
-## 17. Risks and Mitigations
-
-### API Shape Drift
-
-OpenAI Responses fields and recommended models can change. Keep provider-specific request/response helpers isolated in the adapter and verify current docs before implementation.
-
-### Auth Confusion
-
-Users may expect ChatGPT subscription auth to work with the direct runtime. Mitigate with naming, docs, doctor messages, and no Codex auth file access.
-
-### Provider Tool Boundary Drift
-
-Native tools can blur local effect ownership. Mitigate by deferring hosted tools, using custom function tools, and converting every action through existing harness policy.
-
-### Secret Leakage
-
-HTTP diagnostics may include sensitive content. Mitigate with explicit redaction tests and conservative truncation.
-
-### Stateful Response Privacy
-
-Response IDs and background mode imply server-side state. Mitigate by keeping phase 1 stateless and requiring explicit config before stateful features.
-
-## 18. Open Questions
-
-- Should the docs prefer runtime id `openai` or `openai_responses` in examples?
-- Should phase 1 require a model on every OpenAI-backed agent profile, or should docs suggest one current model after a fresh official-docs check?
-- Should `store = false` become a new config field immediately, or remain a hardcoded phase 1 request setting?
-- Should structured output be mandatory for final results, or best-effort with delimiter parsing fallback?
-- Should phase 2 force at most one function call per Responses turn, or allow multiple calls after the app loop explicitly supports batching?
+- runtime type `codex`;
+- command path or configured command;
+- Codex version output;
+- login status summary;
+- remediation when login is missing or unknown.
+
+Doctor must not include credential contents, auth file paths beyond generic
+documentation references, or access-token values.
+
+## 10. Test Plan
+
+Unit tests:
+
+- missing command returns `Unavailable`;
+- command with successful `--version` and `login status` returns `Available`;
+- command with successful `--version` and failed `login status` returns `Unavailable` with login remediation;
+- command with failed `login status` and exec-scoped env auth returns `Unknown`
+  so execution can attempt `codex exec`;
+- `login status` timeout returns `Unknown`;
+- older fake command without `login status` returns `Unknown` rather than panicking;
+- doctor JSON includes command and runtime type without credential material.
+
+Existing runtime tests should continue to cover:
+
+- prompt protocol content;
+- default and explicit model args;
+- stdout-only contract parsing;
+- stderr progress ignored for parsing;
+- malformed output becoming `ParseError`;
+- nonzero child process exit becoming a runtime error.
+
+Future tests:
+
+- JSONL fixtures for `codex exec --json`;
+- fake app-server JSON-RPC lifecycle tests;
+- TUI `/login` state transition tests if login is integrated into the app.
+
+## 11. Rollout Plan
+
+1. Remove the direct Responses runtime implementation from this branch.
+2. Update PRD, techspec, README, and glossary to describe Codex local/subscription behavior.
+3. Add Codex login-status availability checks.
+4. Run config, doctor, and runtime unit tests.
+5. Revisit `codex exec --json` after stream-mode plumbing is stable.
+6. Design app-server policy mapping before enabling app-server-driven local mutations.
+
+## 12. Risks
+
+- `codex login status` output can change. Keep parsing conservative and rely primarily on process success.
+- Older Codex CLI versions may not support every command. Treat this as `Unknown` with remediation instead of a hard crash.
+- Running interactive login from inside the TUI can corrupt terminal state. Prefer external command guidance until raw-mode suspension is implemented.
+- App-server can expose richer local actions than the harness currently models. Do not enable those actions without an explicit policy design.

@@ -101,7 +101,7 @@ Whether an execution runtime can currently perform work with the installed comma
 _Avoid_: health check, provider status
 
 **Codex Runtime**:
-An execution runtime that launches Codex as a child CLI process using the user's subscription authentication.
+An execution runtime that launches Codex locally and relies on Codex-owned authentication, commonly ChatGPT subscription login through the Codex CLI.
 _Avoid_: OpenAI API runtime
 
 **Z.ai Runtime**:
@@ -214,10 +214,10 @@ _Avoid_: prompt, blocker message
 - **Custom Agents** are defined as additional **Agent Profiles** in configuration.
 - Configuration can override a **Built-in Profile** by using the same agent name.
 - An **Agent Profile** uses one **Execution Runtime** when performing work.
-- The first supported **Execution Runtimes** are **Codex Runtime** and **Z.ai Runtime**.
+- The supported **Execution Runtimes** are **Codex Runtime**, **Z.ai Runtime**, and **Fake Runtime**.
 - **Runtime Availability** is shown for each **Agent Profile** in the **Agent Roster**.
-- **Z.ai Runtime** produces reasoning or structured output, while **Harness Actions** are executed by the **Harness**.
-- **Z.ai Runtime** uses a **Credential Reference** to name the environment variable containing its API key.
+- **Codex Runtime** uses Codex-owned local authentication, while API-keyed runtimes use a **Credential Reference** to name the environment variable containing their API key.
+- Execution runtimes produce reasoning or structured output, while **Harness Actions** are executed by the **Harness**.
 
 ## Example dialogue
 
@@ -280,11 +280,11 @@ _Avoid_: prompt, blocker message
 > **Dev:** "Where does Fixer's model live?"
 > **Domain expert:** "In **Harness Configuration**, so changing Fixer's **Model Assignment** does not require code changes."
 > **Dev:** "Does every agent need to use the same provider?"
-> **Domain expert:** "No. One **Agent Profile** can use **Codex Runtime** through subscription auth while another uses **Z.ai Runtime** through an API key."
+> **Domain expert:** "No. One **Agent Profile** can use **Codex Runtime** through Codex-owned login while another uses **Z.ai Runtime** through an API key."
 > **Dev:** "What if no runtime is ready on first launch?"
 > **Domain expert:** "The **Harness** still opens and shows **Runtime Availability** so the user can see what setup is missing."
 > **Dev:** "Does **Codex Runtime** call the OpenAI API directly?"
-> **Domain expert:** "No. **Codex Runtime** launches Codex as a child CLI process, while **Z.ai Runtime** uses API-key HTTP requests."
+> **Domain expert:** "No. **Codex Runtime** launches Codex locally and lets Codex handle its own authentication."
 > **Dev:** "Can **Z.ai Runtime** edit files directly?"
 > **Domain expert:** "No. **Z.ai Runtime** can propose work, but file edits and command execution are **Harness Actions**."
 > **Dev:** "Does `multiagent.toml` store the Z.ai API key?"

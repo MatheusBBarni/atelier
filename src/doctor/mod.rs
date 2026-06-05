@@ -522,4 +522,68 @@ instructions_file = "agents/explorer.md"
         assert!(json.contains("agents/explorer.md"));
         assert!(!json.contains("secret prompt"));
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn doctor_reports_codex_login_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("codex-status.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex-cli 0.137.0"
+  exit 0
+fi
+if [ "$1" = "login" ] && [ "$2" = "status" ]; then
+  echo "Logged in using ChatGPT"
+  exit 0
+fi
+echo "unexpected args: $@" >&2
+exit 64
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let config_path = dir.path().join("multiagent.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[runtimes.codex]
+type = "codex"
+command = "{}"
+
+[agents.explorer]
+runtime = "codex"
+model = "default"
+"#,
+                script_path.display()
+            ),
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let report = run_doctor(&config).await;
+        let json = render_json(&report).unwrap();
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "runtime.codex")
+            .unwrap();
+
+        assert_eq!(check.title, "Codex Runtime");
+        assert_eq!(check.status, DoctorStatus::Ok);
+        assert!(check.message.contains("codex-cli 0.137.0"));
+        assert!(check.message.contains("Logged in using ChatGPT"));
+        assert!(json.contains("\"runtime_type\": \"codex\""));
+        assert!(!json.contains("CODEX_ACCESS_TOKEN"));
+    }
 }
