@@ -29,8 +29,10 @@ use tokio::task::JoinHandle;
 
 const USER_EVENT_BG: Color = Color::Rgb(18, 52, 71);
 const INPUT_COMPOSER_HEIGHT: u16 = 5;
+const ACTIVE_INPUT_BOX_HEIGHT: u16 = 3;
 const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
+const WORK_INDICATOR_HEIGHT: u16 = 1;
 const MOUSE_SCROLL_LINES: usize = 3;
 const WORK_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
@@ -643,7 +645,8 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     render_chat(frame, event_area, state, ui_state);
 
     let work_active = work_indicator_active(state);
-    let input_layout = input_layout(outer[1], &state.input, ui_state.input_cursor, work_active);
+    let input_areas = input_areas(outer[1], work_active);
+    let input_layout = input_layout(input_areas.input, &state.input, ui_state.input_cursor);
     ui_state.input_width = input_layout.width;
     let input = Paragraph::new(wrapped_input_lines(&state.input, input_layout.width))
         .style(Style::default().fg(Color::White))
@@ -653,16 +656,16 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
                 .borders(Borders::ALL),
         )
         .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
-    frame.render_widget(input, outer[1]);
-    if work_active {
-        render_work_indicator(frame, outer[1], ui_state);
+    frame.render_widget(input, input_areas.input);
+    if let Some(status_area) = input_areas.work_status {
+        render_work_indicator(frame, status_area, ui_state);
     } else {
         ui_state.work_spinner_frame = 0;
     }
     if ui_state.help_visible {
         render_help_modal(frame);
     } else {
-        set_input_cursor(frame, outer[1], input_layout);
+        set_input_cursor(frame, input_areas.input, input_layout);
     }
 }
 
@@ -1072,16 +1075,45 @@ fn work_indicator_active(state: &AppState) -> bool {
     matches!(state.run_state, RunState::Planning | RunState::Running)
 }
 
-fn render_work_indicator(frame: &mut Frame, input_area: Rect, ui_state: &mut TuiUiState) {
-    if input_area.width <= 2 || input_area.height <= 2 {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputAreas {
+    input: Rect,
+    work_status: Option<Rect>,
+}
+
+fn input_areas(composer_area: Rect, work_active: bool) -> InputAreas {
+    if !work_active || composer_area.height <= ACTIVE_INPUT_BOX_HEIGHT {
+        return InputAreas {
+            input: composer_area,
+            work_status: None,
+        };
+    }
+
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(ACTIVE_INPUT_BOX_HEIGHT),
+            Constraint::Length(WORK_INDICATOR_HEIGHT),
+            Constraint::Min(0),
+        ])
+        .split(composer_area);
+
+    InputAreas {
+        input: areas[0],
+        work_status: Some(areas[1]),
+    }
+}
+
+fn render_work_indicator(frame: &mut Frame, status_area: Rect, ui_state: &mut TuiUiState) {
+    if status_area.width == 0 || status_area.height == 0 {
         return;
     }
     let spinner = WORK_SPINNER_FRAMES[ui_state.work_spinner_frame % WORK_SPINNER_FRAMES.len()];
     ui_state.work_spinner_frame = ui_state.work_spinner_frame.wrapping_add(1);
-    let status_area = Rect {
-        x: input_area.x + 1,
-        y: input_area.y + input_area.height.saturating_sub(2),
-        width: input_area.width.saturating_sub(2),
+    let line_area = Rect {
+        x: status_area.x + 1,
+        y: status_area.y,
+        width: status_area.width.saturating_sub(1),
         height: 1,
     };
     let line = Line::from(vec![
@@ -1095,7 +1127,7 @@ fn render_work_indicator(frame: &mut Frame, input_area: Rect, ui_state: &mut Tui
         ),
     ]);
     frame.render_widget(Clear, status_area);
-    frame.render_widget(Paragraph::new(line), status_area);
+    frame.render_widget(Paragraph::new(line), line_area);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1106,20 +1138,10 @@ struct InputLayout {
     scroll: usize,
 }
 
-fn input_layout(
-    input_area: Rect,
-    input: &str,
-    cursor: usize,
-    reserve_status_line: bool,
-) -> InputLayout {
+fn input_layout(input_area: Rect, input: &str, cursor: usize) -> InputLayout {
     let inner_width = usize::from(input_area.width.saturating_sub(2).max(1));
     let width = inner_width.saturating_sub(INPUT_PROMPT_WIDTH).max(1);
-    let inner_rows = input_area.height.saturating_sub(2).max(1);
-    let visible_rows = if reserve_status_line {
-        inner_rows.saturating_sub(1).max(1)
-    } else {
-        inner_rows
-    };
+    let visible_rows = input_area.height.saturating_sub(2).max(1);
     let visible_rows = usize::from(visible_rows);
     let cursor_cells = cursor.min(input_char_count(input));
     let cursor_line = cursor_cells / width;
@@ -1258,12 +1280,24 @@ mod tests {
         state.active_run_id = Some("run".to_string());
         let mut ui_state = TuiUiState::default();
 
-        let first = render_to_text_with_ui_mut(&state, &mut ui_state, 100, 24);
+        let first_lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 100, 24);
         let second = render_to_text_with_ui_mut(&state, &mut ui_state, 100, 24);
+        let first = first_lines.join("\n");
+        let prompt_row = first_lines
+            .iter()
+            .position(|line| line.contains("> next prompt"))
+            .unwrap();
+        let working_row = first_lines
+            .iter()
+            .position(|line| line.contains("| Working"))
+            .unwrap();
 
         assert!(first.contains("next prompt"));
         assert!(first.contains("| Working"));
         assert!(second.contains("/ Working"));
+        assert!(working_row > prompt_row);
+        assert!(first_lines[working_row.saturating_sub(1)].contains("└"));
+        assert!(!first_lines[working_row].contains("│"));
     }
 
     #[test]
@@ -2136,6 +2170,26 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    fn render_to_lines_with_ui_mut(
+        state: &AppState,
+        ui_state: &mut TuiUiState,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, state, ui_state))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
     }
 
     fn default_config_status() -> ConfigStatusView {
