@@ -256,7 +256,7 @@ async fn read_sse_message_content(
     events: &RuntimeEventSink,
     cancellation: &CancellationToken,
 ) -> Result<String> {
-    let mut buffer = String::new();
+    let mut buffer = Vec::new();
     let mut content = String::new();
     loop {
         let chunk = tokio::select! {
@@ -266,40 +266,69 @@ async fn read_sse_message_content(
         let Some(chunk) = chunk else {
             break;
         };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        normalize_crlf(&mut buffer);
-        while let Some(frame_end) = buffer.find("\n\n") {
-            let frame = buffer[..frame_end].to_string();
-            buffer.drain(..frame_end + 2);
-            match parse_sse_frame(&frame)? {
-                SseFrame::Content(delta) => {
-                    events.delta("message", delta.clone()).await?;
-                    content.push_str(&delta);
-                }
-                SseFrame::Diagnostic(message) => {
-                    events.diagnostic("error", message.clone()).await?;
-                    return Err(RuntimeProviderError::non_retryable(message).into());
-                }
-                SseFrame::Done | SseFrame::Empty => {}
+        buffer.extend_from_slice(&chunk);
+        while let Some(frame) = drain_next_sse_frame(&mut buffer)? {
+            if apply_sse_frame(frame, events, &mut content).await? {
+                return Ok(content);
             }
         }
     }
 
-    if !buffer.trim().is_empty() {
-        match parse_sse_frame(&buffer)? {
-            SseFrame::Content(delta) => {
-                events.delta("message", delta.clone()).await?;
-                content.push_str(&delta);
-            }
-            SseFrame::Diagnostic(message) => {
-                events.diagnostic("error", message.clone()).await?;
-                return Err(RuntimeProviderError::non_retryable(message).into());
-            }
-            SseFrame::Done | SseFrame::Empty => {}
+    if !buffer.iter().all(u8::is_ascii_whitespace) {
+        let frame = std::str::from_utf8(&buffer).context("malformed Z.ai SSE UTF-8 frame")?;
+        if apply_sse_frame(parse_sse_frame(frame)?, events, &mut content).await? {
+            return Ok(content);
         }
     }
 
     Ok(content)
+}
+
+async fn apply_sse_frame(
+    frame: SseFrame,
+    events: &RuntimeEventSink,
+    content: &mut String,
+) -> Result<bool> {
+    match frame {
+        SseFrame::Content(delta) => {
+            events.delta("message", delta.clone()).await?;
+            content.push_str(&delta);
+            Ok(false)
+        }
+        SseFrame::Diagnostic(message) => {
+            events.diagnostic("error", message.clone()).await?;
+            Err(RuntimeProviderError::non_retryable(message).into())
+        }
+        SseFrame::Done => Ok(true),
+        SseFrame::Empty => Ok(false),
+    }
+}
+
+fn drain_next_sse_frame(buffer: &mut Vec<u8>) -> Result<Option<SseFrame>> {
+    let Some((frame_end, separator_len)) = find_sse_frame_separator(buffer) else {
+        return Ok(None);
+    };
+    let frame = std::str::from_utf8(&buffer[..frame_end])
+        .context("malformed Z.ai SSE UTF-8 frame")
+        .and_then(parse_sse_frame)?;
+    buffer.drain(..frame_end + separator_len);
+    Ok(Some(frame))
+}
+
+fn find_sse_frame_separator(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| (index, 4));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(separator), None) | (None, Some(separator)) => Some(separator),
+        (None, None) => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -380,12 +409,6 @@ fn response_is_sse(response: &reqwest::Response) -> bool {
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
         .unwrap_or(false)
-}
-
-fn normalize_crlf(buffer: &mut String) {
-    if buffer.contains("\r\n") {
-        *buffer = buffer.replace("\r\n", "\n");
-    }
 }
 
 fn zai_status_error(status: reqwest::StatusCode, text: &str) -> RuntimeProviderError {
@@ -585,6 +608,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zai_adapter_finishes_when_done_frame_keeps_connection_open() {
+        let dir = tempdir().unwrap();
+        let result = AgentResult::completed("oracle", "step", "done answer");
+        let wrapped = wrap_json_contract(&result).unwrap();
+        let (addr, request_rx, release_server) = spawn_open_sse_server(vec![
+            sse_data(&serde_json::json!({
+                "choices": [
+                    {
+                        "delta": {
+                            "content": wrapped
+                        }
+                    }
+                ]
+            })),
+            "data: [DONE]\n\n".to_string(),
+        ])
+        .await;
+        std::env::set_var("MULTIAGENT_TEST_ZAI_KEY", "test-token");
+
+        let runtime = ZaiRuntime::new(RuntimeConfig {
+            id: "zai".to_string(),
+            kind: RuntimeKind::Zai,
+            command: None,
+            args: Vec::new(),
+            prompt_mode: PromptMode::Stdin,
+            base_url: Some(format!("http://{addr}")),
+            api_key_env: Some("MULTIAGENT_TEST_ZAI_KEY".to_string()),
+        });
+        let request = runtime_request(dir.path().to_path_buf(), "oracle");
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            collect_runtime_step_result(|events, cancellation| {
+                runtime.stream_step(request, events, cancellation)
+            })
+            .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let _ = release_server.send(());
+
+        match result.output {
+            RuntimeOutput::AgentResult { result } => {
+                assert_eq!(result.summary, "done answer");
+            }
+            other => panic!("unexpected runtime output: {other:?}"),
+        }
+        let request = request_rx.await.unwrap();
+        assert!(request.contains("\"stream\":true"));
+    }
+
+    #[tokio::test]
     async fn zai_streaming_rejection_falls_back_explicitly() {
         let dir = tempdir().unwrap();
         let result = AgentResult::completed("oracle", "step", "fallback answer");
@@ -695,6 +769,37 @@ mod tests {
         assert!(parse_sse_frame("data: not-json\n").is_err());
     }
 
+    #[test]
+    fn zai_sse_frame_buffer_preserves_utf8_split_across_chunks() {
+        let frame = sse_data(&serde_json::json!({
+            "choices": [
+                {
+                    "delta": {
+                        "content": "olá"
+                    }
+                }
+            ]
+        }));
+        let bytes = frame.as_bytes();
+        let split_index = bytes
+            .windows("á".len())
+            .position(|window| window == "á".as_bytes())
+            .unwrap()
+            + 1;
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&bytes[..split_index]);
+
+        assert_eq!(drain_next_sse_frame(&mut buffer).unwrap(), None);
+
+        buffer.extend_from_slice(&bytes[split_index..]);
+
+        assert_eq!(
+            drain_next_sse_frame(&mut buffer).unwrap(),
+            Some(SseFrame::Content("olá".to_string()))
+        );
+        assert!(buffer.is_empty());
+    }
+
     #[tokio::test]
     async fn zai_availability_reports_missing_credential_reference() {
         let runtime = ZaiRuntime::new(RuntimeConfig {
@@ -777,6 +882,29 @@ mod tests {
             let _ = tx.send(requests);
         });
         (addr, rx)
+    }
+
+    async fn spawn_open_sse_server(
+        frames: Vec<String>,
+    ) -> (SocketAddr, oneshot::Receiver<String>, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            let _ = request_tx.send(request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.write_all(frames.join("").as_bytes()).await.unwrap();
+            let _ = release_rx.await;
+        });
+        (addr, request_rx, release_tx)
     }
 
     fn sse_response(frames: &[String]) -> String {
