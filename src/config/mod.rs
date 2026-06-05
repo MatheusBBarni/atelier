@@ -518,10 +518,23 @@ struct RawPresetDefinition {
 }
 
 #[derive(Clone, Debug)]
+struct PendingPresetSelection {
+    name: String,
+    agent_layer_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PendingAgentLayer {
+    source_dir: PathBuf,
+    source_name: String,
+    agents: BTreeMap<String, RawAgentProfile>,
+}
+
+#[derive(Clone, Debug)]
 struct MergedConfig {
     working_directory: PathBuf,
     config_sources: Vec<PathBuf>,
-    active_preset: Option<String>,
+    active_preset: Option<PendingPresetSelection>,
     approval_mode: ApprovalMode,
     workspace: WorkspacePolicy,
     limits: Limits,
@@ -529,6 +542,7 @@ struct MergedConfig {
     runtimes: BTreeMap<String, MergedRuntimeConfig>,
     presets: BTreeMap<String, RawPresetDefinition>,
     agents: BTreeMap<String, MergedAgentProfile>,
+    agent_layers: Vec<PendingAgentLayer>,
 }
 
 impl MergedConfig {
@@ -706,6 +720,7 @@ impl MergedConfig {
             runtimes,
             presets: BTreeMap::new(),
             agents,
+            agent_layers: Vec::new(),
         }
     }
 
@@ -780,16 +795,52 @@ impl MergedConfig {
         }
 
         if let Some(preset) = raw.preset {
-            self.apply_preset(&preset)?;
-            self.active_preset = Some(preset);
+            self.active_preset = Some(PendingPresetSelection {
+                name: preset,
+                agent_layer_index: self.agent_layers.len(),
+            });
         }
 
         if let Some(agents) = raw.agents {
-            for (agent_id, agent) in agents {
-                self.apply_agent(agent_id, agent, source_dir, source_name)?;
-            }
+            self.agent_layers.push(PendingAgentLayer {
+                source_dir: source_dir.to_path_buf(),
+                source_name: source_name.to_string(),
+                agents,
+            });
         }
 
+        Ok(())
+    }
+
+    fn apply_pending_agent_layers(&mut self) -> Result<()> {
+        let active_preset = self.active_preset.clone();
+        let agent_layers = std::mem::take(&mut self.agent_layers);
+        let agent_layer_count = agent_layers.len();
+
+        for (layer_index, layer) in agent_layers.into_iter().enumerate() {
+            if let Some(preset) = active_preset
+                .as_ref()
+                .filter(|preset| preset.agent_layer_index == layer_index)
+            {
+                self.apply_preset(&preset.name)?;
+            }
+            self.apply_agent_layer(layer)?;
+        }
+
+        if let Some(preset) = active_preset
+            .as_ref()
+            .filter(|preset| preset.agent_layer_index == agent_layer_count)
+        {
+            self.apply_preset(&preset.name)?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_agent_layer(&mut self, layer: PendingAgentLayer) -> Result<()> {
+        for (agent_id, agent) in layer.agents {
+            self.apply_agent(agent_id, agent, &layer.source_dir, &layer.source_name)?;
+        }
         Ok(())
     }
 
@@ -1042,7 +1093,13 @@ impl MergedConfig {
         Ok(())
     }
 
-    fn into_effective(self) -> Result<EffectiveConfig> {
+    fn into_effective(mut self) -> Result<EffectiveConfig> {
+        self.apply_pending_agent_layers()?;
+        let active_preset = self
+            .active_preset
+            .as_ref()
+            .map(|preset| preset.name.clone());
+
         let mut runtimes = BTreeMap::new();
         for (id, runtime) in self.runtimes {
             let kind = runtime
@@ -1159,7 +1216,7 @@ impl MergedConfig {
             schema_version: 1,
             working_directory: self.working_directory,
             config_sources: self.config_sources,
-            active_preset: self.active_preset,
+            active_preset,
             approval_mode: self.approval_mode,
             workspace: self.workspace,
             limits: self.limits,
@@ -1987,6 +2044,46 @@ model = "local-model"
         assert_eq!(fixer.model, "local-model");
         assert_eq!(fixer.model_fallbacks, vec!["preset-fallback"]);
         assert_eq!(fixer.effort, AgentEffort::Minimal);
+    }
+
+    #[test]
+    fn later_preset_selection_does_not_leak_earlier_preset_agent_fields() {
+        let dir = tempdir().unwrap();
+        let home_config = dir.path().join("home.toml");
+        fs::write(
+            &home_config,
+            r#"
+preset = "fast"
+
+[presets.fast.agents.fixer]
+model = "fast-model"
+model_fallbacks = ["fast-fallback"]
+effort = "minimal"
+
+[presets.accurate.agents.fixer]
+effort = "high"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("multiagent.toml"),
+            r#"
+preset = "accurate"
+"#,
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(home_config),
+        })
+        .unwrap();
+
+        let fixer = config.agents.get("fixer").unwrap();
+        assert_eq!(config.active_preset.as_deref(), Some("accurate"));
+        assert_eq!(fixer.model, "default");
+        assert!(fixer.model_fallbacks.is_empty());
+        assert_eq!(fixer.effort, AgentEffort::High);
     }
 
     #[test]
