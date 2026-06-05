@@ -506,4 +506,108 @@ model_fallbacks = ["fallback-succeeds"]
 
         assert!(matches!(result.output, RuntimeOutput::ParseError { .. }));
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_runtime_step_blocks_codex_when_login_status_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_guard = EnvGuard::clear(&["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]);
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("codex-status.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex-cli 0.137.0"
+  exit 0
+fi
+if [ "$1" = "login" ] && [ "$2" = "status" ]; then
+  echo "Not logged in" >&2
+  exit 1
+fi
+if [ "$1" = "exec" ]; then
+  echo "exec should not run" >&2
+  exit 99
+fi
+echo "unexpected args: $@" >&2
+exit 64
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[runtimes.codex]
+type = "codex"
+command = "{}"
+
+[agents.explorer]
+runtime = "codex"
+model = "default"
+"#,
+                script_path.display()
+            ),
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let request = RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: "inspect context".to_string(),
+            session_goal: None,
+            working_directory: dir.path().to_path_buf(),
+            agent_profile: config.agents["explorer"].clone(),
+            session_events: Vec::new(),
+            recent_context: RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "agent_result".to_string(),
+            capability_constraints: vec![Capability::Read],
+            limits: Limits::default(),
+        };
+
+        let error = execute_runtime_step(&config, request).await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("runtime codex is unavailable"));
+        assert!(message.contains("Not logged in"));
+        assert!(!message.contains("status 99"));
+    }
+
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn clear(names: &[&'static str]) -> Self {
+            let vars = names
+                .iter()
+                .map(|name| {
+                    let value = std::env::var_os(name);
+                    std::env::remove_var(name);
+                    (*name, value)
+                })
+                .collect();
+            Self { vars }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.vars {
+                match value {
+                    Some(value) => std::env::set_var(*name, value),
+                    None => std::env::remove_var(*name),
+                }
+            }
+        }
+    }
 }

@@ -9,7 +9,7 @@ an orchestrator and a sequence of specialized agent profiles.
 - Interactive TUI with agent roster, event stream, and composer.
 - Orchestrator-driven routing for planning, execution, clarifying questions, and completion.
 - Built-in multi-runtime support:
-  - `codex` (CLI runtime)
+  - `codex` (Codex CLI runtime)
   - `zai` (HTTP API runtime)
   - `fake` (test/runtime simulation)
 - Configurable agents with explicit capabilities and scopes.
@@ -22,7 +22,7 @@ an orchestrator and a sequence of specialized agent profiles.
 ## Requirements
 
 - Rust toolchain (to build from source).
-- Optional: `codex` CLI if you plan to use the Codex runtime.
+- Optional: `codex` CLI with `codex login` completed if you plan to use the Codex runtime.
 - Optional: `ZAI_API_KEY` (or another env var configured as `api_key_env`) for Z.ai runtime.
 
 ## Install
@@ -117,12 +117,18 @@ Important values:
 ## Runtimes
 
 - `codex`
-  - Invokes `codex` as a child process.
+  - Invokes the installed `codex` CLI as a child process.
+  - Reuses Codex-owned login state, including ChatGPT subscription login when the CLI is signed in that way.
   - Defaults: `codex exec --skip-git-repo-check --color never`
+  - Check setup with `codex login status`; sign in with `codex login` or `codex login --device-auth`.
 - `zai`
   - Uses API key from env var (example: `ZAI_API_KEY`) and posts to `api.z.ai`.
 - `fake`
   - Local test/runtime simulation mode.
+
+Use `codex` when you want the installed Codex CLI and its login flow. ChatGPT
+subscription-backed Codex usage goes through Codex local auth, not an
+`OPENAI_API_KEY` in `multiagent.toml`.
 
 ## Session history
 
@@ -205,3 +211,10 @@ cargo build
 ## License
 
 MIT
+
+## Integration Roadmap
+
+The following runtime integrations are planned:
+
+- `Claude` (Anthropic): planned for a future release.
+- `Cursor`: planned for a future release.

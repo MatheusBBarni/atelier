@@ -22,11 +22,11 @@ impl CodexRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
         Self { config }
     }
-}
 
-#[async_trait]
-impl Runtime for CodexRuntime {
-    async fn check_availability(&self) -> RuntimeAvailability {
+    async fn check_availability_with_exec_env_auth_vars(
+        &self,
+        exec_env_auth_vars: &[&str],
+    ) -> RuntimeAvailability {
         let Some(command) = &self.config.command else {
             return RuntimeAvailability {
                 runtime_id: self.config.id.clone(),
@@ -51,16 +51,78 @@ impl Runtime for CodexRuntime {
         )
         .await;
         match version {
-            Ok(Ok(output)) if output.status.success() => RuntimeAvailability {
-                runtime_id: self.config.id.clone(),
-                status: RuntimeAvailabilityStatus::Available,
-                message: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-                remediation: None,
-            },
+            Ok(Ok(output)) if output.status.success() => {
+                let version_message = concise_process_output(&process_output_text(&output));
+                let login = timeout(
+                    Duration::from_secs(2),
+                    Command::new(command).args(["login", "status"]).output(),
+                )
+                .await;
+
+                match login {
+                    Ok(Ok(login_output)) if login_output.status.success() => {
+                        let login_message =
+                            concise_process_output(&process_output_text(&login_output));
+                        RuntimeAvailability {
+                            runtime_id: self.config.id.clone(),
+                            status: RuntimeAvailabilityStatus::Available,
+                            message: join_status_parts(&version_message, &login_message),
+                            remediation: None,
+                        }
+                    }
+                    Ok(Ok(login_output)) => {
+                        let login_message =
+                            concise_process_output(&process_output_text(&login_output));
+                        let (status, message, remediation) = if !exec_env_auth_vars.is_empty() {
+                            (
+                                RuntimeAvailabilityStatus::Unknown,
+                                join_status_parts(
+                                    &join_status_parts(&version_message, &login_message),
+                                    &codex_exec_env_auth_message(exec_env_auth_vars),
+                                ),
+                                Some(codex_exec_env_auth_remediation(exec_env_auth_vars)),
+                            )
+                        } else if codex_login_status_is_known_auth_failure(&login_message) {
+                            (
+                                RuntimeAvailabilityStatus::Unavailable,
+                                join_status_parts(&version_message, &login_message),
+                                Some(codex_login_remediation()),
+                            )
+                        } else {
+                            (
+                                RuntimeAvailabilityStatus::Unknown,
+                                join_status_parts(&version_message, &login_message),
+                                Some(codex_login_remediation()),
+                            )
+                        };
+                        RuntimeAvailability {
+                            runtime_id: self.config.id.clone(),
+                            status,
+                            message,
+                            remediation,
+                        }
+                    }
+                    Ok(Err(error)) => RuntimeAvailability {
+                        runtime_id: self.config.id.clone(),
+                        status: RuntimeAvailabilityStatus::Unknown,
+                        message: join_status_parts(&version_message, &error.to_string()),
+                        remediation: Some(codex_login_remediation()),
+                    },
+                    Err(_) => RuntimeAvailability {
+                        runtime_id: self.config.id.clone(),
+                        status: RuntimeAvailabilityStatus::Unknown,
+                        message: join_status_parts(
+                            &version_message,
+                            "codex login status timed out",
+                        ),
+                        remediation: Some(codex_login_remediation()),
+                    },
+                }
+            }
             Ok(Ok(output)) => RuntimeAvailability {
                 runtime_id: self.config.id.clone(),
                 status: RuntimeAvailabilityStatus::Unknown,
-                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                message: concise_process_output(&process_output_text(&output)),
                 remediation: Some(
                     "Run codex directly to inspect local authentication/setup.".to_string(),
                 ),
@@ -82,6 +144,15 @@ impl Runtime for CodexRuntime {
                 ),
             },
         }
+    }
+}
+
+#[async_trait]
+impl Runtime for CodexRuntime {
+    async fn check_availability(&self) -> RuntimeAvailability {
+        let exec_env_auth_vars = codex_exec_env_auth_vars();
+        self.check_availability_with_exec_env_auth_vars(&exec_env_auth_vars)
+            .await
     }
 
     async fn stream_step(&self, request: RuntimeRequest) -> Result<RuntimeStepResult> {
@@ -262,6 +333,67 @@ fn concise_process_output(output: &str) -> String {
     )
 }
 
+fn process_output_text(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match (stdout.trim(), stderr.trim()) {
+        ("", "") => "command produced no output".to_string(),
+        (stdout, "") => stdout.to_string(),
+        ("", stderr) => stderr.to_string(),
+        (stdout, stderr) => format!("{stdout}; {stderr}"),
+    }
+}
+
+fn join_status_parts(left: &str, right: &str) -> String {
+    match (left.trim(), right.trim()) {
+        ("", "") => "codex status unknown".to_string(),
+        (left, "") => left.to_string(),
+        ("", right) => right.to_string(),
+        (left, right) => format!("{left}; {right}"),
+    }
+}
+
+fn codex_login_remediation() -> String {
+    "Run codex login, or codex login --device-auth on a remote/headless machine.".to_string()
+}
+
+fn codex_exec_env_auth_vars() -> Vec<&'static str> {
+    ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]
+        .into_iter()
+        .filter(|name| {
+            std::env::var_os(name)
+                .map(|value| !value.to_string_lossy().trim().is_empty())
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn codex_exec_env_auth_message(vars: &[&str]) -> String {
+    if vars.len() == 1 {
+        format!("{} is set for codex exec", vars[0])
+    } else {
+        format!("{} are set for codex exec", vars.join(", "))
+    }
+}
+
+fn codex_exec_env_auth_remediation(vars: &[&str]) -> String {
+    format!(
+        "Run codex exec directly to verify {}; use codex login for persistent auth.",
+        vars.join(" or ")
+    )
+}
+
+fn codex_login_status_is_known_auth_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("not logged in")
+        || message.contains("not authenticated")
+        || message.contains("logged out")
+        || message.contains("no valid session")
+        || message.contains("authentication required")
+        || message.contains("unauthorized")
+        || message.contains("forbidden")
+}
+
 fn parse_runtime_output(agent_id: &str, raw_output: String) -> Result<RuntimeOutput> {
     if let Ok(request) = parse_contract(&raw_output) {
         return Ok(RuntimeOutput::ActionRequest { request });
@@ -364,6 +496,164 @@ mod tests {
         assert!(captured_args.contains("--skip-git-repo-check\n"));
         assert!(captured_args.contains("--color\nnever\n"));
         assert!(captured_args.contains("--model\ngpt-5.4\n"));
+    }
+
+    #[tokio::test]
+    async fn codex_availability_reports_login_status() {
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("codex-status.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex-cli 0.137.0"
+  exit 0
+fi
+if [ "$1" = "login" ] && [ "$2" = "status" ]; then
+  echo "Logged in using ChatGPT"
+  exit 0
+fi
+echo "unexpected args: $@" >&2
+exit 64
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let runtime = CodexRuntime::new(codex_runtime_config(&script_path));
+        let availability = runtime.check_availability().await;
+
+        assert_eq!(availability.status, RuntimeAvailabilityStatus::Available);
+        assert!(availability.message.contains("codex-cli 0.137.0"));
+        assert!(availability.message.contains("Logged in using ChatGPT"));
+        assert!(availability.remediation.is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_availability_is_unavailable_when_login_status_fails() {
+        let _env_guard = clear_codex_exec_env_auth();
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("codex-status.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex-cli 0.137.0"
+  exit 0
+fi
+if [ "$1" = "login" ] && [ "$2" = "status" ]; then
+  echo "Not logged in" >&2
+  exit 1
+fi
+echo "unexpected args: $@" >&2
+exit 64
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let runtime = CodexRuntime::new(codex_runtime_config(&script_path));
+        let availability = runtime.check_availability().await;
+
+        assert_eq!(availability.status, RuntimeAvailabilityStatus::Unavailable);
+        assert!(availability.message.contains("codex-cli 0.137.0"));
+        assert!(availability.message.contains("Not logged in"));
+        assert!(availability
+            .remediation
+            .as_deref()
+            .unwrap()
+            .contains("codex login"));
+    }
+
+    #[tokio::test]
+    async fn codex_availability_is_unknown_when_exec_env_auth_is_present() {
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("codex-status.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex-cli 0.137.0"
+  exit 0
+fi
+if [ "$1" = "login" ] && [ "$2" = "status" ]; then
+  echo "Not logged in" >&2
+  exit 1
+fi
+echo "unexpected args: $@" >&2
+exit 64
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let runtime = CodexRuntime::new(codex_runtime_config(&script_path));
+        let availability = runtime
+            .check_availability_with_exec_env_auth_vars(&["CODEX_API_KEY"])
+            .await;
+
+        assert_eq!(availability.status, RuntimeAvailabilityStatus::Unknown);
+        assert!(availability.message.contains("codex-cli 0.137.0"));
+        assert!(availability.message.contains("Not logged in"));
+        assert!(availability.message.contains("CODEX_API_KEY"));
+        assert!(availability
+            .remediation
+            .as_deref()
+            .unwrap()
+            .contains("codex exec"));
+    }
+
+    #[tokio::test]
+    async fn codex_availability_is_unknown_when_login_status_is_unsupported() {
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("codex-status.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex-cli 0.1.0"
+  exit 0
+fi
+if [ "$1" = "login" ] && [ "$2" = "status" ]; then
+  echo "unknown login subcommand: status" >&2
+  exit 64
+fi
+echo "unexpected args: $@" >&2
+exit 65
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let runtime = CodexRuntime::new(codex_runtime_config(&script_path));
+        let availability = runtime.check_availability().await;
+
+        assert_eq!(availability.status, RuntimeAvailabilityStatus::Unknown);
+        assert!(availability.message.contains("codex-cli 0.1.0"));
+        assert!(availability
+            .message
+            .contains("unknown login subcommand: status"));
+        assert!(availability
+            .remediation
+            .as_deref()
+            .unwrap()
+            .contains("codex login"));
     }
 
     #[test]
@@ -549,6 +839,51 @@ mod tests {
             .to_string(),
             capability_constraints: vec![Capability::Read],
             limits: Limits::default(),
+        }
+    }
+
+    fn codex_runtime_config(command: &std::path::Path) -> RuntimeConfig {
+        RuntimeConfig {
+            id: "codex".to_string(),
+            kind: RuntimeKind::Codex,
+            command: Some(command.display().to_string()),
+            args: Vec::new(),
+            prompt_mode: PromptMode::Stdin,
+            base_url: None,
+            api_key_env: None,
+        }
+    }
+
+    fn clear_codex_exec_env_auth() -> EnvGuard {
+        EnvGuard::clear(&["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"])
+    }
+
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn clear(names: &[&'static str]) -> Self {
+            let vars = names
+                .iter()
+                .map(|name| {
+                    let value = std::env::var_os(name);
+                    std::env::remove_var(name);
+                    (*name, value)
+                })
+                .collect();
+            Self { vars }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.vars {
+                match value {
+                    Some(value) => std::env::set_var(*name, value),
+                    None => std::env::remove_var(*name),
+                }
+            }
         }
     }
 }

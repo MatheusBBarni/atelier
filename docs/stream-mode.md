@@ -202,9 +202,10 @@ Risk:
   existing contract extraction, while streamed progress remains best-effort UI
   content.
 
-### OpenAI Responses runtime
+### Future direct OpenAI API runtime
 
-See `docs/codex-api.md`.
+A future direct OpenAI Platform API adapter can use the same stream-mode contract.
+It is separate from the Codex subscription path in `docs/codex-api.md`.
 
 Plan:
 

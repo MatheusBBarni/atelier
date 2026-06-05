@@ -1,7 +1,10 @@
 use crate::app::{App, AppEvent, AppState};
 use crate::config::EffectiveConfig;
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -22,6 +25,7 @@ use tokio::task::JoinHandle;
 
 const USER_EVENT_BG: Color = Color::Rgb(18, 52, 71);
 const INPUT_COMPOSER_HEIGHT: u16 = 5;
+const MOUSE_SCROLL_LINES: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TuiCommand {
@@ -39,6 +43,8 @@ enum TuiCommand {
 enum EventScrollCommand {
     PageUp,
     PageDown,
+    LinesUp(usize),
+    LinesDown(usize),
     Top,
     Bottom,
 }
@@ -65,6 +71,7 @@ struct TuiUiState {
     event_follow: bool,
     event_content_lines: usize,
     event_viewport_lines: usize,
+    event_area: Rect,
     input_cursor: usize,
     input_preferred_col: Option<usize>,
     input_width: usize,
@@ -79,6 +86,7 @@ impl Default for TuiUiState {
             event_follow: true,
             event_content_lines: 0,
             event_viewport_lines: 1,
+            event_area: Rect::ZERO,
             input_cursor: 0,
             input_preferred_col: None,
             input_width: 1,
@@ -99,7 +107,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let worker = tokio::spawn(run_app_worker(app, command_receiver));
@@ -108,7 +116,11 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
 
     let cleanup_result = (|| -> Result<()> {
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
         terminal.show_cursor()?;
         Ok(())
     })();
@@ -132,13 +144,15 @@ async fn run_loop(
         terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if let Some(command) = key_event_to_tui_command_with_ui(&state, &ui_state, key) {
-                    if !execute_tui_command(&mut state, &mut ui_state, &command_sender, command)
-                        .await?
-                    {
-                        break;
-                    }
+            let command = match event::read()? {
+                Event::Key(key) => key_event_to_tui_command_with_ui(&state, &ui_state, key),
+                Event::Mouse(mouse) => mouse_event_to_tui_command(&ui_state, mouse),
+                _ => None,
+            };
+            if let Some(command) = command {
+                if !execute_tui_command(&mut state, &mut ui_state, &command_sender, command).await?
+                {
+                    break;
                 }
             }
         }
@@ -361,6 +375,29 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
     }
 }
 
+fn mouse_event_to_tui_command(ui_state: &TuiUiState, mouse: MouseEvent) -> Option<TuiCommand> {
+    if ui_state.help_visible || !rect_contains(ui_state.event_area, mouse.column, mouse.row) {
+        return None;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Some(TuiCommand::ScrollEvents(EventScrollCommand::LinesUp(
+            MOUSE_SCROLL_LINES,
+        ))),
+        MouseEventKind::ScrollDown => Some(TuiCommand::ScrollEvents(
+            EventScrollCommand::LinesDown(MOUSE_SCROLL_LINES),
+        )),
+        _ => None,
+    }
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
 fn approval_input_is_yes(input: &str) -> bool {
     matches!(
         input.trim().to_ascii_lowercase().as_str(),
@@ -463,6 +500,14 @@ fn scroll_events(ui_state: &mut TuiUiState, command: EventScrollCommand) {
         }
         EventScrollCommand::PageDown => {
             ui_state.event_scroll = ui_state.event_scroll.saturating_add(page).min(max_scroll);
+            ui_state.event_follow = ui_state.event_scroll == max_scroll;
+        }
+        EventScrollCommand::LinesUp(lines) => {
+            ui_state.event_scroll = ui_state.event_scroll.saturating_sub(lines);
+            ui_state.event_follow = false;
+        }
+        EventScrollCommand::LinesDown(lines) => {
+            ui_state.event_scroll = ui_state.event_scroll.saturating_add(lines).min(max_scroll);
             ui_state.event_follow = ui_state.event_scroll == max_scroll;
         }
         EventScrollCommand::Top => {
@@ -643,6 +688,7 @@ fn render_event_stream(
     let content_lines = wrapped_event_line_count(&event_lines, paragraph_width);
     ui_state.event_content_lines = content_lines;
     ui_state.event_viewport_lines = viewport_lines;
+    ui_state.event_area = event_area;
     let max_scroll = event_max_scroll(ui_state);
     if ui_state.event_follow {
         ui_state.event_scroll = max_scroll;
@@ -702,6 +748,7 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("Ctrl-L               show or hide Agent Roster"),
         Line::from("Arrow keys           move input cursor"),
         Line::from("PageUp/PageDown     scroll Event Stream by page"),
+        Line::from("Mouse wheel         scroll Event Stream by line"),
         Line::from("Home/End            jump Event Stream to top/latest"),
         Line::from("Ctrl-C               interrupt active run and exit"),
         Line::from("Backspace            delete input character"),
@@ -1157,6 +1204,7 @@ mod tests {
         assert!(text.contains("/subtask <agent>"));
         assert!(text.contains("/config"));
         assert!(text.contains("Esc"));
+        assert!(text.contains("Mouse wheel"));
         assert!(text.contains("close this help"));
         assert!(text.contains("Ctrl-L"));
         assert!(text.contains("Arrow keys"));
@@ -1308,6 +1356,76 @@ mod tests {
         assert_eq!(
             key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             Some(TuiCommand::MoveInputCursor(InputCursorCommand::Down))
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_over_event_stream_becomes_scroll_commands() {
+        let ui_state = TuiUiState {
+            event_area: Rect::new(10, 2, 30, 12),
+            ..TuiUiState::default()
+        };
+
+        assert_eq!(
+            mouse_event_to_tui_command(
+                &ui_state,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: 12,
+                    row: 4,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::LinesUp(
+                MOUSE_SCROLL_LINES
+            )))
+        );
+        assert_eq!(
+            mouse_event_to_tui_command(
+                &ui_state,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 12,
+                    row: 4,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::LinesDown(
+                MOUSE_SCROLL_LINES
+            )))
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_ignores_non_event_stream_areas_and_help_modal() {
+        let ui_state = TuiUiState {
+            event_area: Rect::new(10, 2, 30, 12),
+            ..TuiUiState::default()
+        };
+        let outside_event_stream = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_event_to_tui_command(&ui_state, outside_event_stream),
+            None
+        );
+
+        let help_state = TuiUiState {
+            help_visible: true,
+            ..ui_state
+        };
+        let inside_event_stream = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse_event_to_tui_command(&help_state, inside_event_stream),
+            None
         );
     }
 
@@ -1568,6 +1686,33 @@ mod tests {
         assert!(!ui_state.event_follow);
 
         scroll_events(&mut ui_state, EventScrollCommand::Bottom);
+
+        assert_eq!(ui_state.event_scroll, 90);
+        assert!(ui_state.event_follow);
+    }
+
+    #[test]
+    fn event_stream_mouse_scroll_moves_by_lines() {
+        let mut ui_state = TuiUiState {
+            event_scroll: 90,
+            event_follow: true,
+            event_content_lines: 100,
+            event_viewport_lines: 10,
+            ..TuiUiState::default()
+        };
+
+        scroll_events(
+            &mut ui_state,
+            EventScrollCommand::LinesUp(MOUSE_SCROLL_LINES),
+        );
+
+        assert_eq!(ui_state.event_scroll, 87);
+        assert!(!ui_state.event_follow);
+
+        scroll_events(
+            &mut ui_state,
+            EventScrollCommand::LinesDown(MOUSE_SCROLL_LINES),
+        );
 
         assert_eq!(ui_state.event_scroll, 90);
         assert!(ui_state.event_follow);

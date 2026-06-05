@@ -101,7 +101,7 @@ Whether an execution runtime can currently perform work with the installed comma
 _Avoid_: health check, provider status
 
 **Codex Runtime**:
-An execution runtime that launches Codex as a child CLI process using the user's subscription authentication.
+An execution runtime that launches Codex locally and relies on Codex-owned authentication, commonly ChatGPT subscription login through the Codex CLI.
 _Avoid_: OpenAI API runtime
 
 **Z.ai Runtime**:
@@ -156,9 +156,13 @@ _Avoid_: process resume, continuation
 A configured bound that stops a run after too many steps, too much time, or too many review-fix cycles.
 _Avoid_: timeout, budget
 
-**Event Stream**:
-The chronological TUI record of prompts, routing decisions, agent activity, and results.
-_Avoid_: log, transcript, console output
+**Chat**:
+The primary TUI surface that presents a readable conversation-style view of prompts, routing decisions, agent activity, harness actions, command results, file edits, diagnostics, and results.
+_Avoid_: Event Stream, log, transcript, console output
+
+**Chat Item**:
+A curated unit rendered in the Chat, such as a user prompt, routing decision, agent summary, harness action, command result, file edit, diagnostic, diff, or final result.
+_Avoid_: message, raw log line
 
 **Agent Roster**:
 The TUI surface that shows available specialized agents, their status, model assignment, runtime, and current step.
@@ -190,8 +194,11 @@ _Avoid_: prompt, blocker message
 - A **Prompt** is first handled by exactly one **Orchestrator**.
 - An **Orchestrator** delegates work to one or more **Specialized Agents**.
 - An **Orchestrator Decision** drives delegation and run state transitions.
-- A **Routing Decision** is displayed in the **Event Stream** before the selected **Specialized Agent** runs.
-- The **Agent Roster**, **Event Stream**, and **Input Composer** are the primary TUI surfaces.
+- A **Routing Decision** is displayed in the **Chat** before the selected **Specialized Agent** runs.
+- A **Chat Item** is curated for user readability and may reference raw output stored in **Session History** or artifacts.
+- A **Chat Item** may aggregate multiple related **Session History** events when they describe one visible lifecycle, such as one harness action moving from requested to running to completed.
+- **Chat** is a presentation layer derived from active run state and **Session History**; it does not replace the durable **Session History** model.
+- The **Agent Roster**, **Chat**, and **Input Composer** are the primary TUI surfaces.
 - An **Orchestrator** owns the **Run Plan** and decides when to delegate, continue, stop, or ask the user for input.
 - A **Specialized Agent** reports results to the **Orchestrator** rather than delegating directly to another **Specialized Agent**.
 - A **Specialized Agent** reports an **Agent Result** after completing a step.
@@ -214,17 +221,17 @@ _Avoid_: prompt, blocker message
 - **Custom Agents** are defined as additional **Agent Profiles** in configuration.
 - Configuration can override a **Built-in Profile** by using the same agent name.
 - An **Agent Profile** uses one **Execution Runtime** when performing work.
-- The first supported **Execution Runtimes** are **Codex Runtime** and **Z.ai Runtime**.
+- The supported **Execution Runtimes** are **Codex Runtime**, **Z.ai Runtime**, and **Fake Runtime**.
 - **Runtime Availability** is shown for each **Agent Profile** in the **Agent Roster**.
-- **Z.ai Runtime** produces reasoning or structured output, while **Harness Actions** are executed by the **Harness**.
-- **Z.ai Runtime** uses a **Credential Reference** to name the environment variable containing its API key.
+- **Codex Runtime** uses Codex-owned local authentication, while API-keyed runtimes use a **Credential Reference** to name the environment variable containing their API key.
+- Execution runtimes produce reasoning or structured output, while **Harness Actions** are executed by the **Harness**.
 
 ## Example dialogue
 
 > **Dev:** "When the user presses Enter in the TUI, does the **Prompt** go directly to Explorer?"
 > **Domain expert:** "No. Every **Prompt** starts with the **Orchestrator**, and the **Orchestrator** decides which **Specialized Agent** handles it next."
 > **Dev:** "Does the user confirm the **Routing Decision** first?"
-> **Domain expert:** "No, the **Routing Decision** appears in the **Event Stream**, then the chosen **Specialized Agent** runs automatically."
+> **Domain expert:** "No, the **Routing Decision** appears in the **Chat**, then the chosen **Specialized Agent** runs automatically."
 > **Dev:** "Where does the user see which model Fixer is using?"
 > **Domain expert:** "The **Agent Roster** shows each **Specialized Agent** with its **Model Assignment** and **Execution Runtime**."
 > **Dev:** "Can the user start a second **Run** while Fixer is still working?"
@@ -252,7 +259,7 @@ _Avoid_: prompt, blocker message
 > **Dev:** "Is the **Orchestrator** just picking the first agent?"
 > **Domain expert:** "No. The **Orchestrator** owns the **Run Plan**, which may involve one or many **Specialized Agents** over the life of a **Run**."
 > **Dev:** "Does the harness parse the **Orchestrator**'s prose to decide what runs?"
-> **Domain expert:** "No. The **Orchestrator** returns an **Orchestrator Decision**, and the **Event Stream** renders it for the user."
+> **Domain expert:** "No. The **Orchestrator** returns an **Orchestrator Decision**, and the **Chat** renders it for the user."
 > **Dev:** "Can Reviewer call Fixer directly?"
 > **Domain expert:** "No. Reviewer reports its result to the **Orchestrator**, and the **Orchestrator** decides whether Fixer should run next."
 > **Dev:** "Can Explorer just send a paragraph back?"
@@ -280,11 +287,11 @@ _Avoid_: prompt, blocker message
 > **Dev:** "Where does Fixer's model live?"
 > **Domain expert:** "In **Harness Configuration**, so changing Fixer's **Model Assignment** does not require code changes."
 > **Dev:** "Does every agent need to use the same provider?"
-> **Domain expert:** "No. One **Agent Profile** can use **Codex Runtime** through subscription auth while another uses **Z.ai Runtime** through an API key."
+> **Domain expert:** "No. One **Agent Profile** can use **Codex Runtime** through Codex-owned login while another uses **Z.ai Runtime** through an API key."
 > **Dev:** "What if no runtime is ready on first launch?"
 > **Domain expert:** "The **Harness** still opens and shows **Runtime Availability** so the user can see what setup is missing."
 > **Dev:** "Does **Codex Runtime** call the OpenAI API directly?"
-> **Domain expert:** "No. **Codex Runtime** launches Codex as a child CLI process, while **Z.ai Runtime** uses API-key HTTP requests."
+> **Domain expert:** "No. **Codex Runtime** launches Codex locally and lets Codex handle its own authentication."
 > **Dev:** "Can **Z.ai Runtime** edit files directly?"
 > **Domain expert:** "No. **Z.ai Runtime** can propose work, but file edits and command execution are **Harness Actions**."
 > **Dev:** "Does `multiagent.toml` store the Z.ai API key?"
