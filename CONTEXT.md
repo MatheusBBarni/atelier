@@ -85,8 +85,16 @@ The merged result of built-in profiles, harness configuration, local configurati
 _Avoid_: active config, resolved config
 
 **Global Command**:
-The installed `multiagent` executable that can be launched from any folder.
+The installed `atelier` executable that can be launched from any folder.
 _Avoid_: project binary, local script
+
+**npm Distribution Package**:
+The scoped npm package that installs the global command through the npm registry.
+_Avoid_: source package, JavaScript CLI
+
+**Platform Binary Package**:
+A platform-specific npm package that contains a prebuilt native `atelier` executable.
+_Avoid_: build script, installer
 
 **Working Directory**:
 The folder where the user launches the global command and where a run reads, edits, and records project-local history by default.
@@ -103,6 +111,14 @@ _Avoid_: health check, provider status
 **Codex Runtime**:
 An execution runtime that launches Codex locally and relies on Codex-owned authentication, commonly ChatGPT subscription login through the Codex CLI.
 _Avoid_: OpenAI API runtime
+
+**Claude Runtime**:
+An execution runtime that launches Claude locally and relies on Claude-owned authentication through the Claude CLI.
+_Avoid_: Anthropic API runtime
+
+**Cursor Runtime**:
+An execution runtime that launches Cursor locally and relies on Cursor-owned authentication through the Cursor Agent CLI.
+_Avoid_: Cursor API runtime
 
 **Z.ai Runtime**:
 An execution runtime that calls Z.ai through API-key authenticated HTTP requests.
@@ -185,8 +201,12 @@ _Avoid_: prompt, blocker message
 - A **Harness Session** may contain multiple **Runs** over time.
 - **Session History** is stored in the project-scoped `.multiagent/` directory.
 - **Context Resume** creates a new **Run** rather than continuing an old process exactly.
+- **Context Resume** does not resume Claude CLI sessions by default; it provides prior **Session History** to a new Claude process.
+- **Context Resume** does not resume Cursor CLI sessions by default; it provides prior **Session History** to a new Cursor process.
 - A **Run Limit** can be a concrete value or explicitly unlimited in configuration.
 - A **Global Command** starts a **Harness Session** in the current **Working Directory**.
+- An **npm Distribution Package** installs the **Global Command** without requiring the user to build Rust from source.
+- An **npm Distribution Package** selects one **Platform Binary Package** for the user's operating system and CPU architecture.
 - **Harness Configuration** applies across working directories.
 - **Local Configuration** can override **Harness Configuration** for the current **Working Directory**.
 - `MULTIAGENT_CONFIG` can point the **Global Command** to an alternate **Harness Configuration** file.
@@ -220,11 +240,15 @@ _Avoid_: prompt, blocker message
 - **Built-in Profiles** provide default **Agent Profiles** when configuration is missing or incomplete.
 - **Custom Agents** are defined as additional **Agent Profiles** in configuration.
 - Configuration can override a **Built-in Profile** by using the same agent name.
+- Adding an **Execution Runtime** does not change **Built-in Profiles** unless a profile explicitly selects that runtime.
 - An **Agent Profile** uses one **Execution Runtime** when performing work.
-- The supported **Execution Runtimes** are **Codex Runtime**, **Z.ai Runtime**, and **Fake Runtime**.
+- The supported **Execution Runtimes** are **Codex Runtime**, **Claude Runtime**, **Cursor Runtime**, **Z.ai Runtime**, and **Fake Runtime**.
 - **Runtime Availability** is shown for each **Agent Profile** in the **Agent Roster**.
+- **Runtime Availability** can be unknown when the harness can verify installation but cannot prove authentication without starting model work.
 - **Codex Runtime** uses Codex-owned local authentication, while API-keyed runtimes use a **Credential Reference** to name the environment variable containing their API key.
 - Execution runtimes produce reasoning or structured output, while **Harness Actions** are executed by the **Harness**.
+- **Claude Runtime** uses Claude-owned local authentication, disables Claude Code tools by default, and requests local reads, edits, commands, and VCS operations as **Harness Actions**.
+- **Claude Runtime** minimizes ambient Claude project context by default; project-specific Claude settings require explicit harness support.
 
 ## Example dialogue
 
@@ -240,6 +264,10 @@ _Avoid_: prompt, blocker message
 > **Domain expert:** "No. A **Harness Session** is the interactive TUI period, and each submitted **Prompt** creates a separate **Run** recorded in **Session History**."
 > **Dev:** "Does resume restore the old Codex child process?"
 > **Domain expert:** "No. **Context Resume** starts a new **Run** with previous **Session History** available as context."
+> **Dev:** "Does **Context Resume** pass `--continue` or `--resume` to **Claude Runtime**?"
+> **Domain expert:** "No. **Context Resume** uses harness-owned **Session History** and starts a new Claude print-mode process by default."
+> **Dev:** "Does **Context Resume** pass `resume` or `--resume` to **Cursor Runtime**?"
+> **Domain expert:** "No. **Context Resume** uses harness-owned **Session History** and starts a new Cursor print-mode process by default."
 > **Dev:** "What stops a bad plan from looping forever?"
 > **Domain expert:** "A **Run Limit** stops the **Run** unless the user explicitly configures that limit as unlimited."
 > **Dev:** "Does the user need to install the harness inside each project?"
@@ -250,6 +278,8 @@ _Avoid_: prompt, blocker message
 > **Domain expert:** "Yes. **Local Configuration** can override project-specific behavior, while secrets remain outside local configuration."
 > **Dev:** "Does first run fail if no `multiagent.toml` exists?"
 > **Domain expert:** "No. **Built-in Profiles** let the **Global Command** start, and configuration can customize them later."
+> **Dev:** "Does adding **Claude Runtime** move Explorer or Fixer to Claude automatically?"
+> **Domain expert:** "No. **Built-in Profiles** stay unchanged, and users opt in through **Harness Configuration**, **Local Configuration**, or a **Custom Agent**."
 > **Dev:** "Can a user add a Security agent?"
 > **Domain expert:** "Yes. A **Custom Agent** is added as another **Agent Profile** in configuration."
 > **Dev:** "What does `--print-config` show?"
@@ -290,8 +320,14 @@ _Avoid_: prompt, blocker message
 > **Domain expert:** "No. One **Agent Profile** can use **Codex Runtime** through Codex-owned login while another uses **Z.ai Runtime** through an API key."
 > **Dev:** "What if no runtime is ready on first launch?"
 > **Domain expert:** "The **Harness** still opens and shows **Runtime Availability** so the user can see what setup is missing."
+> **Dev:** "If `claude --version` works, does that prove **Claude Runtime** is authenticated?"
+> **Domain expert:** "No. **Runtime Availability** can remain unknown when authentication cannot be proven without starting model work."
 > **Dev:** "Does **Codex Runtime** call the OpenAI API directly?"
 > **Domain expert:** "No. **Codex Runtime** launches Codex locally and lets Codex handle its own authentication."
+> **Dev:** "Can **Claude Runtime** use Claude Code tools to edit files directly?"
+> **Domain expert:** "No. **Claude Runtime** disables Claude Code tools by default, so local reads, edits, commands, and VCS operations remain **Harness Actions**."
+> **Dev:** "Does **Claude Runtime** silently inherit project Claude settings and MCP servers?"
+> **Domain expert:** "No. **Claude Runtime** minimizes ambient Claude context by default and needs explicit harness support before project-specific Claude settings are used."
 > **Dev:** "Can **Z.ai Runtime** edit files directly?"
 > **Domain expert:** "No. **Z.ai Runtime** can propose work, but file edits and command execution are **Harness Actions**."
 > **Dev:** "Does `multiagent.toml` store the Z.ai API key?"
@@ -302,3 +338,6 @@ _Avoid_: prompt, blocker message
 - "multiagent-harness" resolved as **Harness**, the terminal-native coordination system rather than a model provider or agent runtime.
 - "agent" resolved as **Specialized Agent**, a role configured by an **Agent Profile** rather than a hardcoded process.
 - "session history" resolved as **Session History**, the persisted `.multiagent/` record of harness sessions and runs rather than the active **Run** itself.
+- "claude integration" resolved as **Claude Runtime**, a CLI-backed execution runtime rather than a direct Anthropic API integration.
+- "integrate Claude" does not mean changing **Built-in Profiles** to Claude; Claude adoption is explicit through configuration.
+- "multiagent" no longer names the executable; the **Global Command** is `atelier`, while `multiagent.toml` remains the configuration file name.
