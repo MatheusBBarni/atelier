@@ -32,7 +32,9 @@ const INPUT_COMPOSER_HEIGHT: u16 = 5;
 const ACTIVE_INPUT_BOX_HEIGHT: u16 = 3;
 const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
+const WORK_HINT: &str = "/help";
 const WORK_INDICATOR_HEIGHT: u16 = 1;
+const WORK_LABEL: &str = "Working";
 const MOUSE_SCROLL_LINES: usize = 3;
 const WORK_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
@@ -1113,21 +1115,35 @@ fn render_work_indicator(frame: &mut Frame, status_area: Rect, ui_state: &mut Tu
     let line_area = Rect {
         x: status_area.x + 1,
         y: status_area.y,
-        width: status_area.width.saturating_sub(1),
+        width: status_area.width.saturating_sub(2),
         height: 1,
     };
-    let line = Line::from(vec![
+    let line_width = usize::from(line_area.width);
+    let left_width = spinner.chars().count() + 1 + WORK_LABEL.chars().count();
+    let hint_width = WORK_HINT.chars().count();
+    let mut spans = vec![
         Span::styled(spinner, Style::default().fg(Color::Yellow)),
         Span::raw(" "),
         Span::styled(
-            "Working",
+            WORK_LABEL,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-    ]);
+    ];
+    if line_width >= left_width.saturating_add(hint_width) {
+        spans.push(Span::raw(
+            " ".repeat(line_width.saturating_sub(left_width + hint_width)),
+        ));
+        spans.push(Span::styled(
+            WORK_HINT,
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     frame.render_widget(Clear, status_area);
-    frame.render_widget(Paragraph::new(line), line_area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), line_area);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1298,6 +1314,7 @@ mod tests {
         assert!(working_row > prompt_row);
         assert!(first_lines[working_row.saturating_sub(1)].contains("└"));
         assert!(!first_lines[working_row].contains("│"));
+        assert!(first_lines[working_row].trim_end().ends_with("/help"));
     }
 
     #[test]
