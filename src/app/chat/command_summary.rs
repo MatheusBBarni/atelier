@@ -66,11 +66,11 @@ pub fn classify_command_for_summary(command: &str) -> CommandCategory {
     if cargo_summary_command(&lower) {
         return CommandCategory::Cargo;
     }
-    if approval_command(&lower) {
-        return CommandCategory::ApprovalRequired;
-    }
     if known_read_only_command(&lower) {
         return CommandCategory::KnownReadOnly;
+    }
+    if approval_command(&lower) {
+        return CommandCategory::ApprovalRequired;
     }
     CommandCategory::Unknown
 }
@@ -82,6 +82,9 @@ fn cargo_summary_command(lower: &str) -> bool {
         "cargo clippy",
         "cargo build",
         "cargo fmt",
+        "cargo metadata",
+        "cargo tree",
+        "cargo locate-project",
     ]
     .iter()
     .any(|prefix| command_has_prefix(lower, prefix))
@@ -101,9 +104,20 @@ fn known_read_only_command(lower: &str) -> bool {
         "git diff",
         "git log",
         "git show",
+        "git rev-parse",
+        "git ls-files",
+        "git grep",
+        "git blame",
+        "git describe",
+        "multiagent --doctor",
+        "multiagent --print-config",
+        "multiagent --help",
+        "multiagent --version",
     ]
     .iter()
     .any(|prefix| command_has_prefix(lower, prefix))
+        || is_read_only_git_branch_command(lower)
+        || is_read_only_git_remote_command(lower)
 }
 
 fn approval_command(lower: &str) -> bool {
@@ -141,6 +155,28 @@ fn approval_command(lower: &str) -> bool {
 fn command_has_prefix(lower_command: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end();
     lower_command == prefix || lower_command.starts_with(&format!("{prefix} "))
+}
+
+fn is_read_only_git_branch_command(lower: &str) -> bool {
+    lower == "git branch"
+        || command_has_prefix(lower, "git branch --show-current")
+        || command_has_prefix(lower, "git branch --list")
+        || command_has_prefix(lower, "git branch --all")
+        || command_has_prefix(lower, "git branch --remotes")
+        || command_has_prefix(lower, "git branch --verbose")
+        || command_has_prefix(lower, "git branch --contains")
+        || command_has_prefix(lower, "git branch --merged")
+        || command_has_prefix(lower, "git branch --no-merged")
+        || command_has_prefix(lower, "git branch -a")
+        || command_has_prefix(lower, "git branch -r")
+        || command_has_prefix(lower, "git branch -v")
+}
+
+fn is_read_only_git_remote_command(lower: &str) -> bool {
+    lower == "git remote"
+        || command_has_prefix(lower, "git remote -v")
+        || command_has_prefix(lower, "git remote show")
+        || command_has_prefix(lower, "git remote get-url")
 }
 
 fn command_title(category: &CommandCategory, command: &str) -> String {
@@ -370,5 +406,25 @@ mod tests {
             .body
             .iter()
             .any(|line| line.text == "/tmp/workspace"));
+    }
+
+    #[test]
+    fn default_read_only_git_commands_render_as_known_commands() {
+        for command in [
+            "git branch --show-current",
+            "git rev-parse --abbrev-ref HEAD",
+            "git remote -v",
+        ] {
+            let summary = summarize_command(CommandSummaryInput {
+                command: command.to_string(),
+                exit_code: Some(0),
+                stdout: Some("feat/defaults\n".to_string()),
+                stderr: None,
+                diagnostic: None,
+            });
+
+            assert_eq!(summary.category, CommandCategory::KnownReadOnly);
+            assert!(summary.title.starts_with("Command:"));
+        }
     }
 }

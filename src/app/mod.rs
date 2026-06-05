@@ -382,6 +382,7 @@ impl App {
         if self.handle_subtask_command(&prompt).await? {
             return Ok(());
         }
+        reject_unknown_slash_command(&prompt)?;
         if matches!(self.state.run_state, RunState::WaitingForUser) {
             if self.state.pending_approval.is_some() {
                 bail!("a run is waiting for action approval");
@@ -2854,6 +2855,17 @@ fn parse_subtask_command(input: &str) -> Result<(&str, &str)> {
     Ok((agent.trim(), task))
 }
 
+fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
+    let trimmed = prompt.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(());
+    }
+    let command = trimmed.split_whitespace().next().unwrap_or(trimmed);
+    bail!(
+        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>"
+    )
+}
+
 fn subtask_prompt(task: &str) -> String {
     format!(
         "Subtask request:\n{task}\n\nScope guard:\n- Work only on the subtask request above.\n- Do not broaden scope beyond this subtask.\n- If the request requires broader work, return a blocked agent_result explaining the needed parent-scope decision.\n- Return a concise child summary and verification evidence for only this subtask."
@@ -3566,6 +3578,23 @@ instructions_file = "agents/explorer.md"
             .payload
             .to_string()
             .contains("secret prompt body"));
+    }
+
+    #[tokio::test]
+    async fn unknown_slash_command_is_not_submitted_as_agent_prompt() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app.submit_prompt("/doctor").await.unwrap_err();
+
+        assert!(error.to_string().contains("unknown command /doctor"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
     }
 
     #[tokio::test]
