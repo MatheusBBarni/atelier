@@ -9,8 +9,11 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Parser)]
-#[command(name = "atelier")]
-#[command(about = "Terminal-native agent orchestration harness")]
+#[command(
+    name = "atelier",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Terminal-native agent orchestration harness"
+)]
 pub struct Cli {
     #[arg(long)]
     pub cwd: Option<PathBuf>,

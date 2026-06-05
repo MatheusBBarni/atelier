@@ -1,2 +1,7 @@
 /target/
 /.multiagent/
+npm/node_modules/
+target/npm-dist/
+npm/**/*.tgz
+npm/platform/*/bin/
+SHA256SUMS
