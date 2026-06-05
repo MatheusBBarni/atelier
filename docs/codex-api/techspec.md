@@ -31,7 +31,7 @@ continues through `codex exec`. Later phases add machine-readable `codex exec
 
 ## 1. Background
 
-`multiagent` currently supports:
+`atelier` currently supports:
 
 - `codex`: launches the Codex CLI as a child process.
 - `zai`: posts to Z.ai with API-key auth.

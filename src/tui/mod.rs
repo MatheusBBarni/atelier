@@ -1,8 +1,9 @@
 use crate::app::chat::{
     ChatDetailRef, ChatItemKind, ChatItemView, ChatLineStyle, ChatLineView, ChatSeverity,
 };
-use crate::app::{App, AppEvent, AppState};
+use crate::app::{App, AppEvent, AppState, InterruptHandle};
 use crate::config::EffectiveConfig;
+use crate::orchestrator::RunState;
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -29,6 +30,7 @@ use tokio::task::JoinHandle;
 const USER_EVENT_BG: Color = Color::Rgb(18, 52, 71);
 const INPUT_COMPOSER_HEIGHT: u16 = 5;
 const MOUSE_SCROLL_LINES: usize = 3;
+const WORK_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TuiCommand {
@@ -78,6 +80,7 @@ struct TuiUiState {
     input_cursor: usize,
     input_preferred_col: Option<usize>,
     input_width: usize,
+    work_spinner_frame: usize,
 }
 
 impl Default for TuiUiState {
@@ -93,19 +96,21 @@ impl Default for TuiUiState {
             input_cursor: 0,
             input_preferred_col: None,
             input_width: 1,
+            work_spinner_frame: 0,
         }
     }
 }
 
 pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()> {
     if !io::stdout().is_terminal() {
-        println!("multiagent TUI requires an interactive terminal. Use --doctor or --print-config for non-interactive checks.");
+        println!("atelier TUI requires an interactive terminal. Use --doctor or --print-config for non-interactive checks.");
         return Ok(());
     }
 
     let mut app = App::new_with_debug(config, debug_enabled).await?;
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
     app.attach_state_sender(state_sender);
+    let interrupt_handle = app.interrupt_handle();
     let (command_sender, command_receiver) = mpsc::channel(1024);
 
     enable_raw_mode()?;
@@ -115,7 +120,13 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let mut terminal = Terminal::new(backend)?;
     let worker = tokio::spawn(run_app_worker(app, command_receiver));
 
-    let result = run_loop(&mut terminal, state_receiver, command_sender.clone()).await;
+    let result = run_loop(
+        &mut terminal,
+        state_receiver,
+        command_sender.clone(),
+        interrupt_handle,
+    )
+    .await;
 
     let cleanup_result = (|| -> Result<()> {
         disable_raw_mode()?;
@@ -138,6 +149,7 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut state_receiver: watch::Receiver<AppState>,
     command_sender: mpsc::Sender<AppWorkerCommand>,
+    interrupt_handle: InterruptHandle,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
     let mut ui_state = TuiUiState::default();
@@ -153,7 +165,14 @@ async fn run_loop(
                 _ => None,
             };
             if let Some(command) = command {
-                if !execute_tui_command(&mut state, &mut ui_state, &command_sender, command).await?
+                if !execute_tui_command_with_interrupt(
+                    &mut state,
+                    &mut ui_state,
+                    &command_sender,
+                    Some(&interrupt_handle),
+                    command,
+                )
+                .await?
                 {
                     break;
                 }
@@ -163,10 +182,21 @@ async fn run_loop(
     Ok(())
 }
 
+#[cfg(test)]
 async fn execute_tui_command(
     state: &mut AppState,
     ui_state: &mut TuiUiState,
     command_sender: &mpsc::Sender<AppWorkerCommand>,
+    command: TuiCommand,
+) -> Result<bool> {
+    execute_tui_command_with_interrupt(state, ui_state, command_sender, None, command).await
+}
+
+async fn execute_tui_command_with_interrupt(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    command_sender: &mpsc::Sender<AppWorkerCommand>,
+    interrupt_handle: Option<&InterruptHandle>,
     command: TuiCommand,
 ) -> Result<bool> {
     match command {
@@ -212,6 +242,11 @@ async fn execute_tui_command(
             Ok(true)
         }
         TuiCommand::DispatchAndQuit(event) => {
+            if matches!(event, AppEvent::RunInterruptRequested) {
+                if let Some(interrupt_handle) = interrupt_handle {
+                    interrupt_handle.request_interrupt();
+                }
+            }
             queue_app_event(command_sender, event).await?;
             Ok(false)
         }
@@ -557,7 +592,10 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(agent.status.as_str(), status_style(&agent.status)),
+                        Span::styled(
+                            agent_status_label(&agent.status),
+                            status_style(&agent.status),
+                        ),
                     ]),
                     Line::from(vec![
                         Span::styled(
@@ -602,7 +640,8 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
 
     render_chat(frame, event_area, state, ui_state);
 
-    let input_layout = input_layout(outer[1], &state.input, ui_state.input_cursor);
+    let work_active = work_indicator_active(state);
+    let input_layout = input_layout(outer[1], &state.input, ui_state.input_cursor, work_active);
     ui_state.input_width = input_layout.width;
     let input_title = format!(" Input Composer | {} ", state.config_status.summary);
     let input = Paragraph::new(wrapped_input_lines(&state.input, input_layout.width))
@@ -616,6 +655,11 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         )
         .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
     frame.render_widget(input, outer[1]);
+    if work_active {
+        render_work_indicator(frame, outer[1], ui_state);
+    } else {
+        ui_state.work_spinner_frame = 0;
+    }
     if ui_state.help_visible {
         render_help_modal(frame);
     } else {
@@ -885,7 +929,6 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("/goal <text> | /goal | /goal clear   manage session goal"),
         Line::from("/subtask <agent> <task>              run bounded child task"),
         Line::from("/config              show config files, preset, warnings"),
-        Line::from("Esc                  close this help"),
         Line::from("Enter                submit prompt or answer approval"),
         Line::from("Ctrl-L               show or hide Agent Roster"),
         Line::from("Arrow keys           move input cursor"),
@@ -905,22 +948,23 @@ fn render_help_modal(frame: &mut Frame) {
             ),
             Span::styled(" commands", Style::default().fg(Color::White)),
         ]),
-        Line::from("multiagent                         open the TUI"),
-        Line::from("multiagent --cwd <path>            run from a workspace"),
-        Line::from("multiagent --config <path>         use a config file"),
-        Line::from("multiagent --doctor [--json]       check runtimes and history"),
-        Line::from("multiagent --print-config          print merged config"),
-        Line::from("multiagent --init-config           create config files"),
-        Line::from("multiagent --codemap init|changes|update manage repo maps"),
-        Line::from("multiagent --clean-sessions [--yes] delete local history"),
-        Line::from("multiagent --debug                 write debug events"),
-        Line::from("multiagent --help                  print CLI help"),
+        Line::from("atelier                            open the TUI"),
+        Line::from("atelier --cwd <path>               run from a workspace"),
+        Line::from("atelier --config <path>            use a config file"),
+        Line::from("atelier --doctor [--json]          check runtimes and history"),
+        Line::from("atelier --print-config             print merged config"),
+        Line::from("atelier --init-config              create config files"),
+        Line::from("atelier --codemap init|changes|update manage repo maps"),
+        Line::from("atelier --clean-sessions [--yes]   delete local history"),
+        Line::from("atelier --debug                    write debug events"),
+        Line::from("atelier --help                     print CLI help"),
     ];
     let help = Paragraph::new(lines)
         .style(Style::default().fg(Color::White).bg(Color::Black))
         .block(
             Block::default()
                 .title(" Help ")
+                .title(Line::from(" Esc ").right_aligned())
                 .title_style(
                     Style::default()
                         .fg(Color::Yellow)
@@ -978,13 +1022,22 @@ fn legacy_chat_line(event: &str) -> Line<'_> {
 
 fn status_style(status: &str) -> Style {
     match status {
-        "running" => Style::default()
+        "running" | "streaming" => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
-        "waiting_approval" | "waiting_for_user" => Style::default().fg(Color::Yellow),
+        "waiting_action" | "waiting_approval" | "waiting_for_user" | "cancelling" => {
+            Style::default().fg(Color::Yellow)
+        }
         "interrupted" => Style::default().fg(Color::Red),
         "disabled" => Style::default().fg(Color::DarkGray),
         _ => Style::default().fg(Color::Gray),
+    }
+}
+
+fn agent_status_label(status: &str) -> &str {
+    match status {
+        "streaming" => "running",
+        _ => status,
     }
 }
 
@@ -1016,6 +1069,36 @@ fn availability_label(availability: &Option<crate::runtime::RuntimeAvailability>
     }
 }
 
+fn work_indicator_active(state: &AppState) -> bool {
+    matches!(state.run_state, RunState::Planning | RunState::Running)
+}
+
+fn render_work_indicator(frame: &mut Frame, input_area: Rect, ui_state: &mut TuiUiState) {
+    if input_area.width <= 2 || input_area.height <= 2 {
+        return;
+    }
+    let spinner = WORK_SPINNER_FRAMES[ui_state.work_spinner_frame % WORK_SPINNER_FRAMES.len()];
+    ui_state.work_spinner_frame = ui_state.work_spinner_frame.wrapping_add(1);
+    let status_area = Rect {
+        x: input_area.x + 1,
+        y: input_area.y + input_area.height.saturating_sub(2),
+        width: input_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let line = Line::from(vec![
+        Span::styled(spinner, Style::default().fg(Color::Yellow)),
+        Span::raw(" "),
+        Span::styled(
+            "Working",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    frame.render_widget(Clear, status_area);
+    frame.render_widget(Paragraph::new(line), status_area);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InputLayout {
     width: usize,
@@ -1024,9 +1107,20 @@ struct InputLayout {
     scroll: usize,
 }
 
-fn input_layout(input_area: Rect, input: &str, cursor: usize) -> InputLayout {
+fn input_layout(
+    input_area: Rect,
+    input: &str,
+    cursor: usize,
+    reserve_status_line: bool,
+) -> InputLayout {
     let width = usize::from(input_area.width.saturating_sub(2).max(1));
-    let visible_rows = usize::from(input_area.height.saturating_sub(2).max(1));
+    let inner_rows = input_area.height.saturating_sub(2).max(1);
+    let visible_rows = if reserve_status_line {
+        inner_rows.saturating_sub(1).max(1)
+    } else {
+        inner_rows
+    };
+    let visible_rows = usize::from(visible_rows);
     let cursor_cells = cursor.min(input_char_count(input));
     let cursor_line = cursor_cells / width;
     let cursor_col = cursor_cells % width;
@@ -1074,7 +1168,7 @@ fn set_input_cursor(frame: &mut Frame, input_area: Rect, input_layout: InputLayo
 mod tests {
     use super::*;
     use crate::app::chat::ChatProjection;
-    use crate::app::{AgentView, ConfigStatusView, LiveStepView, LiveStreamView};
+    use crate::app::{AgentView, ConfigStatusView, LiveStepStatus, LiveStepView, LiveStreamView};
     use crate::history::HistoryEvent;
     use crate::orchestrator::RunState;
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
@@ -1146,15 +1240,62 @@ mod tests {
     }
 
     #[test]
+    fn renders_work_indicator_below_input_while_run_is_active() {
+        let mut state = state_with_input("next prompt", false);
+        state.run_state = RunState::Running;
+        state.active_run_id = Some("run".to_string());
+        let mut ui_state = TuiUiState::default();
+
+        let first = render_to_text_with_ui_mut(&state, &mut ui_state, 100, 24);
+        let second = render_to_text_with_ui_mut(&state, &mut ui_state, 100, 24);
+
+        assert!(first.contains("next prompt"));
+        assert!(first.contains("| Working"));
+        assert!(second.contains("/ Working"));
+    }
+
+    #[test]
+    fn hides_work_indicator_when_run_is_idle() {
+        let state = state_with_input("", false);
+
+        let text = render_to_text(&state, 100, 24);
+
+        assert!(!text.contains("Working"));
+    }
+
+    #[test]
+    fn roster_displays_streaming_status_as_running() {
+        let mut state = state_with_input("", false);
+        state.agents = vec![AgentView {
+            id: "fixer".to_string(),
+            name: "Fixer".to_string(),
+            runtime: "fake".to_string(),
+            model: "default".to_string(),
+            effort: "medium".to_string(),
+            thinking: false,
+            capabilities: vec!["read".to_string()],
+            availability: None,
+            status: "streaming".to_string(),
+        }];
+
+        let text = render_to_text(&state, 100, 24);
+
+        assert!(text.contains("Fixer running"));
+        assert!(!text.contains("Fixer streaming"));
+    }
+
+    #[test]
     fn renders_live_step_stream_detail_as_chat_progress() {
         let mut state = state_with_input("", false);
         state.live_step = Some(LiveStepView {
             run_id: "run".to_string(),
             step_id: "step".to_string(),
             agent: "fixer".to_string(),
+            status: LiveStepStatus::Streaming,
             streams: vec![LiveStreamView {
                 stream: "stdout".to_string(),
                 content: "compiling target".to_string(),
+                sequence_end: 1,
                 final_delta: false,
             }],
         });
@@ -1165,9 +1306,29 @@ mod tests {
 
         let text = render_to_text(&state, 100, 24);
 
-        assert!(text.contains("fixer is working"));
-        assert!(text.contains("[stdout:live] compiling target"));
+        assert!(text.contains("fixer is running"));
+        assert!(text.contains("[stdout:live:#1] compiling target"));
         assert!(!text.contains("Fixer step started."));
+    }
+
+    #[test]
+    fn renders_live_step_running_state_before_stream_content() {
+        let mut state = state_with_input("", false);
+        state.live_step = Some(LiveStepView {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            agent: "fixer".to_string(),
+            status: LiveStepStatus::Running,
+            streams: Vec::new(),
+        });
+        let mut projection = ChatProjection::new();
+        projection.apply_live_step(state.live_step.as_ref());
+        state.chat_items = projection.items().to_vec();
+
+        let text = render_to_text(&state, 100, 24);
+
+        assert!(text.contains("fixer is running"));
+        assert!(text.contains("runtime is running"));
     }
 
     #[test]
@@ -1373,20 +1534,21 @@ mod tests {
         let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
 
         assert!(text.contains("Help"));
+        let header = text.lines().find(|line| line.contains("Help")).unwrap();
+        assert!(header.contains("Esc"));
         assert!(text.contains("/help + Enter"));
         assert!(text.contains("/goal <text>"));
         assert!(text.contains("/goal clear"));
         assert!(text.contains("/subtask <agent>"));
         assert!(text.contains("/config"));
-        assert!(text.contains("Esc"));
         assert!(text.contains("Mouse wheel"));
-        assert!(text.contains("close this help"));
+        assert!(!text.contains("close this help"));
         assert!(text.contains("Ctrl-L"));
         assert!(text.contains("Arrow keys"));
         assert!(text.contains("PageUp/PageDown"));
         assert!(text.contains("Home/End"));
-        assert!(text.contains("multiagent --doctor"));
-        assert!(text.contains("multiagent --clean-sessions"));
+        assert!(text.contains("atelier --doctor"));
+        assert!(text.contains("atelier --clean-sessions"));
     }
 
     #[tokio::test]

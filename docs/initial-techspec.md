@@ -5,7 +5,7 @@ Date: 2026-06-03
 
 ## Executive Summary
 
-This specification defines the v1 technical design for `multiagent`, a globally installed Rust TUI that routes user prompts through an Orchestrator and specialized agent profiles. The implementation is a single Rust binary package with a testable library core, a typed app event loop, durable JSON/JSONL history, TOML configuration, capability-enforced harness actions, and two initial runtimes: Codex as a subscription-backed child process and Z.ai as an OpenAI-compatible HTTP adapter.
+This specification defines the v1 technical design for `atelier`, a globally installed Rust TUI that routes user prompts through an Orchestrator and specialized agent profiles. The implementation is a single Rust binary package with a testable library core, a typed app event loop, durable JSON/JSONL history, TOML configuration, capability-enforced harness actions, and two initial runtimes: Codex as a subscription-backed child process and Z.ai as an OpenAI-compatible HTTP adapter.
 
 The key architectural decision is that model runtimes do not directly mutate files or run shell commands. Runtimes produce structured decisions, agent results, and action requests; the Rust harness validates capabilities, path scope, command policy, limits, and approval mode before executing actions.
 
@@ -17,7 +17,7 @@ The repository currently contains documentation only. There is no Rust scaffold 
 
 ## Goals
 
-- Build a Rust binary crate named `multiagent` that installs globally with `cargo install --path .`.
+- Build a Rust binary crate named `atelier` that installs globally with `cargo install --path .`.
 - Keep the implementation as one Rust package with `src/lib.rs` and `src/main.rs`.
 - Provide a TUI with Agent Roster, Chat, and Input Composer.
 - Implement a typed app event loop that coordinates TUI input, runtime streaming, harness actions, approvals, history, and diagnostics.
@@ -33,7 +33,7 @@ The repository currently contains documentation only. There is no Rust scaffold 
 - Multi-crate workspace in v1.
 - Parallel active runs.
 - In-TUI profile/config editing.
-- Non-interactive `multiagent run`.
+- Non-interactive `atelier run`.
 - Long-lived runtime sessions beyond one agent step.
 - Exact restoration of old external runtime process state.
 - Remote telemetry or cloud sync.
@@ -44,15 +44,15 @@ The repository currently contains documentation only. There is no Rust scaffold 
 
 ### Functional Requirements
 
-- `multiagent` launches the TUI in the current working directory.
-- `multiagent --cwd <path>` launches the TUI in a specific working directory.
-- `multiagent --config <path>` or `MULTIAGENT_CONFIG` selects an alternate home config.
-- `multiagent --doctor` prints human-readable diagnostics.
-- `multiagent --doctor --json` prints machine-readable diagnostics.
-- `multiagent --print-config` prints redacted effective config as TOML only.
-- `multiagent --init-config` creates missing starter home config/instruction files without overwriting existing files.
-- `multiagent --clean-sessions` deletes project-local session/run history for the selected working directory after confirmation.
-- `multiagent --clean-sessions --yes` skips cleanup confirmation.
+- `atelier` launches the TUI in the current working directory.
+- `atelier --cwd <path>` launches the TUI in a specific working directory.
+- `atelier --config <path>` or `MULTIAGENT_CONFIG` selects an alternate home config.
+- `atelier --doctor` prints human-readable diagnostics.
+- `atelier --doctor --json` prints machine-readable diagnostics.
+- `atelier --print-config` prints redacted effective config as TOML only.
+- `atelier --init-config` creates missing starter home config/instruction files without overwriting existing files.
+- `atelier --clean-sessions` deletes project-local session/run history for the selected working directory after confirmation.
+- `atelier --clean-sessions --yes` skips cleanup confirmation.
 - The TUI supports one active run at a time.
 - Every prompt starts with the Orchestrator.
 - Specialized agents never directly delegate to other specialized agents.
@@ -69,7 +69,7 @@ The repository currently contains documentation only. There is no Rust scaffold 
 
 ### Success Metrics
 
-- A user can install and launch `multiagent` from any folder.
+- A user can install and launch `atelier` from any folder.
 - A fake-runtime run can complete through Orchestrator and at least one specialized agent.
 - Codex and Z.ai adapters each execute one agent step in opt-in integration tests.
 - Config merge, action policy, state transitions, and history append/read have deterministic unit tests.
@@ -125,15 +125,15 @@ Recommended crate: `clap`.
 CLI surface:
 
 ```text
-multiagent
-multiagent --config <path>
-multiagent --cwd <path>
-multiagent --doctor
-multiagent --doctor --json
-multiagent --print-config
-multiagent --init-config
-multiagent --clean-sessions
-multiagent --clean-sessions --yes
+atelier
+atelier --config <path>
+atelier --cwd <path>
+atelier --doctor
+atelier --doctor --json
+atelier --print-config
+atelier --init-config
+atelier --clean-sessions
+atelier --clean-sessions --yes
 ```
 
 `--print-config` emits TOML only. `--doctor --json` is the machine-readable diagnostic path.
@@ -858,7 +858,7 @@ Enable debug log with:
 
 ```text
 MULTIAGENT_LOG=debug
-multiagent --debug
+atelier --debug
 ```
 
 Debug logs are opt-in because they may contain prompt, code, and command context.
@@ -1005,8 +1005,8 @@ Rejected by product decision. Default is yolo for speed, with capability enforce
 
 ## Acceptance Criteria
 
-- `cargo install --path .` installs a `multiagent` binary.
-- `multiagent` launches a TUI from an arbitrary folder.
+- `cargo install --path .` installs a `atelier` binary.
+- `atelier` launches a TUI from an arbitrary folder.
 - TUI renders Agent Roster, Chat, and Input Composer from `AppState`.
 - Built-in config resolves into `EffectiveConfig` without user config.
 - Home and local config merge with documented conflict rules.

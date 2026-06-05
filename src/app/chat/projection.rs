@@ -4,7 +4,7 @@ use super::{
     ChatDetailRef, ChatItemKind, ChatItemStatus, ChatItemView, ChatLifecycleKey, ChatLineStyle,
     ChatLineView, ChatSeverity, ChatSourceRef,
 };
-use crate::app::{LiveStepView, PendingApprovalView};
+use crate::app::{LiveStepStatus, LiveStepView, PendingApprovalView};
 use crate::history::HistoryEvent;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -101,23 +101,32 @@ impl ChatProjection {
         }
         let mut body = Vec::new();
         if live_step.streams.is_empty() {
-            body.push(ChatLineView::muted("waiting for runtime output"));
+            body.push(ChatLineView::muted(live_step_status_label(
+                &live_step.status,
+            )));
         } else {
             for stream in live_step.streams.iter().rev().take(4).rev() {
                 let marker = if stream.final_delta { "final" } else { "live" };
                 body.push(ChatLineView::muted(format!(
-                    "[{}:{marker}] {}",
+                    "[{}:{marker}:#{}] {}",
                     stream.stream,
+                    stream.sequence_end,
                     concise(&stream.content, MAX_SUMMARY_CHARS)
                 )));
             }
         }
+        let status = chat_status_for_live_step(&live_step.status);
+        let severity = chat_severity_for_live_step(&live_step.status);
         self.upsert(ItemInput {
             lifecycle_key: Some(key),
             kind: ChatItemKind::AgentProgress,
-            status: ChatItemStatus::Running,
-            severity: ChatSeverity::Info,
-            title: format!("{} is working", live_step.agent),
+            status,
+            severity,
+            title: format!(
+                "{} {}",
+                live_step.agent,
+                live_step_status_title_suffix(&live_step.status)
+            ),
             summary: Some(format!(
                 "run:{} step:{}",
                 live_step.run_id, live_step.step_id
@@ -327,22 +336,43 @@ impl ChatProjection {
         let Some(agent) = string_field(&event.payload, "agent") else {
             return;
         };
-        let Some(content) = string_field(&event.payload, "content") else {
-            return;
-        };
         let Some(key) = step_key(event, ChatItemKind::AgentProgress) else {
             return;
         };
         let stream =
             string_field(&event.payload, "stream").unwrap_or_else(|| "runtime".to_string());
+        let content = string_field(&event.payload, "content")
+            .unwrap_or_else(|| "large stream content stored as artifact".to_string());
+        let final_delta = event
+            .payload
+            .get("final_delta")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let sequence = runtime_stream_sequence_label(&event.payload);
+        let marker = if final_delta { "final" } else { "live" };
         self.upsert(ItemInput {
             lifecycle_key: Some(key),
             kind: ChatItemKind::AgentProgress,
-            status: ChatItemStatus::Running,
-            severity: ChatSeverity::Info,
-            title: format!("{agent} is working"),
-            summary: Some(format!("{stream}: {}", message_summary(&content))),
-            body: message_body_lines(&content, ChatLineStyle::Muted),
+            status: if final_delta {
+                ChatItemStatus::Completed
+            } else {
+                ChatItemStatus::Running
+            },
+            severity: if final_delta {
+                ChatSeverity::Success
+            } else {
+                ChatSeverity::Info
+            },
+            title: if final_delta {
+                format!("{agent} completed runtime output")
+            } else {
+                format!("{agent} is working")
+            },
+            summary: Some(format!(
+                "{stream}:{marker}{sequence}: {}",
+                message_summary(&content)
+            )),
+            body: runtime_stream_body_lines(&stream, marker, &sequence, &content),
             details: history_detail(event, "runtime stream"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
@@ -1410,6 +1440,39 @@ fn message_body_lines(text: &str, fallback_style: ChatLineStyle) -> Vec<ChatLine
         })
 }
 
+fn runtime_stream_body_lines(
+    stream: &str,
+    marker: &str,
+    sequence: &str,
+    content: &str,
+) -> Vec<ChatLineView> {
+    let label = format!("[{stream}:{marker}{sequence}] ");
+    message_body_lines(content, ChatLineStyle::Muted)
+        .into_iter()
+        .map(|mut line| {
+            line.text = format!("{label}{}", line.text);
+            line
+        })
+        .collect()
+}
+
+fn runtime_stream_sequence_label(payload: &Value) -> String {
+    if let (Some(start), Some(end)) = (
+        payload.get("sequence_start").and_then(Value::as_u64),
+        payload.get("sequence_end").and_then(Value::as_u64),
+    ) {
+        if start == end {
+            return format!(":#{start}");
+        }
+        return format!(":#{start}-{end}");
+    }
+    payload
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .map(|sequence| format!(":#{sequence}"))
+        .unwrap_or_default()
+}
+
 fn json_value_from_text(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1738,6 +1801,53 @@ fn concise(text: &str, max_chars: usize) -> String {
     )
 }
 
+fn live_step_status_label(status: &LiveStepStatus) -> &'static str {
+    match status {
+        LiveStepStatus::Starting => "starting runtime work",
+        LiveStepStatus::Running => "runtime is running",
+        LiveStepStatus::Streaming => "runtime is running",
+        LiveStepStatus::WaitingForAction => "waiting for harness action",
+        LiveStepStatus::WaitingForApproval => "waiting for action approval",
+        LiveStepStatus::Cancelling => "cancelling runtime work",
+        LiveStepStatus::Interrupted => "runtime work interrupted",
+        LiveStepStatus::Completed => "runtime work completed",
+        LiveStepStatus::Failed => "runtime work failed",
+    }
+}
+
+fn live_step_status_title_suffix(status: &LiveStepStatus) -> &'static str {
+    match status {
+        LiveStepStatus::Starting => "is starting",
+        LiveStepStatus::Running => "is running",
+        LiveStepStatus::Streaming => "is running",
+        LiveStepStatus::WaitingForAction => "is waiting for action",
+        LiveStepStatus::WaitingForApproval => "is waiting for approval",
+        LiveStepStatus::Cancelling => "is cancelling",
+        LiveStepStatus::Interrupted => "was interrupted",
+        LiveStepStatus::Completed => "completed runtime output",
+        LiveStepStatus::Failed => "failed",
+    }
+}
+
+fn chat_status_for_live_step(status: &LiveStepStatus) -> ChatItemStatus {
+    match status {
+        LiveStepStatus::WaitingForApproval => ChatItemStatus::WaitingApproval,
+        LiveStepStatus::Interrupted => ChatItemStatus::Interrupted,
+        LiveStepStatus::Completed => ChatItemStatus::Completed,
+        LiveStepStatus::Failed => ChatItemStatus::Failed,
+        _ => ChatItemStatus::Running,
+    }
+}
+
+fn chat_severity_for_live_step(status: &LiveStepStatus) -> ChatSeverity {
+    match status {
+        LiveStepStatus::WaitingForApproval | LiveStepStatus::Cancelling => ChatSeverity::Warning,
+        LiveStepStatus::Interrupted | LiveStepStatus::Failed => ChatSeverity::Error,
+        LiveStepStatus::Completed => ChatSeverity::Success,
+        _ => ChatSeverity::Info,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1796,6 +1906,39 @@ mod tests {
 
         assert_eq!(projection.items().len(), 1);
         assert_eq!(projection.items()[0].kind, ChatItemKind::AgentProgress);
+    }
+
+    #[test]
+    fn coalesced_runtime_stream_delta_renders_sequence_range_and_final_marker() {
+        let events = vec![event(
+            "runtime_stream_delta",
+            Some("run"),
+            Some("step"),
+            json!({
+                "agent": "fixer",
+                "sequence_start": 3,
+                "sequence_end": 5,
+                "stream": "stdout",
+                "content": "checking\nverified",
+                "final_delta": true,
+                "coalesced": true
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.severity, ChatSeverity::Success);
+        assert!(item
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("stdout:final:#3-5"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text.contains("[stdout:final:#3-5]")));
     }
 
     #[test]
@@ -2021,11 +2164,14 @@ mod tests {
         let projection = ChatProjection::rebuild(&events);
 
         let item = &projection.items()[0];
-        assert_eq!(item.summary.as_deref(), Some("stdout: Ready to ship"));
+        assert_eq!(item.summary.as_deref(), Some("stdout:final: Ready to ship"));
         assert!(item
             .body
             .iter()
-            .any(|line| line.text == "final summary: Ready to ship"));
-        assert!(item.body.iter().any(|line| line.text == "plan: verify"));
+            .any(|line| line.text == "[stdout:final] final summary: Ready to ship"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "[stdout:final] plan: verify"));
     }
 }

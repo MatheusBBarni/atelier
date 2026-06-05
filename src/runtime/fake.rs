@@ -1,6 +1,6 @@
 use super::{
-    Runtime, RuntimeAvailability, RuntimeAvailabilityStatus, RuntimeOutput, RuntimeProviderError,
-    RuntimeRequest, RuntimeStepResult, RuntimeStreamDelta,
+    Runtime, RuntimeAvailability, RuntimeAvailabilityStatus, RuntimeEventSink, RuntimeOutput,
+    RuntimeProviderError, RuntimeRequest,
 };
 use crate::actions::{ActionKind, ActionRequest};
 use crate::config::{Capability, RuntimeConfig};
@@ -8,6 +8,8 @@ use crate::ids::new_id;
 use crate::orchestrator::{AgentResult, AgentResultStatus, DecisionStatus, OrchestratorDecision};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
 pub struct FakeRuntime {
@@ -31,7 +33,12 @@ impl Runtime for FakeRuntime {
         }
     }
 
-    async fn stream_step(&self, request: RuntimeRequest) -> Result<RuntimeStepResult> {
+    async fn stream_step(
+        &self,
+        request: RuntimeRequest,
+        events: RuntimeEventSink,
+        cancellation: CancellationToken,
+    ) -> Result<RuntimeOutput> {
         if should_emit_fake_retryable_provider_error(&request) {
             return Err(RuntimeProviderError::retryable(format!(
                 "fake retryable provider error for model {}",
@@ -39,6 +46,7 @@ impl Runtime for FakeRuntime {
             ))
             .into());
         }
+        emit_fake_progress(&request, &events, &cancellation).await?;
         let output = if should_emit_fake_parse_error(&request) {
             RuntimeOutput::ParseError {
                 agent: request.agent_profile.id.clone(),
@@ -98,16 +106,53 @@ impl Runtime for FakeRuntime {
             }
         };
 
-        Ok(
-            RuntimeStepResult::new(output).with_delta(RuntimeStreamDelta::final_delta(
-                1,
-                "fake",
-                format!(
-                    "fake runtime completed {} step {}",
-                    request.agent_profile.id, request.step_id
-                ),
-            )),
+        Ok(output)
+    }
+}
+
+async fn emit_fake_progress(
+    request: &RuntimeRequest,
+    events: &RuntimeEventSink,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let delay = fake_stream_delay(request);
+    events
+        .status(format!(
+            "fake runtime started {} step {}",
+            request.agent_profile.id, request.step_id
+        ))
+        .await?;
+    sleep_or_cancel(cancellation, delay).await?;
+    events
+        .delta(
+            "fake",
+            format!(
+                "{} is preparing structured output\n",
+                request.agent_profile.id
+            ),
         )
+        .await?;
+    sleep_or_cancel(cancellation, delay).await?;
+    events
+        .delta(
+            "fake",
+            format!("{} is returning final contract\n", request.agent_profile.id),
+        )
+        .await
+}
+
+fn fake_stream_delay(request: &RuntimeRequest) -> Duration {
+    if request.prompt.to_ascii_lowercase().contains("slow stream") {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(5)
+    }
+}
+
+async fn sleep_or_cancel(cancellation: &CancellationToken, duration: Duration) -> Result<()> {
+    tokio::select! {
+        _ = cancellation.cancelled() => anyhow::bail!("runtime step cancelled"),
+        _ = tokio::time::sleep(duration) => Ok(()),
     }
 }
 

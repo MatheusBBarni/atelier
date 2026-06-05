@@ -9,8 +9,8 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Parser)]
-#[command(name = "multiagent")]
-#[command(about = "Terminal-native multiagent harness")]
+#[command(name = "atelier")]
+#[command(about = "Terminal-native agent orchestration harness")]
 pub struct Cli {
     #[arg(long)]
     pub cwd: Option<PathBuf>,
@@ -133,7 +133,7 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
 
 fn confirm_cleanup(working_directory: &std::path::Path) -> Result<bool> {
     eprint!(
-        "Delete multiagent session history under {}? [y/N] ",
+        "Delete atelier session history under {}? [y/N] ",
         working_directory.display()
     );
     io::stderr().flush()?;
@@ -145,7 +145,13 @@ fn confirm_cleanup(working_directory: &std::path::Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use tempfile::tempdir;
+
+    #[test]
+    fn clap_command_name_is_atelier() {
+        assert_eq!(Cli::command().get_name(), "atelier");
+    }
 
     #[tokio::test]
     async fn print_config_renders_toml() {

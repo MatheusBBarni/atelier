@@ -14,7 +14,17 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+pub const RUNTIME_EVENT_CHANNEL_CAPACITY: usize = 64;
+
+#[cfg(test)]
+pub(crate) static CODEX_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -151,6 +161,137 @@ impl RuntimeStreamDelta {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RuntimeEvent {
+    Delta {
+        sequence: u32,
+        stream: String,
+        content: String,
+    },
+    Status {
+        sequence: u32,
+        message: String,
+    },
+    ToolCallProgress {
+        sequence: u32,
+        name: String,
+        summary: String,
+    },
+    Diagnostic {
+        sequence: u32,
+        stream: String,
+        content: String,
+    },
+}
+
+impl RuntimeEvent {
+    pub fn sequence(&self) -> u32 {
+        match self {
+            Self::Delta { sequence, .. }
+            | Self::Status { sequence, .. }
+            | Self::ToolCallProgress { sequence, .. }
+            | Self::Diagnostic { sequence, .. } => *sequence,
+        }
+    }
+
+    pub fn stream_name(&self) -> String {
+        match self {
+            Self::Delta { stream, .. } | Self::Diagnostic { stream, .. } => stream.clone(),
+            Self::Status { .. } => "status".to_string(),
+            Self::ToolCallProgress { name, .. } => format!("tool:{name}"),
+        }
+    }
+
+    pub fn content(&self) -> String {
+        match self {
+            Self::Delta { content, .. } | Self::Diagnostic { content, .. } => content.clone(),
+            Self::Status { message, .. } => message.clone(),
+            Self::ToolCallProgress { summary, .. } => summary.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeEventSink {
+    sender: mpsc::Sender<RuntimeEvent>,
+    next_sequence: Arc<AtomicU32>,
+}
+
+impl RuntimeEventSink {
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<RuntimeEvent>) {
+        Self::channel_from(capacity, 1)
+    }
+
+    pub fn channel_from(
+        capacity: usize,
+        first_sequence: u32,
+    ) -> (Self, mpsc::Receiver<RuntimeEvent>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (
+            Self {
+                sender,
+                next_sequence: Arc::new(AtomicU32::new(first_sequence)),
+            },
+            receiver,
+        )
+    }
+
+    pub async fn delta(&self, stream: impl Into<String>, content: impl Into<String>) -> Result<()> {
+        self.send(RuntimeEvent::Delta {
+            sequence: self.next_sequence(),
+            stream: stream.into(),
+            content: content.into(),
+        })
+        .await
+    }
+
+    pub async fn status(&self, message: impl Into<String>) -> Result<()> {
+        self.send(RuntimeEvent::Status {
+            sequence: self.next_sequence(),
+            message: message.into(),
+        })
+        .await
+    }
+
+    pub async fn diagnostic(
+        &self,
+        stream: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Result<()> {
+        self.send(RuntimeEvent::Diagnostic {
+            sequence: self.next_sequence(),
+            stream: stream.into(),
+            content: content.into(),
+        })
+        .await
+    }
+
+    pub async fn tool_call_progress(
+        &self,
+        name: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<()> {
+        self.send(RuntimeEvent::ToolCallProgress {
+            sequence: self.next_sequence(),
+            name: name.into(),
+            summary: summary.into(),
+        })
+        .await
+    }
+
+    async fn send(&self, event: RuntimeEvent) -> Result<()> {
+        self.sender
+            .send(event)
+            .await
+            .map_err(|_| anyhow::anyhow!("runtime event receiver closed"))
+    }
+
+    fn next_sequence(&self) -> u32 {
+        self.next_sequence.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeStepResult {
     pub output: RuntimeOutput,
@@ -193,7 +334,12 @@ pub enum RuntimeOutput {
 #[async_trait]
 pub trait Runtime: Send + Sync {
     async fn check_availability(&self) -> RuntimeAvailability;
-    async fn stream_step(&self, request: RuntimeRequest) -> Result<RuntimeStepResult>;
+    async fn stream_step(
+        &self,
+        request: RuntimeRequest,
+        events: RuntimeEventSink,
+        cancellation: CancellationToken,
+    ) -> Result<RuntimeOutput>;
 }
 
 pub async fn check_all_runtime_availability(
@@ -233,6 +379,18 @@ pub async fn execute_runtime_step(
     config: &EffectiveConfig,
     request: RuntimeRequest,
 ) -> Result<RuntimeStepResult> {
+    collect_runtime_step_result(|events, cancellation| {
+        execute_runtime_step_streaming(config, request, events, cancellation)
+    })
+    .await
+}
+
+pub async fn execute_runtime_step_streaming(
+    config: &EffectiveConfig,
+    request: RuntimeRequest,
+    events: RuntimeEventSink,
+    cancellation: CancellationToken,
+) -> Result<RuntimeOutput> {
     let runtime_id = &request.agent_profile.runtime;
     let runtime = config
         .runtimes
@@ -250,11 +408,22 @@ pub async fn execute_runtime_step(
     let model_chain = request.agent_profile.model_chain();
     let mut last_retryable_error = None;
     for (index, model) in model_chain.iter().enumerate() {
+        if cancellation.is_cancelled() {
+            bail!("runtime step cancelled");
+        }
         let mut attempt = request.clone();
         attempt.agent_profile.model = model.clone();
-        match execute_runtime_step_once(runtime, attempt).await {
+        match execute_runtime_step_once(runtime, attempt, events.clone(), cancellation.clone())
+            .await
+        {
             Ok(result) => return Ok(result),
             Err(error) if index + 1 < model_chain.len() && is_retryable_provider_error(&error) => {
+                events
+                    .status(format!(
+                        "retryable provider error for model {model}; trying fallback model {}",
+                        model_chain[index + 1]
+                    ))
+                    .await?;
                 last_retryable_error = Some(error);
             }
             Err(error) => return Err(error),
@@ -271,24 +440,82 @@ pub async fn execute_runtime_step(
 async fn execute_runtime_step_once(
     runtime: &RuntimeConfig,
     request: RuntimeRequest,
-) -> Result<RuntimeStepResult> {
+    events: RuntimeEventSink,
+    cancellation: CancellationToken,
+) -> Result<RuntimeOutput> {
     match runtime.kind {
         RuntimeKind::Codex => {
             codex::CodexRuntime::new(runtime.clone())
-                .stream_step(request)
+                .stream_step(request, events, cancellation)
                 .await
         }
         RuntimeKind::Zai => {
             zai::ZaiRuntime::new(runtime.clone())
-                .stream_step(request)
+                .stream_step(request, events, cancellation)
                 .await
         }
         RuntimeKind::Fake => {
             fake::FakeRuntime::new(runtime.clone())
-                .stream_step(request)
+                .stream_step(request, events, cancellation)
                 .await
         }
     }
+}
+
+pub async fn emit_legacy_step_result(
+    result: RuntimeStepResult,
+    events: &RuntimeEventSink,
+) -> Result<RuntimeOutput> {
+    for delta in result.stream_deltas {
+        events.delta(delta.stream, delta.content).await?;
+    }
+    Ok(result.output)
+}
+
+pub async fn collect_runtime_step_result<F, Fut>(operation: F) -> Result<RuntimeStepResult>
+where
+    F: FnOnce(RuntimeEventSink, CancellationToken) -> Fut,
+    Fut: Future<Output = Result<RuntimeOutput>>,
+{
+    let (events, mut receiver) = RuntimeEventSink::channel(RUNTIME_EVENT_CHANNEL_CAPACITY);
+    let cancellation = CancellationToken::new();
+    let operation = operation(events, cancellation);
+    tokio::pin!(operation);
+
+    let mut runtime_events = Vec::new();
+    let output = loop {
+        tokio::select! {
+            event = receiver.recv() => {
+                if let Some(event) = event {
+                    runtime_events.push(event);
+                }
+            }
+            output = &mut operation => break output?,
+        }
+    };
+
+    while let Ok(event) = receiver.try_recv() {
+        runtime_events.push(event);
+    }
+
+    let last_sequence = runtime_events.last().map(RuntimeEvent::sequence);
+    let stream_deltas = runtime_events
+        .into_iter()
+        .map(|event| {
+            let sequence = event.sequence();
+            RuntimeStreamDelta {
+                sequence,
+                stream: event.stream_name(),
+                content: event.content(),
+                final_delta: Some(sequence) == last_sequence,
+            }
+        })
+        .collect();
+
+    Ok(RuntimeStepResult {
+        output,
+        stream_deltas,
+    })
 }
 
 pub fn is_retryable_provider_error(error: &anyhow::Error) -> bool {
@@ -341,6 +568,23 @@ mod tests {
         ConfigLoadOptions, Limits,
     };
     use serde_json::json;
+
+    #[tokio::test]
+    async fn runtime_event_sink_assigns_monotonic_sequences() {
+        let (events, mut receiver) = RuntimeEventSink::channel(4);
+
+        events.delta("stdout", "first").await.unwrap();
+        events.status("second").await.unwrap();
+        events.diagnostic("stderr", "third").await.unwrap();
+        events.tool_call_progress("search", "fourth").await.unwrap();
+
+        let mut sequences = Vec::new();
+        for _ in 0..4 {
+            sequences.push(receiver.recv().await.unwrap().sequence());
+        }
+
+        assert_eq!(sequences, vec![1, 2, 3, 4]);
+    }
 
     #[test]
     fn prompt_envelope_includes_session_events() {
@@ -512,6 +756,7 @@ model_fallbacks = ["fallback-succeeds"]
     async fn execute_runtime_step_blocks_codex_when_login_status_fails() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _env_lock = CODEX_ENV_MUTEX.lock().await;
         let _env_guard = EnvGuard::clear(&["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]);
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("codex-status.sh");

@@ -4,17 +4,17 @@
 
 Initial product requirements document.
 
-This document defines the v1 product for `multiagent`, a Rust-based terminal UI for orchestrating multiple specialized agents from a global CLI command.
+This document defines the v1 product for `atelier`, a Rust-based terminal UI for orchestrating multiple specialized agents from a global CLI command.
 
 ## Background
 
-Developers already use terminal-native agent CLIs such as Codex, Claude, and opencode for software work. Those tools are powerful, but a single agent often has to switch between planning, exploration, implementation, review, and critique. This project should create a focused multiagent harness that makes those roles explicit, visible, configurable, and resumable from the terminal.
+Developers already use terminal-native agent CLIs such as Codex, Claude, and opencode for software work. Those tools are powerful, but a single agent often has to switch between planning, exploration, implementation, review, and critique. This project should create a focused atelier harness that makes those roles explicit, visible, configurable, and resumable from the terminal.
 
 The desired shape is similar in spirit to `oh-my-opencode-slim`: a lightweight, local-first harness around named agent roles. The first version should not build a cloud service or generic plugin marketplace. It should build the core local orchestration loop.
 
 ## Product Summary
 
-`multiagent` is a globally installed command. When the user runs `multiagent` in any folder, it opens a terminal UI with an input composer. The user enters a prompt and presses Enter. The prompt goes first to the Orchestrator. The Orchestrator creates or updates a run plan, chooses the next specialized agent, and the harness executes that agent through its configured runtime.
+`atelier` is a globally installed command. When the user runs `atelier` in any folder, it opens a terminal UI with an input composer. The user enters a prompt and presses Enter. The prompt goes first to the Orchestrator. The Orchestrator creates or updates a run plan, chooses the next specialized agent, and the harness executes that agent through its configured runtime.
 
 The initial specialized agents are:
 
@@ -29,7 +29,7 @@ Each agent is defined by an agent profile. A profile controls the role instructi
 
 ## Goals
 
-- Provide a global `multiagent` command that can be launched from any working directory.
+- Provide a global `atelier` command that can be launched from any working directory.
 - Open an interactive Rust TUI with an agent roster, event stream, and input composer.
 - Route every user prompt through the Orchestrator before specialized agents run.
 - Support Codex subscription auth through a child CLI process.
@@ -47,7 +47,7 @@ Each agent is defined by an agent profile. A profile controls the role instructi
 - In-TUI editing of agent profiles.
 - Long-lived Codex child sessions.
 - Exact process-level resume of external runtime state.
-- Non-interactive `multiagent run` mode.
+- Non-interactive `atelier run` mode.
 - Remote server or cloud sync.
 - Plugin marketplace.
 - Voice, image, or multimodal UI.
@@ -77,7 +77,7 @@ The first version assumes the user is comfortable configuring a TOML file, setti
 
 ## Launch Behavior
 
-Running `multiagent` without arguments must launch the TUI in the current working directory.
+Running `atelier` without arguments must launch the TUI in the current working directory.
 
 The command must not require the current folder to contain a Rust project, config file, git repo, or prior `.multiagent/` directory. If no config exists, the harness uses built-in profiles and marks unavailable runtimes clearly.
 
@@ -170,7 +170,7 @@ Z.ai streaming should be supported by the event model. If HTTP streaming is defe
 
 ## Built-In Defaults
 
-The binary must include built-in profiles. The user should be able to install the binary, run `multiagent`, type a prompt, and see the TUI without first writing config.
+The binary must include built-in profiles. The user should be able to install the binary, run `atelier`, type a prompt, and see the TUI without first writing config.
 
 Default model assignment policy:
 
@@ -450,15 +450,15 @@ V1 supports history inspection and context resume. Context resume starts a new r
 V1 commands and flags:
 
 ```text
-multiagent
-multiagent --config <path>
-multiagent --cwd <path>
-multiagent --doctor
-multiagent --print-config
-multiagent --init-config
+atelier
+atelier --config <path>
+atelier --cwd <path>
+atelier --doctor
+atelier --print-config
+atelier --init-config
 ```
 
-`multiagent` launches the TUI in the current directory.
+`atelier` launches the TUI in the current directory.
 
 `--config <path>` uses an alternate home configuration file for this invocation. `MULTIAGENT_CONFIG` provides the same override through the environment.
 
@@ -501,7 +501,7 @@ Doctor must not perform real file edits or consume significant tokens.
 
 ## Packaging
 
-The project should be a Rust binary crate named `multiagent`.
+The project should be a Rust binary crate named `atelier`.
 
 Development installation:
 
@@ -512,7 +512,7 @@ cargo install --path .
 Future distribution may use:
 
 ```text
-cargo install multiagent
+cargo install atelier
 ```
 
 or a Homebrew formula.
@@ -554,7 +554,7 @@ TUI rendering may start with smoke tests. Full terminal snapshot tests can come 
 
 V1 is complete when these workflows work end to end:
 
-- Install `multiagent` globally and launch it from any folder.
+- Install `atelier` globally and launch it from any folder.
 - Load built-in profiles, home config, and optional local config.
 - Show the TUI with Agent Roster, Chat, and Input Composer.
 - Accept a prompt and route it through the Orchestrator.

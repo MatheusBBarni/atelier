@@ -373,10 +373,10 @@ fn is_default_read_only_command(lower: &str) -> bool {
         "grep ",
         "find ",
         "wc ",
-        "multiagent --doctor",
-        "multiagent --print-config",
-        "multiagent --help",
-        "multiagent --version",
+        "atelier --doctor",
+        "atelier --print-config",
+        "atelier --help",
+        "atelier --version",
     ];
     allow_prefixes
         .iter()

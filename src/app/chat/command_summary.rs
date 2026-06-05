@@ -113,10 +113,10 @@ fn known_read_only_command(lower: &str) -> bool {
         "git grep",
         "git blame",
         "git describe",
-        "multiagent --doctor",
-        "multiagent --print-config",
-        "multiagent --help",
-        "multiagent --version",
+        "atelier --doctor",
+        "atelier --print-config",
+        "atelier --help",
+        "atelier --version",
     ]
     .iter()
     .any(|prefix| command_has_prefix(lower, prefix))

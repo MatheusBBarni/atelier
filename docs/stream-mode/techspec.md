@@ -7,7 +7,7 @@ Source PRD: `docs/stream-mode/prd.md`
 
 ## Executive Summary
 
-This specification defines the implementation plan for first-class stream mode in `multiagent`. Stream mode lets the active Specialized Agent publish progress into the TUI while an Execution Runtime step is still pending, without moving final output parsing, Harness Actions, Action Approval, or Session History ownership out of the Rust Harness.
+This specification defines the implementation plan for first-class stream mode in `atelier`. Stream mode lets the active Specialized Agent publish progress into the TUI while an Execution Runtime step is still pending, without moving final output parsing, Harness Actions, Action Approval, or Session History ownership out of the Rust Harness.
 
 The core change is replacing after-the-fact `RuntimeStepResult.stream_deltas` delivery with an app-consumed runtime event sink. Runtime adapters emit progress events through a bounded sink, the app loop updates `AppState.live_step` and coalesces durable history records, and the runtime step still returns one authoritative `RuntimeOutput`.
 

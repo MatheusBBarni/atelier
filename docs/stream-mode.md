@@ -5,7 +5,7 @@ Date: 2026-06-03
 
 ## Summary
 
-`multiagent` already has a `RuntimeStreamDelta` type, but the current concrete
+`atelier` already has a `RuntimeStreamDelta` type, but the current concrete
 runtimes emit deltas only after a step finishes. This means the TUI "chat" feels
 batch-oriented: the user sees step start events, then a final result.
 

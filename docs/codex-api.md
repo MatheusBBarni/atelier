@@ -159,7 +159,7 @@ subscription integration.
 
 ## Acceptance Criteria
 
-- `multiagent --doctor` reports Codex command availability and login status.
+- `atelier --doctor` reports Codex command availability and login status.
 - Missing Codex login produces a clear remediation, not an opaque runtime failure.
 - Runtime `codex` continues to execute through the installed Codex CLI.
 - No code path reads local Codex credential files.

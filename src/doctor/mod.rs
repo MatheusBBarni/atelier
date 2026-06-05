@@ -213,7 +213,7 @@ fn tool_access_check(config: &EffectiveConfig) -> DoctorCheck {
 
 pub fn render_human(report: &DoctorReport) -> String {
     let mut output = String::new();
-    output.push_str("multiagent doctor\n");
+    output.push_str("atelier doctor\n");
     output.push_str(&format!(
         "working_directory: {}\n\n",
         report.working_directory
