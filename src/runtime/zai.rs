@@ -178,6 +178,10 @@ fn concise_response_text(text: &str) -> String {
 }
 
 fn redact_sensitive_text(text: &str) -> String {
+    redact_raw_secret_tokens(&redact_bearer_tokens(text))
+}
+
+fn redact_bearer_tokens(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut remaining = text;
     while let Some(auth_start) = remaining.to_ascii_lowercase().find("bearer ") {
@@ -195,6 +199,45 @@ fn redact_sensitive_text(text: &str) -> String {
     }
     output.push_str(remaining);
     output
+}
+
+fn redact_raw_secret_tokens(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some((secret_start, _prefix)) = next_raw_secret_prefix(remaining) {
+        let absolute_start = text.len() - remaining.len() + secret_start;
+        let preceding_character = text[..absolute_start].chars().next_back();
+        if preceding_character.is_some_and(is_secret_token_character) {
+            output.push_str(&remaining[..secret_start + 1]);
+            remaining = &remaining[secret_start + 1..];
+            continue;
+        }
+
+        output.push_str(&remaining[..secret_start]);
+        output.push_str("<redacted secret>");
+        let token = &remaining[secret_start..];
+        let token_length = token
+            .find(|character: char| !is_secret_token_character(character))
+            .unwrap_or(token.len());
+        remaining = &token[token_length..];
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+fn next_raw_secret_prefix(text: &str) -> Option<(usize, &'static str)> {
+    const SECRET_PREFIXES: [&str; 2] = ["sk-", "zai-"];
+    let lower = text.to_ascii_lowercase();
+    SECRET_PREFIXES
+        .into_iter()
+        .filter_map(|prefix| lower.find(prefix).map(|index| (index, prefix)))
+        .min_by_key(|(index, _prefix)| *index)
+}
+
+fn is_secret_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
 
 #[cfg(test)]
@@ -287,6 +330,31 @@ mod tests {
 
         assert!(text.contains("Bearer <redacted>"));
         assert!(!text.contains("test-token"));
+    }
+
+    #[test]
+    fn concise_response_text_redacts_raw_secret_tokens_in_plain_text_errors() {
+        let text = concise_response_text(
+            "invalid api key zai-secret-token while retrying with sk-test-secret",
+        );
+
+        assert!(text.contains("<redacted secret>"));
+        assert!(!text.contains("zai-secret-token"));
+        assert!(!text.contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn redact_response_redacts_raw_secret_tokens_in_json_errors() {
+        let value = serde_json::json!({
+            "error": "invalid credential sk-json-secret",
+            "debug": "fallback credential zai-json-secret",
+        });
+
+        let text = redact_response(&value);
+
+        assert!(text.contains("<redacted secret>"));
+        assert!(!text.contains("sk-json-secret"));
+        assert!(!text.contains("zai-json-secret"));
     }
 
     async fn spawn_mock_zai_server(
