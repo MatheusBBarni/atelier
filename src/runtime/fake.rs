@@ -1,6 +1,6 @@
 use super::{
-    Runtime, RuntimeAvailability, RuntimeAvailabilityStatus, RuntimeOutput, RuntimeRequest,
-    RuntimeStepResult, RuntimeStreamDelta,
+    Runtime, RuntimeAvailability, RuntimeAvailabilityStatus, RuntimeOutput, RuntimeProviderError,
+    RuntimeRequest, RuntimeStepResult, RuntimeStreamDelta,
 };
 use crate::actions::{ActionKind, ActionRequest};
 use crate::config::{Capability, RuntimeConfig};
@@ -32,6 +32,13 @@ impl Runtime for FakeRuntime {
     }
 
     async fn stream_step(&self, request: RuntimeRequest) -> Result<RuntimeStepResult> {
+        if should_emit_fake_retryable_provider_error(&request) {
+            return Err(RuntimeProviderError::retryable(format!(
+                "fake retryable provider error for model {}",
+                request.agent_profile.model
+            ))
+            .into());
+        }
         let output = if should_emit_fake_parse_error(&request) {
             RuntimeOutput::ParseError {
                 agent: request.agent_profile.id.clone(),
@@ -117,6 +124,14 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             Vec::new(),
             "The prompt needs one user clarification before routing.".to_string(),
             "User provides clarification.".to_string(),
+            None,
+        ),
+        None if prompt.contains("council") || prompt.contains("high-risk") || prompt.contains("high risk") => (
+            DecisionStatus::Continue,
+            Some("council".to_string()),
+            vec![Capability::Read, Capability::Challenge, Capability::Review],
+            "The prompt asks for council or high-risk review, so the harness council workflow should run.".to_string(),
+            "Council returns confidence, dissent, risks, and a recommended action.".to_string(),
             None,
         ),
         None if prompt.contains('?') && !looks_like_code_change(&prompt) => (
@@ -250,6 +265,12 @@ fn fake_agent_result(request: &RuntimeRequest) -> AgentResult {
             result.findings =
                 vec!["Fake Consul found no blocking architecture concern.".to_string()];
         }
+        agent if agent.starts_with("council.") => {
+            result.findings = vec![format!(
+                "Fake councillor {} found the proposed path acceptable with noted risk.",
+                agent.trim_start_matches("council.")
+            )];
+        }
         _ => {}
     }
     result
@@ -296,6 +317,14 @@ fn should_emit_fake_write_action_request(request: &RuntimeRequest) -> bool {
 
 fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
     let prompt = request.prompt.to_ascii_lowercase();
+    if request
+        .agent_profile
+        .instructions
+        .to_ascii_lowercase()
+        .contains("fake parse error")
+    {
+        return true;
+    }
     if prompt.contains("always parse error") {
         return true;
     }
@@ -305,6 +334,14 @@ fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
         && prompt.contains("orchestrator parse error"))
         || (agent_id == "explorer" && prompt.contains("agent parse error"));
     requested_once && !has_prior_parse_error(request, agent_id)
+}
+
+fn should_emit_fake_retryable_provider_error(request: &RuntimeRequest) -> bool {
+    request
+        .prompt
+        .to_ascii_lowercase()
+        .contains("retryable provider error")
+        && request.agent_profile.model == "primary-fails"
 }
 
 fn has_prior_parse_error(request: &RuntimeRequest, agent_id: &str) -> bool {

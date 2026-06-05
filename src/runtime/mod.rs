@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
+use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +32,40 @@ pub struct RuntimeAvailability {
     pub remediation: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct RuntimeProviderError {
+    retryable: bool,
+    message: String,
+}
+
+impl RuntimeProviderError {
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            retryable: true,
+            message: message.into(),
+        }
+    }
+
+    pub fn non_retryable(message: impl Into<String>) -> Self {
+        Self {
+            retryable: false,
+            message: message.into(),
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+impl fmt::Display for RuntimeProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl StdError for RuntimeProviderError {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeHistoryEvent {
     pub schema_version: u32,
@@ -43,14 +79,39 @@ pub struct RuntimeHistoryEvent {
     pub payload_truncated: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeRecentContext {
+    pub files: Vec<RuntimeRecentFile>,
+    pub actions: Vec<RuntimeRecentAction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeRecentFile {
+    pub path: String,
+    pub operation: String,
+    pub event_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeRecentAction {
+    pub event_kind: String,
+    pub action_id: Option<String>,
+    pub action_kind: Option<String>,
+    pub status: Option<String>,
+    pub summary: Option<String>,
+    pub event_id: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeRequest {
     pub run_id: String,
     pub step_id: String,
     pub prompt: String,
+    pub session_goal: Option<String>,
     pub working_directory: PathBuf,
     pub agent_profile: AgentProfile,
     pub session_events: Vec<RuntimeHistoryEvent>,
+    pub recent_context: RuntimeRecentContext,
     pub previous_results: Vec<AgentResult>,
     pub action_results: Vec<ActionResult>,
     pub output_schema: String,
@@ -186,6 +247,31 @@ pub async fn execute_runtime_step(
         );
     }
 
+    let model_chain = request.agent_profile.model_chain();
+    let mut last_retryable_error = None;
+    for (index, model) in model_chain.iter().enumerate() {
+        let mut attempt = request.clone();
+        attempt.agent_profile.model = model.clone();
+        match execute_runtime_step_once(runtime, attempt).await {
+            Ok(result) => return Ok(result),
+            Err(error) if index + 1 < model_chain.len() && is_retryable_provider_error(&error) => {
+                last_retryable_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if let Some(error) = last_retryable_error {
+        return Err(error);
+    }
+
+    bail!("runtime {runtime_id} did not execute any model attempt")
+}
+
+async fn execute_runtime_step_once(
+    runtime: &RuntimeConfig,
+    request: RuntimeRequest,
+) -> Result<RuntimeStepResult> {
     match runtime.kind {
         RuntimeKind::Codex => {
             codex::CodexRuntime::new(runtime.clone())
@@ -205,6 +291,15 @@ pub async fn execute_runtime_step(
     }
 }
 
+pub fn is_retryable_provider_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<RuntimeProviderError>()
+            .map(RuntimeProviderError::is_retryable)
+            .unwrap_or(false)
+    })
+}
+
 pub fn prompt_envelope_json(request: &RuntimeRequest) -> Result<String> {
     let envelope = serde_json::json!({
         "schema_version": 1,
@@ -222,7 +317,9 @@ pub fn prompt_envelope_json(request: &RuntimeRequest) -> Result<String> {
         "step_id": request.step_id,
         "working_directory": request.working_directory,
         "prompt": request.prompt,
+        "session_goal": request.session_goal,
         "session_events": request.session_events,
+        "recent_context": request.recent_context,
         "previous_results": request.previous_results,
         "action_results": request.action_results,
         "capability_constraints": request.capability_constraints,
@@ -239,7 +336,10 @@ pub fn prompt_envelope_json(request: &RuntimeRequest) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentEffort, AgentProfile, Capability, Limits};
+    use crate::config::{
+        load_effective_config, AgentEffort, AgentProfile, AgentPromptMetadata, Capability,
+        ConfigLoadOptions, Limits,
+    };
     use serde_json::json;
 
     #[test]
@@ -248,16 +348,21 @@ mod tests {
             run_id: "run".to_string(),
             step_id: "step".to_string(),
             prompt: "inspect context".to_string(),
+            session_goal: Some("Keep changes scoped.".to_string()),
             working_directory: PathBuf::from("/tmp/project"),
             agent_profile: AgentProfile {
                 id: "explorer".to_string(),
                 name: "Explorer".to_string(),
                 runtime: "fake".to_string(),
                 model: "default".to_string(),
+                model_fallbacks: Vec::new(),
                 effort: AgentEffort::Medium,
                 thinking: false,
                 capabilities: vec![Capability::Read],
+                tools: None,
                 instructions: "Read files.".to_string(),
+                orchestrator_description: None,
+                prompt_metadata: AgentPromptMetadata::default(),
                 enabled: true,
             },
             session_events: vec![RuntimeHistoryEvent {
@@ -271,6 +376,21 @@ mod tests {
                 payload: json!({ "summary": "prior finding" }),
                 payload_truncated: false,
             }],
+            recent_context: RuntimeRecentContext {
+                files: vec![RuntimeRecentFile {
+                    path: "src/lib.rs".to_string(),
+                    operation: "apply_patch".to_string(),
+                    event_id: "file-event".to_string(),
+                }],
+                actions: vec![RuntimeRecentAction {
+                    event_kind: "action_completed".to_string(),
+                    action_id: Some("action".to_string()),
+                    action_kind: None,
+                    status: Some("completed".to_string()),
+                    summary: Some("Applied patch.".to_string()),
+                    event_id: "action-event".to_string(),
+                }],
+            },
             previous_results: Vec::new(),
             action_results: Vec::new(),
             output_schema: "agent_result".to_string(),
@@ -284,9 +404,106 @@ mod tests {
         assert_eq!(envelope["session_events"][0]["kind"], "agent_result");
         assert_eq!(envelope["agent"]["effort"], "medium");
         assert_eq!(envelope["agent"]["thinking"], false);
+        assert_eq!(envelope["session_goal"], "Keep changes scoped.");
+        assert_eq!(envelope["recent_context"]["files"][0]["path"], "src/lib.rs");
+        assert_eq!(
+            envelope["recent_context"]["actions"][0]["status"],
+            "completed"
+        );
         assert_eq!(
             envelope["session_events"][0]["payload"]["summary"],
             "prior finding"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_runtime_step_retries_retryable_provider_errors_with_fallback_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.explorer]
+runtime = "fake"
+model = "primary-fails"
+model_fallbacks = ["fallback-succeeds"]
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let request = RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: "retryable provider error".to_string(),
+            session_goal: None,
+            working_directory: dir.path().to_path_buf(),
+            agent_profile: config.agents["explorer"].clone(),
+            session_events: Vec::new(),
+            recent_context: RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "agent_result".to_string(),
+            capability_constraints: vec![Capability::Read],
+            limits: Limits::default(),
+        };
+
+        let result = execute_runtime_step(&config, request).await.unwrap();
+
+        match result.output {
+            RuntimeOutput::AgentResult { result } => {
+                assert_eq!(result.agent, "explorer");
+            }
+            other => panic!("unexpected runtime output: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_runtime_step_does_not_retry_parse_outputs_as_provider_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.explorer]
+runtime = "fake"
+model = "primary-fails"
+model_fallbacks = ["fallback-succeeds"]
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let request = RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: "agent parse error".to_string(),
+            session_goal: None,
+            working_directory: dir.path().to_path_buf(),
+            agent_profile: config.agents["explorer"].clone(),
+            session_events: Vec::new(),
+            recent_context: RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "agent_result".to_string(),
+            capability_constraints: vec![Capability::Read],
+            limits: Limits::default(),
+        };
+
+        let result = execute_runtime_step(&config, request).await.unwrap();
+
+        assert!(matches!(result.output, RuntimeOutput::ParseError { .. }));
     }
 }

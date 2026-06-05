@@ -165,7 +165,7 @@ When output_schema is orchestrator_decision, return:
   "run_id": "{run_id}",
   "status": "continue|waiting_for_user|complete|failed",
   "plan": ["short step"],
-  "next_agent": "explorer|oracle|consul|fixer|reviewer or null",
+  "next_agent": "enabled specialized agent id from the envelope or null",
   "reason": "why this decision is correct",
   "required_capabilities": ["read"],
   "stop_condition": "what should be true after the next step",
@@ -299,7 +299,9 @@ fn resolve_command(command: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentEffort, AgentProfile, Capability, Limits, PromptMode, RuntimeKind};
+    use crate::config::{
+        AgentEffort, AgentProfile, AgentPromptMetadata, Capability, Limits, PromptMode, RuntimeKind,
+    };
     use crate::orchestrator::{
         wrap_json_contract, AgentResult, DecisionStatus, OrchestratorDecision,
     };
@@ -518,19 +520,25 @@ mod tests {
             run_id: "run".to_string(),
             step_id: "step".to_string(),
             prompt: "inspect context".to_string(),
+            session_goal: None,
             working_directory,
             agent_profile: AgentProfile {
                 id: agent_id.to_string(),
                 name: "Explorer".to_string(),
                 runtime: "codex".to_string(),
                 model: "gpt-5.4".to_string(),
+                model_fallbacks: Vec::new(),
                 effort: AgentEffort::Medium,
                 thinking: false,
                 capabilities: vec![Capability::Read],
+                tools: None,
                 instructions: "Read files.".to_string(),
+                orchestrator_description: None,
+                prompt_metadata: AgentPromptMetadata::default(),
                 enabled: true,
             },
             session_events: Vec::new(),
+            recent_context: crate::runtime::RuntimeRecentContext::default(),
             previous_results: Vec::new(),
             action_results: Vec::new(),
             output_schema: if agent_id == "orchestrator" {

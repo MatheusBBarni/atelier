@@ -1,4 +1,4 @@
-use crate::config::{AgentProfile, ApprovalMode, Capability, WorkspacePolicy};
+use crate::config::{AgentProfile, ApprovalMode, Capability, ToolName, WorkspacePolicy};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -117,6 +117,13 @@ pub fn validate_action_request(
         ));
     }
 
+    let tool = tool_name_for_action(&request.kind);
+    if !agent.has_tool(&tool) {
+        return ActionDecision::Denied(format!(
+            "agent {} is not allowed to use tool {:?}",
+            agent.id, tool
+        ));
+    }
     let Some(required) = required_capability(&request.kind) else {
         return ActionDecision::Allowed;
     };
@@ -136,7 +143,17 @@ pub fn validate_action_request(
             }
             ActionDecision::Allowed
         }
-        ActionKind::ApplyPatch | ActionKind::WriteFile => {
+        ActionKind::ApplyPatch => {
+            let Some(diff) = request.params.get("diff").and_then(Value::as_str) else {
+                return ActionDecision::Denied("apply_patch action is missing diff".to_string());
+            };
+            if let Err(error) = validate_unified_diff_for_policy(diff, &workspace.extra_write_roots)
+            {
+                return ActionDecision::Denied(error.to_string());
+            }
+            ActionDecision::Allowed
+        }
+        ActionKind::WriteFile => {
             if let Some(path) = path_param(&request.params) {
                 if let Err(error) = validate_model_path(path, &workspace.extra_write_roots) {
                     return ActionDecision::Denied(error.to_string());
@@ -151,6 +168,18 @@ pub fn validate_action_request(
             decision_for_command(command, approval_mode)
         }
         ActionKind::RecordNote => ActionDecision::Allowed,
+    }
+}
+
+fn tool_name_for_action(kind: &ActionKind) -> ToolName {
+    match kind {
+        ActionKind::ReadFile => ToolName::ReadFile,
+        ActionKind::ListFiles => ToolName::ListFiles,
+        ActionKind::SearchText => ToolName::SearchText,
+        ActionKind::RunCommand => ToolName::RunCommand,
+        ActionKind::ApplyPatch => ToolName::ApplyPatch,
+        ActionKind::WriteFile => ToolName::WriteFile,
+        ActionKind::RecordNote => ToolName::RecordNote,
     }
 }
 
@@ -692,6 +721,16 @@ pub fn apply_unified_diff(
     Ok(changed_files)
 }
 
+fn validate_unified_diff_for_policy(diff: &str, extra_write_roots: &[PathBuf]) -> Result<()> {
+    if diff.contains("GIT binary patch") || diff.contains("Binary files ") {
+        bail!("binary patches are not supported");
+    }
+    for file_patch in parse_unified_diff(diff)? {
+        validate_model_path(&file_patch.target_path, extra_write_roots)?;
+    }
+    Ok(())
+}
+
 fn resolve_action_path(
     working_directory: &Path,
     path: &str,
@@ -836,7 +875,11 @@ fn parse_unified_diff(diff: &str) -> Result<Vec<FilePatch>> {
         if old_path == "/dev/null" || new_path == "/dev/null" {
             bail!("file creation/deletion patches are not supported; use write_file for new files");
         }
+        let old_target_path = normalize_diff_path(&old_path)?;
         let target_path = normalize_diff_path(&new_path)?;
+        if old_target_path != target_path {
+            bail!("rename patches are not supported: {old_target_path} -> {target_path}");
+        }
         let mut hunks = Vec::new();
 
         while index < lines.len() {
@@ -844,10 +887,12 @@ fn parse_unified_diff(diff: &str) -> Result<Vec<FilePatch>> {
                 break;
             }
             if lines[index].starts_with("@@ ") {
-                let (old_start, _old_count, _new_start, _new_count) =
+                let (old_start, old_count, _new_start, new_count) =
                     parse_hunk_header(lines[index])?;
                 index += 1;
                 let mut hunk_lines = Vec::new();
+                let mut actual_old_count = 0usize;
+                let mut actual_new_count = 0usize;
                 while index < lines.len()
                     && !lines[index].starts_with("@@ ")
                     && !lines[index].starts_with("--- ")
@@ -861,12 +906,30 @@ fn parse_unified_diff(diff: &str) -> Result<Vec<FilePatch>> {
                         bail!("invalid hunk line");
                     };
                     match marker {
-                        " " => hunk_lines.push(HunkLine::Context(content.to_string())),
-                        "-" => hunk_lines.push(HunkLine::Remove(content.to_string())),
-                        "+" => hunk_lines.push(HunkLine::Add(content.to_string())),
+                        " " => {
+                            actual_old_count += 1;
+                            actual_new_count += 1;
+                            hunk_lines.push(HunkLine::Context(content.to_string()));
+                        }
+                        "-" => {
+                            actual_old_count += 1;
+                            hunk_lines.push(HunkLine::Remove(content.to_string()));
+                        }
+                        "+" => {
+                            actual_new_count += 1;
+                            hunk_lines.push(HunkLine::Add(content.to_string()));
+                        }
                         _ => bail!("invalid hunk marker {marker:?}"),
                     }
                     index += 1;
+                }
+                if hunk_lines.is_empty() {
+                    bail!("hunk has no body lines");
+                }
+                if actual_old_count != old_count || actual_new_count != new_count {
+                    bail!(
+                        "hunk line count mismatch: header expects -{old_count} +{new_count}, body has -{actual_old_count} +{actual_new_count}"
+                    );
                 }
                 hunks.push(Hunk {
                     old_start,
@@ -1053,6 +1116,53 @@ mod tests {
     }
 
     #[test]
+    fn designer_cannot_run_commands() {
+        let (config, designer) = fixture_agent("designer");
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::RunCommand,
+            params: json!({"command": "pwd"}),
+        };
+
+        let decision = validate_action_request(
+            &designer,
+            &config.workspace,
+            &config.approval_mode,
+            &request,
+        );
+
+        assert!(
+            matches!(decision, ActionDecision::Denied(reason) if reason.contains("lacks required capability"))
+        );
+    }
+
+    #[test]
+    fn tool_allowlist_can_deny_actions_beneath_a_capability() {
+        let (config, mut explorer) = fixture_agent("explorer");
+        explorer.tools = Some(vec![ToolName::ReadFile]);
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::SearchText,
+            params: json!({"path": ".", "query": "needle"}),
+        };
+
+        let decision = validate_action_request(
+            &explorer,
+            &config.workspace,
+            &config.approval_mode,
+            &request,
+        );
+
+        assert!(
+            matches!(decision, ActionDecision::Denied(reason) if reason.contains("not allowed to use tool"))
+        );
+    }
+
+    #[test]
     fn path_scope_rejects_traversal() {
         let error = validate_model_path("../secret", &[]).unwrap_err();
         assert!(error.to_string().contains("traversal"));
@@ -1220,6 +1330,57 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("file.txt")).unwrap(),
             "one\nTWO\nthree\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_policy_rejects_invalid_targets_and_structure() {
+        let (config, fixer) = fixture_agent("fixer");
+        let traversal_patch =
+            "--- a/../secret.txt\n+++ b/../secret.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "patch".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::ApplyPatch,
+            params: json!({ "diff": traversal_patch }),
+        };
+
+        let decision =
+            validate_action_request(&fixer, &config.workspace, &config.approval_mode, &request);
+
+        assert!(matches!(decision, ActionDecision::Denied(reason) if reason.contains("traversal")));
+    }
+
+    #[test]
+    fn apply_patch_policy_rejects_rename_and_hunk_count_mismatch() {
+        let (config, fixer) = fixture_agent("fixer");
+        let rename_patch = "--- a/old.txt\n+++ b/new.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "patch".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::ApplyPatch,
+            params: json!({ "diff": rename_patch }),
+        };
+        let decision =
+            validate_action_request(&fixer, &config.workspace, &config.approval_mode, &request);
+        assert!(
+            matches!(decision, ActionDecision::Denied(reason) if reason.contains("rename patches"))
+        );
+
+        let mismatched_patch = "--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,1 @@\n-old\n+new\n";
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "patch".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::ApplyPatch,
+            params: json!({ "diff": mismatched_patch }),
+        };
+        let decision =
+            validate_action_request(&fixer, &config.workspace, &config.approval_mode, &request);
+        assert!(
+            matches!(decision, ActionDecision::Denied(reason) if reason.contains("hunk line count mismatch"))
         );
     }
 

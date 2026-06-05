@@ -13,6 +13,8 @@ an orchestrator and a sequence of specialized agent profiles.
   - `zai` (HTTP API runtime)
   - `fake` (test/runtime simulation)
 - Configurable agents with explicit capabilities and scopes.
+- Preset-based agent overrides, model fallback chains, and per-agent tool allowlists.
+- Serial council workflow for high-risk or user-requested decision review.
 - Durable per-session history and artifacts under `.multiagent/`.
 - Strict capability checks for file and command actions.
 - Deterministic local tests with optional integration paths.
@@ -48,6 +50,9 @@ multiagent --doctor
 multiagent --doctor --json
 multiagent --print-config
 multiagent --init-config
+multiagent --codemap init
+multiagent --codemap changes
+multiagent --codemap update
 multiagent --clean-sessions
 multiagent --clean-sessions --yes
 multiagent --debug
@@ -59,6 +64,26 @@ Notes:
 - `--yes` is valid only with `--clean-sessions`.
 - `--print-config` prints merged config with secrets redacted.
 - `--init-config` creates starter config/instruction files if missing.
+- `--codemap changes` reports stale maps without writing files.
+
+## Codemaps
+
+Codemaps are visible repository docs for agents and users. `multiagent --codemap
+init` writes folder-level `codemap.md` files and stores hashes in
+`.multiagent/codemap.json`. `multiagent --codemap changes` compares current file
+hashes with that state and reports stale map paths. `multiagent --codemap update`
+regenerates maps and refreshes the state.
+
+Codemap generation excludes `.git`, `.multiagent`, `target`, and common build or
+dependency folders such as `node_modules`, `vendor`, `dist`, and `build`.
+Generated `codemap.md` files are excluded from hashes so editing a map does not
+make the workspace stale by itself.
+
+## TUI commands
+
+- `/goal <text>`, `/goal`, `/goal clear`: manage the active session goal.
+- `/config`: show active config files, selected preset, and warnings without raw prompt bodies.
+- `/subtask <agent> <task>`: run one bounded child task through a specialized enabled agent.
 
 ## Configuration
 
@@ -73,10 +98,14 @@ You can also set `MULTIAGENT_CONFIG` to choose the home config path.
 
 Important values:
 
+- `preset`: optional selected preset name
 - `approval_mode`: `yolo` (default) or `normal`
 - `workspace.extra_read_roots` / `workspace.extra_write_roots`: explicit allowed paths
 - `[runtimes.*]`: `type`, `command`, `args`, `base_url`, `api_key_env`
-- `[agents.*]`: profile, model, effort, capabilities, instructions
+- `[presets.<name>.agents.<agent>]`: preset-scoped agent overrides applied before local agent overrides
+- `[agents.*]`: profile, model, `model_fallbacks`, effort, capabilities, `tools`, prompt files
+- `[council]`: `default_preset`, `timeout_seconds`, `execution_mode = "serial"`
+- `[council.presets.<name>.<councillor>]`: runtime, model, effort, and `prompt` or `prompt_file`
 - `[limits.*]`:
   - `max_agent_steps`
   - `max_step_actions`
@@ -113,8 +142,38 @@ Use `--clean-sessions` to delete project-local history. Use `--yes` to skip conf
 - `consul` (challenge)
 - `fixer` (edit, command, verify)
 - `reviewer` (command, verify, review)
+- `librarian` (read, answer; disabled by default)
+- `designer` (read, edit, verify; disabled by default)
 
 Capabilities are enforced by the harness, not by runtime implementations.
+If `tools` is set for an agent, it further narrows the harness actions exposed
+inside those capabilities.
+
+## Council
+
+The council is a harness workflow, not a normal agent. The orchestrator may route
+to `next_agent = "council"` only for high-risk architecture, security, data
+integrity, difficult review, or explicit user council requests.
+
+Council execution is serial. Each councillor returns an `agent_result`; the
+harness records per-councillor diagnostics and synthesizes a council result with
+confidence, dissent, risks, recommended action, and stop condition. If every
+councillor fails, the council result is `failed`; if some succeed, synthesis still
+proceeds with partial confidence.
+
+## Tooling Policy
+
+Harness tools stay centralized in `src/actions`. `apply_patch` validates unified
+diff structure and target paths before writing files. `ast_search` and docs/web
+fetch actions are intentionally not exposed until ast-grep installation policy
+and network/MCP policy are explicit.
+
+## Visibility
+
+The TUI shows active step details and recent runtime stream snippets inside the
+Event Stream while a step is running. External tmux/zellij pane mirroring is not
+required for correctness and remains deferred until parallel child-run behavior
+needs it.
 
 ## Project layout
 
@@ -126,6 +185,7 @@ Capabilities are enforced by the harness, not by runtime implementations.
 - `src/runtime` – runtime adapters and contracts
 - `src/actions` – file and command action execution
 - `src/history` – event/artifact/run persistence
+- `src/codemap` – folder-level repository map generation
 - `src/doctor` – diagnostics and availability checks
 
 ## Development

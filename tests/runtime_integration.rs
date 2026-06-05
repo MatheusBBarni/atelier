@@ -1,10 +1,11 @@
 use anyhow::{bail, Result};
 use multiagent::config::{
-    AgentEffort, AgentProfile, Capability, Limits, PromptMode, RuntimeConfig, RuntimeKind,
+    AgentEffort, AgentProfile, AgentPromptMetadata, Capability, Limits, PromptMode, RuntimeConfig,
+    RuntimeKind,
 };
 use multiagent::runtime::codex::CodexRuntime;
 use multiagent::runtime::zai::ZaiRuntime;
-use multiagent::runtime::{Runtime, RuntimeOutput, RuntimeRequest};
+use multiagent::runtime::{Runtime, RuntimeOutput, RuntimeRecentContext, RuntimeRequest};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -97,19 +98,25 @@ fn agent_request(
         run_id: "integration-run".to_string(),
         step_id: "integration-step".to_string(),
         prompt: "Return a completed agent_result for this runtime integration smoke test. Do not request actions.".to_string(),
+        session_goal: None,
         working_directory,
         agent_profile: AgentProfile {
             id: agent_id.to_string(),
             name: agent_id.to_string(),
             runtime: runtime_id.to_string(),
             model: model.to_string(),
+            model_fallbacks: Vec::new(),
             effort: AgentEffort::Medium,
             thinking: true,
             capabilities: capabilities.clone(),
+            tools: None,
             instructions: "Produce only the requested structured result inside the JSON contract markers. Do not include prose outside the contract.".to_string(),
+            orchestrator_description: None,
+            prompt_metadata: AgentPromptMetadata::default(),
             enabled: true,
         },
         session_events: Vec::new(),
+        recent_context: RuntimeRecentContext::default(),
         previous_results: Vec::new(),
         action_results: Vec::new(),
         output_schema: "agent_result".to_string(),

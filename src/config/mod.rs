@@ -35,6 +35,41 @@ pub enum Capability {
     Review,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolName {
+    ReadFile,
+    ListFiles,
+    SearchText,
+    RunCommand,
+    ApplyPatch,
+    WriteFile,
+    RecordNote,
+}
+
+impl ToolName {
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::ReadFile,
+            Self::ListFiles,
+            Self::SearchText,
+            Self::RunCommand,
+            Self::ApplyPatch,
+            Self::WriteFile,
+            Self::RecordNote,
+        ]
+    }
+
+    pub fn required_capability(&self) -> Option<Capability> {
+        match self {
+            Self::ReadFile | Self::ListFiles | Self::SearchText => Some(Capability::Read),
+            Self::RunCommand => Some(Capability::Command),
+            Self::ApplyPatch | Self::WriteFile => Some(Capability::Edit),
+            Self::RecordNote => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Limit {
     Value(u32),
@@ -188,6 +223,13 @@ pub enum AgentEffort {
     XHigh,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CouncilExecutionMode {
+    #[default]
+    Serial,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub id: String,
@@ -199,17 +241,75 @@ pub struct RuntimeConfig {
     pub api_key_env: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentPromptMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions_append_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestrator_description_file: Option<PathBuf>,
+}
+
+impl AgentPromptMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.instructions_file.is_none()
+            && self.instructions_append_file.is_none()
+            && self.orchestrator_description_file.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentProfile {
     pub id: String,
     pub name: String,
     pub runtime: String,
     pub model: String,
+    pub model_fallbacks: Vec<String>,
     pub effort: AgentEffort,
     pub thinking: bool,
     pub capabilities: Vec<Capability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolName>>,
     pub instructions: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestrator_description: Option<String>,
+    #[serde(default, skip_serializing_if = "AgentPromptMetadata::is_empty")]
+    pub prompt_metadata: AgentPromptMetadata,
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CouncilPromptMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_file: Option<PathBuf>,
+}
+
+impl CouncilPromptMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.prompt_file.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CouncilMemberProfile {
+    pub id: String,
+    pub runtime: String,
+    pub model: String,
+    pub model_fallbacks: Vec<String>,
+    pub effort: AgentEffort,
+    pub thinking: bool,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "CouncilPromptMetadata::is_empty")]
+    pub prompt_metadata: CouncilPromptMetadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CouncilConfig {
+    pub default_preset: String,
+    pub timeout_seconds: u64,
+    pub execution_mode: CouncilExecutionMode,
+    pub presets: BTreeMap<String, BTreeMap<String, CouncilMemberProfile>>,
 }
 
 impl AgentProfile {
@@ -218,6 +318,32 @@ impl AgentProfile {
             .iter()
             .any(|existing| existing == capability)
     }
+
+    pub fn has_tool(&self, tool: &ToolName) -> bool {
+        self.tools
+            .as_ref()
+            .map(|tools| tools.iter().any(|existing| existing == tool))
+            .unwrap_or(true)
+    }
+
+    pub fn effective_tools(&self) -> Vec<ToolName> {
+        let tools = self.tools.clone().unwrap_or_else(ToolName::all);
+        tools
+            .into_iter()
+            .filter(|tool| {
+                tool.required_capability()
+                    .map(|capability| self.has_capability(&capability))
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    pub fn model_chain(&self) -> Vec<String> {
+        let mut models = Vec::with_capacity(self.model_fallbacks.len() + 1);
+        models.push(self.model.clone());
+        models.extend(self.model_fallbacks.iter().cloned());
+        models
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,9 +351,11 @@ pub struct EffectiveConfig {
     pub schema_version: u32,
     pub working_directory: PathBuf,
     pub config_sources: Vec<PathBuf>,
+    pub active_preset: Option<String>,
     pub approval_mode: ApprovalMode,
     pub workspace: WorkspacePolicy,
     pub limits: Limits,
+    pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
     pub agents: BTreeMap<String, AgentProfile>,
 }
@@ -236,10 +364,19 @@ pub struct EffectiveConfig {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     schema_version: Option<u32>,
+    preset: Option<String>,
     approval_mode: Option<ApprovalMode>,
     workspace: Option<RawWorkspacePolicy>,
     limits: Option<RawLimits>,
+    council: Option<RawCouncilConfig>,
     runtimes: Option<BTreeMap<String, RawRuntimeConfig>>,
+    presets: Option<BTreeMap<String, RawPreset>>,
+    agents: Option<BTreeMap<String, RawAgentProfile>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPreset {
     agents: Option<BTreeMap<String, RawAgentProfile>>,
 }
 
@@ -263,6 +400,27 @@ struct RawLimits {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawCouncilConfig {
+    default_preset: Option<String>,
+    timeout_seconds: Option<u64>,
+    execution_mode: Option<CouncilExecutionMode>,
+    presets: Option<BTreeMap<String, BTreeMap<String, RawCouncilMember>>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCouncilMember {
+    runtime: Option<String>,
+    model: Option<String>,
+    model_fallbacks: Option<Vec<String>>,
+    effort: Option<AgentEffort>,
+    thinking: Option<bool>,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawRuntimeConfig {
     #[serde(rename = "type")]
     runtime_type: Option<RuntimeKind>,
@@ -277,13 +435,19 @@ struct RawRuntimeConfig {
 #[serde(deny_unknown_fields)]
 struct RawAgentProfile {
     name: Option<String>,
+    display_name: Option<String>,
     runtime: Option<String>,
     model: Option<String>,
+    model_fallbacks: Option<Vec<String>>,
     effort: Option<AgentEffort>,
     thinking: Option<bool>,
     capabilities: Option<Vec<Capability>>,
+    tools: Option<Vec<ToolName>>,
     instructions: Option<String>,
     instructions_file: Option<PathBuf>,
+    instructions_append_file: Option<PathBuf>,
+    orchestrator_description: Option<String>,
+    orchestrator_description_file: Option<PathBuf>,
     enabled: Option<bool>,
 }
 
@@ -291,6 +455,15 @@ struct RawAgentProfile {
 enum InstructionSource {
     Inline(String),
     File(PathBuf),
+}
+
+impl InstructionSource {
+    fn path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Inline(_) => None,
+            Self::File(path) => Some(path.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -308,22 +481,68 @@ struct MergedAgentProfile {
     name: Option<String>,
     runtime: Option<String>,
     model: Option<String>,
+    model_fallbacks: Option<Vec<String>>,
     effort: Option<AgentEffort>,
     thinking: Option<bool>,
     capabilities: Option<Vec<Capability>>,
+    tools: Option<Vec<ToolName>>,
     instruction_source: Option<InstructionSource>,
+    instruction_append_source: Option<InstructionSource>,
+    orchestrator_description_source: Option<InstructionSource>,
     enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+struct MergedCouncilConfig {
+    default_preset: String,
+    timeout_seconds: u64,
+    execution_mode: CouncilExecutionMode,
+    presets: BTreeMap<String, BTreeMap<String, MergedCouncilMember>>,
+}
+
+#[derive(Clone, Debug)]
+struct MergedCouncilMember {
+    runtime: Option<String>,
+    model: Option<String>,
+    model_fallbacks: Option<Vec<String>>,
+    effort: Option<AgentEffort>,
+    thinking: Option<bool>,
+    prompt_source: Option<InstructionSource>,
+}
+
+#[derive(Clone, Debug)]
+struct RawPresetDefinition {
+    source_dir: PathBuf,
+    source_name: String,
+    preset: RawPreset,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPresetSelection {
+    name: String,
+    agent_layer_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PendingAgentLayer {
+    source_dir: PathBuf,
+    source_name: String,
+    agents: BTreeMap<String, RawAgentProfile>,
 }
 
 #[derive(Clone, Debug)]
 struct MergedConfig {
     working_directory: PathBuf,
     config_sources: Vec<PathBuf>,
+    active_preset: Option<PendingPresetSelection>,
     approval_mode: ApprovalMode,
     workspace: WorkspacePolicy,
     limits: Limits,
+    council: MergedCouncilConfig,
     runtimes: BTreeMap<String, MergedRuntimeConfig>,
+    presets: BTreeMap<String, RawPresetDefinition>,
     agents: BTreeMap<String, MergedAgentProfile>,
+    agent_layers: Vec<PendingAgentLayer>,
 }
 
 impl MergedConfig {
@@ -364,6 +583,8 @@ impl MergedConfig {
                 thinking: true,
                 capabilities: vec![Capability::Plan],
                 instructions: "Own the run plan, choose specialized agents, ask clarifying questions, and decide when the run is complete.",
+                orchestrator_description: None,
+                enabled: true,
             },
         );
         insert_builtin_agent(
@@ -376,7 +597,9 @@ impl MergedConfig {
                 effort: AgentEffort::Medium,
                 thinking: false,
                 capabilities: vec![Capability::Read],
-                instructions: "Read code, documentation, repository state, and session context without changing files.",
+                instructions: "Read code, documentation, repository state, optional codemap.md files, and session context without changing files. Treat codemap.md as user-editable and verify source files when freshness matters.",
+                orchestrator_description: None,
+                enabled: true,
             },
         );
         insert_builtin_agent(
@@ -390,6 +613,8 @@ impl MergedConfig {
                 thinking: true,
                 capabilities: vec![Capability::Read, Capability::Answer],
                 instructions: "Answer design or implementation questions from gathered context inside the typed result envelope.",
+                orchestrator_description: None,
+                enabled: true,
             },
         );
         insert_builtin_agent(
@@ -404,6 +629,8 @@ impl MergedConfig {
                 capabilities: vec![Capability::Read, Capability::Challenge],
                 instructions:
                     "Challenge plans, architecture, and domain decisions before work proceeds.",
+                orchestrator_description: None,
+                enabled: true,
             },
         );
         insert_builtin_agent(
@@ -422,6 +649,8 @@ impl MergedConfig {
                     Capability::Verify,
                 ],
                 instructions: "Apply scoped file changes through harness actions and run targeted verification.",
+                orchestrator_description: None,
+                enabled: true,
             },
         );
         insert_builtin_agent(
@@ -441,17 +670,57 @@ impl MergedConfig {
                 ],
                 instructions:
                     "Review changes for bugs, regressions, and missing tests without editing files.",
+                orchestrator_description: None,
+                enabled: true,
+            },
+        );
+        insert_builtin_agent(
+            &mut agents,
+            BuiltinAgent {
+                id: "librarian",
+                name: "Librarian",
+                runtime: "zai",
+                model: "glm-5.1",
+                effort: AgentEffort::Medium,
+                thinking: true,
+                capabilities: vec![Capability::Read, Capability::Answer],
+                instructions: "Research current official documentation and APIs. Return cited answers without editing files or running commands.",
+                orchestrator_description: Some(
+                    "Use for current official documentation, API lookup, and library research; do not use for edits or shell commands.",
+                ),
+                enabled: false,
+            },
+        );
+        insert_builtin_agent(
+            &mut agents,
+            BuiltinAgent {
+                id: "designer",
+                name: "Designer",
+                runtime: "codex",
+                model: "default",
+                effort: AgentEffort::High,
+                thinking: false,
+                capabilities: vec![Capability::Read, Capability::Edit, Capability::Verify],
+                instructions: "Work on user-facing UI and TUI changes through harness actions, preserving accessibility and verification evidence.",
+                orchestrator_description: Some(
+                    "Use for user-facing UI/TUI implementation and polish; do not use for backend-only or non-visual changes.",
+                ),
+                enabled: false,
             },
         );
 
         Self {
             working_directory,
             config_sources: Vec::new(),
+            active_preset: None,
             approval_mode: ApprovalMode::Yolo,
             workspace: WorkspacePolicy::default(),
             limits: Limits::default(),
+            council: builtin_council_config(),
             runtimes,
+            presets: BTreeMap::new(),
             agents,
+            agent_layers: Vec::new(),
         }
     }
 
@@ -502,16 +771,182 @@ impl MergedConfig {
             }
         }
 
+        if let Some(council) = raw.council {
+            self.apply_council(council, source_dir, source_name)?;
+        }
+
         if let Some(runtimes) = raw.runtimes {
             for (runtime_id, runtime) in runtimes {
                 self.apply_runtime(runtime_id, runtime, source_name)?;
             }
         }
 
-        if let Some(agents) = raw.agents {
-            for (agent_id, agent) in agents {
-                self.apply_agent(agent_id, agent, source_dir, source_name)?;
+        if let Some(presets) = raw.presets {
+            for (preset_name, preset) in presets {
+                self.presets.insert(
+                    preset_name,
+                    RawPresetDefinition {
+                        source_dir: source_dir.to_path_buf(),
+                        source_name: source_name.to_string(),
+                        preset,
+                    },
+                );
             }
+        }
+
+        if let Some(preset) = raw.preset {
+            self.active_preset = Some(PendingPresetSelection {
+                name: preset,
+                agent_layer_index: self.agent_layers.len(),
+            });
+        }
+
+        if let Some(agents) = raw.agents {
+            self.agent_layers.push(PendingAgentLayer {
+                source_dir: source_dir.to_path_buf(),
+                source_name: source_name.to_string(),
+                agents,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn apply_pending_agent_layers(&mut self) -> Result<()> {
+        let active_preset = self.active_preset.clone();
+        let agent_layers = std::mem::take(&mut self.agent_layers);
+        let agent_layer_count = agent_layers.len();
+
+        for (layer_index, layer) in agent_layers.into_iter().enumerate() {
+            if let Some(preset) = active_preset
+                .as_ref()
+                .filter(|preset| preset.agent_layer_index == layer_index)
+            {
+                self.apply_preset(&preset.name)?;
+            }
+            self.apply_agent_layer(layer)?;
+        }
+
+        if let Some(preset) = active_preset
+            .as_ref()
+            .filter(|preset| preset.agent_layer_index == agent_layer_count)
+        {
+            self.apply_preset(&preset.name)?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_agent_layer(&mut self, layer: PendingAgentLayer) -> Result<()> {
+        for (agent_id, agent) in layer.agents {
+            self.apply_agent(agent_id, agent, &layer.source_dir, &layer.source_name)?;
+        }
+        Ok(())
+    }
+
+    fn apply_preset(&mut self, preset_name: &str) -> Result<()> {
+        let definition = self
+            .presets
+            .get(preset_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("selected preset {preset_name} is not defined"))?;
+        let source_name = format!("preset {preset_name} in {}", definition.source_name);
+        if let Some(agents) = definition.preset.agents {
+            for (agent_id, agent) in agents {
+                self.apply_agent(agent_id, agent, &definition.source_dir, &source_name)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_council(
+        &mut self,
+        raw: RawCouncilConfig,
+        source_dir: &Path,
+        source_name: &str,
+    ) -> Result<()> {
+        if let Some(default_preset) = raw.default_preset {
+            if default_preset.trim().is_empty() {
+                bail!("council default_preset in {source_name} cannot be empty");
+            }
+            self.council.default_preset = default_preset;
+        }
+        if let Some(timeout_seconds) = raw.timeout_seconds {
+            if timeout_seconds == 0 {
+                bail!("council timeout_seconds in {source_name} must be positive");
+            }
+            self.council.timeout_seconds = timeout_seconds;
+        }
+        if let Some(execution_mode) = raw.execution_mode {
+            self.council.execution_mode = execution_mode;
+        }
+        if let Some(presets) = raw.presets {
+            for (preset_name, members) in presets {
+                for (member_id, member) in members {
+                    self.apply_council_member(
+                        &preset_name,
+                        member_id,
+                        member,
+                        source_dir,
+                        source_name,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_council_member(
+        &mut self,
+        preset_name: &str,
+        member_id: String,
+        raw: RawCouncilMember,
+        source_dir: &Path,
+        source_name: &str,
+    ) -> Result<()> {
+        if raw.prompt.is_some() && raw.prompt_file.is_some() {
+            bail!(
+                "council member {member_id} in preset {preset_name} in {source_name} sets both prompt and prompt_file"
+            );
+        }
+        let entry = self
+            .council
+            .presets
+            .entry(preset_name.to_string())
+            .or_default()
+            .entry(member_id)
+            .or_insert(MergedCouncilMember {
+                runtime: None,
+                model: None,
+                model_fallbacks: None,
+                effort: None,
+                thinking: None,
+                prompt_source: None,
+            });
+
+        if let Some(runtime) = raw.runtime {
+            entry.runtime = Some(runtime);
+        }
+        if let Some(model) = raw.model {
+            entry.model = Some(model);
+        }
+        if let Some(model_fallbacks) = raw.model_fallbacks {
+            entry.model_fallbacks = Some(model_fallbacks);
+        }
+        if let Some(effort) = raw.effort {
+            entry.effort = Some(effort);
+        }
+        if let Some(thinking) = raw.thinking {
+            entry.thinking = Some(thinking);
+        }
+        if let Some(prompt) = raw.prompt {
+            entry.prompt_source = Some(InstructionSource::Inline(prompt));
+        }
+        if let Some(prompt_file) = raw.prompt_file {
+            entry.prompt_source = Some(InstructionSource::File(resolve_config_path(
+                source_dir,
+                prompt_file,
+            )));
         }
 
         Ok(())
@@ -576,6 +1011,14 @@ impl MergedConfig {
         if raw.instructions.is_some() && raw.instructions_file.is_some() {
             bail!("agent {agent_id} in {source_name} sets both instructions and instructions_file");
         }
+        if raw.name.is_some() && raw.display_name.is_some() {
+            bail!("agent {agent_id} in {source_name} sets both name and display_name");
+        }
+        if raw.orchestrator_description.is_some() && raw.orchestrator_description_file.is_some() {
+            bail!(
+                "agent {agent_id} in {source_name} sets both orchestrator_description and orchestrator_description_file"
+            );
+        }
 
         let entry = self
             .agents
@@ -584,14 +1027,18 @@ impl MergedConfig {
                 name: None,
                 runtime: None,
                 model: None,
+                model_fallbacks: None,
                 effort: None,
                 thinking: None,
                 capabilities: None,
+                tools: None,
                 instruction_source: None,
+                instruction_append_source: None,
+                orchestrator_description_source: None,
                 enabled: None,
             });
 
-        if let Some(name) = raw.name {
+        if let Some(name) = raw.display_name.or(raw.name) {
             entry.name = Some(name);
         }
         if let Some(runtime) = raw.runtime {
@@ -599,6 +1046,9 @@ impl MergedConfig {
         }
         if let Some(model) = raw.model {
             entry.model = Some(model);
+        }
+        if let Some(model_fallbacks) = raw.model_fallbacks {
+            entry.model_fallbacks = Some(model_fallbacks);
         }
         if let Some(effort) = raw.effort {
             entry.effort = Some(effort);
@@ -609,6 +1059,9 @@ impl MergedConfig {
         if let Some(capabilities) = raw.capabilities {
             entry.capabilities = Some(capabilities);
         }
+        if let Some(tools) = raw.tools {
+            entry.tools = Some(tools);
+        }
         if let Some(instructions) = raw.instructions {
             entry.instruction_source = Some(InstructionSource::Inline(instructions));
         }
@@ -618,6 +1071,21 @@ impl MergedConfig {
                 instructions_file,
             )));
         }
+        if let Some(instructions_append_file) = raw.instructions_append_file {
+            entry.instruction_append_source = Some(InstructionSource::File(resolve_config_path(
+                source_dir,
+                instructions_append_file,
+            )));
+        }
+        if let Some(orchestrator_description) = raw.orchestrator_description {
+            entry.orchestrator_description_source =
+                Some(InstructionSource::Inline(orchestrator_description));
+        }
+        if let Some(orchestrator_description_file) = raw.orchestrator_description_file {
+            entry.orchestrator_description_source = Some(InstructionSource::File(
+                resolve_config_path(source_dir, orchestrator_description_file),
+            ));
+        }
         if let Some(enabled) = raw.enabled {
             entry.enabled = Some(enabled);
         }
@@ -625,7 +1093,13 @@ impl MergedConfig {
         Ok(())
     }
 
-    fn into_effective(self) -> Result<EffectiveConfig> {
+    fn into_effective(mut self) -> Result<EffectiveConfig> {
+        self.apply_pending_agent_layers()?;
+        let active_preset = self
+            .active_preset
+            .as_ref()
+            .map(|preset| preset.name.clone());
+
         let mut runtimes = BTreeMap::new();
         for (id, runtime) in self.runtimes {
             let kind = runtime
@@ -684,17 +1158,36 @@ impl MergedConfig {
                 bail!("agent {id} points at undefined runtime {runtime}");
             }
 
+            let model = agent.model.unwrap_or_else(|| "default".to_string());
+            validate_model_name(&model).with_context(|| format!("invalid model for agent {id}"))?;
+            let model_fallbacks = agent.model_fallbacks.unwrap_or_default();
+            validate_model_fallbacks(&id, &model, &model_fallbacks)?;
             let capabilities = agent
                 .capabilities
                 .ok_or_else(|| anyhow!("agent {id} is missing required field capabilities"))?;
             let instruction_source = agent
                 .instruction_source
                 .ok_or_else(|| anyhow!("agent {id} is missing instructions"))?;
-            let instructions = match instruction_source {
-                InstructionSource::Inline(instructions) => instructions,
-                InstructionSource::File(path) => fs::read_to_string(&path).with_context(|| {
-                    format!("failed to read instructions_file {}", path.display())
-                })?,
+            let mut prompt_metadata = AgentPromptMetadata {
+                instructions_file: instruction_source.path(),
+                instructions_append_file: None,
+                orchestrator_description_file: None,
+            };
+            let mut instructions = read_prompt_source(&instruction_source, "instructions_file")?;
+            if let Some(append_source) = agent.instruction_append_source {
+                prompt_metadata.instructions_append_file = append_source.path();
+                let appended = read_prompt_source(&append_source, "instructions_append_file")?;
+                append_instruction_text(&mut instructions, &appended);
+            }
+            let orchestrator_description = match agent.orchestrator_description_source {
+                Some(source) => {
+                    prompt_metadata.orchestrator_description_file = source.path();
+                    Some(read_prompt_source(
+                        &source,
+                        "orchestrator_description_file",
+                    )?)
+                }
+                None => None,
             };
 
             agents.insert(
@@ -703,25 +1196,98 @@ impl MergedConfig {
                     id: id.clone(),
                     name: agent.name.unwrap_or_else(|| title_case_id(&id)),
                     runtime,
-                    model: agent.model.unwrap_or_else(|| "default".to_string()),
+                    model,
+                    model_fallbacks,
                     effort: agent.effort.unwrap_or_default(),
                     thinking: agent.thinking.unwrap_or(false),
                     capabilities,
+                    tools: agent.tools,
                     instructions,
+                    orchestrator_description,
+                    prompt_metadata,
                     enabled: agent.enabled.unwrap_or(true),
                 },
             );
         }
 
+        let council = Self::into_effective_council(self.council, &runtimes)?;
+
         Ok(EffectiveConfig {
             schema_version: 1,
             working_directory: self.working_directory,
             config_sources: self.config_sources,
+            active_preset,
             approval_mode: self.approval_mode,
             workspace: self.workspace,
             limits: self.limits,
+            council,
             runtimes,
             agents,
+        })
+    }
+
+    fn into_effective_council(
+        council: MergedCouncilConfig,
+        runtimes: &BTreeMap<String, RuntimeConfig>,
+    ) -> Result<CouncilConfig> {
+        if !council.presets.contains_key(&council.default_preset) {
+            bail!(
+                "council default_preset {} is not defined",
+                council.default_preset
+            );
+        }
+
+        let mut presets = BTreeMap::new();
+        for (preset_name, members) in council.presets {
+            let mut effective_members = BTreeMap::new();
+            for (member_id, member) in members {
+                let runtime = member.runtime.ok_or_else(|| {
+                    anyhow!("council member {member_id} in preset {preset_name} is missing runtime")
+                })?;
+                if !runtimes.contains_key(&runtime) {
+                    bail!(
+                        "council member {member_id} in preset {preset_name} points at undefined runtime {runtime}"
+                    );
+                }
+                let model = member.model.unwrap_or_else(|| "default".to_string());
+                validate_model_name(&model).with_context(|| {
+                    format!("invalid model for council member {member_id} in preset {preset_name}")
+                })?;
+                let model_fallbacks = member.model_fallbacks.unwrap_or_default();
+                validate_model_fallbacks(
+                    &format!("council.{preset_name}.{member_id}"),
+                    &model,
+                    &model_fallbacks,
+                )?;
+                let prompt_source = member.prompt_source.ok_or_else(|| {
+                    anyhow!("council member {member_id} in preset {preset_name} is missing prompt")
+                })?;
+                let prompt_metadata = CouncilPromptMetadata {
+                    prompt_file: prompt_source.path(),
+                };
+                let prompt = read_prompt_source(&prompt_source, "council prompt_file")?;
+                effective_members.insert(
+                    member_id.clone(),
+                    CouncilMemberProfile {
+                        id: member_id,
+                        runtime,
+                        model,
+                        model_fallbacks,
+                        effort: member.effort.unwrap_or_default(),
+                        thinking: member.thinking.unwrap_or(false),
+                        prompt,
+                        prompt_metadata,
+                    },
+                );
+            }
+            presets.insert(preset_name, effective_members);
+        }
+
+        Ok(CouncilConfig {
+            default_preset: council.default_preset,
+            timeout_seconds: council.timeout_seconds,
+            execution_mode: council.execution_mode,
+            presets,
         })
     }
 }
@@ -735,6 +1301,69 @@ struct BuiltinAgent {
     thinking: bool,
     capabilities: Vec<Capability>,
     instructions: &'static str,
+    orchestrator_description: Option<&'static str>,
+    enabled: bool,
+}
+
+struct BuiltinCouncilMember {
+    id: &'static str,
+    runtime: &'static str,
+    model: &'static str,
+    effort: AgentEffort,
+    thinking: bool,
+    prompt: &'static str,
+}
+
+fn builtin_council_config() -> MergedCouncilConfig {
+    let mut default_members = BTreeMap::new();
+    for member in [
+        BuiltinCouncilMember {
+            id: "architect",
+            runtime: "zai",
+            model: "glm-5.1",
+            effort: AgentEffort::High,
+            thinking: true,
+            prompt: "Evaluate architecture, maintainability, coupling, and migration risks. Return a concrete recommendation with dissent if important.",
+        },
+        BuiltinCouncilMember {
+            id: "security",
+            runtime: "zai",
+            model: "glm-5.1",
+            effort: AgentEffort::High,
+            thinking: true,
+            prompt: "Evaluate security, data exposure, dependency, and abuse-case risks. Return concrete blockers and mitigations.",
+        },
+        BuiltinCouncilMember {
+            id: "reviewer",
+            runtime: "zai",
+            model: "glm-5.1",
+            effort: AgentEffort::Medium,
+            thinking: true,
+            prompt: "Evaluate correctness, testability, rollout risk, and user impact. Return the safest next action.",
+        },
+    ] {
+        default_members.insert(
+            member.id.to_string(),
+            MergedCouncilMember {
+                runtime: Some(member.runtime.to_string()),
+                model: Some(member.model.to_string()),
+                model_fallbacks: Some(Vec::new()),
+                effort: Some(member.effort),
+                thinking: Some(member.thinking),
+                prompt_source: Some(InstructionSource::Inline(member.prompt.to_string())),
+            },
+        );
+    }
+
+    let mut presets = BTreeMap::new();
+    presets.insert("default".to_string(), default_members);
+
+    MergedCouncilConfig {
+        default_preset: "default".to_string(),
+        timeout_seconds: 900,
+        execution_mode: CouncilExecutionMode::Serial,
+        presets,
+    }
 }
 
 fn insert_builtin_agent(agents: &mut BTreeMap<String, MergedAgentProfile>, agent: BuiltinAgent) {
@@ -744,11 +1373,17 @@ fn insert_builtin_agent(agents: &mut BTreeMap<String, MergedAgentProfile>, agent
             name: Some(agent.name.to_string()),
             runtime: Some(agent.runtime.to_string()),
             model: Some(agent.model.to_string()),
+            model_fallbacks: Some(Vec::new()),
             effort: Some(agent.effort),
             thinking: Some(agent.thinking),
             capabilities: Some(agent.capabilities),
+            tools: None,
             instruction_source: Some(InstructionSource::Inline(agent.instructions.to_string())),
-            enabled: Some(true),
+            instruction_append_source: None,
+            orchestrator_description_source: agent
+                .orchestrator_description
+                .map(|description| InstructionSource::Inline(description.to_string())),
+            enabled: Some(agent.enabled),
         },
     );
 }
@@ -814,6 +1449,39 @@ fn resolve_config_path(source_dir: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
+fn read_prompt_source(source: &InstructionSource, file_label: &str) -> Result<String> {
+    match source {
+        InstructionSource::Inline(value) => Ok(value.clone()),
+        InstructionSource::File(path) => fs::read_to_string(path)
+            .with_context(|| format!("failed to read {file_label} {}", path.display())),
+    }
+}
+
+fn append_instruction_text(base: &mut String, appended: &str) {
+    if !base.ends_with('\n') {
+        base.push('\n');
+    }
+    base.push_str(appended);
+}
+
+fn validate_model_name(model: &str) -> Result<()> {
+    if model.trim().is_empty() {
+        bail!("model cannot be empty");
+    }
+    Ok(())
+}
+
+fn validate_model_fallbacks(agent_id: &str, model: &str, fallbacks: &[String]) -> Result<()> {
+    for fallback in fallbacks {
+        validate_model_name(fallback)
+            .with_context(|| format!("agent {agent_id} has an invalid fallback model"))?;
+        if fallback == model {
+            bail!("agent {agent_id} repeats its primary model in model_fallbacks");
+        }
+    }
+    Ok(())
+}
+
 fn validate_env_reference(value: &str) -> Result<()> {
     if value.is_empty() {
         bail!("credential reference cannot be empty");
@@ -845,9 +1513,12 @@ fn title_case_id(id: &str) -> String {
 #[derive(Clone, Debug, Serialize)]
 struct PrintableConfig {
     schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preset: Option<String>,
     approval_mode: ApprovalMode,
     workspace: WorkspacePolicy,
     limits: Limits,
+    council: PrintableCouncilConfig,
     runtimes: BTreeMap<String, PrintableRuntime>,
     agents: BTreeMap<String, PrintableAgent>,
 }
@@ -870,22 +1541,94 @@ struct PrintableRuntime {
 
 #[derive(Clone, Debug, Serialize)]
 struct PrintableAgent {
-    name: String,
+    display_name: String,
     runtime: String,
     model: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    model_fallbacks: Vec<String>,
     effort: AgentEffort,
     thinking: bool,
     capabilities: Vec<Capability>,
-    instructions: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolName>>,
+    prompt_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions_append_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orchestrator_description_file: Option<PathBuf>,
     enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PrintableCouncilConfig {
+    default_preset: String,
+    timeout_seconds: u64,
+    execution_mode: CouncilExecutionMode,
+    presets: BTreeMap<String, BTreeMap<String, PrintableCouncilMember>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PrintableCouncilMember {
+    runtime: String,
+    model: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    model_fallbacks: Vec<String>,
+    effort: AgentEffort,
+    thinking: bool,
+    prompt_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_file: Option<PathBuf>,
 }
 
 pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
     let printable = PrintableConfig {
         schema_version: config.schema_version,
+        preset: config.active_preset.clone(),
         approval_mode: config.approval_mode.clone(),
         workspace: config.workspace.clone(),
         limits: config.limits.clone(),
+        council: PrintableCouncilConfig {
+            default_preset: config.council.default_preset.clone(),
+            timeout_seconds: config.council.timeout_seconds,
+            execution_mode: config.council.execution_mode.clone(),
+            presets: config
+                .council
+                .presets
+                .iter()
+                .map(|(preset, members)| {
+                    (
+                        preset.clone(),
+                        members
+                            .iter()
+                            .map(|(id, member)| {
+                                (
+                                    id.clone(),
+                                    PrintableCouncilMember {
+                                        runtime: member.runtime.clone(),
+                                        model: member.model.clone(),
+                                        model_fallbacks: member.model_fallbacks.clone(),
+                                        effort: member.effort.clone(),
+                                        thinking: member.thinking,
+                                        prompt_source: if member
+                                            .prompt_metadata
+                                            .prompt_file
+                                            .is_some()
+                                        {
+                                            "file".to_string()
+                                        } else {
+                                            "inline_redacted".to_string()
+                                        },
+                                        prompt_file: member.prompt_metadata.prompt_file.clone(),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        },
         runtimes: config
             .runtimes
             .iter()
@@ -913,13 +1656,24 @@ pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
                 (
                     id.clone(),
                     PrintableAgent {
-                        name: agent.name.clone(),
+                        display_name: agent.name.clone(),
                         runtime: agent.runtime.clone(),
                         model: agent.model.clone(),
+                        model_fallbacks: agent.model_fallbacks.clone(),
                         effort: agent.effort.clone(),
                         thinking: agent.thinking,
                         capabilities: agent.capabilities.clone(),
-                        instructions: agent.instructions.clone(),
+                        tools: agent.tools.clone(),
+                        prompt_source: prompt_source_label(&agent.prompt_metadata),
+                        instructions_file: agent.prompt_metadata.instructions_file.clone(),
+                        instructions_append_file: agent
+                            .prompt_metadata
+                            .instructions_append_file
+                            .clone(),
+                        orchestrator_description_file: agent
+                            .prompt_metadata
+                            .orchestrator_description_file
+                            .clone(),
                         enabled: agent.enabled,
                     },
                 )
@@ -928,6 +1682,14 @@ pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
     };
 
     toml::to_string_pretty(&printable).context("failed to render effective configuration")
+}
+
+fn prompt_source_label(metadata: &AgentPromptMetadata) -> String {
+    if metadata.instructions_file.is_some() {
+        "file".to_string()
+    } else {
+        "inline_redacted".to_string()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -993,6 +1755,32 @@ max_step_minutes = 10
 max_command_minutes = 10
 max_review_fix_cycles = 2
 
+[council]
+default_preset = "default"
+timeout_seconds = 900
+execution_mode = "serial"
+
+[council.presets.default.architect]
+runtime = "zai"
+model = "glm-5.1"
+effort = "high"
+thinking = true
+prompt_file = "agents/council-architect.md"
+
+[council.presets.default.security]
+runtime = "zai"
+model = "glm-5.1"
+effort = "high"
+thinking = true
+prompt_file = "agents/council-security.md"
+
+[council.presets.default.reviewer]
+runtime = "zai"
+model = "glm-5.1"
+effort = "medium"
+thinking = true
+prompt_file = "agents/council-reviewer.md"
+
 [agents.orchestrator]
 runtime = "zai"
 model = "glm-5.1"
@@ -1040,6 +1828,25 @@ effort = "high"
 thinking = false
 capabilities = ["read", "command", "verify", "review"]
 instructions_file = "agents/reviewer.md"
+
+[agents.librarian]
+runtime = "zai"
+model = "glm-5.1"
+effort = "medium"
+thinking = true
+capabilities = ["read", "answer"]
+instructions_file = "agents/librarian.md"
+enabled = false
+
+[agents.designer]
+runtime = "codex"
+model = "default"
+effort = "high"
+thinking = false
+capabilities = ["read", "edit", "verify"]
+instructions_file = "agents/designer.md"
+orchestrator_description = "Use for user-facing UI/TUI implementation and polish; do not use for backend-only or non-visual changes."
+enabled = false
 "#
     .to_string()
 }
@@ -1052,7 +1859,7 @@ fn starter_instruction_files() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "explorer",
-            "Read repository context without changing files and return structured findings.",
+            "Read repository context and optional codemap.md files without changing files. Treat codemap.md as user-editable and verify source files when freshness matters.",
         ),
         (
             "oracle",
@@ -1069,6 +1876,26 @@ fn starter_instruction_files() -> Vec<(&'static str, &'static str)> {
         (
             "reviewer",
             "Review diffs and verification evidence without editing files.",
+        ),
+        (
+            "librarian",
+            "Research current official documentation and APIs. Return cited answers without editing files or running commands.",
+        ),
+        (
+            "designer",
+            "Work on user-facing UI and TUI changes through harness actions, preserving accessibility and verification evidence.",
+        ),
+        (
+            "council-architect",
+            "Evaluate architecture, maintainability, coupling, and migration risks. Return a concrete recommendation with dissent if important.",
+        ),
+        (
+            "council-security",
+            "Evaluate security, data exposure, dependency, and abuse-case risks. Return concrete blockers and mitigations.",
+        ),
+        (
+            "council-reviewer",
+            "Evaluate correctness, testability, rollout risk, and user impact. Return the safest next action.",
         ),
     ]
 }
@@ -1148,6 +1975,9 @@ mod tests {
         assert_eq!(config.approval_mode, ApprovalMode::Yolo);
         assert_eq!(config.agents["orchestrator"].effort, AgentEffort::High);
         assert!(config.agents["orchestrator"].thinking);
+        assert_eq!(config.council.default_preset, "default");
+        assert_eq!(config.council.execution_mode, CouncilExecutionMode::Serial);
+        assert!(config.council.presets["default"].contains_key("architect"));
     }
 
     #[test]
@@ -1176,6 +2006,176 @@ capabilities = ["read"]
         .unwrap();
         let fixer = config.agents.get("fixer").unwrap();
         assert_eq!(fixer.capabilities, vec![Capability::Read]);
+    }
+
+    #[test]
+    fn selected_preset_applies_before_local_agent_overrides() {
+        let dir = tempdir().unwrap();
+        let home_config = dir.path().join("home.toml");
+        fs::write(
+            &home_config,
+            r#"
+preset = "fast"
+
+[presets.fast.agents.fixer]
+model = "preset-model"
+model_fallbacks = ["preset-fallback"]
+effort = "minimal"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("multiagent.toml"),
+            r#"
+[agents.fixer]
+model = "local-model"
+"#,
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(home_config),
+        })
+        .unwrap();
+
+        let fixer = config.agents.get("fixer").unwrap();
+        assert_eq!(config.active_preset.as_deref(), Some("fast"));
+        assert_eq!(fixer.model, "local-model");
+        assert_eq!(fixer.model_fallbacks, vec!["preset-fallback"]);
+        assert_eq!(fixer.effort, AgentEffort::Minimal);
+    }
+
+    #[test]
+    fn later_preset_selection_does_not_leak_earlier_preset_agent_fields() {
+        let dir = tempdir().unwrap();
+        let home_config = dir.path().join("home.toml");
+        fs::write(
+            &home_config,
+            r#"
+preset = "fast"
+
+[presets.fast.agents.fixer]
+model = "fast-model"
+model_fallbacks = ["fast-fallback"]
+effort = "minimal"
+
+[presets.accurate.agents.fixer]
+effort = "high"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("multiagent.toml"),
+            r#"
+preset = "accurate"
+"#,
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(home_config),
+        })
+        .unwrap();
+
+        let fixer = config.agents.get("fixer").unwrap();
+        assert_eq!(config.active_preset.as_deref(), Some("accurate"));
+        assert_eq!(fixer.model, "default");
+        assert!(fixer.model_fallbacks.is_empty());
+        assert_eq!(fixer.effort, AgentEffort::High);
+    }
+
+    #[test]
+    fn prompt_append_and_orchestrator_description_files_resolve_from_config_dir() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("agents")).unwrap();
+        fs::write(dir.path().join("agents/base.md"), "base instructions").unwrap();
+        fs::write(dir.path().join("agents/append.md"), "append instructions").unwrap();
+        fs::write(
+            dir.path().join("agents/route.md"),
+            "route to fixer for edits",
+        )
+        .unwrap();
+        let config_path = dir.path().join("custom.toml");
+        fs::write(
+            &config_path,
+            r#"
+[agents.fixer]
+instructions_file = "agents/base.md"
+instructions_append_file = "agents/append.md"
+orchestrator_description_file = "agents/route.md"
+"#,
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let fixer = config.agents.get("fixer").unwrap();
+        assert_eq!(fixer.instructions, "base instructions\nappend instructions");
+        assert_eq!(
+            fixer.orchestrator_description.as_deref(),
+            Some("route to fixer for edits")
+        );
+        assert!(fixer
+            .prompt_metadata
+            .instructions_file
+            .as_ref()
+            .unwrap()
+            .ends_with("agents/base.md"));
+        assert!(fixer
+            .prompt_metadata
+            .instructions_append_file
+            .as_ref()
+            .unwrap()
+            .ends_with("agents/append.md"));
+    }
+
+    #[test]
+    fn council_prompt_files_resolve_and_print_config_redacts_prompt_bodies() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("council")).unwrap();
+        fs::write(
+            dir.path().join("council/architect.md"),
+            "private council prompt",
+        )
+        .unwrap();
+        let config_path = dir.path().join("custom.toml");
+        fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[council]
+default_preset = "local"
+timeout_seconds = 5
+execution_mode = "serial"
+
+[council.presets.local.architect]
+runtime = "fake"
+model = "default"
+prompt_file = "council/architect.md"
+"#,
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let architect = &config.council.presets["local"]["architect"];
+        let rendered = to_redacted_toml(&config).unwrap();
+
+        assert_eq!(architect.prompt, "private council prompt");
+        assert!(rendered.contains("prompt_file"));
+        assert!(rendered.contains("council/architect.md"));
+        assert!(!rendered.contains("private council prompt"));
     }
 
     #[test]
@@ -1246,6 +2246,78 @@ api_key_env = "sk-secret"
         assert!(rendered.contains("api_key_env = \"ZAI_API_KEY\""));
         assert!(rendered.contains("effort = \"high\""));
         assert!(rendered.contains("thinking = true"));
+        assert!(rendered.contains("prompt_source = \"inline_redacted\""));
+        assert!(!rendered.contains("Own the run plan"));
         assert!(!rendered.contains("Bearer"));
+    }
+
+    #[test]
+    fn redacted_toml_shows_prompt_file_paths_without_prompt_bodies() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("agents")).unwrap();
+        fs::write(dir.path().join("agents/fixer.md"), "secret prompt body").unwrap();
+        let config_path = dir.path().join("custom.toml");
+        fs::write(
+            &config_path,
+            r#"
+[agents.fixer]
+instructions_file = "agents/fixer.md"
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let rendered = to_redacted_toml(&config).unwrap();
+
+        assert!(rendered.contains("instructions_file"));
+        assert!(rendered.contains("agents/fixer.md"));
+        assert!(!rendered.contains("secret prompt body"));
+    }
+
+    #[test]
+    fn librarian_is_available_but_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("empty-home.toml");
+        fs::write(&config_path, "schema_version = 1\n").unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let librarian = config.agents.get("librarian").unwrap();
+
+        assert!(!librarian.enabled);
+        assert_eq!(
+            librarian.capabilities,
+            vec![Capability::Read, Capability::Answer]
+        );
+    }
+
+    #[test]
+    fn designer_is_available_but_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("empty-home.toml");
+        fs::write(&config_path, "schema_version = 1\n").unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let designer = config.agents.get("designer").unwrap();
+
+        assert!(!designer.enabled);
+        assert_eq!(
+            designer.capabilities,
+            vec![Capability::Read, Capability::Edit, Capability::Verify]
+        );
+        assert!(designer
+            .orchestrator_description
+            .as_deref()
+            .unwrap()
+            .contains("do not use for backend-only"));
     }
 }

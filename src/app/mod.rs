@@ -3,15 +3,20 @@ use crate::actions::{
     vcs_action_explicitly_requested, ActionDecision, ActionExecutionContext, ActionKind,
     ActionRequest, ActionResult, ActionStatus,
 };
-use crate::config::{AgentProfile, ApprovalMode, EffectiveConfig, Limit};
+use crate::config::{
+    AgentProfile, AgentPromptMetadata, ApprovalMode, Capability, CouncilExecutionMode,
+    CouncilMemberProfile, EffectiveConfig, Limit,
+};
 use crate::history::{HistoryEvent, HistoryStore};
 use crate::ids::new_id;
 use crate::orchestrator::{
-    validate_orchestrator_decision, AgentResult, AgentResultStatus, DecisionStatus, RunState,
+    build_orchestrator_prompt, validate_orchestrator_decision, AgentResult, AgentResultStatus,
+    DecisionStatus, RunState, COUNCIL_WORKFLOW_AGENT_ID,
 };
 use crate::runtime::{
-    check_all_runtime_availability, execute_runtime_step, RuntimeAvailability, RuntimeHistoryEvent,
-    RuntimeOutput, RuntimeRequest, RuntimeStreamDelta,
+    check_all_runtime_availability, execute_runtime_step, RuntimeAvailability,
+    RuntimeAvailabilityStatus, RuntimeHistoryEvent, RuntimeOutput, RuntimeRecentAction,
+    RuntimeRecentContext, RuntimeRecentFile, RuntimeRequest, RuntimeStreamDelta,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -28,6 +33,7 @@ const RUNTIME_HISTORY_PAYLOAD_DEPTH: usize = 3;
 const RUNTIME_HISTORY_PAYLOAD_FIELDS: usize = 20;
 const RUNTIME_HISTORY_PAYLOAD_ITEMS: usize = 20;
 const RUNTIME_HISTORY_STRING_CHARS: usize = 512;
+const RUNTIME_RECENT_CONTEXT_LIMIT: usize = 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentView {
@@ -47,10 +53,36 @@ pub struct AppState {
     pub session_id: String,
     pub run_state: RunState,
     pub active_run_id: Option<String>,
+    pub session_goal: Option<String>,
+    pub config_status: ConfigStatusView,
+    pub live_step: Option<LiveStepView>,
     pub pending_approval: Option<PendingApprovalView>,
     pub agents: Vec<AgentView>,
     pub events: Vec<String>,
     pub input: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveStepView {
+    pub run_id: String,
+    pub step_id: String,
+    pub agent: String,
+    pub streams: Vec<LiveStreamView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveStreamView {
+    pub stream: String,
+    pub content: String,
+    pub final_delta: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigStatusView {
+    pub summary: String,
+    pub sources: Vec<String>,
+    pub preset: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,11 +147,38 @@ struct ActiveStep {
 #[derive(Clone, Debug)]
 struct RunDriveContext {
     run_id: String,
+    parent_run_id: Option<String>,
     prompt: String,
+    subtask: Option<SubtaskContext>,
     previous_results: Vec<AgentResult>,
     step_count: u32,
     started_at: Instant,
     parse_repair_attempts: u32,
+}
+
+#[derive(Clone, Debug)]
+struct SubtaskContext {
+    agent_id: String,
+    request: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CouncilMemberReport {
+    member_id: String,
+    status: AgentResultStatus,
+    summary: String,
+    diagnostic: Option<String>,
+    artifact: Option<crate::orchestrator::ArtifactReference>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CouncilDecisionEnvelope {
+    schema_version: u32,
+    confidence: String,
+    dissent: Vec<String>,
+    risks: Vec<String>,
+    recommended_action: String,
+    stop_condition: String,
 }
 
 #[derive(Clone, Debug)]
@@ -169,10 +228,19 @@ enum AgentStepOutcome {
 struct RunRecord {
     schema_version: u32,
     run_id: String,
+    parent_run_id: Option<String>,
     session_id: String,
     prompt: String,
+    session_goal: Option<String>,
+    subtask: Option<SubtaskRecord>,
     state: RunState,
     results: Vec<AgentResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SubtaskRecord {
+    agent_id: String,
+    request: String,
 }
 
 impl App {
@@ -187,6 +255,9 @@ impl App {
             session_id: history.session_id().to_string(),
             run_state: RunState::Idle,
             active_run_id: None,
+            session_goal: None,
+            config_status: build_config_status(&config, &availability),
+            live_step: None,
             pending_approval: None,
             agents: build_agent_views(&config, &availability),
             events: Vec::new(),
@@ -268,6 +339,7 @@ impl App {
     pub async fn refresh_runtime_availability(&mut self) {
         self.availability = check_all_runtime_availability(&self.config).await;
         self.state.agents = build_agent_views(&self.config, &self.availability);
+        self.state.config_status = build_config_status(&self.config, &self.availability);
         self.publish_state();
     }
 
@@ -292,6 +364,15 @@ impl App {
     pub async fn submit_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
+            return Ok(());
+        }
+        if self.handle_goal_command(&prompt)? {
+            return Ok(());
+        }
+        if self.handle_config_command(&prompt)? {
+            return Ok(());
+        }
+        if self.handle_subtask_command(&prompt).await? {
             return Ok(());
         }
         if matches!(self.state.run_state, RunState::WaitingForUser) {
@@ -341,7 +422,144 @@ impl App {
 
         let run = RunDriveContext {
             run_id,
+            parent_run_id: None,
             prompt,
+            subtask: None,
+            previous_results: Vec::new(),
+            step_count: 0,
+            started_at: Instant::now(),
+            parse_repair_attempts: 0,
+        };
+        self.drive_run(run, None).await
+    }
+
+    fn handle_goal_command(&mut self, prompt: &str) -> Result<bool> {
+        let trimmed = prompt.trim();
+        if trimmed == "/goal" {
+            let display = self
+                .state
+                .session_goal
+                .as_deref()
+                .map(|goal| format!("Goal: {}", single_line_event_text(goal)))
+                .unwrap_or_else(|| "No active goal.".to_string());
+            self.record_event(
+                None,
+                None,
+                "session_goal_viewed",
+                json!({ "goal": self.state.session_goal.clone() }),
+                display,
+            )?;
+            return Ok(true);
+        }
+
+        if trimmed == "/goal clear" {
+            let previous_goal = self.state.session_goal.take();
+            self.record_event(
+                None,
+                None,
+                "session_goal_cleared",
+                json!({ "previous_goal": previous_goal }),
+                "Goal cleared.",
+            )?;
+            return Ok(true);
+        }
+
+        if let Some(goal) = trimmed.strip_prefix("/goal ") {
+            let goal = goal.trim();
+            if goal.is_empty() {
+                bail!("usage: /goal <text>");
+            }
+            self.state.session_goal = Some(goal.to_string());
+            self.record_event(
+                None,
+                None,
+                "session_goal_set",
+                json!({ "goal": goal }),
+                "Goal set.",
+            )?;
+            return Ok(true);
+        }
+
+        if trimmed.starts_with("/goal") {
+            bail!("usage: /goal, /goal <text>, or /goal clear");
+        }
+
+        Ok(false)
+    }
+
+    fn handle_config_command(&mut self, prompt: &str) -> Result<bool> {
+        let trimmed = prompt.trim();
+        if trimmed != "/config" {
+            if trimmed.starts_with("/config") {
+                bail!("usage: /config");
+            }
+            return Ok(false);
+        }
+
+        self.record_event(
+            None,
+            None,
+            "config_viewed",
+            serde_json::to_value(&self.state.config_status)?,
+            config_status_display(&self.state.config_status),
+        )?;
+        Ok(true)
+    }
+
+    async fn handle_subtask_command(&mut self, prompt: &str) -> Result<bool> {
+        let trimmed = prompt.trim();
+        if !trimmed.starts_with("/subtask") {
+            return Ok(false);
+        }
+        let Some(rest) = trimmed.strip_prefix("/subtask ") else {
+            bail!("usage: /subtask <agent> <task>");
+        };
+        let (agent_id, task) = parse_subtask_command(rest)?;
+        if matches!(
+            self.state.run_state,
+            RunState::Planning | RunState::Running | RunState::WaitingForUser
+        ) {
+            bail!("a run is already active");
+        }
+        self.start_subtask(agent_id, task).await?;
+        Ok(true)
+    }
+
+    async fn start_subtask(&mut self, agent_id: &str, task: &str) -> Result<()> {
+        if agent_id == "orchestrator" {
+            bail!("subtasks must target a specialized agent, not orchestrator");
+        }
+        let agent = self.agent(agent_id)?.clone();
+        if !agent.enabled {
+            bail!("subtask references disabled agent {agent_id}");
+        }
+
+        self.reset_enabled_agent_statuses();
+        let run_id = new_id();
+        let parent_run_id = self.state.active_run_id.clone();
+        self.state.active_run_id = Some(run_id.clone());
+        self.state.run_state = RunState::Running;
+        let prompt = subtask_prompt(task);
+        self.record_event(
+            Some(run_id.clone()),
+            None,
+            "subtask_started",
+            json!({
+                "run_id": run_id,
+                "parent_run_id": parent_run_id,
+                "agent": agent_id,
+                "request": task,
+            }),
+            format!("Subtask started: {agent_id}."),
+        )?;
+        let run = RunDriveContext {
+            run_id,
+            parent_run_id,
+            prompt,
+            subtask: Some(SubtaskContext {
+                agent_id: agent.id.clone(),
+                request: task.to_string(),
+            }),
             previous_results: Vec::new(),
             step_count: 0,
             started_at: Instant::now(),
@@ -472,6 +690,7 @@ impl App {
                 self.write_run_record(&run)?;
             }
             self.state.active_run_id = None;
+            self.state.live_step = None;
             self.state.pending_approval = None;
             self.pending_approval = None;
             self.pending_clarification = None;
@@ -535,8 +754,22 @@ impl App {
                         AgentStepOutcome::Completed => {}
                         AgentStepOutcome::Paused | AgentStepOutcome::Stop => return Ok(()),
                     }
+                    if run.subtask.is_some() {
+                        self.finish_subtask_run(run)?;
+                        return Ok(());
+                    }
                 }
             }
+        }
+
+        if let Some(subtask) = run.subtask.clone() {
+            match self.run_agent_step(run, &subtask.agent_id, None).await? {
+                AgentStepOutcome::Completed => {
+                    self.finish_subtask_run(run)?;
+                }
+                AgentStepOutcome::Paused | AgentStepOutcome::Stop => {}
+            }
+            return Ok(());
         }
 
         loop {
@@ -565,6 +798,23 @@ impl App {
                     .next_agent
                     .clone()
                     .context("validated continue decision missing next_agent")?;
+                if next_agent_id == COUNCIL_WORKFLOW_AGENT_ID {
+                    if !council_route_allowed(&run.prompt, self.state.session_goal.as_deref()) {
+                        self.state.run_state = RunState::Failed;
+                        self.record_event(
+                            Some(run.run_id.clone()),
+                            Some(decision.decision_id.clone()),
+                            "orchestrator_decision_invalid",
+                            json!({
+                                "reason": "council workflow can only be routed for high-risk or user-requested cases",
+                                "decision": decision
+                            }),
+                            "Orchestrator routed council outside its allowed scope.",
+                        )?;
+                        return Ok(false);
+                    }
+                    return self.run_council_workflow(run, &decision).await;
+                }
                 if self.review_fix_cycle_limit_reached(run, &next_agent_id) {
                     self.stop_for_review_fix_cycle_limit(run)?;
                     return Ok(false);
@@ -878,12 +1128,302 @@ impl App {
         }
     }
 
+    async fn run_council_workflow(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+    ) -> Result<bool> {
+        self.state.run_state = RunState::Running;
+        if self.wall_clock_limit_reached(run) {
+            self.stop_for_wall_clock_limit(run)?;
+            return Ok(false);
+        }
+        if !matches!(
+            self.config.council.execution_mode,
+            CouncilExecutionMode::Serial
+        ) {
+            self.state.run_state = RunState::Failed;
+            self.record_event(
+                Some(run.run_id.clone()),
+                Some(decision.decision_id.clone()),
+                "run_failed",
+                json!({ "reason": "unsupported council execution_mode" }),
+                "Council execution mode is unsupported.",
+            )?;
+            return Ok(false);
+        }
+
+        let preset_name = self.config.council.default_preset.clone();
+        let members = self
+            .config
+            .council
+            .presets
+            .get(&preset_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("council preset {preset_name} is not configured"))?;
+        let timeout = Duration::from_secs(self.config.council.timeout_seconds);
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(decision.decision_id.clone()),
+            "council_started",
+            json!({
+                "preset": preset_name,
+                "execution_mode": self.config.council.execution_mode.clone(),
+                "timeout_seconds": self.config.council.timeout_seconds,
+                "councillors": members.keys().cloned().collect::<Vec<_>>()
+            }),
+            "Council workflow started.",
+        )?;
+
+        let mut reports = Vec::new();
+        for (member_id, member) in members {
+            if self.wall_clock_limit_reached(run) {
+                self.stop_for_wall_clock_limit(run)?;
+                return Ok(false);
+            }
+            if limit_reached(&self.config.limits.max_agent_steps, run.step_count) {
+                self.state.run_state = RunState::LimitReached;
+                self.record_event(
+                    Some(run.run_id.clone()),
+                    None,
+                    "run_limit_reached",
+                    json!({ "limit": "max_agent_steps", "value": run.step_count }),
+                    "Run limit reached before the next councillor.",
+                )?;
+                return Ok(false);
+            }
+
+            let step_id = new_id();
+            run.step_count += 1;
+            self.record_event(
+                Some(run.run_id.clone()),
+                Some(step_id.clone()),
+                "agent_step_started",
+                json!({ "agent": format!("{COUNCIL_WORKFLOW_AGENT_ID}.{member_id}") }),
+                format!("Council councillor {member_id} step started."),
+            )?;
+
+            let agent = council_member_agent(&member_id, &member);
+            let prompt = council_member_prompt(&run.prompt, decision);
+            let request = self.runtime_request(
+                &run.run_id,
+                &step_id,
+                &prompt,
+                agent,
+                run.previous_results.clone(),
+                "agent_result",
+            )?;
+            self.set_active_step(
+                &run.run_id,
+                &step_id,
+                &format!("{COUNCIL_WORKFLOW_AGENT_ID}.{member_id}"),
+            );
+
+            let step_result =
+                tokio::time::timeout(timeout, execute_runtime_step(&self.config, request)).await;
+            let report = match step_result {
+                Ok(Ok(result)) => {
+                    self.record_runtime_stream_deltas(
+                        run,
+                        &step_id,
+                        &format!("{COUNCIL_WORKFLOW_AGENT_ID}.{member_id}"),
+                        &result.stream_deltas,
+                    )?;
+                    self.council_report_from_runtime_output(
+                        run,
+                        &step_id,
+                        &member_id,
+                        result.output,
+                    )?
+                }
+                Ok(Err(error)) => CouncilMemberReport {
+                    member_id: member_id.clone(),
+                    status: AgentResultStatus::Failed,
+                    summary: "Councillor runtime failed.".to_string(),
+                    diagnostic: Some(concise_diagnostic(&error.to_string())),
+                    artifact: None,
+                },
+                Err(_) => CouncilMemberReport {
+                    member_id: member_id.clone(),
+                    status: AgentResultStatus::Failed,
+                    summary: "Councillor timed out.".to_string(),
+                    diagnostic: Some(format!(
+                        "councillor exceeded council timeout of {} seconds",
+                        timeout.as_secs()
+                    )),
+                    artifact: None,
+                },
+            };
+            self.record_event(
+                Some(run.run_id.clone()),
+                Some(step_id.clone()),
+                "councillor_result",
+                serde_json::to_value(&report)?,
+                format!(
+                    "Council {member_id}: {}",
+                    concise_diagnostic(&report.summary)
+                ),
+            )?;
+            self.clear_active_step(&step_id);
+            reports.push(report);
+        }
+
+        let synthesis = synthesize_council_decision(decision, &reports);
+        let result = council_agent_result(new_id(), &synthesis, &reports);
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(result.step_id.clone()),
+            "council_synthesized",
+            json!({
+                "envelope": synthesis,
+                "reports": reports
+            }),
+            "Council synthesized councillor results.",
+        )?;
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(result.step_id.clone()),
+            "agent_result",
+            serde_json::to_value(&result)?,
+            format!("council: {}", result.summary),
+        )?;
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(result.step_id.clone()),
+            "council_completed",
+            json!({ "result": result.clone() }),
+            "Council workflow completed.",
+        )?;
+        run.previous_results.push(result);
+        Ok(true)
+    }
+
+    fn council_report_from_runtime_output(
+        &mut self,
+        run: &RunDriveContext,
+        step_id: &str,
+        member_id: &str,
+        output: RuntimeOutput,
+    ) -> Result<CouncilMemberReport> {
+        match output {
+            RuntimeOutput::AgentResult { result } => {
+                self.record_event(
+                    Some(run.run_id.clone()),
+                    Some(result.step_id.clone()),
+                    "councillor_agent_result",
+                    serde_json::to_value(&result)?,
+                    format!("{member_id}: {}", result.summary),
+                )?;
+                self.council_report_from_agent_result(run, step_id, member_id, &result)
+            }
+            RuntimeOutput::ParseError {
+                raw_output,
+                diagnostic,
+                ..
+            } => {
+                let artifact = self.history.write_artifact(
+                    "txt",
+                    "text/plain",
+                    raw_output.as_bytes(),
+                    "contains_user_content",
+                )?;
+                self.record_event(
+                    Some(run.run_id.clone()),
+                    Some(step_id.to_string()),
+                    "artifact_written",
+                    serde_json::to_value(&artifact)?,
+                    "Malformed councillor output stored as an artifact.",
+                )?;
+                Ok(CouncilMemberReport {
+                    member_id: member_id.to_string(),
+                    status: AgentResultStatus::ParseError,
+                    summary: "Councillor output did not match the required structured contract."
+                        .to_string(),
+                    diagnostic: Some(diagnostic),
+                    artifact: Some(artifact),
+                })
+            }
+            RuntimeOutput::ActionRequest { .. } => Ok(CouncilMemberReport {
+                member_id: member_id.to_string(),
+                status: AgentResultStatus::Failed,
+                summary: "Councillor requested an action, but council runs cannot execute actions."
+                    .to_string(),
+                diagnostic: Some(
+                    "council workflows collect opinions only; use fixer/reviewer for actions"
+                        .to_string(),
+                ),
+                artifact: None,
+            }),
+            RuntimeOutput::OrchestratorDecision { .. } => Ok(CouncilMemberReport {
+                member_id: member_id.to_string(),
+                status: AgentResultStatus::Failed,
+                summary: "Councillor returned an orchestrator decision instead of an agent result."
+                    .to_string(),
+                diagnostic: Some("councillors must return agent_result envelopes".to_string()),
+                artifact: None,
+            }),
+        }
+    }
+
+    fn council_report_from_agent_result(
+        &mut self,
+        run: &RunDriveContext,
+        step_id: &str,
+        member_id: &str,
+        result: &AgentResult,
+    ) -> Result<CouncilMemberReport> {
+        let artifact = self.write_large_councillor_artifact(run, step_id, member_id, result)?;
+        Ok(CouncilMemberReport {
+            member_id: member_id.to_string(),
+            status: result.status.clone(),
+            summary: concise_diagnostic(&result.summary),
+            diagnostic: result
+                .blocker
+                .clone()
+                .map(|blocker| concise_diagnostic(&blocker)),
+            artifact,
+        })
+    }
+
+    fn write_large_councillor_artifact(
+        &mut self,
+        run: &RunDriveContext,
+        step_id: &str,
+        member_id: &str,
+        result: &AgentResult,
+    ) -> Result<Option<crate::orchestrator::ArtifactReference>> {
+        let contents = serde_json::to_vec_pretty(result)?;
+        if contents.len() <= LARGE_ACTION_CONTENT_BYTES {
+            return Ok(None);
+        }
+        let artifact = self.history.write_artifact(
+            "json",
+            "application/json",
+            &contents,
+            "contains_user_content",
+        )?;
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(step_id.to_string()),
+            "artifact_written",
+            json!({ "member_id": member_id, "artifact": artifact }),
+            "Large councillor output stored as an artifact.",
+        )?;
+        Ok(Some(artifact))
+    }
+
     fn write_run_record(&mut self, run: &RunDriveContext) -> Result<()> {
         let record = RunRecord {
             schema_version: 1,
             run_id: run.run_id.clone(),
+            parent_run_id: run.parent_run_id.clone(),
             session_id: self.history.session_id().to_string(),
             prompt: run.prompt.clone(),
+            session_goal: self.state.session_goal.clone(),
+            subtask: run.subtask.as_ref().map(|subtask| SubtaskRecord {
+                agent_id: subtask.agent_id.clone(),
+                request: subtask.request.clone(),
+            }),
             state: self.state.run_state.clone(),
             results: run.previous_results.clone(),
         };
@@ -897,6 +1437,12 @@ impl App {
             step_id: step_id.to_string(),
             agent: agent.to_string(),
         });
+        self.state.live_step = Some(LiveStepView {
+            run_id: run_id.to_string(),
+            step_id: step_id.to_string(),
+            agent: agent.to_string(),
+            streams: Vec::new(),
+        });
         self.set_agent_status(agent, "running");
     }
 
@@ -907,6 +1453,7 @@ impl App {
             .filter(|step| step.step_id == step_id)
             .map(|step| step.agent.clone());
         if let Some(agent) = agent {
+            self.state.live_step = None;
             self.set_agent_status(&agent, "idle");
             self.active_step = None;
         }
@@ -1037,12 +1584,52 @@ impl App {
         )
     }
 
+    fn finish_subtask_run(&mut self, run: &RunDriveContext) -> Result<()> {
+        let subtask = run
+            .subtask
+            .as_ref()
+            .context("subtask run is missing subtask context")?;
+        let result = run
+            .previous_results
+            .last()
+            .ok_or_else(|| anyhow!("subtask finished without an agent result"))?;
+        let completed = matches!(
+            result.status,
+            AgentResultStatus::Completed | AgentResultStatus::NoChanges
+        );
+        self.state.run_state = if completed {
+            RunState::Completed
+        } else {
+            RunState::Failed
+        };
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(result.step_id.clone()),
+            "subtask_completed",
+            json!({
+                "run_id": run.run_id,
+                "parent_run_id": run.parent_run_id,
+                "agent": subtask.agent_id,
+                "request": subtask.request,
+                "result": result,
+                "scope_guard": "subtask_result_must_not_broaden_request",
+            }),
+            format!(
+                "Subtask completed: {}: {}",
+                subtask.agent_id, result.summary
+            ),
+        )
+    }
+
     fn schedule_parse_repair(
         &mut self,
         run: &mut RunDriveContext,
         step_id: &str,
         agent: &str,
     ) -> Result<bool> {
+        if run.subtask.is_some() {
+            return Ok(false);
+        }
         if run.parse_repair_attempts >= 1
             || limit_reached(&self.config.limits.max_agent_steps, run.step_count)
         {
@@ -1073,14 +1660,20 @@ impl App {
         previous_results: Vec<AgentResult>,
         output_schema: &str,
     ) -> Result<RuntimeRequest> {
+        let mut agent_profile = agent_profile;
+        if agent_profile.id == "orchestrator" {
+            agent_profile.instructions = build_orchestrator_prompt(&self.config);
+        }
         Ok(RuntimeRequest {
             run_id: run_id.to_string(),
             step_id: step_id.to_string(),
             prompt: prompt.to_string(),
+            session_goal: self.state.session_goal.clone(),
             working_directory: self.config.working_directory.clone(),
             capability_constraints: agent_profile.capabilities.clone(),
             agent_profile,
             session_events: self.runtime_history_events()?,
+            recent_context: self.runtime_recent_context()?,
             previous_results,
             action_results: Vec::new(),
             output_schema: output_schema.to_string(),
@@ -1092,6 +1685,11 @@ impl App {
         let events = self.history.read_events()?;
         let start = events.len().saturating_sub(RUNTIME_HISTORY_EVENT_LIMIT);
         Ok(events[start..].iter().map(runtime_history_event).collect())
+    }
+
+    fn runtime_recent_context(&self) -> Result<RuntimeRecentContext> {
+        let events = self.history.read_events()?;
+        Ok(runtime_recent_context(&events))
     }
 
     async fn execute_runtime_step_with_actions(
@@ -1307,6 +1905,15 @@ impl App {
         result: &ActionResult,
     ) -> Result<()> {
         let durable_result = self.action_result_for_history(run_id, step_id, request, result)?;
+        if matches!(durable_result.status, ActionStatus::Denied) {
+            self.record_event(
+                Some(run_id.to_string()),
+                Some(step_id.to_string()),
+                "action_denied",
+                serde_json::to_value(&durable_result)?,
+                action_denied_display(request, result),
+            )?;
+        }
         self.record_event(
             Some(run_id.to_string()),
             Some(step_id.to_string()),
@@ -1355,6 +1962,7 @@ impl App {
         deltas: &[RuntimeStreamDelta],
     ) -> Result<()> {
         for delta in deltas {
+            self.push_live_stream_delta(step_id, delta);
             let payload = self.runtime_stream_delta_payload(agent_id, delta)?;
             self.record_event(
                 Some(run.run_id.clone()),
@@ -1365,6 +1973,27 @@ impl App {
             )?;
         }
         Ok(())
+    }
+
+    fn push_live_stream_delta(&mut self, step_id: &str, delta: &RuntimeStreamDelta) {
+        const LIVE_STREAM_LIMIT: usize = 8;
+        let Some(live_step) = self
+            .state
+            .live_step
+            .as_mut()
+            .filter(|live_step| live_step.step_id == step_id)
+        else {
+            return;
+        };
+        live_step.streams.push(LiveStreamView {
+            stream: delta.stream.clone(),
+            content: concise_diagnostic(&delta.content),
+            final_delta: delta.final_delta,
+        });
+        if live_step.streams.len() > LIVE_STREAM_LIMIT {
+            let overflow = live_step.streams.len() - LIVE_STREAM_LIMIT;
+            live_step.streams.drain(0..overflow);
+        }
     }
 
     fn runtime_stream_delta_payload(
@@ -1572,6 +2201,92 @@ fn runtime_history_event(event: &HistoryEvent) -> RuntimeHistoryEvent {
     }
 }
 
+fn runtime_recent_context(events: &[HistoryEvent]) -> RuntimeRecentContext {
+    let mut files = Vec::new();
+    let mut actions = Vec::new();
+    for event in events.iter().rev() {
+        if files.len() < RUNTIME_RECENT_CONTEXT_LIMIT {
+            files.extend(recent_files_from_event(event));
+            files.truncate(RUNTIME_RECENT_CONTEXT_LIMIT);
+        }
+        if actions.len() < RUNTIME_RECENT_CONTEXT_LIMIT {
+            if let Some(action) = recent_action_from_event(event) {
+                actions.push(action);
+            }
+        }
+        if files.len() >= RUNTIME_RECENT_CONTEXT_LIMIT
+            && actions.len() >= RUNTIME_RECENT_CONTEXT_LIMIT
+        {
+            break;
+        }
+    }
+    files.reverse();
+    actions.reverse();
+    RuntimeRecentContext { files, actions }
+}
+
+fn recent_files_from_event(event: &HistoryEvent) -> Vec<RuntimeRecentFile> {
+    if event.kind != "file_edit_applied" {
+        return Vec::new();
+    }
+    let operation = event
+        .payload
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("file_event")
+        .to_string();
+    if let Some(path) = event.payload.get("path").and_then(Value::as_str) {
+        return vec![RuntimeRecentFile {
+            path: path.to_string(),
+            operation,
+            event_id: event.event_id.clone(),
+        }];
+    }
+    event
+        .payload
+        .get("changed_files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|path| RuntimeRecentFile {
+            path: path.to_string(),
+            operation: operation.clone(),
+            event_id: event.event_id.clone(),
+        })
+        .collect()
+}
+
+fn recent_action_from_event(event: &HistoryEvent) -> Option<RuntimeRecentAction> {
+    match event.kind.as_str() {
+        "action_requested" | "action_completed" | "action_denied" => Some(RuntimeRecentAction {
+            event_kind: event.kind.clone(),
+            action_id: event
+                .payload
+                .get("action_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            action_kind: event
+                .payload
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            status: event
+                .payload
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            summary: event
+                .payload
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            event_id: event.event_id.clone(),
+        }),
+        _ => None,
+    }
+}
+
 fn compact_history_payload(kind: &str, payload: &Value) -> (Value, bool) {
     if kind == "runtime_stream_delta" {
         return compact_runtime_stream_delta_payload(payload);
@@ -1724,6 +2439,71 @@ fn build_agent_views(
     views
 }
 
+fn build_config_status(
+    config: &EffectiveConfig,
+    availability: &BTreeMap<String, RuntimeAvailability>,
+) -> ConfigStatusView {
+    let sources = if config.config_sources.is_empty() {
+        vec!["built-in defaults".to_string()]
+    } else {
+        config
+            .config_sources
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect()
+    };
+    let mut warnings = config_warning_messages(config);
+    warnings.extend(runtime_warning_messages(availability));
+    let preset = config.active_preset.clone();
+    let preset_label = preset.as_deref().unwrap_or("none");
+    let summary = format!(
+        "Config: sources={} preset={} warnings={}",
+        sources.len(),
+        preset_label,
+        warnings.len()
+    );
+    ConfigStatusView {
+        summary,
+        sources,
+        preset,
+        warnings,
+    }
+}
+
+fn config_warning_messages(config: &EffectiveConfig) -> Vec<String> {
+    let agents_without_fallbacks = config
+        .agents
+        .values()
+        .filter(|agent| agent.enabled && agent.model_fallbacks.is_empty())
+        .map(|agent| agent.id.clone())
+        .collect::<Vec<_>>();
+    if agents_without_fallbacks.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "enabled agents without model_fallbacks: {}",
+            agents_without_fallbacks.join(", ")
+        )]
+    }
+}
+
+fn runtime_warning_messages(availability: &BTreeMap<String, RuntimeAvailability>) -> Vec<String> {
+    availability
+        .values()
+        .filter_map(|runtime| match runtime.status {
+            RuntimeAvailabilityStatus::Available => None,
+            RuntimeAvailabilityStatus::Unavailable => Some(format!(
+                "runtime {} unavailable: {}",
+                runtime.runtime_id, runtime.message
+            )),
+            RuntimeAvailabilityStatus::Unknown => Some(format!(
+                "runtime {} status unknown: {}",
+                runtime.runtime_id, runtime.message
+            )),
+        })
+        .collect()
+}
+
 fn agent_roster_rank(agent_id: &str) -> u8 {
     match agent_id {
         "orchestrator" => 0,
@@ -1739,6 +2519,204 @@ fn command_timeout(limit: &Limit) -> Option<Duration> {
     match limit {
         Limit::Value(minutes) => Some(Duration::from_secs(u64::from(*minutes) * 60)),
         Limit::Unlimited => None,
+    }
+}
+
+fn council_member_agent(member_id: &str, member: &CouncilMemberProfile) -> AgentProfile {
+    AgentProfile {
+        id: format!("{COUNCIL_WORKFLOW_AGENT_ID}.{member_id}"),
+        name: format!("Council {member_id}"),
+        runtime: member.runtime.clone(),
+        model: member.model.clone(),
+        model_fallbacks: member.model_fallbacks.clone(),
+        effort: member.effort.clone(),
+        thinking: member.thinking,
+        capabilities: vec![Capability::Read, Capability::Challenge, Capability::Review],
+        tools: Some(Vec::new()),
+        instructions: format!(
+            "{}\n\nReturn only an agent_result JSON envelope. Do not request actions; council workflows collect opinions and recommendations only.",
+            member.prompt.trim()
+        ),
+        orchestrator_description: None,
+        prompt_metadata: AgentPromptMetadata::default(),
+        enabled: true,
+    }
+}
+
+fn council_member_prompt(
+    user_prompt: &str,
+    decision: &crate::orchestrator::OrchestratorDecision,
+) -> String {
+    format!(
+        "Council review request:\n\nOriginal user prompt:\n{user_prompt}\n\nOrchestrator reason:\n{reason}\n\nCouncil stop condition:\n{stop_condition}\n\nReturn focused risks, dissent, and a recommended next action from your council role.",
+        reason = decision.reason,
+        stop_condition = decision.stop_condition
+    )
+}
+
+fn council_route_allowed(prompt: &str, session_goal: Option<&str>) -> bool {
+    let text = match session_goal {
+        Some(goal) => format!("{prompt} {goal}").to_ascii_lowercase(),
+        None => prompt.to_ascii_lowercase(),
+    };
+    [
+        "council",
+        "high-risk",
+        "high risk",
+        "architecture",
+        "security",
+        "data integrity",
+        "difficult review",
+        "privacy",
+        "compliance",
+        "migration",
+        "rollback",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn synthesize_council_decision(
+    decision: &crate::orchestrator::OrchestratorDecision,
+    reports: &[CouncilMemberReport],
+) -> CouncilDecisionEnvelope {
+    let successful = reports
+        .iter()
+        .filter(|report| {
+            matches!(
+                report.status,
+                AgentResultStatus::Completed | AgentResultStatus::NoChanges
+            )
+        })
+        .collect::<Vec<_>>();
+    let failed = reports
+        .iter()
+        .filter(|report| {
+            !matches!(
+                report.status,
+                AgentResultStatus::Completed | AgentResultStatus::NoChanges
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let confidence = if successful.is_empty() {
+        "blocked"
+    } else if failed.is_empty() {
+        "high"
+    } else {
+        "partial"
+    }
+    .to_string();
+    let recommended_action = successful
+        .first()
+        .map(|report| report.summary.clone())
+        .unwrap_or_else(|| {
+            "Do not proceed until council runtime failures are resolved.".to_string()
+        });
+    let risks = successful
+        .iter()
+        .map(|report| format!("{}: {}", report.member_id, report.summary))
+        .chain(failed.iter().filter_map(|report| {
+            report
+                .diagnostic
+                .as_ref()
+                .map(|diagnostic| format!("{} failed: {diagnostic}", report.member_id))
+        }))
+        .collect();
+    let dissent = failed
+        .iter()
+        .map(|report| {
+            format!(
+                "{} did not complete: {}",
+                report.member_id,
+                report
+                    .diagnostic
+                    .as_deref()
+                    .unwrap_or(report.summary.as_str())
+            )
+        })
+        .collect();
+
+    CouncilDecisionEnvelope {
+        schema_version: 1,
+        confidence,
+        dissent,
+        risks,
+        recommended_action,
+        stop_condition: decision.stop_condition.clone(),
+    }
+}
+
+fn council_agent_result(
+    step_id: String,
+    synthesis: &CouncilDecisionEnvelope,
+    reports: &[CouncilMemberReport],
+) -> AgentResult {
+    let successful_count = reports
+        .iter()
+        .filter(|report| {
+            matches!(
+                report.status,
+                AgentResultStatus::Completed | AgentResultStatus::NoChanges
+            )
+        })
+        .count();
+    let status = if successful_count == 0 {
+        AgentResultStatus::Failed
+    } else {
+        AgentResultStatus::Completed
+    };
+    let mut findings = vec![
+        format!("confidence: {}", synthesis.confidence),
+        format!("recommended_action: {}", synthesis.recommended_action),
+        format!("stop_condition: {}", synthesis.stop_condition),
+    ];
+    findings.extend(synthesis.risks.iter().map(|risk| format!("risk: {risk}")));
+    findings.extend(
+        synthesis
+            .dissent
+            .iter()
+            .map(|dissent| format!("dissent: {dissent}")),
+    );
+    let artifacts = reports
+        .iter()
+        .filter_map(|report| report.artifact.clone())
+        .collect::<Vec<_>>();
+    let blocker = (successful_count == 0).then(|| {
+        reports
+            .iter()
+            .map(|report| {
+                format!(
+                    "{}: {}",
+                    report.member_id,
+                    report
+                        .diagnostic
+                        .as_deref()
+                        .unwrap_or(report.summary.as_str())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    });
+
+    AgentResult {
+        schema_version: 1,
+        agent: COUNCIL_WORKFLOW_AGENT_ID.to_string(),
+        step_id,
+        status,
+        summary: format!(
+            "Council confidence {} from {}/{} councillor(s). Recommended action: {}",
+            synthesis.confidence,
+            successful_count,
+            reports.len(),
+            synthesis.recommended_action
+        ),
+        findings,
+        changed_files: Vec::new(),
+        commands: Vec::new(),
+        verification: Vec::new(),
+        blocker,
+        artifacts,
     }
 }
 
@@ -1831,6 +2809,37 @@ fn user_event_display(message: &str) -> String {
     format!("You: {}", single_line_event_text(message))
 }
 
+fn config_status_display(status: &ConfigStatusView) -> String {
+    let sources = status.sources.join(", ");
+    let preset = status.preset.as_deref().unwrap_or("none");
+    if status.warnings.is_empty() {
+        format!("Config: sources: {sources}; preset: {preset}; warnings: none.")
+    } else {
+        format!(
+            "Config: sources: {sources}; preset: {preset}; warnings: {}.",
+            status.warnings.join("; ")
+        )
+    }
+}
+
+fn parse_subtask_command(input: &str) -> Result<(&str, &str)> {
+    let trimmed = input.trim();
+    let Some((agent, task)) = trimmed.split_once(char::is_whitespace) else {
+        bail!("usage: /subtask <agent> <task>");
+    };
+    let task = task.trim();
+    if agent.trim().is_empty() || task.is_empty() {
+        bail!("usage: /subtask <agent> <task>");
+    }
+    Ok((agent.trim(), task))
+}
+
+fn subtask_prompt(task: &str) -> String {
+    format!(
+        "Subtask request:\n{task}\n\nScope guard:\n- Work only on the subtask request above.\n- Do not broaden scope beyond this subtask.\n- If the request requires broader work, return a blocked agent_result explaining the needed parent-scope decision.\n- Return a concise child summary and verification evidence for only this subtask."
+    )
+}
+
 fn action_requested_display(request: &ActionRequest) -> String {
     format!("Action requested: {}", action_target_display(request))
 }
@@ -1848,6 +2857,18 @@ fn action_completed_display(request: &ActionRequest, result: &ActionResult) -> S
         format!("Action completed: {target} -> {status}.{artifact_suffix}")
     } else {
         format!("Action completed: {target} -> {status} ({detail}).{artifact_suffix}")
+    }
+}
+
+fn action_denied_display(request: &ActionRequest, result: &ActionResult) -> String {
+    let detail = action_result_detail(result);
+    if detail.is_empty() {
+        format!("Action denied: {}.", action_target_display(request))
+    } else {
+        format!(
+            "Action denied: {} ({detail}).",
+            action_target_display(request)
+        )
     }
 }
 
@@ -2021,7 +3042,78 @@ runtime = "fake"
 
 [agents.consul]
 runtime = "fake"
+
+[council.presets.default.architect]
+runtime = "fake"
+
+[council.presets.default.security]
+runtime = "fake"
+
+[council.presets.default.reviewer]
+runtime = "fake"
 "#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn fake_config_with_council_prompts(
+        dir: &std::path::Path,
+        architect_prompt: &str,
+        security_prompt: &str,
+        reviewer_prompt: &str,
+    ) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "fake"
+
+[agents.consul]
+runtime = "fake"
+
+[council]
+default_preset = "default"
+timeout_seconds = 5
+execution_mode = "serial"
+
+[council.presets.default.architect]
+runtime = "fake"
+model = "default"
+prompt = "{architect_prompt}"
+
+[council.presets.default.security]
+runtime = "fake"
+model = "default"
+prompt = "{security_prompt}"
+
+[council.presets.default.reviewer]
+runtime = "fake"
+model = "default"
+prompt = "{reviewer_prompt}"
+"#
+            ),
         )
         .unwrap();
         load_effective_config(ConfigLoadOptions {
@@ -2078,6 +3170,190 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn live_step_state_tracks_recent_runtime_streams_until_step_clears() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run", "step", "fixer");
+        app.push_live_stream_delta("step", &RuntimeStreamDelta::new(1, "stdout", "first"));
+        app.push_live_stream_delta(
+            "step",
+            &RuntimeStreamDelta::final_delta(2, "stdout", "done"),
+        );
+
+        let live_step = app.state.live_step.as_ref().unwrap();
+        assert_eq!(live_step.agent, "fixer");
+        assert_eq!(live_step.streams.len(), 2);
+        assert!(live_step.streams[1].final_delta);
+
+        app.clear_active_step("step");
+
+        assert!(app.state.live_step.is_none());
+    }
+
+    #[tokio::test]
+    async fn council_workflow_runs_serial_councillors_and_returns_result() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("ask council for a high-risk architecture decision")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "council_started"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "councillor_result")
+                .count(),
+            3
+        );
+        let council_result = events
+            .iter()
+            .find(|event| {
+                event.kind == "agent_result"
+                    && event
+                        .payload
+                        .get("agent")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(COUNCIL_WORKFLOW_AGENT_ID)
+            })
+            .unwrap();
+        assert_eq!(council_result.payload["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn council_partial_failure_synthesizes_partial_confidence() {
+        let dir = tempdir().unwrap();
+        let config = fake_config_with_council_prompts(
+            dir.path(),
+            "fake parse error",
+            "security review",
+            "reviewer review",
+        );
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("ask council for a high-risk migration review")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let synthesized = events
+            .iter()
+            .find(|event| event.kind == "council_synthesized")
+            .unwrap();
+        assert_eq!(synthesized.payload["envelope"]["confidence"], "partial");
+        assert!(synthesized.payload["envelope"]["dissent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str().unwrap().contains("architect")));
+    }
+
+    #[tokio::test]
+    async fn council_all_fail_returns_failed_result_with_diagnostics() {
+        let dir = tempdir().unwrap();
+        let config = fake_config_with_council_prompts(
+            dir.path(),
+            "fake parse error",
+            "fake parse error",
+            "fake parse error",
+        );
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("ask council for a high-risk security review")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let council_result = events
+            .iter()
+            .find(|event| {
+                event.kind == "agent_result"
+                    && event
+                        .payload
+                        .get("agent")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(COUNCIL_WORKFLOW_AGENT_ID)
+            })
+            .unwrap();
+        assert_eq!(council_result.payload["status"], "failed");
+        assert!(council_result.payload["blocker"]
+            .as_str()
+            .unwrap()
+            .contains("fake runtime emitted malformed control output"));
+    }
+
+    #[test]
+    fn council_route_guard_allows_user_prompt_council_requests() {
+        assert!(council_route_allowed("please ask council", None));
+    }
+
+    #[test]
+    fn council_route_guard_allows_session_goal_risk_context() {
+        assert!(council_route_allowed(
+            "continue with the next step",
+            Some("high-risk architecture migration")
+        ));
+    }
+
+    #[test]
+    fn council_route_guard_rejects_low_risk_prompt_without_user_controlled_risk_context() {
+        assert!(!council_route_allowed(
+            "fix a typo",
+            Some("keep implementation scoped")
+        ));
+    }
+
+    #[tokio::test]
+    async fn council_route_guard_rejects_model_authored_risk_terms() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let mut run = RunDriveContext {
+            run_id: "run".to_string(),
+            parent_run_id: None,
+            prompt: "fix a typo".to_string(),
+            subtask: None,
+            previous_results: Vec::new(),
+            step_count: 0,
+            started_at: Instant::now(),
+            parse_repair_attempts: 0,
+        };
+        let decision = crate::orchestrator::OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: Vec::new(),
+            next_agent: Some(COUNCIL_WORKFLOW_AGENT_ID.to_string()),
+            reason: "High-risk security council review is useful.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Council returns a recommendation.".to_string(),
+            clarifying_question: None,
+            final_summary: None,
+        };
+
+        let continue_run = app
+            .handle_orchestrator_decision(&mut run, decision)
+            .await
+            .unwrap();
+
+        assert!(!continue_run);
+        assert_eq!(app.state.run_state, RunState::Failed);
+        assert!(app
+            .history
+            .read_events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision_invalid"));
+    }
+
+    #[tokio::test]
     async fn runtime_request_includes_recent_session_history() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
@@ -2127,6 +3403,43 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn runtime_request_includes_compact_recent_file_and_action_context() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("write action create a feature")
+            .await
+            .unwrap();
+        let orchestrator = app.agent("orchestrator").unwrap().clone();
+        let request = app
+            .runtime_request(
+                "next-run",
+                "next-step",
+                "continue",
+                orchestrator,
+                Vec::new(),
+                "orchestrator_decision",
+            )
+            .unwrap();
+
+        assert!(request
+            .recent_context
+            .files
+            .iter()
+            .any(|file| file.path == "multiagent-action-output.txt"
+                && file.operation == "write_file"));
+        assert!(request
+            .recent_context
+            .actions
+            .iter()
+            .any(|action| action.event_kind == "action_completed"
+                && action.status.as_deref() == Some("completed")));
+        let serialized = serde_json::to_string(&request.recent_context).unwrap();
+        assert!(!serialized.contains("created by fake runtime"));
+    }
+
+    #[tokio::test]
     async fn app_event_handler_updates_input_and_submits_prompt() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
@@ -2153,6 +3466,249 @@ runtime = "fake"
             .unwrap()
             .iter()
             .any(|event| event.kind == "prompt_submitted"));
+    }
+
+    #[tokio::test]
+    async fn goal_command_updates_state_and_session_history() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/goal keep implementation scoped")
+            .await
+            .unwrap();
+        app.submit_prompt("/goal").await.unwrap();
+        app.submit_prompt("/goal clear").await.unwrap();
+
+        assert!(app.state.session_goal.is_none());
+        let display_events = app.state.events.join("\n");
+        assert!(display_events.contains("Goal set."));
+        assert!(display_events.contains("Goal: keep implementation scoped"));
+        assert!(display_events.contains("Goal cleared."));
+        let history_events = app.history.read_events().unwrap();
+        assert!(history_events
+            .iter()
+            .any(|event| event.kind == "session_goal_set"
+                && event.payload["goal"] == "keep implementation scoped"));
+        assert!(history_events
+            .iter()
+            .any(|event| event.kind == "session_goal_cleared"));
+    }
+
+    #[tokio::test]
+    async fn config_command_reports_sources_preset_and_warnings_without_prompt_bodies() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("agents")).unwrap();
+        fs::write(dir.path().join("agents/explorer.md"), "secret prompt body").unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+preset = "research"
+
+[runtimes.fake]
+type = "fake"
+
+[presets.research.agents.explorer]
+runtime = "fake"
+instructions_file = "agents/explorer.md"
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/config").await.unwrap();
+
+        let display_events = app.state.events.join("\n");
+        assert!(display_events.contains("Config: sources:"));
+        assert!(display_events.contains("preset: research"));
+        assert!(display_events.contains("enabled agents without model_fallbacks"));
+        assert!(!display_events.contains("secret prompt body"));
+        let history_events = app.history.read_events().unwrap();
+        let config_viewed = history_events
+            .iter()
+            .find(|event| event.kind == "config_viewed")
+            .unwrap();
+        assert_eq!(
+            config_viewed
+                .payload
+                .get("preset")
+                .and_then(serde_json::Value::as_str),
+            Some("research")
+        );
+        assert!(!config_viewed
+            .payload
+            .to_string()
+            .contains("secret prompt body"));
+    }
+
+    #[tokio::test]
+    async fn subtask_command_runs_one_bounded_child_agent_step() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/subtask explorer inspect README only")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert!(app.state.active_run_id.is_none());
+        let display_events = app.state.events.join("\n");
+        assert!(display_events.contains("Subtask started: explorer."));
+        assert!(display_events.contains("Subtask completed: explorer:"));
+        assert!(!display_events.contains("Orchestrator step started."));
+        let history_events = app.history.read_events().unwrap();
+        assert!(history_events
+            .iter()
+            .any(|event| event.kind == "subtask_started"));
+        let completed = history_events
+            .iter()
+            .find(|event| event.kind == "subtask_completed")
+            .unwrap();
+        assert_eq!(
+            completed
+                .payload
+                .get("scope_guard")
+                .and_then(serde_json::Value::as_str),
+            Some("subtask_result_must_not_broaden_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn subtask_run_record_persists_scope_guarded_prompt_and_metadata() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/subtask explorer inspect src only")
+            .await
+            .unwrap();
+
+        let subtask_started = app
+            .history
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "subtask_started")
+            .unwrap();
+        let run_id = subtask_started
+            .payload
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let record_path = dir
+            .path()
+            .join(".multiagent")
+            .join("runs")
+            .join(format!("{run_id}.json"));
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
+
+        assert!(record
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .contains("Do not broaden scope beyond this subtask."));
+        assert_eq!(
+            record
+                .get("subtask")
+                .and_then(|subtask| subtask.get("agent_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("explorer")
+        );
+        assert_eq!(
+            record
+                .get("subtask")
+                .and_then(|subtask| subtask.get("request"))
+                .and_then(serde_json::Value::as_str),
+            Some("inspect src only")
+        );
+    }
+
+    #[tokio::test]
+    async fn subtask_rejects_disabled_orchestrator_targets() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/subtask orchestrator plan everything")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("specialized agent"));
+    }
+
+    #[tokio::test]
+    async fn runtime_request_includes_active_session_goal() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/goal prefer root-cause fixes")
+            .await
+            .unwrap();
+        let orchestrator = app.agent("orchestrator").unwrap().clone();
+        let request = app
+            .runtime_request(
+                "run",
+                "step",
+                "create a feature",
+                orchestrator,
+                Vec::new(),
+                "orchestrator_decision",
+            )
+            .unwrap();
+
+        assert_eq!(
+            request.session_goal.as_deref(),
+            Some("prefer root-cause fixes")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_record_persists_active_session_goal() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/goal preserve action policy")
+            .await
+            .unwrap();
+        app.submit_prompt("create a feature").await.unwrap();
+
+        let run_started = app
+            .history
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "run_started")
+            .unwrap();
+        let run_id = run_started
+            .payload
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let record_path = dir
+            .path()
+            .join(".multiagent")
+            .join("runs")
+            .join(format!("{run_id}.json"));
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
+
+        assert_eq!(
+            record
+                .get("session_goal")
+                .and_then(serde_json::Value::as_str),
+            Some("preserve action policy")
+        );
     }
 
     #[tokio::test]
@@ -2279,7 +3835,9 @@ runtime = "fake"
         app.state.run_state = RunState::Planning;
         let run = RunDriveContext {
             run_id,
+            parent_run_id: None,
             prompt: "create a feature".to_string(),
+            subtask: None,
             previous_results: Vec::new(),
             step_count: 0,
             started_at: Instant::now() - Duration::from_secs(61),
@@ -2336,7 +3894,9 @@ runtime = "fake"
         app.state.run_state = RunState::Planning;
         let run = RunDriveContext {
             run_id,
+            parent_run_id: None,
             prompt: "create a feature".to_string(),
+            subtask: None,
             previous_results: Vec::new(),
             step_count: 1,
             started_at: Instant::now(),
@@ -2405,6 +3965,16 @@ runtime = "fake"
             files_edited_display(&json!({ "changed_files": ["src/lib.rs", "src/main.rs"] })),
             "Files edited: src/lib.rs, src/main.rs."
         );
+    }
+
+    #[test]
+    fn subtask_parser_requires_agent_and_task() {
+        let (agent, task) = parse_subtask_command("explorer inspect docs").unwrap();
+        assert_eq!(agent, "explorer");
+        assert_eq!(task, "inspect docs");
+
+        let error = parse_subtask_command("explorer").unwrap_err();
+        assert!(error.to_string().contains("usage"));
     }
 
     #[tokio::test]
@@ -2504,6 +4074,55 @@ runtime = "fake"
         assert!(events.contains("Action requested: read README.md"));
         assert!(events.contains("Action completed: read README.md -> Completed"));
         assert!(events.contains("Read 15 bytes from README.md"));
+    }
+
+    #[tokio::test]
+    async fn tool_policy_denials_are_recorded_as_durable_events() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+tools = ["list_files"]
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("use action to create a feature")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let denied = events
+            .iter()
+            .find(|event| event.kind == "action_denied")
+            .unwrap();
+        assert!(denied
+            .payload
+            .get("diagnostic")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .contains("not allowed to use tool"));
     }
 
     #[tokio::test]

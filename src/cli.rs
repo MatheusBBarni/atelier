@@ -1,3 +1,4 @@
+use crate::codemap::{render_summary as render_codemap_summary, run_codemap, CodemapCommand};
 use crate::config::{init_config, load_effective_config, to_redacted_toml, ConfigLoadOptions};
 use crate::doctor::{render_human, render_json, run_doctor};
 use crate::history::clean_sessions;
@@ -32,6 +33,9 @@ pub struct Cli {
     #[arg(long)]
     pub clean_sessions: bool,
 
+    #[arg(long, value_enum)]
+    pub codemap: Option<CodemapCommand>,
+
     #[arg(long)]
     pub yes: bool,
 
@@ -50,6 +54,13 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
     }
     if cli.yes && !cli.clean_sessions {
         bail!("--yes is only valid with --clean-sessions");
+    }
+    if cli.codemap.is_some()
+        && (cli.doctor || cli.print_config || cli.init_config || cli.clean_sessions)
+    {
+        bail!(
+            "--codemap cannot be combined with --doctor, --print-config, --init-config, or --clean-sessions"
+        );
     }
 
     if cli.init_config {
@@ -71,6 +82,13 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
         Some(path) => path.clone(),
         None => env::current_dir().context("failed to read current working directory")?,
     };
+
+    if let Some(command) = cli.codemap {
+        let summary = run_codemap(&working_directory, command)?;
+        print!("{}", render_codemap_summary(&summary));
+        return Ok(());
+    }
+
     let config = load_effective_config(ConfigLoadOptions {
         working_directory,
         config_path: cli.config.clone(),
@@ -140,9 +158,33 @@ mod tests {
             print_config: true,
             init_config: false,
             clean_sessions: false,
+            codemap: None,
             yes: false,
             debug: false,
         };
         run_cli_with(cli).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codemap_init_writes_state_without_loading_runtime_config() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let cli = Cli {
+            cwd: Some(dir.path().to_path_buf()),
+            config: None,
+            doctor: false,
+            json: false,
+            print_config: false,
+            init_config: false,
+            clean_sessions: false,
+            codemap: Some(CodemapCommand::Init),
+            yes: false,
+            debug: false,
+        };
+
+        run_cli_with(cli).await.unwrap();
+
+        assert!(dir.path().join(".multiagent/codemap.json").exists());
+        assert!(dir.path().join("codemap.md").exists());
     }
 }

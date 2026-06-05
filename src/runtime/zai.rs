@@ -1,6 +1,6 @@
 use super::{
     prompt_envelope_json, Runtime, RuntimeAvailability, RuntimeAvailabilityStatus, RuntimeOutput,
-    RuntimeRequest, RuntimeStepResult, RuntimeStreamDelta,
+    RuntimeProviderError, RuntimeRequest, RuntimeStepResult, RuntimeStreamDelta,
 };
 use crate::config::RuntimeConfig;
 use crate::orchestrator::{parse_agent_result, parse_contract, parse_orchestrator_decision};
@@ -88,19 +88,29 @@ impl Runtime for ZaiRuntime {
             .json(&body)
             .send()
             .await
-            .context("Z.ai chat completions request failed")?;
+            .map_err(|error| {
+                RuntimeProviderError::retryable(format!(
+                    "Z.ai chat completions request failed: {error}"
+                ))
+            })?;
 
         let status = response.status();
-        let value: Value = response
-            .json()
+        let text = response
+            .text()
             .await
-            .context("failed to parse Z.ai response JSON")?;
+            .context("failed to read Z.ai response body")?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "Z.ai request failed with status {status}: {}",
-                redact_response(&value)
-            ));
+            let body = serde_json::from_str::<Value>(&text)
+                .map(|value| redact_response(&value))
+                .unwrap_or_else(|_| concise_response_text(&text));
+            let message = format!("Z.ai request failed with status {status}: {body}");
+            if retryable_status(status) {
+                return Err(RuntimeProviderError::retryable(message).into());
+            }
+            return Err(RuntimeProviderError::non_retryable(message).into());
         }
+        let value: Value =
+            serde_json::from_str(&text).context("failed to parse Z.ai response JSON")?;
 
         let content = value
             .get("choices")
@@ -145,21 +155,97 @@ impl Runtime for ZaiRuntime {
     }
 }
 
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
+}
+
 fn redact_response(value: &Value) -> String {
-    let mut text = value.to_string();
-    if let Some(auth_start) = text.to_ascii_lowercase().find("bearer ") {
-        let suffix_start = auth_start + "bearer ".len();
-        if let Some(end) = text[suffix_start..].find(['"', ' ', '\\']) {
-            text.replace_range(suffix_start..suffix_start + end, "<redacted>");
-        }
+    redact_sensitive_text(&value.to_string())
+}
+
+fn concise_response_text(text: &str) -> String {
+    let text = redact_sensitive_text(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+    const MAX_CHARS: usize = 240;
+    if text.chars().count() <= MAX_CHARS {
+        return text;
     }
-    text
+    format!(
+        "{}...",
+        text.chars()
+            .take(MAX_CHARS.saturating_sub(3))
+            .collect::<String>()
+    )
+}
+
+fn redact_sensitive_text(text: &str) -> String {
+    redact_raw_secret_tokens(&redact_bearer_tokens(text))
+}
+
+fn redact_bearer_tokens(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(auth_start) = remaining.to_ascii_lowercase().find("bearer ") {
+        output.push_str(&remaining[..auth_start]);
+        output.push_str("Bearer <redacted>");
+        let token_start = auth_start + "bearer ".len();
+        let token = &remaining[token_start..];
+        let token_len = token
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '"' | '\'' | '\\' | ',' | ';' | ')' | ']')
+            })
+            .unwrap_or(token.len());
+        remaining = &token[token_len..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_raw_secret_tokens(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some((secret_start, _prefix)) = next_raw_secret_prefix(remaining) {
+        let absolute_start = text.len() - remaining.len() + secret_start;
+        let preceding_character = text[..absolute_start].chars().next_back();
+        if preceding_character.is_some_and(is_secret_token_character) {
+            output.push_str(&remaining[..secret_start + 1]);
+            remaining = &remaining[secret_start + 1..];
+            continue;
+        }
+
+        output.push_str(&remaining[..secret_start]);
+        output.push_str("<redacted secret>");
+        let token = &remaining[secret_start..];
+        let token_length = token
+            .find(|character: char| !is_secret_token_character(character))
+            .unwrap_or(token.len());
+        remaining = &token[token_length..];
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+fn next_raw_secret_prefix(text: &str) -> Option<(usize, &'static str)> {
+    const SECRET_PREFIXES: [&str; 2] = ["sk-", "zai-"];
+    let lower = text.to_ascii_lowercase();
+    SECRET_PREFIXES
+        .into_iter()
+        .filter_map(|prefix| lower.find(prefix).map(|index| (index, prefix)))
+        .min_by_key(|(index, _prefix)| *index)
+}
+
+fn is_secret_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentEffort, AgentProfile, Capability, Limits, PromptMode, RuntimeKind};
+    use crate::config::{
+        AgentEffort, AgentProfile, AgentPromptMetadata, Capability, Limits, PromptMode, RuntimeKind,
+    };
     use crate::orchestrator::{wrap_json_contract, AgentResult};
     use std::net::SocketAddr;
     use tempfile::tempdir;
@@ -222,6 +308,53 @@ mod tests {
         assert!(availability
             .message
             .contains("MULTIAGENT_TEST_MISSING_ZAI_KEY"));
+    }
+
+    #[test]
+    fn concise_response_text_redacts_bearer_tokens_in_plain_text_errors() {
+        let text = concise_response_text(
+            "upstream proxy echoed Authorization: Bearer zai-secret-token while failing",
+        );
+
+        assert!(text.contains("Bearer <redacted>"));
+        assert!(!text.contains("zai-secret-token"));
+    }
+
+    #[test]
+    fn redact_response_redacts_bearer_tokens_in_json_errors() {
+        let value = serde_json::json!({
+            "error": "request included Bearer test-token",
+        });
+
+        let text = redact_response(&value);
+
+        assert!(text.contains("Bearer <redacted>"));
+        assert!(!text.contains("test-token"));
+    }
+
+    #[test]
+    fn concise_response_text_redacts_raw_secret_tokens_in_plain_text_errors() {
+        let text = concise_response_text(
+            "invalid api key zai-secret-token while retrying with sk-test-secret",
+        );
+
+        assert!(text.contains("<redacted secret>"));
+        assert!(!text.contains("zai-secret-token"));
+        assert!(!text.contains("sk-test-secret"));
+    }
+
+    #[test]
+    fn redact_response_redacts_raw_secret_tokens_in_json_errors() {
+        let value = serde_json::json!({
+            "error": "invalid credential sk-json-secret",
+            "debug": "fallback credential zai-json-secret",
+        });
+
+        let text = redact_response(&value);
+
+        assert!(text.contains("<redacted secret>"));
+        assert!(!text.contains("sk-json-secret"));
+        assert!(!text.contains("zai-json-secret"));
     }
 
     async fn spawn_mock_zai_server(
@@ -296,19 +429,25 @@ mod tests {
             run_id: "run".to_string(),
             step_id: "step".to_string(),
             prompt: "answer this".to_string(),
+            session_goal: None,
             working_directory,
             agent_profile: AgentProfile {
                 id: agent_id.to_string(),
                 name: "Oracle".to_string(),
                 runtime: "zai".to_string(),
                 model: "glm-5.1".to_string(),
+                model_fallbacks: Vec::new(),
                 effort: AgentEffort::Medium,
                 thinking: true,
                 capabilities: vec![Capability::Read, Capability::Answer],
+                tools: None,
                 instructions: "Answer questions.".to_string(),
+                orchestrator_description: None,
+                prompt_metadata: AgentPromptMetadata::default(),
                 enabled: true,
             },
             session_events: Vec::new(),
+            recent_context: crate::runtime::RuntimeRecentContext::default(),
             previous_results: Vec::new(),
             action_results: Vec::new(),
             output_schema: "agent_result".to_string(),
