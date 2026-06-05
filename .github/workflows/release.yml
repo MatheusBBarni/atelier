@@ -329,6 +329,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.validate-release.outputs.tag }}
     steps:
       - uses: actions/download-artifact@v4
