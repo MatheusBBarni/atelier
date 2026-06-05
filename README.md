@@ -211,3 +211,10 @@ cargo build
 ## License
 
 MIT
+
+## Integration Roadmap
+
+The following runtime integrations are planned:
+
+- `Claude` (Anthropic): planned for a future release.
+- `Cursor`: planned for a future release.
