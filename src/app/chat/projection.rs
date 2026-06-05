@@ -747,6 +747,9 @@ impl ChatProjection {
             .unwrap_or("Action");
         let diagnostic = string_field(&event.payload, "diagnostic");
         let mut body = Vec::new();
+        if matches!(context.kind.as_deref(), Some("search_text")) {
+            body.extend(search_text_result_lines(&event.payload));
+        }
         if let Some(diagnostic) = diagnostic.as_deref() {
             let line = if status == "failed" {
                 ChatLineView::error(concise(diagnostic, MAX_SUMMARY_CHARS))
@@ -1754,6 +1757,49 @@ fn action_kind_label(kind: &str) -> &'static str {
     }
 }
 
+fn search_text_result_lines(payload: &Value) -> Vec<ChatLineView> {
+    let Some(matches) = payload
+        .get("content")
+        .and_then(|content| content.get("matches"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let mut seen = Vec::new();
+    for entry in matches {
+        let Some(path) = string_field(entry, "path") else {
+            continue;
+        };
+        let location = entry
+            .get("line")
+            .and_then(Value::as_u64)
+            .map(|line| format!("{path}:{line}"))
+            .unwrap_or(path);
+        if seen.contains(&location) {
+            continue;
+        }
+        seen.push(location.clone());
+        lines.push(ChatLineView::plain(format!("match: {location}")));
+        if lines.len() >= 6 {
+            break;
+        }
+    }
+    if let Some(total) = payload
+        .get("content")
+        .and_then(|content| content.get("total_matches"))
+        .and_then(Value::as_u64)
+        .and_then(|total| usize::try_from(total).ok())
+        .filter(|total| *total > seen.len())
+    {
+        lines.push(ChatLineView::muted(format!(
+            "showing {} of {total} matches",
+            seen.len()
+        )));
+    }
+    lines
+}
+
 fn summarize_items(items: &[String], limit: usize) -> String {
     let visible = items
         .iter()
@@ -2113,6 +2159,70 @@ mod tests {
             .iter()
             .any(|line| line.text == "requested patch was not applied"));
         assert!(item.body.iter().any(|line| line.text == "+extra line"));
+    }
+
+    #[test]
+    fn search_text_completion_surfaces_match_locations() {
+        let events = vec![
+            event(
+                "action_requested",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "action",
+                    "step_id": "step",
+                    "kind": "search_text",
+                    "params": {
+                        "query": "npm distribution plan",
+                        "path": "."
+                    }
+                }),
+            ),
+            event(
+                "action_completed",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "action",
+                    "status": "completed",
+                    "summary": "Found 200 matches for \"npm distribution plan\".",
+                    "content": {
+                        "query": "npm distribution plan",
+                        "path": ".",
+                        "matches": [
+                            { "path": "docs/npm-distribution-plan.md", "line": 1, "text": "# npm distribution plan" },
+                            { "path": "README.md", "line": 12, "text": "See npm distribution plan." }
+                        ],
+                        "total_matches": 200,
+                        "truncated": true
+                    },
+                    "artifact": {
+                        "artifact_id": "artifact",
+                        "path": "sessions/session/artifacts/artifact.json"
+                    },
+                    "diagnostic": null
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.title, "Search text completed");
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "match: docs/npm-distribution-plan.md:1"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "match: README.md:12"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "showing 2 of 200 matches"));
     }
 
     #[test]

@@ -33,6 +33,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const LARGE_ACTION_CONTENT_BYTES: usize = 8 * 1024;
+const SEARCH_TEXT_HISTORY_PREVIEW_MATCHES: usize = 8;
 const RUNTIME_HISTORY_EVENT_LIMIT: usize = 100;
 const RUNTIME_HISTORY_PAYLOAD_DEPTH: usize = 3;
 const RUNTIME_HISTORY_PAYLOAD_FIELDS: usize = 20;
@@ -2510,10 +2511,33 @@ impl App {
                 action_target_display(request)
             ),
         )?;
-        durable_result.content = None;
+        durable_result.content = action_content_preview_for_history(request, content);
         durable_result.artifact = Some(serde_json::to_value(artifact)?);
         Ok(durable_result)
     }
+}
+
+fn action_content_preview_for_history(request: &ActionRequest, content: &Value) -> Option<Value> {
+    match request.kind {
+        ActionKind::SearchText => search_text_content_preview(content),
+        _ => None,
+    }
+}
+
+fn search_text_content_preview(content: &Value) -> Option<Value> {
+    let matches = content.get("matches").and_then(Value::as_array)?;
+    let preview = matches
+        .iter()
+        .take(SEARCH_TEXT_HISTORY_PREVIEW_MATCHES)
+        .cloned()
+        .collect::<Vec<_>>();
+    Some(json!({
+        "query": content.get("query").cloned().unwrap_or(Value::Null),
+        "path": content.get("path").cloned().unwrap_or(Value::Null),
+        "matches": preview,
+        "total_matches": matches.len(),
+        "truncated": matches.len() > SEARCH_TEXT_HISTORY_PREVIEW_MATCHES
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -5348,6 +5372,72 @@ runtime = "fake"
         let artifact_path = action_completed
             .payload
             .get("artifact")
+            .and_then(|artifact| artifact.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(dir.path().join(".multiagent").join(artifact_path).exists());
+    }
+
+    #[tokio::test]
+    async fn large_search_results_keep_history_preview_when_spilled() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "action".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::SearchText,
+            params: json!({ "query": "npm distribution plan", "path": "." }),
+        };
+        let matches = (0..240)
+            .map(|index| {
+                json!({
+                    "path": format!("docs/file-{index}.md"),
+                    "line": index + 1,
+                    "text": "npm distribution plan ".repeat(8)
+                })
+            })
+            .collect::<Vec<_>>();
+        let result = ActionResult {
+            schema_version: 1,
+            action_id: "action".to_string(),
+            status: ActionStatus::Completed,
+            summary: "Found 240 matches for \"npm distribution plan\".".to_string(),
+            content: Some(json!({
+                "query": "npm distribution plan",
+                "path": ".",
+                "matches": matches
+            })),
+            artifact: None,
+            diagnostic: None,
+        };
+
+        let durable = app
+            .action_result_for_history("run", "step", &request, &result)
+            .unwrap();
+
+        assert!(durable.artifact.is_some());
+        let preview = durable.content.unwrap();
+        assert_eq!(
+            preview
+                .get("matches")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .len(),
+            SEARCH_TEXT_HISTORY_PREVIEW_MATCHES
+        );
+        assert_eq!(
+            preview.get("total_matches").and_then(Value::as_u64),
+            Some(240)
+        );
+        assert_eq!(
+            preview.get("truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+        let artifact_path = durable
+            .artifact
+            .as_ref()
             .and_then(|artifact| artifact.get("path"))
             .and_then(serde_json::Value::as_str)
             .unwrap();
