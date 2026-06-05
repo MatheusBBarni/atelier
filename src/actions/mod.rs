@@ -343,6 +343,10 @@ pub fn classify_command(command: &str) -> CommandClassification {
 }
 
 fn is_default_read_only_command(lower: &str) -> bool {
+    if has_shell_control_syntax(lower) {
+        return false;
+    }
+
     let allow_prefixes = [
         "cargo test",
         "cargo check",
@@ -379,6 +383,43 @@ fn is_default_read_only_command(lower: &str) -> bool {
         .any(|prefix| command_has_prefix(lower, prefix))
         || is_read_only_git_branch_command(lower)
         || is_read_only_git_remote_command(lower)
+}
+
+fn has_shell_control_syntax(command: &str) -> bool {
+    let mut chars = command.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if in_single || in_double {
+            continue;
+        }
+
+        match ch {
+            '\n' | '\r' | ';' | '&' | '|' | '>' | '<' | '`' | '(' | ')' => return true,
+            '$' if chars.peek() == Some(&'(') => return true,
+            _ => {}
+        }
+    }
+
+    false
 }
 
 pub fn is_vcs_mutation(command: &str) -> bool {
@@ -1230,6 +1271,18 @@ mod tests {
             CommandClassification::Allow
         );
         assert_eq!(
+            classify_command("rg \"todo|fixme\" src"),
+            CommandClassification::Allow
+        );
+        assert_eq!(
+            classify_command("git rev-parse --abbrev-ref HEAD && rm -rf target"),
+            CommandClassification::Approve
+        );
+        assert_eq!(
+            classify_command("rg todo src | cat"),
+            CommandClassification::Approve
+        );
+        assert_eq!(
             classify_command("git push origin main"),
             CommandClassification::Approve
         );
@@ -1265,6 +1318,17 @@ mod tests {
         assert!(!vcs_action_explicitly_requested(
             &Some("inspect the branch state".to_string()),
             "git add ."
+        ));
+    }
+
+    #[test]
+    fn read_only_shell_suffix_requires_approval_in_normal_mode() {
+        assert!(matches!(
+            decision_for_command(
+                "git rev-parse --abbrev-ref HEAD && rm -rf target",
+                &ApprovalMode::Normal
+            ),
+            ActionDecision::RequiresApproval(_)
         ));
     }
 

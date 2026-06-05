@@ -91,6 +91,10 @@ fn cargo_summary_command(lower: &str) -> bool {
 }
 
 fn known_read_only_command(lower: &str) -> bool {
+    if has_shell_control_syntax(lower) {
+        return false;
+    }
+
     [
         "pwd",
         "ls",
@@ -155,6 +159,43 @@ fn approval_command(lower: &str) -> bool {
 fn command_has_prefix(lower_command: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end();
     lower_command == prefix || lower_command.starts_with(&format!("{prefix} "))
+}
+
+fn has_shell_control_syntax(command: &str) -> bool {
+    let mut chars = command.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if in_single || in_double {
+            continue;
+        }
+
+        match ch {
+            '\n' | '\r' | ';' | '&' | '|' | '>' | '<' | '`' | '(' | ')' => return true,
+            '$' if chars.peek() == Some(&'(') => return true,
+            _ => {}
+        }
+    }
+
+    false
 }
 
 fn is_read_only_git_branch_command(lower: &str) -> bool {
@@ -414,6 +455,7 @@ mod tests {
             "git branch --show-current",
             "git rev-parse --abbrev-ref HEAD",
             "git remote -v",
+            "rg \"todo|fixme\" src",
         ] {
             let summary = summarize_command(CommandSummaryInput {
                 command: command.to_string(),
@@ -426,5 +468,19 @@ mod tests {
             assert_eq!(summary.category, CommandCategory::KnownReadOnly);
             assert!(summary.title.starts_with("Command:"));
         }
+    }
+
+    #[test]
+    fn shell_suffixed_read_only_command_uses_fallback_summary() {
+        let summary = summarize_command(CommandSummaryInput {
+            command: "git rev-parse --abbrev-ref HEAD && rm -rf target".to_string(),
+            exit_code: Some(0),
+            stdout: Some("main\n".to_string()),
+            stderr: None,
+            diagnostic: None,
+        });
+
+        assert_eq!(summary.category, CommandCategory::Unknown);
+        assert!(summary.title.starts_with("Command:"));
     }
 }

@@ -382,7 +382,6 @@ impl App {
         if self.handle_subtask_command(&prompt).await? {
             return Ok(());
         }
-        reject_unknown_slash_command(&prompt)?;
         if matches!(self.state.run_state, RunState::WaitingForUser) {
             if self.state.pending_approval.is_some() {
                 bail!("a run is waiting for action approval");
@@ -402,6 +401,7 @@ impl App {
                 return self.drive_run(pending.run, None).await;
             }
         }
+        reject_unknown_slash_command(&prompt)?;
         if matches!(
             self.state.run_state,
             RunState::Planning | RunState::Running | RunState::WaitingForUser
@@ -4410,6 +4410,34 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn clarifying_answer_can_start_with_slash() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        app.submit_prompt("/tmp/project").await.unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answer = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answer
+                .payload
+                .get("answer")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
+    }
+
+    #[tokio::test]
     async fn normal_prompt_cannot_answer_pending_approval() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("multiagent.toml");
@@ -4496,6 +4524,16 @@ runtime = "fake"
         assert!(app.state.pending_approval.is_none());
         assert!(app.active_step.is_none());
         assert_eq!(agent_status(&app, "fixer"), "interrupted");
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.status == ChatItemStatus::WaitingApproval));
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.title.contains("Approval required")));
         let events = app.history.read_events().unwrap();
         assert!(events
             .iter()

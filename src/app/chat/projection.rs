@@ -137,7 +137,8 @@ impl ChatProjection {
 
     pub fn apply_pending_approval(&mut self, approval: Option<&PendingApprovalView>) {
         let Some(approval) = approval else {
-            self.pending_key = None;
+            let previous_key = self.pending_key.take();
+            self.remove_waiting_approval_key(previous_key);
             return;
         };
         let key = ChatLifecycleKey::Action {
@@ -990,6 +991,21 @@ impl ChatProjection {
         let Some(index) = self.index.remove(&key) else {
             return;
         };
+        self.items.remove(index);
+        self.rebuild_index();
+    }
+
+    fn remove_waiting_approval_key(&mut self, key: Option<ChatLifecycleKey>) {
+        let Some(key) = key else {
+            return;
+        };
+        let Some(index) = self.index.get(&key).copied() else {
+            return;
+        };
+        if self.items[index].status != ChatItemStatus::WaitingApproval {
+            return;
+        }
+        self.index.remove(&key);
         self.items.remove(index);
         self.rebuild_index();
     }
