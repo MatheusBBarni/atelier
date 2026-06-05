@@ -1,3 +1,6 @@
+pub mod chat;
+
+use self::chat::{ChatItemView, ChatProjection};
 use crate::actions::{
     execute_action_request, is_vcs_mutation, validate_action_request,
     vcs_action_explicitly_requested, ActionDecision, ActionExecutionContext, ActionKind,
@@ -58,6 +61,7 @@ pub struct AppState {
     pub live_step: Option<LiveStepView>,
     pub pending_approval: Option<PendingApprovalView>,
     pub agents: Vec<AgentView>,
+    pub chat_items: Vec<ChatItemView>,
     pub events: Vec<String>,
     pub input: String,
 }
@@ -110,6 +114,7 @@ pub struct App {
     history: HistoryStore,
     availability: BTreeMap<String, RuntimeAvailability>,
     state: AppState,
+    chat_projection: ChatProjection,
     pending_approval: Option<PendingApproval>,
     pending_clarification: Option<PendingClarification>,
     active_step: Option<ActiveStep>,
@@ -260,6 +265,7 @@ impl App {
             live_step: None,
             pending_approval: None,
             agents: build_agent_views(&config, &availability),
+            chat_items: Vec::new(),
             events: Vec::new(),
             input: String::new(),
         };
@@ -268,6 +274,7 @@ impl App {
             history,
             availability,
             state,
+            chat_projection: ChatProjection::new(),
             pending_approval: None,
             pending_clarification: None,
             active_step: None,
@@ -394,6 +401,7 @@ impl App {
                 return self.drive_run(pending.run, None).await;
             }
         }
+        reject_unknown_slash_command(&prompt)?;
         if matches!(
             self.state.run_state,
             RunState::Planning | RunState::Running | RunState::WaitingForUser
@@ -695,6 +703,7 @@ impl App {
             self.pending_approval = None;
             self.pending_clarification = None;
             self.active_step = None;
+            self.sync_chat_items();
             self.publish_state();
         }
         Ok(())
@@ -1443,6 +1452,7 @@ impl App {
             agent: agent.to_string(),
             streams: Vec::new(),
         });
+        self.sync_chat_items();
         self.set_agent_status(agent, "running");
     }
 
@@ -1454,6 +1464,7 @@ impl App {
             .map(|step| step.agent.clone());
         if let Some(agent) = agent {
             self.state.live_step = None;
+            self.sync_chat_items();
             self.set_agent_status(&agent, "idle");
             self.active_step = None;
         }
@@ -1886,9 +1897,19 @@ impl App {
         if self.debug_enabled {
             self.history.append_debug_event(&event)?;
         }
+        self.chat_projection.apply_history_event(&event);
+        self.sync_chat_items();
         self.state.events.push(display.into());
         self.publish_state();
         Ok(())
+    }
+
+    fn sync_chat_items(&mut self) {
+        self.chat_projection
+            .apply_live_step(self.state.live_step.as_ref());
+        self.chat_projection
+            .apply_pending_approval(self.state.pending_approval.as_ref());
+        self.state.chat_items = self.chat_projection.items().to_vec();
     }
 
     fn publish_state(&self) {
@@ -2834,6 +2855,17 @@ fn parse_subtask_command(input: &str) -> Result<(&str, &str)> {
     Ok((agent.trim(), task))
 }
 
+fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
+    let trimmed = prompt.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(());
+    }
+    let command = trimmed.split_whitespace().next().unwrap_or(trimmed);
+    bail!(
+        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>"
+    )
+}
+
 fn subtask_prompt(task: &str) -> String {
     format!(
         "Subtask request:\n{task}\n\nScope guard:\n- Work only on the subtask request above.\n- Do not broaden scope beyond this subtask.\n- If the request requires broader work, return a blocked agent_result explaining the needed parent-scope decision.\n- Return a concise child summary and verification evidence for only this subtask."
@@ -3013,6 +3045,7 @@ fn single_line_event_text(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::chat::{ChatItemKind, ChatItemStatus, ChatSeverity};
     use crate::config::{load_effective_config, ConfigLoadOptions};
     use std::fs;
     use tempfile::tempdir;
@@ -3545,6 +3578,23 @@ instructions_file = "agents/explorer.md"
             .payload
             .to_string()
             .contains("secret prompt body"));
+    }
+
+    #[tokio::test]
+    async fn unknown_slash_command_is_not_submitted_as_agent_prompt() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app.submit_prompt("/doctor").await.unwrap_err();
+
+        assert!(error.to_string().contains("unknown command /doctor"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
     }
 
     #[tokio::test]
@@ -4169,6 +4219,20 @@ runtime = "fake"
         let display_events = app.state.events.join("\n");
         assert!(display_events.contains("Action requested: run command pwd"));
         assert!(display_events.contains("Command completed: pwd -> Completed"));
+        let command_items = app
+            .state
+            .chat_items
+            .iter()
+            .filter(|item| {
+                item.kind == ChatItemKind::CommandResult && item.source.action_id.is_some()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(command_items.len(), 1);
+        assert_eq!(command_items[0].severity, ChatSeverity::Success);
+        assert!(command_items[0]
+            .body
+            .iter()
+            .any(|line| line.text.contains("$ pwd")));
     }
 
     #[tokio::test]
@@ -4208,6 +4272,14 @@ runtime = "fake"
         let display_events = app.state.events.join("\n");
         assert!(display_events.contains("Action requested: write multiagent-action-output.txt"));
         assert!(display_events.contains("File created: multiagent-action-output.txt"));
+        let file_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::FileEdit && item.source.action_id.is_some())
+            .unwrap();
+        assert_eq!(file_item.severity, ChatSeverity::Success);
+        assert!(file_item.title.contains("multiagent-action-output.txt"));
     }
 
     #[tokio::test]
@@ -4299,6 +4371,14 @@ runtime = "fake"
         let events = app.state.events.join("\n");
         assert!(events.contains("Action approval required."));
         assert!(!events.contains("Action completed: ApprovalRequired"));
+        let approval_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::Approval)
+            .unwrap();
+        assert_eq!(approval_item.status, ChatItemStatus::WaitingApproval);
+        assert_eq!(approval_item.severity, ChatSeverity::Warning);
     }
 
     #[tokio::test]
@@ -4327,6 +4407,34 @@ runtime = "fake"
         assert!(events.contains("You: use the CLI path"));
         assert!(events.contains("explorer:"));
         assert!(events.contains("Run completed."));
+    }
+
+    #[tokio::test]
+    async fn clarifying_answer_can_start_with_slash() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        app.submit_prompt("/tmp/project").await.unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answer = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answer
+                .payload
+                .get("answer")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
     }
 
     #[tokio::test]
@@ -4416,6 +4524,16 @@ runtime = "fake"
         assert!(app.state.pending_approval.is_none());
         assert!(app.active_step.is_none());
         assert_eq!(agent_status(&app, "fixer"), "interrupted");
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.status == ChatItemStatus::WaitingApproval));
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.title.contains("Approval required")));
         let events = app.history.read_events().unwrap();
         assert!(events
             .iter()
@@ -4483,6 +4601,14 @@ runtime = "fake"
         assert!(events.contains("fixer: Fake Fixer validated"));
         assert!(events.contains("reviewer: Fake reviewer step completed."));
         assert!(events.contains("Run completed."));
+        let denied_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.source.action_id.is_some())
+            .unwrap();
+        assert_eq!(denied_item.status, ChatItemStatus::Denied);
+        assert_eq!(denied_item.severity, ChatSeverity::Warning);
     }
 
     #[tokio::test]

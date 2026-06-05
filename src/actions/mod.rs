@@ -303,6 +303,10 @@ pub fn classify_command(command: &str) -> CommandClassification {
         return CommandClassification::Deny;
     }
 
+    if is_default_read_only_command(&lower) {
+        return CommandClassification::Allow;
+    }
+
     let approve_prefixes = [
         "git commit",
         "git push",
@@ -335,16 +339,32 @@ pub fn classify_command(command: &str) -> CommandClassification {
         return CommandClassification::Approve;
     }
 
+    CommandClassification::Approve
+}
+
+fn is_default_read_only_command(lower: &str) -> bool {
+    if has_shell_control_syntax(lower) {
+        return false;
+    }
+
     let allow_prefixes = [
         "cargo test",
         "cargo check",
         "cargo build",
         "cargo fmt",
         "cargo clippy",
+        "cargo metadata",
+        "cargo tree",
+        "cargo locate-project",
         "git status",
         "git diff",
         "git log",
         "git show",
+        "git rev-parse",
+        "git ls-files",
+        "git grep",
+        "git blame",
+        "git describe",
         "rg ",
         "ls",
         "pwd",
@@ -353,19 +373,61 @@ pub fn classify_command(command: &str) -> CommandClassification {
         "grep ",
         "find ",
         "wc ",
+        "multiagent --doctor",
+        "multiagent --print-config",
+        "multiagent --help",
+        "multiagent --version",
     ];
-    if allow_prefixes
+    allow_prefixes
         .iter()
-        .any(|prefix| command_has_prefix(&lower, prefix))
-    {
-        return CommandClassification::Allow;
+        .any(|prefix| command_has_prefix(lower, prefix))
+        || is_read_only_git_branch_command(lower)
+        || is_read_only_git_remote_command(lower)
+}
+
+fn has_shell_control_syntax(command: &str) -> bool {
+    let mut chars = command.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if in_single || in_double {
+            continue;
+        }
+
+        match ch {
+            '\n' | '\r' | ';' | '&' | '|' | '>' | '<' | '`' | '(' | ')' => return true,
+            '$' if chars.peek() == Some(&'(') => return true,
+            _ => {}
+        }
     }
 
-    CommandClassification::Approve
+    false
 }
 
 pub fn is_vcs_mutation(command: &str) -> bool {
     let lower = command.trim().to_ascii_lowercase();
+    if is_default_read_only_command(&lower) {
+        return false;
+    }
+
     let mutation_prefixes = [
         "git commit",
         "git push",
@@ -407,7 +469,7 @@ pub fn vcs_action_explicitly_requested(user_prompt: &Option<String>, command: &s
     } else if command.starts_with("git branch ") {
         prompt.contains("branch")
     } else if command.starts_with("git add") {
-        prompt.contains("stage") || prompt.contains("git add")
+        prompt.contains("stage") || prompt.contains("git add") || prompt.contains("commit")
     } else if command.starts_with("git rm") {
         prompt.contains("git rm") || prompt.contains("remove from git")
     } else if command.starts_with("git restore") {
@@ -425,6 +487,28 @@ pub fn vcs_action_explicitly_requested(user_prompt: &Option<String>, command: &s
     } else {
         false
     }
+}
+
+fn is_read_only_git_branch_command(lower: &str) -> bool {
+    lower == "git branch"
+        || command_has_prefix(lower, "git branch --show-current")
+        || command_has_prefix(lower, "git branch --list")
+        || command_has_prefix(lower, "git branch --all")
+        || command_has_prefix(lower, "git branch --remotes")
+        || command_has_prefix(lower, "git branch --verbose")
+        || command_has_prefix(lower, "git branch --contains")
+        || command_has_prefix(lower, "git branch --merged")
+        || command_has_prefix(lower, "git branch --no-merged")
+        || command_has_prefix(lower, "git branch -a")
+        || command_has_prefix(lower, "git branch -r")
+        || command_has_prefix(lower, "git branch -v")
+}
+
+fn is_read_only_git_remote_command(lower: &str) -> bool {
+    lower == "git remote"
+        || command_has_prefix(lower, "git remote -v")
+        || command_has_prefix(lower, "git remote show")
+        || command_has_prefix(lower, "git remote get-url")
 }
 
 fn command_has_prefix(lower_command: &str, prefix: &str) -> bool {
@@ -1175,6 +1259,30 @@ mod tests {
             CommandClassification::Allow
         );
         assert_eq!(
+            classify_command("git branch --show-current"),
+            CommandClassification::Allow
+        );
+        assert_eq!(
+            classify_command("git rev-parse --abbrev-ref HEAD"),
+            CommandClassification::Allow
+        );
+        assert_eq!(
+            classify_command("git remote -v"),
+            CommandClassification::Allow
+        );
+        assert_eq!(
+            classify_command("rg \"todo|fixme\" src"),
+            CommandClassification::Allow
+        );
+        assert_eq!(
+            classify_command("git rev-parse --abbrev-ref HEAD && rm -rf target"),
+            CommandClassification::Approve
+        );
+        assert_eq!(
+            classify_command("rg todo src | cat"),
+            CommandClassification::Approve
+        );
+        assert_eq!(
             classify_command("git push origin main"),
             CommandClassification::Approve
         );
@@ -1185,10 +1293,43 @@ mod tests {
     fn vcs_mutations_are_detected_separately_from_safe_git_inspection() {
         assert!(!is_vcs_mutation("git status --short"));
         assert!(!is_vcs_mutation("git diff"));
+        assert!(!is_vcs_mutation("git branch --show-current"));
+        assert!(!is_vcs_mutation("git remote get-url origin"));
         assert!(is_vcs_mutation("git commit -m test"));
         assert!(is_vcs_mutation("git push origin main"));
         assert!(is_vcs_mutation("git branch feature/new"));
         assert!(is_vcs_mutation("git reset --hard HEAD~1"));
+    }
+
+    #[test]
+    fn commit_request_allows_default_staging_command() {
+        let prompt = Some("commit and push the current changes".to_string());
+
+        assert!(vcs_action_explicitly_requested(&prompt, "git add -u"));
+        assert!(vcs_action_explicitly_requested(&prompt, "git add ."));
+        assert!(vcs_action_explicitly_requested(
+            &prompt,
+            "git commit --no-verify -m \"feat: add chat\""
+        ));
+        assert!(vcs_action_explicitly_requested(
+            &prompt,
+            "git push -u origin feat/chat"
+        ));
+        assert!(!vcs_action_explicitly_requested(
+            &Some("inspect the branch state".to_string()),
+            "git add ."
+        ));
+    }
+
+    #[test]
+    fn read_only_shell_suffix_requires_approval_in_normal_mode() {
+        assert!(matches!(
+            decision_for_command(
+                "git rev-parse --abbrev-ref HEAD && rm -rf target",
+                &ApprovalMode::Normal
+            ),
+            ActionDecision::RequiresApproval(_)
+        ));
     }
 
     #[test]

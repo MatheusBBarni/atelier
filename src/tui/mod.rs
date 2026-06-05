@@ -1,3 +1,6 @@
+use crate::app::chat::{
+    ChatDetailRef, ChatItemKind, ChatItemView, ChatLineStyle, ChatLineView, ChatSeverity,
+};
 use crate::app::{App, AppEvent, AppState};
 use crate::config::EffectiveConfig;
 use anyhow::{Context, Result};
@@ -597,7 +600,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         outer[0]
     };
 
-    render_event_stream(frame, event_area, state, ui_state);
+    render_chat(frame, event_area, state, ui_state);
 
     let input_layout = input_layout(outer[1], &state.input, ui_state.input_cursor);
     ui_state.input_width = input_layout.width;
@@ -620,13 +623,10 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     }
 }
 
-fn render_event_stream(
-    frame: &mut Frame,
-    event_area: Rect,
-    state: &AppState,
-    ui_state: &mut TuiUiState,
-) {
-    let mut event_lines = if let Some(pending) = &state.pending_approval {
+fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: &mut TuiUiState) {
+    let event_lines = if !state.chat_items.is_empty() {
+        chat_item_lines(&state.chat_items)
+    } else if let Some(pending) = &state.pending_approval {
         vec![
             Line::from(format!(
                 "Approval required for {} action {}.",
@@ -640,45 +640,16 @@ fn render_event_stream(
             ),
         ]
     } else if state.events.is_empty() {
-        vec![Line::from("No events yet.")]
+        vec![Line::from("No chat yet.")]
     } else {
         state
             .events
             .iter()
-            .map(|event| event_stream_line(event))
+            .map(|event| legacy_chat_line(event))
             .collect::<Vec<_>>()
     };
-    if let Some(live_step) = &state.live_step {
-        let mut live_lines = vec![Line::from(vec![
-            Span::styled("Active step ", Style::default().fg(Color::LightGreen)),
-            Span::styled(
-                format!("{} ", live_step.agent),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("run:{} step:{}", live_step.run_id, live_step.step_id),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])];
-        if live_step.streams.is_empty() {
-            live_lines.push(Line::from("  waiting for runtime output"));
-        } else {
-            for stream in &live_step.streams {
-                let marker = if stream.final_delta { "final" } else { "live" };
-                live_lines.push(Line::from(format!(
-                    "  [{}:{}] {}",
-                    stream.stream, marker, stream.content
-                )));
-            }
-        }
-        live_lines.push(Line::from(""));
-        live_lines.extend(event_lines);
-        event_lines = live_lines;
-    }
     let block = Block::default()
-        .title(" Event Stream ")
+        .title(" Chat ")
         .title_style(Style::default().fg(Color::Green))
         .border_style(Style::default().fg(Color::DarkGray))
         .borders(Borders::ALL);
@@ -719,6 +690,177 @@ fn render_event_stream(
     }
 }
 
+fn chat_item_lines(items: &[ChatItemView]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for item in items {
+        if item.kind == ChatItemKind::UserPrompt {
+            lines.extend(user_prompt_lines(item));
+            lines.push(Line::from(""));
+            continue;
+        }
+        lines.push(chat_item_header_line(item));
+        if let Some(summary) = item
+            .summary
+            .as_deref()
+            .filter(|summary| !summary.is_empty())
+        {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(summary.to_string(), Style::default().fg(Color::Gray)),
+            ]));
+        }
+        for body in &item.body {
+            lines.push(chat_body_line(body));
+        }
+        if !item.details.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  details: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    item.details
+                        .iter()
+                        .map(detail_label)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    if lines.last().is_some_and(|line| line.width() == 0) {
+        lines.pop();
+    }
+    lines
+}
+
+fn user_prompt_lines(item: &ChatItemView) -> Vec<Line<'static>> {
+    let mut texts = item
+        .body
+        .iter()
+        .map(|line| line.text.clone())
+        .collect::<Vec<_>>();
+    if texts.is_empty() {
+        if let Some(summary) = item.summary.clone() {
+            texts.push(summary);
+        }
+    }
+    if texts.is_empty() {
+        texts.push(item.title.clone());
+    }
+
+    let label = if item.title.to_ascii_lowercase().contains("clarification") {
+        " You / clarification "
+    } else {
+        " You "
+    };
+    let continuation_prefix = " ".repeat(label.chars().count());
+    texts
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            if index == 0 {
+                Line::from(vec![
+                    Span::styled(
+                        label,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" ", Style::default().bg(USER_EVENT_BG)),
+                    Span::styled(text, Style::default().fg(Color::White).bg(USER_EVENT_BG)),
+                    Span::styled(" ", Style::default().bg(USER_EVENT_BG)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        continuation_prefix.clone(),
+                        Style::default().bg(USER_EVENT_BG),
+                    ),
+                    Span::styled(text, Style::default().fg(Color::White).bg(USER_EVENT_BG)),
+                    Span::styled(" ", Style::default().bg(USER_EVENT_BG)),
+                ])
+            }
+        })
+        .collect()
+}
+
+fn chat_item_header_line(item: &ChatItemView) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" {} ", item.status.label()),
+            severity_badge_style(&item.severity),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            item.title.clone(),
+            severity_title_style(&item.severity).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}", chat_kind_label(&item.kind)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn chat_body_line(line: &ChatLineView) -> Line<'static> {
+    let (prefix, style) = match line.style {
+        ChatLineStyle::Plain => ("  ", Style::default().fg(Color::White)),
+        ChatLineStyle::Muted => ("  ", Style::default().fg(Color::Gray)),
+        ChatLineStyle::Code => ("  ", Style::default().fg(Color::LightBlue)),
+        ChatLineStyle::DiffAdd => ("  ", Style::default().fg(Color::Green)),
+        ChatLineStyle::DiffRemove => ("  ", Style::default().fg(Color::Red)),
+        ChatLineStyle::DiffContext => ("  ", Style::default().fg(Color::DarkGray)),
+        ChatLineStyle::Warning => ("  ", Style::default().fg(Color::Yellow)),
+        ChatLineStyle::Error => ("  ", Style::default().fg(Color::Red)),
+    };
+    Line::from(vec![
+        Span::styled(prefix, Style::default()),
+        Span::styled(line.text.clone(), style),
+    ])
+}
+
+fn detail_label(detail: &ChatDetailRef) -> String {
+    match detail {
+        ChatDetailRef::HistoryEvent { label, .. }
+        | ChatDetailRef::Artifact { label, .. }
+        | ChatDetailRef::Inline { label, .. } => label.clone(),
+    }
+}
+
+fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
+    match kind {
+        ChatItemKind::UserPrompt => "prompt",
+        ChatItemKind::RoutingDecision => "route",
+        ChatItemKind::AgentProgress => "progress",
+        ChatItemKind::ActionRequested => "action",
+        ChatItemKind::CommandResult => "command",
+        ChatItemKind::FileEdit => "file edit",
+        ChatItemKind::Approval => "approval",
+        ChatItemKind::Diagnostic => "diagnostic",
+        ChatItemKind::AgentResult => "agent",
+        ChatItemKind::RunSummary => "run",
+    }
+}
+
+fn severity_badge_style(severity: &ChatSeverity) -> Style {
+    match severity {
+        ChatSeverity::Info => Style::default().fg(Color::Black).bg(Color::Blue),
+        ChatSeverity::Success => Style::default().fg(Color::Black).bg(Color::Green),
+        ChatSeverity::Warning => Style::default().fg(Color::Black).bg(Color::Yellow),
+        ChatSeverity::Error => Style::default().fg(Color::White).bg(Color::Red),
+    }
+}
+
+fn severity_title_style(severity: &ChatSeverity) -> Style {
+    match severity {
+        ChatSeverity::Info => Style::default().fg(Color::White),
+        ChatSeverity::Success => Style::default().fg(Color::LightGreen),
+        ChatSeverity::Warning => Style::default().fg(Color::Yellow),
+        ChatSeverity::Error => Style::default().fg(Color::Red),
+    }
+}
+
 fn wrapped_event_line_count(lines: &[Line<'_>], width: u16) -> usize {
     let width = usize::from(width.max(1));
     lines
@@ -747,9 +889,9 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("Enter                submit prompt or answer approval"),
         Line::from("Ctrl-L               show or hide Agent Roster"),
         Line::from("Arrow keys           move input cursor"),
-        Line::from("PageUp/PageDown     scroll Event Stream by page"),
-        Line::from("Mouse wheel         scroll Event Stream by line"),
-        Line::from("Home/End            jump Event Stream to top/latest"),
+        Line::from("PageUp/PageDown     scroll Chat by page"),
+        Line::from("Mouse wheel         scroll Chat by line"),
+        Line::from("Home/End            jump Chat to top/latest"),
         Line::from("Ctrl-C               interrupt active run and exit"),
         Line::from("Backspace            delete input character"),
         Line::from("Text                 edit the input composer"),
@@ -811,7 +953,7 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn event_stream_line(event: &str) -> Line<'_> {
+fn legacy_chat_line(event: &str) -> Line<'_> {
     if let Some(message) = event.strip_prefix("You: ") {
         return Line::from(vec![
             Span::styled(
@@ -931,10 +1073,13 @@ fn set_input_cursor(frame: &mut Frame, input_area: Rect, input_layout: InputLayo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::chat::ChatProjection;
     use crate::app::{AgentView, ConfigStatusView, LiveStepView, LiveStreamView};
+    use crate::history::HistoryEvent;
     use crate::orchestrator::RunState;
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
     use ratatui::backend::TestBackend;
+    use serde_json::json;
 
     #[test]
     fn renders_empty_tui_surfaces() {
@@ -947,14 +1092,15 @@ mod tests {
             live_step: None,
             pending_approval: None,
             agents: Vec::new(),
+            chat_items: Vec::new(),
             events: Vec::new(),
             input: String::new(),
         };
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Agent Roster"));
-        assert!(text.contains("Event Stream"));
+        assert!(text.contains("Chat"));
         assert!(text.contains("Input Composer"));
-        assert!(text.contains("No events yet."));
+        assert!(text.contains("No chat yet."));
     }
 
     #[test]
@@ -983,6 +1129,7 @@ mod tests {
                 }),
                 status: "running".to_string(),
             }],
+            chat_items: Vec::new(),
             events: vec![
                 "Run started.".to_string(),
                 "Fixer step started.".to_string(),
@@ -999,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_live_step_stream_detail_above_events() {
+    fn renders_live_step_stream_detail_as_chat_progress() {
         let mut state = state_with_input("", false);
         state.live_step = Some(LiveStepView {
             run_id: "run".to_string(),
@@ -1012,13 +1159,15 @@ mod tests {
             }],
         });
         state.events = vec!["Fixer step started.".to_string()];
+        let mut projection = ChatProjection::new();
+        projection.apply_live_step(state.live_step.as_ref());
+        state.chat_items = projection.items().to_vec();
 
         let text = render_to_text(&state, 100, 24);
 
-        assert!(text.contains("Active step"));
-        assert!(text.contains("fixer"));
+        assert!(text.contains("fixer is working"));
         assert!(text.contains("[stdout:live] compiling target"));
-        assert!(text.contains("Fixer step started."));
+        assert!(!text.contains("Fixer step started."));
     }
 
     #[test]
@@ -1052,6 +1201,7 @@ mod tests {
             live_step: None,
             pending_approval: None,
             agents: Vec::new(),
+            chat_items: Vec::new(),
             events: vec!["You: build a feature".to_string()],
             input: String::new(),
         };
@@ -1060,6 +1210,30 @@ mod tests {
 
         assert!(text.contains("You"));
         assert!(text.contains("build a feature"));
+    }
+
+    #[test]
+    fn renders_typed_user_prompt_as_dedicated_prompt_row() {
+        let mut state = state_with_input("", false);
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&HistoryEvent {
+            schema_version: 1,
+            event_id: "event-prompt".to_string(),
+            session_id: "session".to_string(),
+            run_id: Some("run".to_string()),
+            step_id: None,
+            timestamp: "2026-06-05T00:00:00.000Z".to_string(),
+            kind: "prompt_submitted".to_string(),
+            payload: json!({ "prompt": "build a feature" }),
+        });
+        state.chat_items = projection.items().to_vec();
+
+        let text = render_to_text(&state, 100, 24);
+
+        assert!(text.contains("You"));
+        assert!(text.contains("build a feature"));
+        assert!(!text.contains("User prompt"));
+        assert!(!text.contains("completed"));
     }
 
     #[test]
@@ -1121,6 +1295,7 @@ mod tests {
                 diagnostic: Some("command requires action approval: cargo install x".to_string()),
             }),
             agents: Vec::new(),
+            chat_items: Vec::new(),
             events: vec!["Action approval required.".to_string()],
             input: String::new(),
         };
@@ -1300,7 +1475,7 @@ mod tests {
 
     #[test]
     fn user_prompt_event_line_has_background() {
-        let line = event_stream_line("You: build a feature");
+        let line = legacy_chat_line("You: build a feature");
 
         assert!(line.spans.iter().all(|span| span.style.bg.is_some()));
     }
@@ -1637,6 +1812,7 @@ mod tests {
                 availability: None,
                 status: "idle".to_string(),
             }],
+            chat_items: Vec::new(),
             events: vec!["Run started.".to_string()],
             input: String::new(),
         };
@@ -1648,7 +1824,7 @@ mod tests {
         let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
 
         assert!(!text.contains("Agent Roster"));
-        assert!(text.contains("Event Stream"));
+        assert!(text.contains("Chat"));
         assert!(text.contains("Run started."));
     }
 
@@ -1739,6 +1915,7 @@ mod tests {
                 diagnostic: None,
             }),
             agents: Vec::new(),
+            chat_items: Vec::new(),
             events: Vec::new(),
             input: input.to_string(),
         }

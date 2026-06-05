@@ -19,7 +19,7 @@ The repository currently contains documentation only. There is no Rust scaffold 
 
 - Build a Rust binary crate named `multiagent` that installs globally with `cargo install --path .`.
 - Keep the implementation as one Rust package with `src/lib.rs` and `src/main.rs`.
-- Provide a TUI with Agent Roster, Event Stream, and Input Composer.
+- Provide a TUI with Agent Roster, Chat, and Input Composer.
 - Implement a typed app event loop that coordinates TUI input, runtime streaming, harness actions, approvals, history, and diagnostics.
 - Resolve built-in, home, local, and CLI config into a validated `EffectiveConfig`.
 - Persist meaningful session/run history as JSON/JSONL under `.multiagent/`.
@@ -220,7 +220,7 @@ The TUI must be side-effect-light:
 Primary surfaces:
 
 - Agent Roster.
-- Event Stream.
+- Chat.
 - Input Composer.
 
 ### Orchestrator
@@ -886,7 +886,7 @@ Implementation milestones:
 
 1. Crate skeleton, CLI parsing, config pipeline, built-in profiles.
 2. History store, app event loop, run/step state machine.
-3. TUI shell rendering Agent Roster, Event Stream, and Input Composer with fake runtime.
+3. TUI shell rendering Agent Roster, Chat, and Input Composer with fake runtime.
 4. Action protocol, capability/path/command policy, approvals/yolo.
 5. Codex and Z.ai runtime adapters, doctor checks, final acceptance loop.
 
@@ -1007,7 +1007,7 @@ Rejected by product decision. Default is yolo for speed, with capability enforce
 
 - `cargo install --path .` installs a `multiagent` binary.
 - `multiagent` launches a TUI from an arbitrary folder.
-- TUI renders Agent Roster, Event Stream, and Input Composer from `AppState`.
+- TUI renders Agent Roster, Chat, and Input Composer from `AppState`.
 - Built-in config resolves into `EffectiveConfig` without user config.
 - Home and local config merge with documented conflict rules.
 - `--print-config` prints redacted effective TOML.

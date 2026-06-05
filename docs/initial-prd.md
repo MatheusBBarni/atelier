@@ -88,7 +88,7 @@ The working directory is where the run reads, edits, runs commands, and stores p
 The first TUI should use a three-zone layout:
 
 - Agent Roster: shows agents, runtime, model assignment, runtime availability, capabilities summary, and current status.
-- Event Stream: shows prompts, run plans, routing decisions, agent output, diffs, command results, approval prompts, blockers, review findings, and final summaries.
+- Chat: shows prompts, run plans, routing decisions, agent output, diffs, command results, approval prompts, blockers, review findings, and final summaries.
 - Input Composer: accepts the initial prompt, clarifying answers, follow-up instructions, and run interrupts.
 
 The harness supports one active run at a time in v1. While a run is active, the Input Composer controls that run. It does not start a new parallel run.
@@ -158,7 +158,7 @@ For each Codex step, the harness sends a prompt envelope containing:
 - Working directory.
 - Requested output schema.
 
-Codex output should stream into the Event Stream where possible.
+Codex output should stream into Chat where possible.
 
 ### Z.ai Runtime
 
@@ -335,7 +335,7 @@ Each limit accepts either a positive integer or the explicit string `"unlimited"
 
 Omitted values use defaults. Numeric `0` must not mean unlimited.
 
-When a limit is reached, the Orchestrator stops the run and writes a clear summary to the Event Stream.
+When a limit is reached, the Orchestrator stops the run and writes a clear summary to Chat.
 
 ## Structured Outputs
 
@@ -556,7 +556,7 @@ V1 is complete when these workflows work end to end:
 
 - Install `multiagent` globally and launch it from any folder.
 - Load built-in profiles, home config, and optional local config.
-- Show the TUI with Agent Roster, Event Stream, and Input Composer.
+- Show the TUI with Agent Roster, Chat, and Input Composer.
 - Accept a prompt and route it through the Orchestrator.
 - Execute at least one Codex Runtime agent step when Codex is configured.
 - Execute at least one Z.ai Runtime agent step when Z.ai is configured.

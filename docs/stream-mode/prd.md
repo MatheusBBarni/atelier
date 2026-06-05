@@ -1,6 +1,6 @@
 ## Problem Statement
 
-The Harness already records runtime stream deltas, but active agent output is still effectively batch-oriented. A user starts a Run, sees step-start events, then waits until the Execution Runtime finishes before any meaningful agent output appears in the Event Stream. This makes the TUI feel unresponsive during long agent steps, hides useful progress, and makes interruption less clear because the user cannot see what the active Specialized Agent is doing while it is doing it.
+The Harness already records runtime stream deltas, but active agent output is still effectively batch-oriented. A user starts a Run, sees step-start events, then waits until the Execution Runtime finishes before any meaningful agent output appears in Chat. This makes the TUI feel unresponsive during long agent steps, hides useful progress, and makes interruption less clear because the user cannot see what the active Specialized Agent is doing while it is doing it.
 
 The current behavior also blurs the intended streaming contract. Runtime adapters can attach deltas to a completed step result, but those deltas are delivered after the final Runtime Output is already available. For true chat-like behavior, streaming progress needs to reach the app while the step is pending, while the Rust Harness must continue to own Capability Enforcement, Harness Actions, Action Approval, final structured parsing, and Session History.
 
@@ -8,14 +8,14 @@ The current behavior also blurs the intended streaming contract. Runtime adapter
 
 Add first-class stream mode for active agent steps. Each Execution Runtime should be able to emit progress events while it is generating output. The app loop should consume those events while the runtime step is still pending, update live TUI state, coalesce durable Session History writes, and keep the final Runtime Output on the normal app-owned completion path.
 
-From the user's perspective, the Event Stream should show a live block for the active Specialized Agent as output arrives. The Agent Roster should clearly show which agent is active. Interrupting the Run should cancel or stop the active runtime work when possible, record coherent cancellation events, and leave the TUI in a recoverable state.
+From the user's perspective, Chat should show a live block for the active Specialized Agent as output arrives. The Agent Roster should clearly show which agent is active. Interrupting the Run should cancel or stop the active runtime work when possible, record coherent cancellation events, and leave the TUI in a recoverable state.
 
 The feature should preserve the existing action-policy boundary: runtimes may stream text, status, diagnostics, and tool-call progress, but they must not directly execute file writes, shell commands, approvals, or other Harness Actions. The Harness remains responsible for validating and executing Action Requests.
 
 ## User Stories
 
 1. As a developer using the TUI, I want to see active agent output as it is generated, so that I know the Harness is making progress.
-2. As a developer running a long agent step, I want the Event Stream to update before completion, so that I do not mistake a slow runtime for a frozen app.
+2. As a developer running a long agent step, I want Chat to update before completion, so that I do not mistake a slow runtime for a frozen app.
 3. As a developer watching the Agent Roster, I want the active Specialized Agent to be visually identifiable, so that I can understand which Agent Profile is currently working.
 4. As a developer, I want live runtime output to appear in a stable TUI location, so that new chunks do not make the interface hard to follow.
 5. As a developer, I want follow mode to keep recent stream output visible, so that I can monitor the latest progress without manual scrolling.
@@ -46,7 +46,7 @@ The feature should preserve the existing action-policy boundary: runtimes may st
 30. As a maintainer, I want the runtime driver to preserve model fallback behavior, so that retryable provider errors still try configured fallback models.
 31. As a maintainer, I want final parsing errors to return through the existing step result path, so that malformed runtime output keeps the same error handling semantics.
 32. As a maintainer, I want streaming tests to assert externally visible behavior, so that implementation details can change without brittle tests.
-33. As a maintainer, I want the Event Stream to keep durable events distinct from live output, so that app state and Session History do not diverge.
+33. As a maintainer, I want Chat to keep durable events distinct from live output, so that app state and Session History do not diverge.
 34. As a maintainer, I want timeout handling to work with streaming child processes and HTTP requests, so that Run Limits remain enforceable.
 35. As a maintainer, I want interrupted live output to be marked rather than silently disappearing, so that the user can trust the interface.
 36. As a maintainer, I want live stream payloads to avoid leaking secrets beyond existing runtime-output handling, so that diagnostics remain safe to display and persist.
@@ -66,7 +66,7 @@ The feature should preserve the existing action-policy boundary: runtimes may st
 - Add stable per-step ordering to runtime events. Sequence data should be sufficient for display, history coalescing, and tests.
 - Reuse the existing live-step state concept where possible. It should represent the currently active Run step, its agent, and recent stream content.
 - Keep app-owned AppState updates. Runtime adapters must not mutate app state, TUI state, or Session History directly.
-- Render a live active-step block in the Event Stream area. The block should update in place while streaming and remain visually distinct from durable event lines.
+- Render a live active-step block in the Chat area. The block should update in place while streaming and remain visually distinct from durable event lines.
 - Keep the Agent Roster status synchronized with the active step through the same app-owned lifecycle transitions that drive the live stream view. Active, streaming, waiting for action, waiting for approval, cancelling, interrupted, failed, and completed states should remain clear.
 - Persist stream progress through coalesced Session History events rather than one event per token or byte chunk.
 - Coalescing should flush on a short interval, after a reasonable byte threshold, and immediately on final delta, runtime error, Action Request, or cancellation.

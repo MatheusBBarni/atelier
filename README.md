@@ -177,7 +177,7 @@ and network/MCP policy are explicit.
 ## Visibility
 
 The TUI shows active step details and recent runtime stream snippets inside the
-Event Stream while a step is running. External tmux/zellij pane mirroring is not
+Chat while a step is running. External tmux/zellij pane mirroring is not
 required for correctness and remains deferred until parallel child-run behavior
 needs it.
 

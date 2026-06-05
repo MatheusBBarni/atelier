@@ -5,7 +5,7 @@ Date: 2026-06-03
 
 ## Summary
 
-The current TUI is functional: it has an Agent Roster, Event Stream, Input
+The current TUI is functional: it has an Agent Roster, Chat, Input
 Composer, help modal, scroll behavior, and basic key handling. To feel closer to
 modern coding CLIs such as Codex CLI or Claude Code, it needs to become more
 transcript-centric, keyboard-fluent, status-rich, and action-aware.

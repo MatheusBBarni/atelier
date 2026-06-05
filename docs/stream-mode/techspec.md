@@ -93,7 +93,7 @@ This shape makes stream deltas passive data attached to a completed result. It i
 pub live_step: Option<LiveStepView>
 ```
 
-with a live-step payload containing a run id, step id, agent id, and stream entries. The TUI renders that live step above durable Event Stream lines. This is the right TUI entry point, but the app needs to update it while the runtime future is pending.
+with a live-step payload containing a run id, step id, agent id, and stream entries. The TUI renders that live step above durable Chat lines. This is the right TUI entry point, but the app needs to update it while the runtime future is pending.
 
 ### History
 
@@ -361,7 +361,7 @@ When an `ActionRequest` final output arrives, mark the live step `WaitingForActi
 
 ### TUI Rendering
 
-The current live block in the Event Stream should remain the v1 rendering surface. Update it to show:
+The current live block in Chat should remain the v1 rendering surface. Update it to show:
 
 - active agent;
 - run id and step id;
@@ -369,7 +369,7 @@ The current live block in the Event Stream should remain the v1 rendering surfac
 - latest visible content by stream;
 - final/interrupted marker when applicable.
 
-Follow mode should keep the Event Stream pinned to the bottom only when the user has not manually scrolled. Existing event scroll state can continue to own that behavior.
+Follow mode should keep Chat pinned to the bottom only when the user has not manually scrolled. Existing event scroll state can continue to own that behavior.
 
 ## 10. History and Coalescing
 
@@ -614,7 +614,7 @@ Step time limits should use the same cancellation plumbing. A step limit is not 
 
 ### TUI Render Tests
 
-- Live active step renders above durable Event Stream lines.
+- Live active step renders above durable Chat lines.
 - Live stream content wraps without shifting the Input Composer.
 - Final stream marker renders.
 - Interrupted stream marker renders.
