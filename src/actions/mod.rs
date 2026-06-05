@@ -9,6 +9,16 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+const DEFAULT_SEARCH_EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    ".multiagent",
+    "target",
+    "node_modules",
+    ".next",
+    "dist",
+    "build",
+];
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
@@ -900,17 +910,28 @@ fn search_text_entries(
         return Ok(());
     }
 
-    for entry in
-        fs::read_dir(path).with_context(|| format!("failed to search {}", path.display()))?
-    {
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("failed to search {}", path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
         if matches.len() >= max_matches {
             return Ok(());
         }
-        let entry = entry?;
         let entry_path = entry.path();
+        if entry.file_type()?.is_dir() && should_skip_default_search_dir(&entry_path) {
+            continue;
+        }
         search_text_entries(working_directory, &entry_path, query, matches, max_matches)?;
     }
     Ok(())
+}
+
+fn should_skip_default_search_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| DEFAULT_SEARCH_EXCLUDED_DIRS.contains(&name))
 }
 
 fn display_action_path(working_directory: &Path, path: &Path) -> String {
@@ -1397,6 +1418,50 @@ mod tests {
         let result = execute_action_request(&explorer, &context, &search).await;
         assert_eq!(result.status, ActionStatus::Completed);
         assert!(result.content.unwrap().to_string().contains("\"line\":2"));
+    }
+
+    #[tokio::test]
+    async fn search_text_skips_harness_runtime_history_by_default() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".multiagent/sessions/session")).unwrap();
+        fs::create_dir_all(dir.path().join("docs")).unwrap();
+        fs::write(
+            dir.path().join(".multiagent/sessions/session/events.jsonl"),
+            "npm distribution plan\n".repeat(20),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("docs/npm-distribution-plan.md"),
+            "# npm distribution plan\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+        let explorer = config.agents["explorer"].clone();
+        let context = action_context(dir.path(), &config);
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "search".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::SearchText,
+            params: json!({ "path": ".", "query": "npm distribution plan" }),
+        };
+
+        let result = execute_action_request(&explorer, &context, &request).await;
+
+        assert_eq!(result.status, ActionStatus::Completed);
+        let content = result.content.as_ref().unwrap();
+        let paths = content
+            .get("matches")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["docs/npm-distribution-plan.md"]);
     }
 
     #[tokio::test]

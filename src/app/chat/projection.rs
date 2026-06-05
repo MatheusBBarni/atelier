@@ -1765,39 +1765,96 @@ fn search_text_result_lines(payload: &Value) -> Vec<ChatLineView> {
     else {
         return Vec::new();
     };
-    let mut lines = Vec::new();
-    let mut seen = Vec::new();
+    let mut first_locations_by_path = Vec::new();
+    let mut seen_paths = Vec::new();
     for entry in matches {
         let Some(path) = string_field(entry, "path") else {
             continue;
         };
-        let location = entry
-            .get("line")
-            .and_then(Value::as_u64)
-            .map(|line| format!("{path}:{line}"))
-            .unwrap_or(path);
-        if seen.contains(&location) {
+        if seen_paths.contains(&path) {
             continue;
         }
-        seen.push(location.clone());
-        lines.push(ChatLineView::plain(format!("match: {location}")));
-        if lines.len() >= 6 {
+        let line = entry.get("line").and_then(Value::as_u64);
+        seen_paths.push(path.clone());
+        first_locations_by_path.push((path, line));
+        if first_locations_by_path.len() >= 6 {
             break;
         }
     }
+    if first_locations_by_path.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    if first_locations_by_path.len() == 1 {
+        let (path, line) = &first_locations_by_path[0];
+        lines.push(ChatLineView::plain(format!(
+            "Found it in {}",
+            search_text_location(path, *line)
+        )));
+    } else {
+        let paths = first_locations_by_path
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        lines.push(ChatLineView::plain(format!(
+            "Found matches in {}",
+            format_search_path_list(&paths, 3)
+        )));
+        for (index, (path, line)) in first_locations_by_path.iter().take(4).enumerate() {
+            let label = if index == 0 {
+                "first match"
+            } else {
+                "also matched"
+            };
+            lines.push(ChatLineView::muted(format!(
+                "{label}: {}",
+                search_text_location(path, *line)
+            )));
+        }
+    }
+
     if let Some(total) = payload
         .get("content")
         .and_then(|content| content.get("total_matches"))
         .and_then(Value::as_u64)
         .and_then(|total| usize::try_from(total).ok())
-        .filter(|total| *total > seen.len())
+        .filter(|total| *total > first_locations_by_path.len())
     {
         lines.push(ChatLineView::muted(format!(
-            "showing {} of {total} matches",
-            seen.len()
+            "showing {} files from {total} matches",
+            first_locations_by_path.len()
         )));
     }
     lines
+}
+
+fn search_text_location(path: &str, line: Option<u64>) -> String {
+    line.map(|line| format!("{path}:{line}"))
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn format_search_path_list(paths: &[String], limit: usize) -> String {
+    let visible = paths
+        .iter()
+        .take(limit)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let rendered = match visible.as_slice() {
+        [] => String::new(),
+        [single] => (*single).to_string(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let last = visible.last().copied().unwrap_or_default();
+            let rest = visible[..visible.len() - 1].join(", ");
+            format!("{rest}, and {last}")
+        }
+    };
+    if paths.len() > limit {
+        format!("{rendered}, +{} more", paths.len() - limit)
+    } else {
+        rendered
+    }
 }
 
 fn summarize_items(items: &[String], limit: usize) -> String {
@@ -2211,18 +2268,25 @@ mod tests {
         let item = &projection.items()[0];
 
         assert_eq!(item.title, "Search text completed");
+        assert!(item.body.iter().any(
+            |line| line.text == "Found matches in docs/npm-distribution-plan.md and README.md"
+        ));
         assert!(item
             .body
             .iter()
-            .any(|line| line.text == "match: docs/npm-distribution-plan.md:1"));
+            .any(|line| line.text == "first match: docs/npm-distribution-plan.md:1"));
         assert!(item
             .body
             .iter()
-            .any(|line| line.text == "match: README.md:12"));
+            .any(|line| line.text == "also matched: README.md:12"));
         assert!(item
             .body
             .iter()
-            .any(|line| line.text == "showing 2 of 200 matches"));
+            .any(|line| line.text == "showing 2 files from 200 matches"));
+        assert!(!item
+            .body
+            .iter()
+            .any(|line| line.text.starts_with("match: ")));
     }
 
     #[test]
