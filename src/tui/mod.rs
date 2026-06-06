@@ -1537,6 +1537,7 @@ fn render_skill_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &SkillDr
     let selected = dropdown
         .selected
         .min(dropdown.suggestions.len().saturating_sub(1));
+    let row_width = input_area.width.saturating_sub(2);
     let first_visible = selected.saturating_sub(visible_count.saturating_sub(1));
     let items = dropdown
         .suggestions
@@ -1544,7 +1545,7 @@ fn render_skill_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &SkillDr
         .enumerate()
         .skip(first_visible)
         .take(visible_count)
-        .map(|(index, suggestion)| skill_dropdown_item(suggestion, index == selected))
+        .map(|(index, suggestion)| skill_dropdown_item(suggestion, index == selected, row_width))
         .collect::<Vec<_>>();
     let area = Rect {
         x: input_area.x,
@@ -1564,7 +1565,11 @@ fn render_skill_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &SkillDr
     frame.render_widget(list, area);
 }
 
-fn skill_dropdown_item(suggestion: &SkillSuggestion, selected: bool) -> ListItem<'static> {
+fn skill_dropdown_item(
+    suggestion: &SkillSuggestion,
+    selected: bool,
+    row_width: u16,
+) -> ListItem<'static> {
     let marker_style = if selected {
         Style::default()
             .fg(Color::Black)
@@ -1587,13 +1592,34 @@ fn skill_dropdown_item(suggestion: &SkillSuggestion, selected: bool) -> ListItem
             SkillSourceTag::Personal => Color::LightBlue,
         })
         .add_modifier(Modifier::BOLD);
+    let tag = format!(" {} ", suggestion.tag.label());
+    let tag_width = input_char_count(&tag);
+    let marker = if selected { "> " } else { "  " };
+    let marker_width = input_char_count(marker);
+    let row_width = usize::from(row_width);
+    let content_width = row_width.saturating_sub(marker_width + tag_width + 1);
+    let id = truncate_to_char_width(&suggestion.id, content_width);
+    let id_width = input_char_count(&id);
+    let remaining_width = content_width.saturating_sub(id_width);
+    let origin_width = remaining_width.saturating_sub(2);
+    let origin = if origin_width > 0 && id_width < content_width {
+        truncate_to_char_width(&suggestion.origin, origin_width)
+    } else {
+        String::new()
+    };
+    let separator = if origin.is_empty() { "" } else { "  " };
+    let left_width = marker_width
+        .saturating_add(id_width)
+        .saturating_add(input_char_count(separator))
+        .saturating_add(input_char_count(&origin));
+    let spacer_width = row_width.saturating_sub(left_width.saturating_add(tag_width));
     let line = Line::from(vec![
-        Span::styled(if selected { "> " } else { "  " }, marker_style),
-        Span::styled(suggestion.id.clone(), id_style),
-        Span::raw("  "),
-        Span::styled(format!(" {} ", suggestion.tag.label()), tag_style),
-        Span::raw("  "),
-        Span::styled(suggestion.origin.clone(), Style::default().fg(Color::Gray)),
+        Span::styled(marker.to_string(), marker_style),
+        Span::styled(id, id_style),
+        Span::raw(separator.to_string()),
+        Span::styled(origin, Style::default().fg(Color::Gray)),
+        Span::raw(" ".repeat(spacer_width)),
+        Span::styled(tag, tag_style),
     ]);
     let item = ListItem::new(line);
     if selected {
@@ -1601,6 +1627,10 @@ fn skill_dropdown_item(suggestion: &SkillSuggestion, selected: bool) -> ListItem
     } else {
         item
     }
+}
+
+fn truncate_to_char_width(value: &str, max_width: usize) -> String {
+    value.chars().take(max_width).collect()
 }
 
 fn chat_item_lines(items: &[ChatItemView]) -> Vec<Line<'static>> {
@@ -2753,6 +2783,29 @@ mod tests {
     }
 
     #[test]
+    fn skill_dropdown_renders_tag_at_row_end() {
+        let state = state_with_input("/skill:", false);
+        let mut ui_state = ui_state_with_skills_at_end(&state.input);
+
+        let lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 100, 24);
+        let row = lines
+            .iter()
+            .find(|line| line.contains("project-alpha"))
+            .unwrap();
+        let origin_col = char_column(row, ".agents/skills");
+        let tag_col = char_column(row, "Project");
+        let right_border_col = row
+            .chars()
+            .enumerate()
+            .filter_map(|(index, ch)| (ch == '│').then_some(index))
+            .last()
+            .unwrap();
+
+        assert!(tag_col > origin_col);
+        assert!(right_border_col.saturating_sub(tag_col + "Project".len()) <= 2);
+    }
+
+    #[test]
     fn skill_dropdown_filters_by_typed_skill_query() {
         let state = state_with_input("/skill:personal", false);
         let ui_state = ui_state_with_skills_at_end(&state.input);
@@ -3629,6 +3682,11 @@ mod tests {
             .chunks(usize::from(width))
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect()
+    }
+
+    fn char_column(value: &str, needle: &str) -> usize {
+        let byte_index = value.find(needle).unwrap();
+        value[..byte_index].chars().count()
     }
 
     fn default_config_status() -> ConfigStatusView {
