@@ -3318,17 +3318,17 @@ fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
     if !trimmed.starts_with('/') {
         return Ok(());
     }
-    if is_agent_prompt_prefix(trimmed) {
+    if is_named_prompt_prefix(trimmed, "/agent:") || is_named_prompt_prefix(trimmed, "/skill:") {
         return Ok(());
     }
     let command = trimmed.split_whitespace().next().unwrap_or(trimmed);
     bail!(
-        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>, /agent:<name>"
+        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>, /agent:<name>, /skill:<name>"
     )
 }
 
-fn is_agent_prompt_prefix(prompt: &str) -> bool {
-    let Some(rest) = prompt.strip_prefix("/agent:") else {
+fn is_named_prompt_prefix(prompt: &str, prefix: &str) -> bool {
+    let Some(rest) = prompt.strip_prefix(prefix) else {
         return false;
     };
     rest.split_whitespace()
@@ -4405,6 +4405,31 @@ instructions_file = "agents/explorer.md"
                 .get("prompt")
                 .and_then(serde_json::Value::as_str),
             Some("/agent:fixer inspect README")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_prompt_prefix_is_allowed_as_agent_prompt() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/skill:reviewer inspect README")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let history_events = app.history.read_events().unwrap();
+        let prompt = history_events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert_eq!(
+            prompt
+                .payload
+                .get("prompt")
+                .and_then(serde_json::Value::as_str),
+            Some("/skill:reviewer inspect README")
         );
     }
 

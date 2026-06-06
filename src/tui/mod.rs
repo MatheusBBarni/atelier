@@ -1200,7 +1200,8 @@ fn render_help_modal(frame: &mut Frame) {
             Span::styled(" commands", Style::default().fg(Color::White)),
         ]),
         Line::from("/help + Enter        toggle this help"),
-        Line::from("/agent:<agent>       select enabled agent with Up/Down + Enter"),
+        Line::from("/agent:<agent_name>  select enabled agent with Up/Down + Enter"),
+        Line::from("/skill:<skill_name>  prefix prompt with skill name"),
         Line::from("/goal <text> | /goal | /goal clear   manage session goal"),
         Line::from("/subtask <agent> <task>              run bounded child task"),
         Line::from("/config              show config files, preset, warnings"),
@@ -1925,7 +1926,8 @@ mod tests {
         let header = text.lines().find(|line| line.contains("Help")).unwrap();
         assert!(header.contains("Esc"));
         assert!(text.contains("/help + Enter"));
-        assert!(text.contains("/agent:<agent>"));
+        assert!(text.contains("/agent:<agent_name>"));
+        assert!(text.contains("/skill:<skill_name>"));
         assert!(text.contains("enabled agent"));
         assert!(text.contains("/goal <text>"));
         assert!(text.contains("/goal clear"));
