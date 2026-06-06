@@ -37,11 +37,11 @@ The Cursor PRD establishes the product boundary:
 - harness-owned Session History and Context Resume;
 - fake fixtures for normal tests.
 
-Current Cursor CLI docs consulted through Context7 describe the installed
-command as `agent`, with examples such as `agent --version`, `agent status`, and
-`agent -p "..." --model gpt-5.2`. The runtime therefore defaults to `agent`
-while keeping `[runtimes.cursor].command` configurable for older or local
-installations that expose a different executable name.
+Current Cursor CLI docs describe the installed command as `cursor-agent`, with
+examples such as `cursor-agent --version`, `cursor-agent status`, and
+`cursor-agent -p "..." --model gpt-5`. The runtime therefore defaults to
+`cursor-agent` while keeping `[runtimes.cursor].command` configurable for older
+or local installations that expose a different executable name.
 
 ## Goals
 
@@ -150,14 +150,14 @@ Add a default runtime during config merge:
 ```toml
 [runtimes.cursor]
 type = "cursor"
-command = "agent"
+command = "cursor-agent"
 args = []
 prompt_mode = "stdin"
 ```
 
 For `RuntimeKind::Cursor`, effective config should set:
 
-- `command`: configured value or `agent`;
+- `command`: configured value or `cursor-agent`;
 - `args`: validated user-provided args, default empty;
 - `prompt_mode`: stdin;
 - `base_url`: none;
@@ -210,7 +210,7 @@ wording:
 Default invocation shape:
 
 ```text
-agent --print --output-format stream-json
+cursor-agent --print --output-format stream-json
 ```
 
 Append `--model <model>` when the Agent Profile model is not `default`.
@@ -382,7 +382,7 @@ Backwards compatibility:
 - Users opt in by setting `runtime = "cursor"` on an Agent Profile or Custom
   Agent.
 - `--init-config` should include an active `[runtimes.cursor]` entry with
-  `command = "agent"`, `args = []`, and `prompt_mode = "stdin"` so Cursor
+  `command = "cursor-agent"`, `args = []`, and `prompt_mode = "stdin"` so Cursor
   opt-in is discoverable without changing any agent assignment.
 - Cursor Runtime Availability warnings from `--doctor` are non-fatal when no
   enabled Agent Profile selects `runtime = "cursor"`.
@@ -461,7 +461,7 @@ Live Cursor tests:
 
 ## Risks and Mitigations
 
-- **Cursor command name drift:** default to the current documented `agent`
+- **Cursor command name drift:** default to the current documented `cursor-agent`
   executable and keep the command configurable.
 - **Cursor stream schema drift:** parse conservatively, ignore unknown fields,
   and test with recorded fixtures.
