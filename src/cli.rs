@@ -78,6 +78,11 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
         for path in &summary.skipped {
             println!("skipped {}", path.display());
         }
+        println!(
+            "review {} before running agents",
+            summary.config_path.display()
+        );
+        println!("then run atelier --doctor to check runtime setup");
         return Ok(());
     }
 

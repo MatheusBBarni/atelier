@@ -3,6 +3,7 @@ use multiagent::config::{
     AgentEffort, AgentProfile, AgentPromptMetadata, Capability, Limits, PromptMode, RuntimeConfig,
     RuntimeKind,
 };
+use multiagent::runtime::claude::ClaudeRuntime;
 use multiagent::runtime::codex::CodexRuntime;
 use multiagent::runtime::zai::ZaiRuntime;
 use multiagent::runtime::{
@@ -79,6 +80,40 @@ async fn zai_runtime_executes_real_agent_step() -> Result<()> {
     .await?;
 
     assert_agent_result(result.output, "oracle")?;
+    assert!(!result.stream_deltas.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires MULTIAGENT_TEST_CLAUDE=1 and a working Claude CLI session"]
+async fn claude_runtime_executes_real_agent_step() -> Result<()> {
+    if std::env::var_os("MULTIAGENT_TEST_CLAUDE").is_none() {
+        eprintln!("skipping Claude integration test; set MULTIAGENT_TEST_CLAUDE=1");
+        return Ok(());
+    }
+
+    let dir = tempdir()?;
+    let runtime = ClaudeRuntime::new(RuntimeConfig {
+        id: "claude".to_string(),
+        kind: RuntimeKind::Claude,
+        command: Some(
+            std::env::var("MULTIAGENT_CLAUDE_INTEGRATION_COMMAND")
+                .unwrap_or_else(|_| "claude".to_string()),
+        ),
+        args: integration_args("MULTIAGENT_CLAUDE_INTEGRATION_ARGS_JSON")?,
+        prompt_mode: PromptMode::Stdin,
+        base_url: None,
+        api_key_env: None,
+    });
+    let model = std::env::var("MULTIAGENT_CLAUDE_MODEL").unwrap_or_else(|_| "default".to_string());
+
+    let request = agent_request(dir.path().to_path_buf(), "explorer", "claude", &model);
+    let result = collect_runtime_step_result(|events, cancellation| {
+        runtime.stream_step(request, events, cancellation)
+    })
+    .await?;
+
+    assert_agent_result(result.output, "explorer")?;
     assert!(!result.stream_deltas.is_empty());
     Ok(())
 }

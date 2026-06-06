@@ -2162,6 +2162,9 @@ impl App {
         let mut coalescer = RuntimeStreamCoalescer::new(agent_id.to_string());
         for delta in deltas {
             self.push_live_stream_delta(step_id, delta);
+            if delta.transient {
+                continue;
+            }
             coalescer.push_delta(delta);
             if coalescer.should_flush() {
                 self.flush_runtime_stream_coalescer(run, step_id, &mut coalescer, false)?;
@@ -2179,6 +2182,9 @@ impl App {
         event: RuntimeEvent,
     ) -> Result<()> {
         self.push_live_runtime_event(step_id, &event);
+        if event.is_transient() {
+            return Ok(());
+        }
         coalescer.push_event(event);
         if coalescer.should_flush() {
             self.flush_runtime_stream_coalescer(run, step_id, coalescer, false)?;
@@ -3800,6 +3806,44 @@ prompt = "{reviewer_prompt}"
                 && event.payload.get("sequence_start").is_some()
                 && event.payload.get("sequence_end").is_some()
         }));
+    }
+
+    #[tokio::test]
+    async fn transient_runtime_stream_deltas_are_live_only() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let run = RunDriveContext {
+            run_id: "run".to_string(),
+            parent_run_id: None,
+            prompt: "prompt".to_string(),
+            subtask: None,
+            previous_results: Vec::new(),
+            step_count: 1,
+            started_at: Instant::now(),
+            parse_repair_attempts: 0,
+        };
+
+        app.set_active_step("run", "step", "explorer");
+        app.record_runtime_stream_deltas(
+            &run,
+            "step",
+            "explorer",
+            &[RuntimeStreamDelta::transient(1, "message", "partial text")],
+        )
+        .unwrap();
+
+        let live_step = app.state.live_step.as_ref().unwrap();
+        assert!(live_step
+            .streams
+            .iter()
+            .any(|stream| stream.stream == "message" && stream.content == "partial text"));
+        assert!(app
+            .history
+            .read_events()
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "runtime_stream_delta"));
     }
 
     #[tokio::test]

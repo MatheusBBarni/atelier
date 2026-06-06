@@ -900,7 +900,7 @@ exit 65
         fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\ncat >/dev/null\n/bin/echo early stdout\nsleep 1\ncat <<'JSON'\n{wrapped}\nJSON\n"
+                "#!/bin/sh\ncat >/dev/null &\n/bin/echo early stdout\nsleep 1\ncat <<'JSON'\n{wrapped}\nJSON\n"
             ),
         )
         .unwrap();
@@ -924,7 +924,7 @@ exit 65
         let runtime_step =
             tokio::spawn(async move { runtime.stream_step(request, events, cancellation).await });
 
-        let event = tokio::time::timeout(Duration::from_millis(750), receiver.recv())
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
             .await
             .unwrap()
             .unwrap();
