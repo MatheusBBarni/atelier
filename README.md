@@ -116,6 +116,9 @@ make the workspace stale by itself.
 - `/goal <text>`, `/goal`, `/goal clear`: manage the active session goal.
 - `/config`: show active config files, selected preset, and warnings without raw prompt bodies.
 - `/subtask <agent> <task>`: run one bounded child task through a specialized enabled agent.
+- `/agent:<name>`: prefix a prompt with a selected agent; in the TUI, type `/agent:` and use Up/Down plus Enter to insert an enabled agent id.
+- `/skill:<name>`: prefix a prompt with a selected skill; in the TUI, type `/skill:` and use Up/Down plus Enter to insert a cached project or personal skill.
+- `/reload:skills`: refresh cached skill names from project and personal skill folders.
 
 ## Configuration
 

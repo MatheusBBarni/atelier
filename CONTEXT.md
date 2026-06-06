@@ -144,13 +144,25 @@ _Avoid_: assignment, dispatch
 The orchestrator-owned sequence of steps for satisfying a prompt.
 _Avoid_: task list, workflow
 
+**Parallel Step Group**:
+A set of specialized agent steps that the orchestrator starts concurrently inside one run.
+_Avoid_: parallel run, sub-run, worker pool
+
+**Parallel File Scope**:
+The file paths assigned to one specialized agent step inside a parallel step group.
+_Avoid_: shared files, unrestricted workspace
+
 **Orchestrator Decision**:
-The structured output from the orchestrator that describes the run plan, next agent, reason, required capabilities, and stop condition.
+The structured output from the orchestrator that describes the run plan, next step, reason, required capabilities, and stop condition.
 _Avoid_: prose plan, routing text
 
 **Agent Result**:
 The typed output envelope returned by a specialized agent after it completes a step.
 _Avoid_: message, response
+
+**Parallel Group Result**:
+The typed output envelope returned after a parallel step group joins and summarizes its child agent results.
+_Avoid_: merged agent result, batch response
 
 **Run**:
 A single attempt to satisfy one prompt through a run plan and agent activity.
@@ -198,8 +210,11 @@ _Avoid_: prompt, blocker message
 - A **Prompt** creates exactly one **Run**.
 - A **Run** is guided by exactly one **Run Plan**.
 - A **Harness** has at most one active **Run** at a time in the first version.
+- A **Run** may contain **Parallel Step Groups** while remaining the only active **Run** in the **Harness Session**.
 - A **Harness Session** may contain multiple **Runs** over time.
 - **Session History** is stored in the project-scoped `.multiagent/` directory.
+- **Session History** records chronological events from **Parallel Step Groups** with group, step, and agent identity.
+- **Session History** also records the joined **Parallel Group Result** for each completed **Parallel Step Group**.
 - **Context Resume** creates a new **Run** rather than continuing an old process exactly.
 - **Context Resume** does not resume Claude CLI sessions by default; it provides prior **Session History** to a new Claude process.
 - **Context Resume** does not resume Cursor CLI sessions by default; it provides prior **Session History** to a new Cursor process.
@@ -213,19 +228,51 @@ _Avoid_: prompt, blocker message
 - **Effective Configuration** is produced by merging built-in profiles, **Harness Configuration**, **Local Configuration**, and command-line overrides.
 - A **Prompt** is first handled by exactly one **Orchestrator**.
 - An **Orchestrator** delegates work to one or more **Specialized Agents**.
+- The **Orchestrator** may propose a **Parallel Step Group** when independent file scopes can move forward concurrently.
+- The **Orchestrator** may choose sequential steps instead of a **Parallel Step Group** when ordering, safety, review quality, or clarity matters more than throughput.
+- **Harness Configuration** bounds how many specialized agent steps may run concurrently.
+- Runtime and model fallback happens independently for each step in a **Parallel Step Group**.
 - An **Orchestrator Decision** drives delegation and run state transitions.
+- An **Orchestrator Decision** may select one **Specialized Agent** step or one **Parallel Step Group** as the next step.
 - A **Routing Decision** is displayed in the **Chat** before the selected **Specialized Agent** runs.
+- A **Parallel Step Group** contains two or more **Specialized Agent** steps that run concurrently.
+- A **Parallel Step Group** may contain multiple concurrent steps that use the same **Agent Profile**.
+- A **Parallel Step Group** may use built-in or custom enabled **Agent Profiles**.
+- Each **Specialized Agent** step in a **Parallel Step Group** has a **Parallel File Scope**.
+- Each **Specialized Agent** step in a **Parallel Step Group** receives shared run context plus a scoped instruction for its assigned work.
+- A file path belongs to at most one **Parallel File Scope** in the same **Parallel Step Group**.
+- A **Parallel Step Group** runs in the same **Working Directory** as the **Run**.
+- **Capability Enforcement** restricts parallel agent file actions to their assigned **Parallel File Scope**.
+- Parallel **Fixer** steps may edit files only inside disjoint **Parallel File Scopes**.
+- A **Specialized Agent** in a **Parallel Step Group** cannot expand its own **Parallel File Scope**.
+- An out-of-scope file action in a **Parallel Step Group** is blocked and reported as an **Agent Result**.
+- Parallel agents may run scoped read-only verification commands for their assigned **Parallel File Scope**.
+- Mutation-capable or project-wide commands run outside a **Parallel Step Group** after the group joins.
+- **Action Approval** requests from a **Parallel Step Group** are handled one at a time by the **Harness**.
+- A parallel step waiting for **Action Approval** does not stop unrelated parallel steps by default.
+- A blocked or failed step in a **Parallel Step Group** does not cancel other independent parallel steps by default.
+- A **Parallel Step Group** joins only after every parallel step finishes, fails, blocks, or is cancelled.
+- The **Orchestrator** decides how to continue from one joined **Parallel Step Group** result with per-agent outcomes.
+- A **Parallel Group Result** records the joined outcome of one **Parallel Step Group**.
+- A **Parallel Group Result** references each child **Agent Result** rather than replacing it.
+- The **Orchestrator** may infer **Parallel File Scopes** from **Explorer** findings when the file boundaries are clear.
+- The **Orchestrator** asks a **Clarifying Question** before a **Parallel Step Group** starts when file boundaries are missing, overlapping, or high-risk.
+- A **Reviewer** in a **Parallel Step Group** reviews only its assigned **Parallel File Scope**.
+- A combined-diff **Reviewer** pass happens after a **Parallel Step Group** only when the **Orchestrator** chooses it as the next step.
 - A **Chat Item** is curated for user readability and may reference raw output stored in **Session History** or artifacts.
 - A **Chat Item** may aggregate multiple related **Session History** events when they describe one visible lifecycle, such as one harness action moving from requested to running to completed.
 - **Chat** is a presentation layer derived from active run state and **Session History**; it does not replace the durable **Session History** model.
+- During a **Parallel Step Group**, **Chat** shows each active **Specialized Agent** as working.
 - The **Agent Roster**, **Chat**, and **Input Composer** are the primary TUI surfaces.
 - An **Orchestrator** owns the **Run Plan** and decides when to delegate, continue, stop, or ask the user for input.
 - A **Specialized Agent** reports results to the **Orchestrator** rather than delegating directly to another **Specialized Agent**.
 - A **Specialized Agent** reports an **Agent Result** after completing a step.
 - A **Clarifying Question** is asked only by the **Orchestrator**.
 - A **Run** pauses while waiting for the user's answer to a **Clarifying Question**.
+- Interrupting a **Run** cancels every active step in the current **Parallel Step Group**.
 - The initial **Specialized Agents** are **Orchestrator**, **Explorer**, **Oracle**, **Fixer**, **Reviewer**, and **Consul**.
 - A non-trivial code-change **Run Plan** uses **Explorer** before **Fixer**.
+- A non-trivial code-change **Parallel Step Group** uses **Explorer** first unless the user provides explicit file scopes.
 - An architecture-heavy or ambiguous **Run Plan** uses **Consul** before **Fixer**.
 - A normal code-change **Run Plan** follows **Explorer**, **Fixer**, **Reviewer**, optional **Fixer**, then final **Orchestrator** summary.
 - A **Specialized Agent** is defined by exactly one **Agent Profile**.
@@ -318,6 +365,14 @@ _Avoid_: prompt, blocker message
 > **Domain expert:** "In **Harness Configuration**, so changing Fixer's **Model Assignment** does not require code changes."
 > **Dev:** "Does every agent need to use the same provider?"
 > **Domain expert:** "No. One **Agent Profile** can use **Codex Runtime** through Codex-owned login while another uses **Z.ai Runtime** through an API key."
+> **Dev:** "Does parallel agent work mean starting multiple **Runs**?"
+> **Domain expert:** "No. A **Parallel Step Group** runs multiple **Specialized Agent** steps inside one active **Run**."
+> **Dev:** "Can two Fixers edit the same file at the same time?"
+> **Domain expert:** "No. Each parallel step has a **Parallel File Scope**, and a file can belong to only one scope in the group."
+> **Dev:** "Can a parallel Reviewer review the Fixer's changes before the Fixer finishes?"
+> **Domain expert:** "No. A parallel **Reviewer** reviews its assigned **Parallel File Scope** as a slice reviewer; the **Orchestrator** can schedule a combined-diff review after the group joins."
+> **Dev:** "What happens if one parallel agent gets blocked?"
+> **Domain expert:** "Independent steps keep running, then the **Orchestrator** decides from the joined **Parallel Group Result**."
 > **Dev:** "What if no runtime is ready on first launch?"
 > **Domain expert:** "The **Harness** still opens and shows **Runtime Availability** so the user can see what setup is missing."
 > **Dev:** "If `claude --version` works, does that prove **Claude Runtime** is authenticated?"
@@ -341,3 +396,4 @@ _Avoid_: prompt, blocker message
 - "claude integration" resolved as **Claude Runtime**, a CLI-backed execution runtime rather than a direct Anthropic API integration.
 - "integrate Claude" does not mean changing **Built-in Profiles** to Claude; Claude adoption is explicit through configuration.
 - "multiagent" no longer names the executable; the **Global Command** is `atelier`, while `multiagent.toml` remains the configuration file name.
+- "multi agent feature" resolved as **Parallel Step Group** inside one active **Run**, not multiple active **Runs**.
