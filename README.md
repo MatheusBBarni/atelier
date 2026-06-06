@@ -152,7 +152,8 @@ Important values:
 - `cursor`
   - Invokes the installed `cursor-agent` CLI as a child process.
   - Reuses Cursor-owned login state; check setup with `cursor-agent status` and sign in with `cursor-agent login`.
-  - Uses `cursor-agent --print --output-format stream-json` internally and keeps Cursor-native tool calls behind Harness Actions.
+  - Uses `cursor-agent --print --output-format stream-json` internally from an isolated deny-all Cursor permission sandbox.
+  - Keeps Cursor-native tool calls behind Harness Actions.
   - Built-in agents do not use Cursor unless you opt in through config.
 - `zai`
   - Uses API key from env var (example: `ZAI_API_KEY`) and posts to `api.z.ai`.

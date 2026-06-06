@@ -8,10 +8,11 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use std::env;
-use std::path::Path;
-use std::process::{ExitStatus, Stdio};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{self, ExitStatus, Stdio};
 use std::time::Duration;
+use std::{env, io};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
@@ -23,6 +24,17 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const CURSOR_API_KEY_ENV: &str = "CURSOR_API_KEY";
 
 const PROTECTED_DEFAULT_ARGS: &[&str] = &["--print", "--output-format", "stream-json"];
+const ISOLATED_DENY_PERMISSIONS: &[&str] = &[
+    "Shell(*)",
+    "Read(*)",
+    "Read(**)",
+    "Read(/*)",
+    "Write(*)",
+    "Write(**)",
+    "Write(/*)",
+    "WebFetch(*)",
+    "Mcp(*)",
+];
 
 #[derive(Clone, Debug)]
 pub struct CursorRuntime {
@@ -171,10 +183,14 @@ impl Runtime for CursorRuntime {
         let prompt = cursor_prompt_text(&request)?;
         let args = cursor_step_args(&self.config.args, &request.agent_profile.model);
         validate_synthesized_args(&args)?;
+        let permission_sandbox = CursorPermissionSandbox::create()
+            .context("failed to prepare isolated Cursor permission sandbox")?;
 
         let mut child = Command::new(command)
             .args(&args)
-            .current_dir(&request.working_directory)
+            .current_dir(permission_sandbox.working_directory())
+            .env("CURSOR_CONFIG_DIR", permission_sandbox.cursor_config_dir())
+            .env("XDG_CONFIG_HOME", permission_sandbox.xdg_config_home())
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -285,8 +301,81 @@ pub(crate) fn protected_defaults_summary() -> Vec<&'static str> {
         "stream-json enabled",
         "session resume disabled",
         "model flag owned by agent profiles",
+        "isolated deny-all Cursor permission config",
         "Cursor tools must not bypass Harness Actions",
     ]
+}
+
+#[derive(Debug)]
+struct CursorPermissionSandbox {
+    root: PathBuf,
+    cursor_config_dir: PathBuf,
+    xdg_config_home: PathBuf,
+    working_directory: PathBuf,
+}
+
+impl CursorPermissionSandbox {
+    fn create() -> Result<Self> {
+        let root = env::temp_dir().join(format!(
+            "multiagent-cursor-{}-{}",
+            process::id(),
+            ulid::Ulid::new()
+        ));
+        let cursor_config_dir = root.join("cursor-config");
+        let xdg_config_home = root.join("xdg-config");
+        let xdg_cursor_config_dir = xdg_config_home.join("cursor");
+        let working_directory = root.join("workspace");
+        let project_cursor_dir = working_directory.join(".cursor");
+
+        fs::create_dir_all(&cursor_config_dir)?;
+        fs::create_dir_all(&xdg_cursor_config_dir)?;
+        fs::create_dir_all(&project_cursor_dir)?;
+
+        let config = isolated_cursor_permission_config()?;
+        fs::write(cursor_config_dir.join("cli-config.json"), &config)?;
+        fs::write(xdg_cursor_config_dir.join("cli-config.json"), &config)?;
+        fs::write(project_cursor_dir.join("cli.json"), &config)?;
+
+        Ok(Self {
+            root,
+            cursor_config_dir,
+            xdg_config_home,
+            working_directory,
+        })
+    }
+
+    fn cursor_config_dir(&self) -> &Path {
+        &self.cursor_config_dir
+    }
+
+    fn xdg_config_home(&self) -> &Path {
+        &self.xdg_config_home
+    }
+
+    fn working_directory(&self) -> &Path {
+        &self.working_directory
+    }
+}
+
+impl Drop for CursorPermissionSandbox {
+    fn drop(&mut self) {
+        match fs::remove_dir_all(&self.root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_error) => {}
+        }
+    }
+}
+
+fn isolated_cursor_permission_config() -> Result<String> {
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "version": 1,
+        "editor": { "vimMode": false },
+        "permissions": {
+            "allow": [],
+            "deny": ISOLATED_DENY_PERMISSIONS,
+        }
+    }))?)
 }
 
 fn cursor_step_args(config_args: &[String], model: &str) -> Vec<String> {
@@ -905,6 +994,7 @@ fn cursor_prompt_text(request: &RuntimeRequest) -> Result<String> {
 
 Follow this protocol exactly:
 - Use the JSON envelope below as the only task input.
+- The Cursor process is running from a harness-owned isolated permission sandbox; use the working_directory field in the envelope only when asking the harness for actions.
 - Do not solve the user's prompt directly in prose.
 - Do not edit files, run commands, inspect the repository, use Cursor tools, use MCP tools, or call local tool surfaces directly.
 - If you need repository data or a file/command/edit operation, return one action_request JSON contract. The harness will execute it and call you again with action_results.
@@ -1254,6 +1344,75 @@ printf '%s\n' {}
             }
             other => panic!("unexpected output: {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_runtime_starts_with_isolated_permission_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let request_working_directory = dir.path().join("repo");
+        fs::create_dir(&request_working_directory).unwrap();
+        let capture_pwd = dir.path().join("pwd.txt");
+        let capture_stdin = dir.path().join("stdin.txt");
+        let capture_config_dir = dir.path().join("cursor-config-dir.txt");
+        let capture_xdg_config_home = dir.path().join("xdg-config-home.txt");
+        let capture_global_config = dir.path().join("global-config.json");
+        let capture_project_config = dir.path().join("project-config.json");
+        let script_path = dir.path().join("sandbox-cursor.sh");
+        let final_frame = final_result_frame("explorer", "step", "sandboxed");
+        fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$PWD" > "{}"
+printf '%s\n' "$CURSOR_CONFIG_DIR" > "{}"
+printf '%s\n' "$XDG_CONFIG_HOME" > "{}"
+cat "$CURSOR_CONFIG_DIR/cli-config.json" > "{}"
+cat "$PWD/.cursor/cli.json" > "{}"
+cat > "{}"
+printf '%s\n' {}
+"#,
+                capture_pwd.display(),
+                capture_config_dir.display(),
+                capture_xdg_config_home.display(),
+                capture_global_config.display(),
+                capture_project_config.display(),
+                capture_stdin.display(),
+                shell_single_quoted(&final_frame),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = CursorRuntime::new(cursor_runtime_config(&script_path));
+        let request = runtime_request(request_working_directory.clone(), "explorer", "default");
+
+        let result = collect_runtime_step_result(|events, cancellation| {
+            runtime.stream_step(request, events, cancellation)
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(result.output, RuntimeOutput::AgentResult { .. }));
+        let sandbox_pwd = fs::read_to_string(capture_pwd).unwrap();
+        assert_ne!(Path::new(sandbox_pwd.trim()), request_working_directory);
+        assert!(!Path::new(sandbox_pwd.trim()).exists());
+        let cursor_config_dir = fs::read_to_string(capture_config_dir).unwrap();
+        let xdg_config_home = fs::read_to_string(capture_xdg_config_home).unwrap();
+        assert!(cursor_config_dir.contains("multiagent-cursor"));
+        assert!(xdg_config_home.contains("multiagent-cursor"));
+        let global_config = fs::read_to_string(capture_global_config).unwrap();
+        let project_config = fs::read_to_string(capture_project_config).unwrap();
+        for config in [global_config, project_config] {
+            assert!(config.contains("\"allow\": []"));
+            assert!(config.contains("Shell(*)"));
+            assert!(config.contains("Write(**)"));
+            assert!(config.contains("Mcp(*)"));
+        }
+        let stdin = fs::read_to_string(capture_stdin).unwrap();
+        assert!(stdin.contains(&request_working_directory.display().to_string()));
+        assert!(stdin.contains("isolated permission sandbox"));
     }
 
     #[cfg(unix)]

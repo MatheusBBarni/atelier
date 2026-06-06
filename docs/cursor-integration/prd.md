@@ -105,13 +105,15 @@ semantics, stream JSON events, tool-call events, and failure modes.
   plus harness-owned Session History for context.
 - Preserve Cursor `session_id` values from stream events only as diagnostic
   metadata.
-- Do not generate or mutate `.cursor/cli.json` permission files in the first
-  phase. Document how Cursor permissions interact with harness capabilities, but
-  keep Agent Capabilities and Action Approval as the authoritative policy.
-- Allow normal Cursor project context by default. Cursor project rules and
-  ambient instruction files may be loaded by the Cursor command, but Agent Profile
-  instructions, Capability Enforcement, Action Approval, and the structured
-  output contract remain higher priority.
+- Do not generate or mutate user or project `.cursor/cli.json` permission files.
+  Before spawning Cursor, create a harness-owned temporary Cursor CLI config and
+  temporary working directory with deny rules for Cursor-native Shell, Read,
+  Write, WebFetch, and MCP tools. Keep Agent Capabilities and Action Approval as
+  the authoritative policy.
+- Do not load normal Cursor project context by default. Cursor project rules and
+  ambient instruction files are not trusted policy inputs for this runtime
+  adapter; the harness prompt envelope provides the real working directory for
+  Harness Actions instead.
 - Map the Agent Profile model field to Cursor's `--model` flag when the model is
   not `default`.
 - Keep CLI args configurable for advanced users, but reject args that bypass

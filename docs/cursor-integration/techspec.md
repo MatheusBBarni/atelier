@@ -217,7 +217,16 @@ Append `--model <model>` when the Agent Profile model is not `default`.
 
 Spawn rules:
 
-- `current_dir` is `RuntimeRequest.working_directory`;
+- create a temporary harness-owned Cursor CLI permission sandbox before spawning
+  the process;
+- the sandbox writes temporary `cli-config.json` / `.cursor/cli.json` files that
+  deny Cursor-native Shell, Read, Write, WebFetch, and MCP tools without
+  mutating user or project Cursor config;
+- `current_dir` is the sandbox working directory, while
+  `RuntimeRequest.working_directory` remains in the prompt envelope for Harness
+  Actions;
+- set Cursor config environment overrides such as `CURSOR_CONFIG_DIR` and
+  `XDG_CONFIG_HOME` to the sandbox paths;
 - `stdin` is piped and receives the full harness prompt envelope;
 - if live Cursor smoke testing proves stdin is unsupported, the runtime may pass
   the same prompt envelope as a `-p` argument using `Command::arg`; it must not
@@ -319,7 +328,8 @@ records. No migration is required.
   `--resume`, session resume identifiers, `--print`, `--output-format`, and
   `--model`. Reject them during config loading.
 - Do not read Cursor credential files.
-- Do not write Cursor permission files.
+- Do not write user or project Cursor permission files; only write temporary
+  harness-owned Cursor permission files inside the runtime sandbox.
 - Do not pass API keys through argv.
 - Allow `CURSOR_API_KEY` only as an environment-owned optional fallback.
 - Treat every Cursor tool event except `readToolCall` as a policy violation.
