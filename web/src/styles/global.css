@@ -730,6 +730,10 @@ h3 {
   padding: clamp(76px, 10vw, 120px) 0;
 }
 
+.install > * {
+  min-width: 0;
+}
+
 .install__panel {
   padding: 22px;
   background: #0b0f0c;
@@ -737,7 +741,9 @@ h3 {
 
 .install__panel pre {
   margin: 0 0 18px;
-  overflow: auto;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .install__panel code {

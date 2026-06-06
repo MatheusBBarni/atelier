@@ -527,18 +527,9 @@ fn validate_parallel_file_scope(scope: &ParallelFileScope, config: &EffectiveCon
         if parallel_scope_path_is_existing_directory(write_file, config)? {
             bail!("parallel write_files must be exact file paths, not directories: {write_file}");
         }
-        if Path::new(write_file)
-            .components()
-            .any(|component| matches!(component, Component::CurDir) && write_file.trim() == ".")
-        {
-            bail!("parallel write_files must be exact file paths, not .");
-        }
     }
     for read_root in &scope.read_roots {
         validate_parallel_scope_path(read_root, &config.workspace.extra_read_roots)?;
-        if read_root.trim() == "." {
-            bail!("parallel read_roots cannot use . in a multi-child group");
-        }
     }
     Ok(())
 }
@@ -547,6 +538,9 @@ fn validate_parallel_scope_path(path: &str, extra_roots: &[PathBuf]) -> Result<P
     let trimmed = path.trim();
     if trimmed.is_empty() {
         bail!("parallel file scope contains an empty path");
+    }
+    if trimmed.split('/').any(|component| component == ".") {
+        bail!("current-directory components are not allowed in parallel scope: {path}");
     }
     let candidate = Path::new(trimmed);
     if candidate.is_absolute() {
@@ -564,7 +558,10 @@ fn validate_parallel_scope_path(path: &str, extra_roots: &[PathBuf]) -> Result<P
             Component::Prefix(_) | Component::RootDir => {
                 bail!("rooted paths are not allowed in parallel scope: {path}")
             }
-            Component::CurDir | Component::Normal(_) => {}
+            Component::CurDir => {
+                bail!("current-directory components are not allowed in parallel scope: {path}")
+            }
+            Component::Normal(_) => {}
         }
     }
     Ok(candidate.to_path_buf())
@@ -1038,6 +1035,23 @@ mod tests {
         let error = validate_parallel_group_plan(&group, &config).unwrap_err();
 
         assert!(error.to_string().contains("not directories"));
+    }
+
+    #[test]
+    fn rejects_parallel_group_with_current_dir_scope_component() {
+        let config = parallel_enabled_config(2);
+        let group = ParallelGroupPlan {
+            group_id: "group".to_string(),
+            reason: "Ambiguous lexical scope.".to_string(),
+            steps: vec![
+                parallel_child("fix dotted", "src/./a.rs"),
+                parallel_child("fix file", "src/b.rs"),
+            ],
+        };
+
+        let error = validate_parallel_group_plan(&group, &config).unwrap_err();
+
+        assert!(error.to_string().contains("current-directory components"));
     }
 
     #[test]

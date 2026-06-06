@@ -726,21 +726,13 @@ fn validate_parallel_command(command: &str) -> Result<()> {
 
 fn is_parallel_read_only_command(lower: &str) -> bool {
     let allow_prefixes = [
-        "rg ",
         "git status",
         "git diff",
         "git log",
         "git show",
         "git grep",
         "git blame",
-        "ls",
         "pwd",
-        "sed -n",
-        "cat ",
-        "grep ",
-        "find ",
-        "wc ",
-        "atelier --doctor",
         "atelier --print-config",
         "atelier --help",
         "atelier --version",
@@ -1874,6 +1866,34 @@ mod tests {
             step_id: "step".to_string(),
             kind: ActionKind::RunCommand,
             params: json!({ "command": "cargo test" }),
+        };
+        let scope = ActionScope::ParallelFileScope(ParallelFileScope {
+            write_files: vec!["src/lib.rs".to_string()],
+            read_roots: vec!["src".to_string()],
+        });
+
+        let decision = validate_action_request_with_scope(
+            &fixer,
+            &config.workspace,
+            &config.approval_mode,
+            &scope,
+            &request,
+        );
+
+        assert!(
+            matches!(decision, ActionDecision::Denied(reason) if reason.contains("schedule after group join"))
+        );
+    }
+
+    #[test]
+    fn parallel_command_policy_rejects_free_form_filesystem_commands() {
+        let (config, fixer) = fixture_agent("fixer");
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "command".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::RunCommand,
+            params: json!({ "command": "find . -delete" }),
         };
         let scope = ActionScope::ParallelFileScope(ParallelFileScope {
             write_files: vec!["src/lib.rs".to_string()],
