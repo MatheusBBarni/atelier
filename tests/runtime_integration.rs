@@ -186,6 +186,7 @@ fn agent_request(
         previous_results: Vec::new(),
         action_results: Vec::new(),
         output_schema: "agent_result".to_string(),
+            parallel_context: None,
         capability_constraints: capabilities,
         limits: Limits::default(),
     }

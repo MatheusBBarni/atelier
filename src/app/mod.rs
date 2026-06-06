@@ -2,9 +2,8 @@ pub mod chat;
 
 use self::chat::{ChatItemView, ChatProjection};
 use crate::actions::{
-    execute_action_request, is_vcs_mutation, validate_action_request,
-    vcs_action_explicitly_requested, ActionDecision, ActionExecutionContext, ActionKind,
-    ActionRequest, ActionResult, ActionStatus,
+    execute_action_request, is_vcs_mutation, vcs_action_explicitly_requested, ActionDecision,
+    ActionExecutionContext, ActionKind, ActionRequest, ActionResult, ActionStatus,
 };
 use crate::config::{
     AgentProfile, AgentPromptMetadata, ApprovalMode, Capability, CouncilExecutionMode,
@@ -13,23 +12,27 @@ use crate::config::{
 use crate::history::{HistoryEvent, HistoryStore};
 use crate::ids::new_id;
 use crate::orchestrator::{
-    build_orchestrator_prompt, validate_orchestrator_decision, AgentResult, AgentResultStatus,
-    DecisionStatus, RunState, COUNCIL_WORKFLOW_AGENT_ID,
+    agent_results, build_orchestrator_prompt, validate_orchestrator_decision, AgentResult,
+    AgentResultStatus, DecisionNextStep, DecisionStatus, ParallelBlockedScope,
+    ParallelChildResultRef, ParallelFailedScope, ParallelFileScope, ParallelGroupPlan,
+    ParallelGroupResult, ParallelGroupStatus, RunState, RunStepResult, COUNCIL_WORKFLOW_AGENT_ID,
 };
 use crate::runtime::{
     check_all_runtime_availability, execute_runtime_step, execute_runtime_step_streaming,
-    RuntimeAvailability, RuntimeAvailabilityStatus, RuntimeEvent, RuntimeEventSink,
-    RuntimeHistoryEvent, RuntimeOutput, RuntimeRecentAction, RuntimeRecentContext,
-    RuntimeRecentFile, RuntimeRequest, RuntimeStreamDelta, RUNTIME_EVENT_CHANNEL_CAPACITY,
+    ParallelRuntimeContext, ParallelSiblingContext, RuntimeAvailability, RuntimeAvailabilityStatus,
+    RuntimeEvent, RuntimeEventSink, RuntimeHistoryEvent, RuntimeOutput, RuntimeRecentAction,
+    RuntimeRecentContext, RuntimeRecentFile, RuntimeRequest, RuntimeStreamDelta,
+    RUNTIME_EVENT_CHANNEL_CAPACITY,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::future::{pending, Future};
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 const LARGE_ACTION_CONTENT_BYTES: usize = 8 * 1024;
@@ -65,6 +68,7 @@ pub struct AppState {
     pub session_goal: Option<String>,
     pub config_status: ConfigStatusView,
     pub live_step: Option<LiveStepView>,
+    pub live_steps: Vec<LiveStepView>,
     pub pending_approval: Option<PendingApprovalView>,
     pub agents: Vec<AgentView>,
     pub chat_items: Vec<ChatItemView>,
@@ -75,7 +79,10 @@ pub struct AppState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveStepView {
     pub run_id: String,
+    pub group_id: Option<String>,
     pub step_id: String,
+    pub step_label: Option<String>,
+    pub file_scope: Option<ParallelFileScope>,
     pub agent: String,
     pub status: LiveStepStatus,
     pub streams: Vec<LiveStreamView>,
@@ -133,6 +140,21 @@ impl InterruptHandle {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ApprovalHandle {
+    sender: watch::Sender<ApprovalSignal>,
+}
+
+impl ApprovalHandle {
+    pub fn answer(&self, approved: bool) {
+        let current = *self.sender.borrow();
+        let _ = self.sender.send(ApprovalSignal {
+            sequence: current.sequence.wrapping_add(1),
+            approved,
+        });
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
     PromptSubmitted(String),
@@ -152,11 +174,14 @@ pub struct App {
     pending_approval: Option<PendingApproval>,
     pending_clarification: Option<PendingClarification>,
     active_step: Option<ActiveStep>,
+    active_steps: Vec<ActiveStep>,
     debug_enabled: bool,
     session_ended: bool,
     state_sender: Option<watch::Sender<AppState>>,
     interrupt_sender: watch::Sender<u64>,
     interrupt_receiver: watch::Receiver<u64>,
+    approval_sender: watch::Sender<ApprovalSignal>,
+    approval_receiver: watch::Receiver<ApprovalSignal>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +199,17 @@ struct PendingApproval {
 }
 
 #[derive(Clone, Debug)]
+struct PendingParallelApproval {
+    run_id: String,
+    group_id: String,
+    step_id: String,
+    action_request: ActionRequest,
+    agent_profile: AgentProfile,
+    context: ActionExecutionContext,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 struct PendingClarification {
     run: RunDriveContext,
 }
@@ -181,7 +217,10 @@ struct PendingClarification {
 #[derive(Clone, Debug)]
 struct ActiveStep {
     run_id: String,
+    group_id: Option<String>,
     step_id: String,
+    step_label: Option<String>,
+    file_scope: Option<ParallelFileScope>,
     agent: String,
 }
 
@@ -191,7 +230,7 @@ struct RunDriveContext {
     parent_run_id: Option<String>,
     prompt: String,
     subtask: Option<SubtaskContext>,
-    previous_results: Vec<AgentResult>,
+    previous_results: Vec<RunStepResult>,
     step_count: u32,
     started_at: Instant,
     parse_repair_attempts: u32,
@@ -266,6 +305,45 @@ enum AgentStepOutcome {
     Stop,
 }
 
+#[derive(Debug)]
+enum ParallelRuntimeMessage {
+    RuntimeEvent {
+        step_id: String,
+        event: RuntimeEvent,
+    },
+    Output {
+        step_id: String,
+        output: Box<Result<RuntimeOutput>>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ParallelRuntimeResumeHandle {
+    cancellation: CancellationToken,
+    sender: mpsc::Sender<ParallelRuntimeMessage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApprovalSignal {
+    sequence: u64,
+    approved: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ParallelChildRuntimeState {
+    step_id: String,
+    step_label: String,
+    agent_id: String,
+    file_scope: ParallelFileScope,
+    request: RuntimeRequest,
+    step_started_at: Instant,
+    next_runtime_sequence: u32,
+    action_count: u32,
+    cancellation: CancellationToken,
+    terminal_result: Option<AgentResult>,
+    result_recorded: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RunRecord {
     schema_version: u32,
@@ -276,7 +354,7 @@ struct RunRecord {
     session_goal: Option<String>,
     subtask: Option<SubtaskRecord>,
     state: RunState,
-    results: Vec<AgentResult>,
+    results: Vec<RunStepResult>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,6 +372,10 @@ impl App {
         let history = HistoryStore::create(&config.working_directory)?;
         let availability = check_all_runtime_availability(&config).await;
         let (interrupt_sender, interrupt_receiver) = watch::channel(0);
+        let (approval_sender, approval_receiver) = watch::channel(ApprovalSignal {
+            sequence: 0,
+            approved: false,
+        });
         let state = AppState {
             session_id: history.session_id().to_string(),
             run_state: RunState::Idle,
@@ -301,6 +383,7 @@ impl App {
             session_goal: None,
             config_status: build_config_status(&config, &availability),
             live_step: None,
+            live_steps: Vec::new(),
             pending_approval: None,
             agents: build_agent_views(&config, &availability),
             chat_items: Vec::new(),
@@ -316,11 +399,14 @@ impl App {
             pending_approval: None,
             pending_clarification: None,
             active_step: None,
+            active_steps: Vec::new(),
             debug_enabled: debug_enabled || debug_enabled_from_env(),
             session_ended: false,
             state_sender: None,
             interrupt_sender,
             interrupt_receiver,
+            approval_sender,
+            approval_receiver,
         };
         app.record_event(
             None,
@@ -348,6 +434,12 @@ impl App {
     pub fn interrupt_handle(&self) -> InterruptHandle {
         InterruptHandle {
             sender: self.interrupt_sender.clone(),
+        }
+    }
+
+    pub fn approval_handle(&self) -> ApprovalHandle {
+        ApprovalHandle {
+            sender: self.approval_sender.clone(),
         }
     }
 
@@ -745,10 +837,12 @@ impl App {
             }
             self.state.active_run_id = None;
             self.state.live_step = None;
+            self.state.live_steps.clear();
             self.state.pending_approval = None;
             self.pending_approval = None;
             self.pending_clarification = None;
             self.active_step = None;
+            self.active_steps.clear();
             self.sync_chat_items();
             self.publish_state();
         }
@@ -849,34 +943,19 @@ impl App {
     ) -> Result<bool> {
         match decision.status {
             DecisionStatus::Continue => {
-                let next_agent_id = decision
-                    .next_agent
-                    .clone()
-                    .context("validated continue decision missing next_agent")?;
-                if next_agent_id == COUNCIL_WORKFLOW_AGENT_ID {
-                    if !council_route_allowed(&run.prompt, self.state.session_goal.as_deref()) {
-                        self.state.run_state = RunState::Failed;
-                        self.record_event(
-                            Some(run.run_id.clone()),
-                            Some(decision.decision_id.clone()),
-                            "orchestrator_decision_invalid",
-                            json!({
-                                "reason": "council workflow can only be routed for high-risk or user-requested cases",
-                                "decision": decision
-                            }),
-                            "Orchestrator routed council outside its allowed scope.",
-                        )?;
-                        return Ok(false);
+                let next_step = decision
+                    .normalized_next_step()
+                    .context("failed to normalize orchestrator next step")?
+                    .context("validated continue decision missing next_step")?;
+                match next_step {
+                    DecisionNextStep::SingleAgent(plan) => {
+                        self.handle_single_agent_decision(run, &decision, &plan.agent)
+                            .await
                     }
-                    return self.run_council_workflow(run, &decision).await;
-                }
-                if self.review_fix_cycle_limit_reached(run, &next_agent_id) {
-                    self.stop_for_review_fix_cycle_limit(run)?;
-                    return Ok(false);
-                }
-                match self.run_agent_step(run, &next_agent_id, None).await? {
-                    AgentStepOutcome::Completed => Ok(true),
-                    AgentStepOutcome::Paused | AgentStepOutcome::Stop => Ok(false),
+                    DecisionNextStep::ParallelGroup(group) => {
+                        self.handle_parallel_group_decision(run, &decision, group)
+                            .await
+                    }
                 }
             }
             DecisionStatus::WaitingForUser => {
@@ -915,6 +994,864 @@ impl App {
                 Ok(false)
             }
         }
+    }
+
+    async fn handle_single_agent_decision(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+        next_agent_id: &str,
+    ) -> Result<bool> {
+        if next_agent_id == COUNCIL_WORKFLOW_AGENT_ID {
+            if !council_route_allowed(&run.prompt, self.state.session_goal.as_deref()) {
+                self.state.run_state = RunState::Failed;
+                self.record_event(
+                    Some(run.run_id.clone()),
+                    Some(decision.decision_id.clone()),
+                    "orchestrator_decision_invalid",
+                    json!({
+                        "reason": "council workflow can only be routed for high-risk or user-requested cases",
+                        "decision": decision
+                    }),
+                    "Orchestrator routed council outside its allowed scope.",
+                )?;
+                return Ok(false);
+            }
+            return self.run_council_workflow(run, decision).await;
+        }
+        if self.review_fix_cycle_limit_reached(run, next_agent_id) {
+            self.stop_for_review_fix_cycle_limit(run)?;
+            return Ok(false);
+        }
+        match self.run_agent_step(run, next_agent_id, None).await? {
+            AgentStepOutcome::Completed => Ok(true),
+            AgentStepOutcome::Paused | AgentStepOutcome::Stop => Ok(false),
+        }
+    }
+
+    async fn handle_parallel_group_decision(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+        group: ParallelGroupPlan,
+    ) -> Result<bool> {
+        if self.review_fix_cycle_limit_reached(run, "fixer")
+            && group.steps.iter().any(|step| step.agent == "fixer")
+        {
+            self.stop_for_review_fix_cycle_limit(run)?;
+            return Ok(false);
+        }
+        match self.run_parallel_group(run, decision, group).await? {
+            AgentStepOutcome::Completed => Ok(true),
+            AgentStepOutcome::Paused | AgentStepOutcome::Stop => Ok(false),
+        }
+    }
+
+    async fn run_parallel_group(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+        group: ParallelGroupPlan,
+    ) -> Result<AgentStepOutcome> {
+        self.state.run_state = RunState::Running;
+        if self.wall_clock_limit_reached(run) {
+            self.stop_for_wall_clock_limit(run)?;
+            return Ok(AgentStepOutcome::Stop);
+        }
+        if self.parallel_group_exceeds_agent_step_limit(run, &group) {
+            self.stop_for_parallel_group_agent_step_limit(run, &group)?;
+            return Ok(AgentStepOutcome::Stop);
+        }
+
+        let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let cancellation = CancellationToken::new();
+        let interrupt_start = *self.interrupt_receiver.borrow();
+        let approval_start = self.approval_receiver.borrow().sequence;
+        self.record_event_with_group(
+            Some(run.run_id.clone()),
+            Some(group.group_id.clone()),
+            None,
+            "parallel_group_started",
+            json!({
+                "group_id": group.group_id,
+                "decision_id": decision.decision_id,
+                "reason": group.reason,
+                "children": group.steps.len()
+            }),
+            "Parallel group started.",
+        )?;
+
+        let child_specs = self.prepare_parallel_children(run, &group)?;
+        let (sender, mut receiver) =
+            mpsc::channel(RUNTIME_EVENT_CHANNEL_CAPACITY * child_specs.len().max(1));
+        let resume_handle = ParallelRuntimeResumeHandle {
+            cancellation: cancellation.clone(),
+            sender: sender.clone(),
+        };
+        let mut children = BTreeMap::new();
+        let mut coalescers = BTreeMap::new();
+        for mut child in child_specs {
+            child.cancellation = cancellation.child_token();
+            self.record_event_with_group(
+                Some(run.run_id.clone()),
+                Some(group.group_id.clone()),
+                Some(child.step_id.clone()),
+                "parallel_child_started",
+                json!({
+                    "group_id": group.group_id,
+                    "step_id": child.step_id,
+                    "agent": child.agent_id,
+                    "step_label": child.step_label,
+                    "file_scope": child.file_scope
+                }),
+                format!("Parallel child started: {}.", child.step_label),
+            )?;
+            self.record_event_with_group(
+                Some(run.run_id.clone()),
+                Some(group.group_id.clone()),
+                Some(child.step_id.clone()),
+                "agent_step_started",
+                json!({
+                    "agent": child.agent_id,
+                    "group_id": group.group_id,
+                    "step_label": child.step_label,
+                    "file_scope": child.file_scope
+                }),
+                format!("{} parallel step started.", child.agent_id),
+            )?;
+            self.set_active_step_with_metadata(
+                &run.run_id,
+                Some(group.group_id.clone()),
+                &child.step_id,
+                Some(child.step_label.clone()),
+                Some(child.file_scope.clone()),
+                &child.agent_id,
+            );
+            self.set_agent_status(&child.agent_id, "running_parallel");
+            coalescers.insert(
+                child.step_id.clone(),
+                RuntimeStreamCoalescer::new(child.agent_id.clone()),
+            );
+            spawn_parallel_runtime_task(
+                self.config.clone(),
+                child.step_id.clone(),
+                child.request.clone(),
+                child.next_runtime_sequence,
+                child.cancellation.clone(),
+                sender.clone(),
+            );
+            child.next_runtime_sequence = child.next_runtime_sequence.saturating_add(1);
+            children.insert(child.step_id.clone(), child);
+        }
+        let interrupt_requested =
+            wait_for_interrupt(self.interrupt_receiver.clone(), interrupt_start);
+        tokio::pin!(interrupt_requested);
+        let mut approval_answered = Box::pin(wait_for_approval(
+            self.approval_receiver.clone(),
+            approval_start,
+        ));
+        let mut approval_queue: VecDeque<PendingParallelApproval> = VecDeque::new();
+        let mut limit_tick = tokio::time::interval(Duration::from_millis(100));
+
+        let mut interrupted = false;
+        while children
+            .values()
+            .any(|child| child.terminal_result.is_none())
+        {
+            let message = tokio::select! {
+                message = receiver.recv() => message,
+                _ = &mut interrupt_requested => {
+                    cancellation.cancel();
+                    interrupted = true;
+                    self.state.run_state = RunState::Interrupted;
+                    self.state.pending_approval = None;
+                    approval_queue.clear();
+                    self.record_step_cancelled_if_active()?;
+                    self.record_event(
+                        Some(run.run_id.clone()),
+                        None,
+                        "run_interrupted",
+                        json!({}),
+                        "Run interrupted.",
+                    )?;
+                    for child in children.values_mut() {
+                        if child.terminal_result.is_none() {
+                            child.terminal_result = Some(cancelled_agent_result(
+                                &child.agent_id,
+                                &child.step_id,
+                                "Parallel group cancelled by run interrupt.",
+                            ));
+                        }
+                    }
+                    None
+                }
+                approval = &mut approval_answered => {
+                    approval_answered = Box::pin(wait_for_approval(
+                        self.approval_receiver.clone(),
+                        approval.sequence,
+                    ));
+                    if let Some(pending) = approval_queue.pop_front() {
+                        self.publish_parallel_approval_head(&approval_queue);
+                        if let Some(child) = children.get_mut(&pending.step_id) {
+                            if child.terminal_result.is_none() {
+                                self.resolve_parallel_approval(
+                                    run,
+                                    child,
+                                    pending,
+                                    approval.approved,
+                                    resume_handle.clone(),
+                                )
+                                .await?;
+                            }
+                        }
+                        self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue);
+                    }
+                    continue;
+                }
+                _ = limit_tick.tick() => {
+                    if self.apply_parallel_limit_checks(run, &mut children, &cancellation)? {
+                        self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue);
+                    }
+                    continue;
+                }
+            };
+            let Some(message) = message else {
+                break;
+            };
+            match message {
+                ParallelRuntimeMessage::RuntimeEvent { step_id, event } => {
+                    if let Some(child) = children.get(&step_id) {
+                        if child.terminal_result.is_some() {
+                            continue;
+                        }
+                        let coalescer = coalescers
+                            .get_mut(&step_id)
+                            .context("missing parallel stream coalescer")?;
+                        self.record_parallel_runtime_event(
+                            run,
+                            &group.group_id,
+                            &step_id,
+                            coalescer,
+                            event,
+                        )?;
+                        self.set_agent_status(&child.agent_id, "running_parallel");
+                    }
+                }
+                ParallelRuntimeMessage::Output { step_id, output } => {
+                    let Some(child) = children.get_mut(&step_id) else {
+                        continue;
+                    };
+                    if child.terminal_result.is_some() {
+                        continue;
+                    }
+                    let output = *output;
+                    if let Some(coalescer) = coalescers.get_mut(&step_id) {
+                        self.flush_runtime_stream_coalescer_with_group(
+                            run,
+                            Some(&group.group_id),
+                            &step_id,
+                            coalescer,
+                            true,
+                        )?;
+                    }
+                    match output {
+                        Ok(RuntimeOutput::AgentResult { result }) => {
+                            self.record_parallel_child_result(run, &group.group_id, child, result)?;
+                        }
+                        Ok(RuntimeOutput::ActionRequest { request }) => {
+                            if self
+                                .handle_parallel_child_action(
+                                    run,
+                                    &group.group_id,
+                                    child,
+                                    request,
+                                    resume_handle.clone(),
+                                    &mut approval_queue,
+                                )
+                                .await?
+                            {
+                                continue;
+                            }
+                            self.publish_parallel_approval_head(&approval_queue);
+                        }
+                        Ok(RuntimeOutput::ParseError {
+                            agent,
+                            raw_output,
+                            diagnostic,
+                        }) => {
+                            let result = self.persist_parse_error_with_group(
+                                &run.run_id,
+                                &group.group_id,
+                                &step_id,
+                                &agent,
+                                raw_output,
+                                diagnostic,
+                            )?;
+                            self.record_parallel_child_result(run, &group.group_id, child, result)?;
+                        }
+                        Ok(RuntimeOutput::OrchestratorDecision { .. }) => {
+                            let result = failed_agent_result(
+                                &child.agent_id,
+                                &step_id,
+                                "Parallel child returned an orchestrator decision.",
+                            );
+                            self.record_parallel_child_result(run, &group.group_id, child, result)?;
+                        }
+                        Err(error) => {
+                            let result = failed_agent_result(
+                                &child.agent_id,
+                                &step_id,
+                                &format!("Parallel child runtime failed: {error:#}"),
+                            );
+                            self.record_parallel_child_result(run, &group.group_id, child, result)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let unrecorded = children
+            .iter()
+            .filter_map(|(step_id, child)| {
+                child
+                    .terminal_result
+                    .as_ref()
+                    .filter(|_| !child.result_recorded)
+                    .map(|_| step_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for step_id in unrecorded {
+            let child = children
+                .get_mut(&step_id)
+                .context("missing unrecorded parallel child")?;
+            let result = child
+                .terminal_result
+                .clone()
+                .context("unrecorded parallel child missing terminal result")?;
+            self.record_parallel_child_result(run, &group.group_id, child, result)?;
+        }
+
+        let child_results = children
+            .values()
+            .filter_map(|child| child.terminal_result.clone().map(|result| (child, result)))
+            .collect::<Vec<_>>();
+        for (_child, result) in &child_results {
+            run.previous_results.push(RunStepResult::Agent {
+                result: result.clone(),
+            });
+        }
+        let group_result = synthesize_parallel_group_result(
+            &run.run_id,
+            &group.group_id,
+            &started_at,
+            &child_results,
+        );
+        self.record_event_with_group(
+            Some(run.run_id.clone()),
+            Some(group.group_id.clone()),
+            None,
+            "parallel_group_joined",
+            serde_json::to_value(&group_result)?,
+            "Parallel group joined.",
+        )?;
+        run.previous_results.push(RunStepResult::ParallelGroup {
+            result: group_result,
+        });
+        for child in children.values() {
+            self.clear_active_step(&child.step_id);
+        }
+        self.state.pending_approval = None;
+        self.sync_chat_items();
+        self.publish_state();
+        if interrupted {
+            return Ok(AgentStepOutcome::Stop);
+        }
+        Ok(AgentStepOutcome::Completed)
+    }
+
+    fn parallel_group_exceeds_agent_step_limit(
+        &self,
+        run: &RunDriveContext,
+        group: &ParallelGroupPlan,
+    ) -> bool {
+        match self.config.limits.max_agent_steps {
+            Limit::Value(limit) => run.step_count.saturating_add(group.steps.len() as u32) > limit,
+            Limit::Unlimited => false,
+        }
+    }
+
+    fn stop_for_parallel_group_agent_step_limit(
+        &mut self,
+        run: &RunDriveContext,
+        group: &ParallelGroupPlan,
+    ) -> Result<()> {
+        self.state.run_state = RunState::LimitReached;
+        self.record_event_with_group(
+            Some(run.run_id.clone()),
+            Some(group.group_id.clone()),
+            None,
+            "run_limit_reached",
+            json!({
+                "limit": "max_agent_steps",
+                "value": run.step_count,
+                "requested_parallel_children": group.steps.len(),
+                "group_id": group.group_id
+            }),
+            "Run limit reached before the parallel group could start.",
+        )
+    }
+
+    fn prepare_parallel_children(
+        &mut self,
+        run: &mut RunDriveContext,
+        group: &ParallelGroupPlan,
+    ) -> Result<Vec<ParallelChildRuntimeState>> {
+        let child_ids = group
+            .steps
+            .iter()
+            .map(|step| (new_id(), step))
+            .collect::<Vec<_>>();
+        let sibling_contexts = child_ids
+            .iter()
+            .map(|(step_id, step)| ParallelSiblingContext {
+                step_id: step_id.clone(),
+                step_label: step.step_label.clone(),
+                agent: step.agent.clone(),
+                file_scope: step.file_scope.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut children = Vec::with_capacity(child_ids.len());
+        for (step_id, step) in child_ids {
+            if limit_reached(&self.config.limits.max_agent_steps, run.step_count) {
+                self.state.run_state = RunState::LimitReached;
+                self.record_event(
+                    Some(run.run_id.clone()),
+                    None,
+                    "run_limit_reached",
+                    json!({ "limit": "max_agent_steps", "value": run.step_count }),
+                    "Run limit reached before a parallel child step.",
+                )?;
+                break;
+            }
+            let agent = self.agent(&step.agent)?.clone();
+            run.step_count += 1;
+            let mut request = self.runtime_request(
+                &run.run_id,
+                &step_id,
+                &parallel_child_prompt(&run.prompt, step),
+                agent,
+                run.previous_results.clone(),
+                "agent_result",
+            )?;
+            request.parallel_context = Some(ParallelRuntimeContext {
+                group_id: group.group_id.clone(),
+                step_label: step.step_label.clone(),
+                file_scope: step.file_scope.clone(),
+                parallel_siblings: sibling_contexts
+                    .iter()
+                    .filter(|sibling| sibling.step_id != step_id)
+                    .cloned()
+                    .collect(),
+                scope_policy_summary: parallel_scope_policy_summary(&step.file_scope),
+            });
+            children.push(ParallelChildRuntimeState {
+                step_id,
+                step_label: step.step_label.clone(),
+                agent_id: step.agent.clone(),
+                file_scope: step.file_scope.clone(),
+                request,
+                step_started_at: Instant::now(),
+                next_runtime_sequence: 1,
+                action_count: 0,
+                cancellation: CancellationToken::new(),
+                terminal_result: None,
+                result_recorded: false,
+            });
+        }
+        Ok(children)
+    }
+
+    async fn handle_parallel_child_action(
+        &mut self,
+        run: &RunDriveContext,
+        group_id: &str,
+        child: &mut ParallelChildRuntimeState,
+        action_request: ActionRequest,
+        resume_handle: ParallelRuntimeResumeHandle,
+        approval_queue: &mut VecDeque<PendingParallelApproval>,
+    ) -> Result<bool> {
+        if limit_reached(&self.config.limits.max_step_actions, child.action_count) {
+            self.stop_for_step_action_limit(run, &child.step_id, child.action_count as usize)?;
+            child.terminal_result = Some(limit_reached_agent_result(
+                &child.agent_id,
+                &child.step_id,
+                "Parallel child reached max_step_actions.",
+            ));
+            return Ok(false);
+        }
+        self.record_event_with_group(
+            Some(run.run_id.clone()),
+            Some(group_id.to_string()),
+            Some(child.step_id.clone()),
+            "action_requested",
+            serde_json::to_value(&action_request)?,
+            action_requested_display(&action_request),
+        )?;
+        self.set_live_step_status(&child.step_id, LiveStepStatus::WaitingForAction);
+        self.set_agent_status(&child.agent_id, "waiting_action");
+        let context = ActionExecutionContext {
+            working_directory: self.config.working_directory.clone(),
+            workspace: self.config.workspace.clone(),
+            approval_mode: self.config.approval_mode.clone(),
+            command_timeout: command_timeout(&self.config.limits.max_command_minutes),
+            user_prompt: Some(child.request.prompt.clone()),
+            action_scope: crate::actions::ActionScope::ParallelFileScope(child.file_scope.clone()),
+        };
+        self.record_command_started_if_executable_with_group(
+            &run.run_id,
+            Some(group_id),
+            &child.step_id,
+            &child.request.agent_profile,
+            &context,
+            &action_request,
+        )?;
+        let action =
+            execute_action_request(&child.request.agent_profile, &context, &action_request);
+        let Some(result) = await_with_step_limit(
+            action,
+            &self.config.limits.max_step_minutes,
+            child.step_started_at,
+        )
+        .await
+        else {
+            self.stop_for_step_time_limit(run, &child.step_id, child.step_started_at)?;
+            child.cancellation.cancel();
+            child.terminal_result = Some(limit_reached_agent_result(
+                &child.agent_id,
+                &child.step_id,
+                "Parallel child reached max_step_minutes.",
+            ));
+            return Ok(false);
+        };
+        if matches!(result.status, ActionStatus::ApprovalRequired) {
+            self.set_live_step_status(&child.step_id, LiveStepStatus::WaitingForApproval);
+            self.set_agent_status(&child.agent_id, "waiting_approval");
+            self.record_event_with_group(
+                Some(run.run_id.clone()),
+                Some(group_id.to_string()),
+                Some(child.step_id.clone()),
+                "approval_requested",
+                serde_json::to_value(&result)?,
+                "Action approval required.",
+            )?;
+            approval_queue.push_back(PendingParallelApproval {
+                run_id: run.run_id.clone(),
+                group_id: group_id.to_string(),
+                step_id: child.step_id.clone(),
+                action_request,
+                agent_profile: child.request.agent_profile.clone(),
+                context,
+                reason: result.diagnostic.clone(),
+            });
+            return Ok(false);
+        }
+        if matches!(result.status, ActionStatus::Denied) {
+            self.record_event_with_group(
+                Some(run.run_id.clone()),
+                Some(group_id.to_string()),
+                Some(child.step_id.clone()),
+                "action_denied",
+                serde_json::to_value(&result)?,
+                action_denied_display(&action_request, &result),
+            )?;
+        }
+        self.record_action_specific_events_with_group(
+            &run.run_id,
+            Some(group_id),
+            &child.step_id,
+            &action_request,
+            &result,
+        )?;
+        self.record_event_with_group(
+            Some(run.run_id.clone()),
+            Some(group_id.to_string()),
+            Some(child.step_id.clone()),
+            "action_completed",
+            serde_json::to_value(&result)?,
+            action_completed_display(&action_request, &result),
+        )?;
+        child.action_count += 1;
+        child.request.action_results.push(result);
+        self.set_live_step_status(&child.step_id, LiveStepStatus::Running);
+        self.set_agent_status(&child.agent_id, "running_parallel");
+        spawn_parallel_runtime_task(
+            self.config.clone(),
+            child.step_id.clone(),
+            child.request.clone(),
+            child.next_runtime_sequence,
+            child.cancellation.clone(),
+            resume_handle.sender,
+        );
+        child.next_runtime_sequence = child.next_runtime_sequence.saturating_add(1);
+        Ok(true)
+    }
+
+    async fn resolve_parallel_approval(
+        &mut self,
+        run: &RunDriveContext,
+        child: &mut ParallelChildRuntimeState,
+        mut pending: PendingParallelApproval,
+        approved: bool,
+        resume_handle: ParallelRuntimeResumeHandle,
+    ) -> Result<()> {
+        self.record_event_with_group(
+            Some(pending.run_id.clone()),
+            Some(pending.group_id.clone()),
+            Some(pending.step_id.clone()),
+            "approval_resolved",
+            json!({
+                "action_id": pending.action_request.action_id.clone(),
+                "approved": approved
+            }),
+            if approved {
+                "Action approval granted."
+            } else {
+                "Action approval denied."
+            },
+        )?;
+
+        if self.wall_clock_limit_reached(run) {
+            self.stop_for_wall_clock_limit(run)?;
+            resume_handle.cancellation.cancel();
+            child.terminal_result = Some(limit_reached_agent_result(
+                &child.agent_id,
+                &child.step_id,
+                "Parallel group reached max_wall_clock_minutes.",
+            ));
+            return Ok(());
+        }
+        if self.step_time_limit_reached(child.step_started_at) {
+            self.stop_for_step_time_limit(run, &child.step_id, child.step_started_at)?;
+            child.cancellation.cancel();
+            child.terminal_result = Some(limit_reached_agent_result(
+                &child.agent_id,
+                &child.step_id,
+                "Parallel child reached max_step_minutes.",
+            ));
+            return Ok(());
+        }
+
+        let result = if approved {
+            pending.context.approval_mode = ApprovalMode::Yolo;
+            self.record_command_started_if_executable_with_group(
+                &pending.run_id,
+                Some(&pending.group_id),
+                &pending.step_id,
+                &pending.agent_profile,
+                &pending.context,
+                &pending.action_request,
+            )?;
+            let action = execute_action_request(
+                &pending.agent_profile,
+                &pending.context,
+                &pending.action_request,
+            );
+            let Some(result) = await_with_step_limit(
+                action,
+                &self.config.limits.max_step_minutes,
+                child.step_started_at,
+            )
+            .await
+            else {
+                self.stop_for_step_time_limit(run, &child.step_id, child.step_started_at)?;
+                child.cancellation.cancel();
+                child.terminal_result = Some(limit_reached_agent_result(
+                    &child.agent_id,
+                    &child.step_id,
+                    "Parallel child reached max_step_minutes.",
+                ));
+                return Ok(());
+            };
+            result
+        } else {
+            ActionResult::approval_denied(
+                &pending.action_request,
+                pending
+                    .reason
+                    .unwrap_or_else(|| "user denied action approval".to_string()),
+            )
+        };
+
+        self.record_action_specific_events_with_group(
+            &pending.run_id,
+            Some(&pending.group_id),
+            &pending.step_id,
+            &pending.action_request,
+            &result,
+        )?;
+        self.record_action_completed_with_group(
+            &pending.run_id,
+            Some(&pending.group_id),
+            &pending.step_id,
+            &pending.action_request,
+            &result,
+        )?;
+        child.action_count += 1;
+        child.request.action_results.push(result);
+        self.set_live_step_status(&child.step_id, LiveStepStatus::Running);
+        self.set_agent_status(&child.agent_id, "running_parallel");
+        spawn_parallel_runtime_task(
+            self.config.clone(),
+            child.step_id.clone(),
+            child.request.clone(),
+            child.next_runtime_sequence,
+            child.cancellation.clone(),
+            resume_handle.sender,
+        );
+        child.next_runtime_sequence = child.next_runtime_sequence.saturating_add(1);
+        Ok(())
+    }
+
+    fn publish_parallel_approval_head(&mut self, queue: &VecDeque<PendingParallelApproval>) {
+        self.state.pending_approval = queue.front().map(|pending| PendingApprovalView {
+            run_id: pending.run_id.clone(),
+            step_id: pending.step_id.clone(),
+            action_id: pending.action_request.action_id.clone(),
+            agent: pending.agent_profile.id.clone(),
+            summary: action_requested_display(&pending.action_request).to_string(),
+            diagnostic: pending.reason.clone(),
+        });
+        self.sync_chat_items();
+        self.publish_state();
+    }
+
+    fn drop_terminal_parallel_approvals(
+        &mut self,
+        children: &BTreeMap<String, ParallelChildRuntimeState>,
+        queue: &mut VecDeque<PendingParallelApproval>,
+    ) {
+        queue.retain(|pending| {
+            children
+                .get(&pending.step_id)
+                .is_some_and(|child| child.terminal_result.is_none())
+        });
+    }
+
+    fn apply_parallel_limit_checks(
+        &mut self,
+        run: &RunDriveContext,
+        children: &mut BTreeMap<String, ParallelChildRuntimeState>,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let mut changed = false;
+        if self.wall_clock_limit_reached(run) {
+            self.stop_for_wall_clock_limit(run)?;
+            cancellation.cancel();
+            for child in children.values_mut() {
+                if child.terminal_result.is_none() {
+                    child.terminal_result = Some(limit_reached_agent_result(
+                        &child.agent_id,
+                        &child.step_id,
+                        "Parallel group reached max_wall_clock_minutes.",
+                    ));
+                    changed = true;
+                }
+            }
+            return Ok(changed);
+        }
+
+        let timed_out = children
+            .values()
+            .filter(|child| {
+                child.terminal_result.is_none()
+                    && self.step_time_limit_reached(child.step_started_at)
+            })
+            .map(|child| {
+                (
+                    child.step_id.clone(),
+                    child.agent_id.clone(),
+                    child.step_started_at,
+                    child.cancellation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (_, _, _, child_cancellation) in &timed_out {
+            child_cancellation.cancel();
+        }
+        for (step_id, agent_id, started_at, _) in timed_out {
+            self.stop_for_step_time_limit(run, &step_id, started_at)?;
+            if let Some(child) = children.get_mut(&step_id) {
+                child.terminal_result = Some(limit_reached_agent_result(
+                    &agent_id,
+                    &step_id,
+                    "Parallel child reached max_step_minutes.",
+                ));
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn record_parallel_child_result(
+        &mut self,
+        run: &RunDriveContext,
+        group_id: &str,
+        child: &mut ParallelChildRuntimeState,
+        result: AgentResult,
+    ) -> Result<()> {
+        let status = result.status.clone();
+        self.record_event_with_group(
+            Some(run.run_id.clone()),
+            Some(group_id.to_string()),
+            Some(result.step_id.clone()),
+            "agent_result",
+            serde_json::to_value(&result)?,
+            format!("{}: {}", result.agent, result.summary),
+        )?;
+        let kind = if matches!(
+            status,
+            AgentResultStatus::Completed | AgentResultStatus::NoChanges
+        ) {
+            "parallel_child_completed"
+        } else if matches!(
+            status,
+            AgentResultStatus::Blocked | AgentResultStatus::ApprovalDenied
+        ) {
+            "parallel_child_blocked"
+        } else {
+            "parallel_child_failed"
+        };
+        self.record_event_with_group(
+            Some(run.run_id.clone()),
+            Some(group_id.to_string()),
+            Some(child.step_id.clone()),
+            kind,
+            json!({
+                "group_id": group_id,
+                "step_id": child.step_id,
+                "agent": child.agent_id,
+                "step_label": child.step_label,
+                "file_scope": child.file_scope,
+                "status": status
+            }),
+            format!("Parallel child finished: {}.", child.step_label),
+        )?;
+        self.set_live_step_status(
+            &child.step_id,
+            if matches!(
+                result.status,
+                AgentResultStatus::Completed | AgentResultStatus::NoChanges
+            ) {
+                LiveStepStatus::Completed
+            } else {
+                LiveStepStatus::Failed
+            },
+        );
+        child.terminal_result = Some(result);
+        child.result_recorded = true;
+        Ok(())
     }
 
     async fn run_orchestrator_step(
@@ -975,6 +1912,11 @@ impl App {
             Ok(StepOutcome::Output(output)) => match *output {
                 RuntimeOutput::OrchestratorDecision { decision } => {
                     if let Err(error) = validate_orchestrator_decision(&decision, &self.config) {
+                        self.record_parallel_group_rejected_if_present(
+                            &run.run_id,
+                            &decision,
+                            &error.to_string(),
+                        )?;
                         self.state.run_state = RunState::Failed;
                         self.record_event(
                             Some(run.run_id.clone()),
@@ -1009,7 +1951,7 @@ impl App {
                         raw_output,
                         diagnostic,
                     )?;
-                    run.previous_results.push(result);
+                    run.previous_results.push(RunStepResult::Agent { result });
                     if self.schedule_parse_repair(run, &step_id, &agent)? {
                         self.clear_active_step(&step_id);
                         return Ok(OrchestratorStepOutcome::Retry);
@@ -1122,7 +2064,7 @@ impl App {
                         serde_json::to_value(&result)?,
                         format!("{}: {}", result.agent, result.summary),
                     )?;
-                    run.previous_results.push(result);
+                    run.previous_results.push(RunStepResult::Agent { result });
                     self.clear_active_step(&step_id);
                     Ok(AgentStepOutcome::Completed)
                 }
@@ -1138,7 +2080,7 @@ impl App {
                         raw_output,
                         diagnostic,
                     )?;
-                    run.previous_results.push(result);
+                    run.previous_results.push(RunStepResult::Agent { result });
                     if self.schedule_parse_repair(run, &step_id, &agent)? {
                         self.clear_active_step(&step_id);
                         return Ok(AgentStepOutcome::Completed);
@@ -1351,7 +2293,7 @@ impl App {
             json!({ "result": result.clone() }),
             "Council workflow completed.",
         )?;
-        run.previous_results.push(result);
+        run.previous_results.push(RunStepResult::Agent { result });
         Ok(true)
     }
 
@@ -1489,33 +2431,86 @@ impl App {
     }
 
     fn set_active_step(&mut self, run_id: &str, step_id: &str, agent: &str) {
-        self.active_step = Some(ActiveStep {
+        self.set_active_step_with_metadata(run_id, None, step_id, None, None, agent);
+    }
+
+    fn set_active_step_with_metadata(
+        &mut self,
+        run_id: &str,
+        group_id: Option<String>,
+        step_id: &str,
+        step_label: Option<String>,
+        file_scope: Option<ParallelFileScope>,
+        agent: &str,
+    ) {
+        let active = ActiveStep {
             run_id: run_id.to_string(),
+            group_id: group_id.clone(),
             step_id: step_id.to_string(),
+            step_label: step_label.clone(),
+            file_scope: file_scope.clone(),
             agent: agent.to_string(),
-        });
-        self.state.live_step = Some(LiveStepView {
+        };
+        self.active_step = Some(active.clone());
+        self.active_steps
+            .retain(|step| step.step_id != step_id || step.run_id != run_id);
+        self.active_steps.push(active);
+        let view = LiveStepView {
             run_id: run_id.to_string(),
+            group_id,
             step_id: step_id.to_string(),
+            step_label,
+            file_scope,
             agent: agent.to_string(),
             status: LiveStepStatus::Starting,
             streams: Vec::new(),
-        });
+        };
+        self.state
+            .live_steps
+            .retain(|live_step| live_step.step_id != step_id || live_step.run_id != run_id);
+        self.state.live_steps.push(view.clone());
+        self.state.live_step = Some(view);
         self.sync_chat_items();
         self.set_agent_status(agent, "running");
     }
 
     fn clear_active_step(&mut self, step_id: &str) {
         let agent = self
-            .active_step
-            .as_ref()
-            .filter(|step| step.step_id == step_id)
-            .map(|step| step.agent.clone());
+            .active_steps
+            .iter()
+            .find(|step| step.step_id == step_id)
+            .map(|step| step.agent.clone())
+            .or_else(|| {
+                self.active_step
+                    .as_ref()
+                    .filter(|step| step.step_id == step_id)
+                    .map(|step| step.agent.clone())
+            });
         if let Some(agent) = agent {
-            self.state.live_step = None;
+            self.state
+                .live_steps
+                .retain(|live_step| live_step.step_id != step_id);
+            self.state.live_step = self.state.live_steps.first().cloned();
             self.sync_chat_items();
-            self.set_agent_status(&agent, "idle");
-            self.active_step = None;
+            self.active_steps.retain(|step| step.step_id != step_id);
+            if self
+                .active_steps
+                .iter()
+                .any(|step| step.agent == agent && step.group_id.is_some())
+            {
+                self.set_agent_status(&agent, "running_parallel");
+            } else if self.active_steps.iter().any(|step| step.agent == agent) {
+                self.set_agent_status(&agent, "running");
+            } else {
+                self.set_agent_status(&agent, "idle");
+            }
+            if self
+                .active_step
+                .as_ref()
+                .is_some_and(|step| step.step_id == step_id)
+            {
+                self.active_step = self.active_steps.first().cloned();
+            }
         }
     }
 
@@ -1541,26 +2536,40 @@ impl App {
     }
 
     fn record_step_cancelled_if_active(&mut self) -> Result<()> {
-        let Some(step) = self.active_step.clone() else {
+        let steps = if self.active_steps.is_empty() {
+            self.active_step.iter().cloned().collect::<Vec<_>>()
+        } else {
+            self.active_steps.clone()
+        };
+        if steps.is_empty() {
             return Ok(());
         };
-        self.set_live_step_status(&step.step_id, LiveStepStatus::Interrupted);
-        self.set_agent_status(&step.agent, "interrupted");
-        let payload = json!({ "agent": step.agent });
-        self.record_event(
-            Some(step.run_id.clone()),
-            Some(step.step_id.clone()),
-            "step_cancel_requested",
-            payload.clone(),
-            "Step cancellation requested.",
-        )?;
-        self.record_event(
-            Some(step.run_id),
-            Some(step.step_id),
-            "step_cancelled",
-            payload,
-            "Step cancelled.",
-        )
+        for step in steps {
+            self.set_live_step_status(&step.step_id, LiveStepStatus::Interrupted);
+            self.set_agent_status(&step.agent, "interrupted");
+            let payload = json!({
+                "agent": step.agent,
+                "step_label": step.step_label,
+                "file_scope": step.file_scope
+            });
+            self.record_event_with_group(
+                Some(step.run_id.clone()),
+                step.group_id.clone(),
+                Some(step.step_id.clone()),
+                "step_cancel_requested",
+                payload.clone(),
+                "Step cancellation requested.",
+            )?;
+            self.record_event_with_group(
+                Some(step.run_id),
+                step.group_id,
+                Some(step.step_id),
+                "step_cancelled",
+                payload,
+                "Step cancelled.",
+            )?;
+        }
+        Ok(())
     }
 
     fn record_step_cancel_failed_if_active(&mut self, diagnostic: &str) -> Result<()> {
@@ -1676,8 +2685,7 @@ impl App {
             .subtask
             .as_ref()
             .context("subtask run is missing subtask context")?;
-        let result = run
-            .previous_results
+        let result = agent_results(&run.previous_results)
             .last()
             .ok_or_else(|| anyhow!("subtask finished without an agent result"))?;
         let completed = matches!(
@@ -1744,7 +2752,7 @@ impl App {
         step_id: &str,
         prompt: &str,
         agent_profile: AgentProfile,
-        previous_results: Vec<AgentResult>,
+        previous_results: Vec<RunStepResult>,
         output_schema: &str,
     ) -> Result<RuntimeRequest> {
         let mut agent_profile = agent_profile;
@@ -1764,6 +2772,7 @@ impl App {
             previous_results,
             action_results: Vec::new(),
             output_schema: output_schema.to_string(),
+            parallel_context: None,
             limits: self.config.limits.clone(),
         })
     }
@@ -1938,6 +2947,7 @@ impl App {
                         approval_mode: self.config.approval_mode.clone(),
                         command_timeout: command_timeout(&self.config.limits.max_command_minutes),
                         user_prompt: Some(request.prompt.clone()),
+                        action_scope: crate::actions::ActionScope::Unrestricted,
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -2055,6 +3065,53 @@ impl App {
         Ok(result)
     }
 
+    fn persist_parse_error_with_group(
+        &mut self,
+        run_id: &str,
+        group_id: &str,
+        step_id: &str,
+        agent: &str,
+        raw_output: String,
+        diagnostic: String,
+    ) -> Result<AgentResult> {
+        let artifact = self.history.write_artifact(
+            "txt",
+            "text/plain",
+            raw_output.as_bytes(),
+            "contains_user_content",
+        )?;
+        self.record_event_with_group(
+            Some(run_id.to_string()),
+            Some(group_id.to_string()),
+            Some(step_id.to_string()),
+            "artifact_written",
+            serde_json::to_value(&artifact)?,
+            "Malformed runtime output stored as an artifact.",
+        )?;
+        let result = AgentResult {
+            schema_version: 1,
+            agent: agent.to_string(),
+            step_id: step_id.to_string(),
+            status: AgentResultStatus::ParseError,
+            summary: "Runtime output did not match the required structured contract.".to_string(),
+            findings: Vec::new(),
+            changed_files: Vec::new(),
+            commands: Vec::new(),
+            verification: Vec::new(),
+            blocker: Some(diagnostic),
+            artifacts: vec![artifact],
+        };
+        self.record_event_with_group(
+            Some(run_id.to_string()),
+            Some(group_id.to_string()),
+            Some(step_id.to_string()),
+            "agent_result",
+            serde_json::to_value(&result)?,
+            "Parse error represented as an agent result.",
+        )?;
+        Ok(result)
+    }
+
     fn record_event(
         &mut self,
         run_id: Option<String>,
@@ -2063,9 +3120,22 @@ impl App {
         payload: serde_json::Value,
         display: impl Into<String>,
     ) -> Result<()> {
-        let event = HistoryEvent::new(
+        self.record_event_with_group(run_id, None, step_id, kind, payload, display)
+    }
+
+    fn record_event_with_group(
+        &mut self,
+        run_id: Option<String>,
+        group_id: Option<String>,
+        step_id: Option<String>,
+        kind: &str,
+        payload: serde_json::Value,
+        display: impl Into<String>,
+    ) -> Result<()> {
+        let event = HistoryEvent::new_with_group(
             self.history.session_id().to_string(),
             run_id,
+            group_id,
             step_id,
             kind,
             payload,
@@ -2081,9 +3151,33 @@ impl App {
         Ok(())
     }
 
+    fn record_parallel_group_rejected_if_present(
+        &mut self,
+        run_id: &str,
+        decision: &crate::orchestrator::OrchestratorDecision,
+        reason: &str,
+    ) -> Result<()> {
+        let Some(DecisionNextStep::ParallelGroup(group)) = decision.next_step.as_ref() else {
+            return Ok(());
+        };
+        self.record_event_with_group(
+            Some(run_id.to_string()),
+            Some(group.group_id.clone()),
+            None,
+            "parallel_group_rejected",
+            json!({
+                "group_id": group.group_id,
+                "decision_id": decision.decision_id,
+                "reason": reason,
+                "children": group.steps.len()
+            }),
+            "Parallel group rejected.",
+        )
+    }
+
     fn sync_chat_items(&mut self) {
         self.chat_projection
-            .apply_live_step(self.state.live_step.as_ref());
+            .apply_live_steps(&self.state.live_steps);
         self.chat_projection
             .apply_pending_approval(self.state.pending_approval.as_ref());
         self.state.chat_items = self.chat_projection.items().to_vec();
@@ -2102,18 +3196,32 @@ impl App {
         request: &ActionRequest,
         result: &ActionResult,
     ) -> Result<()> {
-        let durable_result = self.action_result_for_history(run_id, step_id, request, result)?;
+        self.record_action_completed_with_group(run_id, None, step_id, request, result)
+    }
+
+    fn record_action_completed_with_group(
+        &mut self,
+        run_id: &str,
+        group_id: Option<&str>,
+        step_id: &str,
+        request: &ActionRequest,
+        result: &ActionResult,
+    ) -> Result<()> {
+        let durable_result =
+            self.action_result_for_history_with_group(run_id, group_id, step_id, request, result)?;
         if matches!(durable_result.status, ActionStatus::Denied) {
-            self.record_event(
+            self.record_event_with_group(
                 Some(run_id.to_string()),
+                group_id.map(str::to_string),
                 Some(step_id.to_string()),
                 "action_denied",
                 serde_json::to_value(&durable_result)?,
                 action_denied_display(request, result),
             )?;
         }
-        self.record_event(
+        self.record_event_with_group(
             Some(run_id.to_string()),
+            group_id.map(str::to_string),
             Some(step_id.to_string()),
             "action_completed",
             serde_json::to_value(&durable_result)?,
@@ -2124,6 +3232,25 @@ impl App {
     fn record_command_started_if_executable(
         &mut self,
         run_id: &str,
+        step_id: &str,
+        agent_profile: &AgentProfile,
+        context: &ActionExecutionContext,
+        request: &ActionRequest,
+    ) -> Result<()> {
+        self.record_command_started_if_executable_with_group(
+            run_id,
+            None,
+            step_id,
+            agent_profile,
+            context,
+            request,
+        )
+    }
+
+    fn record_command_started_if_executable_with_group(
+        &mut self,
+        run_id: &str,
+        group_id: Option<&str>,
         step_id: &str,
         agent_profile: &AgentProfile,
         context: &ActionExecutionContext,
@@ -2140,8 +3267,9 @@ impl App {
             .get("command")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        self.record_event(
+        self.record_event_with_group(
             Some(run_id.to_string()),
+            group_id.map(str::to_string),
             Some(step_id.to_string()),
             "command_started",
             json!({
@@ -2192,6 +3320,31 @@ impl App {
         Ok(())
     }
 
+    fn record_parallel_runtime_event(
+        &mut self,
+        run: &RunDriveContext,
+        group_id: &str,
+        step_id: &str,
+        coalescer: &mut RuntimeStreamCoalescer,
+        event: RuntimeEvent,
+    ) -> Result<()> {
+        self.push_live_runtime_event(step_id, &event);
+        if event.is_transient() {
+            return Ok(());
+        }
+        coalescer.push_event(event);
+        if coalescer.should_flush() {
+            self.flush_runtime_stream_coalescer_with_group(
+                run,
+                Some(group_id),
+                step_id,
+                coalescer,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
     fn finish_streaming_interrupt(
         &mut self,
         run: &RunDriveContext,
@@ -2219,7 +3372,8 @@ impl App {
             .as_ref()
             .is_some_and(|step| step.step_id == step_id)
         {
-            self.active_step = None;
+            self.active_steps.retain(|step| step.step_id != step_id);
+            self.active_step = self.active_steps.first().cloned();
         }
         self.sync_chat_items();
         self.publish_state();
@@ -2233,12 +3387,24 @@ impl App {
         coalescer: &mut RuntimeStreamCoalescer,
         final_delta: bool,
     ) -> Result<()> {
+        self.flush_runtime_stream_coalescer_with_group(run, None, step_id, coalescer, final_delta)
+    }
+
+    fn flush_runtime_stream_coalescer_with_group(
+        &mut self,
+        run: &RunDriveContext,
+        group_id: Option<&str>,
+        step_id: &str,
+        coalescer: &mut RuntimeStreamCoalescer,
+        final_delta: bool,
+    ) -> Result<()> {
         let records = coalescer.flush(final_delta);
         for record in records {
             let stream = record.stream.clone();
             let payload = self.runtime_stream_record_payload(&record)?;
-            self.record_event(
+            self.record_event_with_group(
                 Some(run.run_id.clone()),
+                group_id.map(str::to_string),
                 Some(step_id.to_string()),
                 "runtime_stream_delta",
                 payload,
@@ -2278,9 +3444,9 @@ impl App {
     ) {
         let Some(live_step) = self
             .state
-            .live_step
-            .as_mut()
-            .filter(|live_step| live_step.step_id == step_id)
+            .live_steps
+            .iter_mut()
+            .find(|live_step| live_step.step_id == step_id)
         else {
             return;
         };
@@ -2305,6 +3471,7 @@ impl App {
             });
         }
         let agent = live_step.agent.clone();
+        self.state.live_step = self.state.live_steps.first().cloned();
         self.sync_chat_items();
         self.set_agent_status(&agent, "running");
     }
@@ -2312,9 +3479,9 @@ impl App {
     fn set_live_step_status(&mut self, step_id: &str, status: LiveStepStatus) {
         let Some(live_step) = self
             .state
-            .live_step
-            .as_mut()
-            .filter(|live_step| live_step.step_id == step_id)
+            .live_steps
+            .iter_mut()
+            .find(|live_step| live_step.step_id == step_id)
         else {
             return;
         };
@@ -2328,6 +3495,7 @@ impl App {
                 stream.final_delta = true;
             }
         }
+        self.state.live_step = self.state.live_steps.first().cloned();
         self.sync_chat_items();
         self.publish_state();
     }
@@ -2365,20 +3533,32 @@ impl App {
         request: &ActionRequest,
         result: &ActionResult,
     ) -> Result<()> {
+        self.record_action_specific_events_with_group(run_id, None, step_id, request, result)
+    }
+
+    fn record_action_specific_events_with_group(
+        &mut self,
+        run_id: &str,
+        group_id: Option<&str>,
+        step_id: &str,
+        request: &ActionRequest,
+        result: &ActionResult,
+    ) -> Result<()> {
         match request.kind {
             ActionKind::RunCommand => {
-                self.record_command_completed(run_id, step_id, request, result)
+                self.record_command_completed_with_group(run_id, group_id, step_id, request, result)
             }
             ActionKind::ApplyPatch | ActionKind::WriteFile => {
-                self.record_file_edit_applied(run_id, step_id, request, result)
+                self.record_file_edit_applied_with_group(run_id, group_id, step_id, request, result)
             }
             _ => Ok(()),
         }
     }
 
-    fn record_command_completed(
+    fn record_command_completed_with_group(
         &mut self,
         run_id: &str,
+        group_id: Option<&str>,
         step_id: &str,
         request: &ActionRequest,
         result: &ActionResult,
@@ -2409,8 +3589,9 @@ impl App {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         let display = command_completed_display(command, result, &exit_code);
-        self.record_event(
+        self.record_event_with_group(
             Some(run_id.to_string()),
+            group_id.map(str::to_string),
             Some(step_id.to_string()),
             "command_completed",
             json!({
@@ -2424,9 +3605,10 @@ impl App {
         )
     }
 
-    fn record_file_edit_applied(
+    fn record_file_edit_applied_with_group(
         &mut self,
         run_id: &str,
+        group_id: Option<&str>,
         step_id: &str,
         request: &ActionRequest,
         result: &ActionResult,
@@ -2476,8 +3658,9 @@ impl App {
             _ => return Ok(()),
         };
 
-        self.record_event(
+        self.record_event_with_group(
             Some(run_id.to_string()),
+            group_id.map(str::to_string),
             Some(step_id.to_string()),
             "file_edit_applied",
             payload,
@@ -2485,9 +3668,10 @@ impl App {
         )
     }
 
-    fn action_result_for_history(
+    fn action_result_for_history_with_group(
         &mut self,
         run_id: &str,
+        group_id: Option<&str>,
         step_id: &str,
         request: &ActionRequest,
         result: &ActionResult,
@@ -2507,8 +3691,9 @@ impl App {
             &bytes,
             "contains_user_content",
         )?;
-        self.record_event(
+        self.record_event_with_group(
             Some(run_id.to_string()),
+            group_id.map(str::to_string),
             Some(step_id.to_string()),
             "artifact_written",
             serde_json::to_value(&artifact)?,
@@ -2648,11 +3833,12 @@ fn runtime_history_event(event: &HistoryEvent) -> RuntimeHistoryEvent {
         event_id: event.event_id.clone(),
         session_id: event.session_id.clone(),
         run_id: event.run_id.clone(),
+        group_id: event.group_id.clone(),
         step_id: event.step_id.clone(),
         timestamp: event.timestamp.clone(),
         kind: event.kind.clone(),
         payload,
-        payload_truncated,
+        payload_truncated: event.payload_truncated || payload_truncated,
     }
 }
 
@@ -3190,10 +4376,11 @@ fn action_executable_without_approval(
     request: &ActionRequest,
 ) -> bool {
     if !matches!(
-        validate_action_request(
+        crate::actions::validate_action_request_with_scope(
             agent_profile,
             &context.workspace,
             &context.approval_mode,
+            &context.action_scope,
             request
         ),
         ActionDecision::Allowed
@@ -3262,10 +4449,249 @@ async fn wait_for_interrupt(mut receiver: watch::Receiver<u64>, initial_value: u
     }
 }
 
-fn review_fix_cycle_count(results: &[AgentResult]) -> u32 {
+async fn wait_for_approval(
+    mut receiver: watch::Receiver<ApprovalSignal>,
+    initial_sequence: u64,
+) -> ApprovalSignal {
+    loop {
+        let signal = *receiver.borrow_and_update();
+        if signal.sequence != initial_sequence {
+            return signal;
+        }
+        if receiver.changed().await.is_err() {
+            pending::<()>().await;
+        }
+    }
+}
+
+fn spawn_parallel_runtime_task(
+    config: EffectiveConfig,
+    step_id: String,
+    request: RuntimeRequest,
+    first_sequence: u32,
+    cancellation: CancellationToken,
+    sender: mpsc::Sender<ParallelRuntimeMessage>,
+) {
+    tokio::spawn(async move {
+        let (events, mut receiver) =
+            RuntimeEventSink::channel_from(RUNTIME_EVENT_CHANNEL_CAPACITY, first_sequence);
+        let runtime_step =
+            execute_runtime_step_streaming(&config, request, events, cancellation.clone());
+        tokio::pin!(runtime_step);
+        loop {
+            tokio::select! {
+                output = &mut runtime_step => {
+                    while let Ok(event) = receiver.try_recv() {
+                        let _ = sender
+                            .send(ParallelRuntimeMessage::RuntimeEvent {
+                                step_id: step_id.clone(),
+                                event,
+                            })
+                            .await;
+                    }
+                    let _ = sender
+                        .send(ParallelRuntimeMessage::Output {
+                            step_id: step_id.clone(),
+                            output: Box::new(output),
+                        })
+                        .await;
+                    break;
+                }
+                event = receiver.recv() => {
+                    let Some(event) = event else {
+                        continue;
+                    };
+                    if sender
+                        .send(ParallelRuntimeMessage::RuntimeEvent {
+                            step_id: step_id.clone(),
+                            event,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        cancellation.cancel();
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn parallel_child_prompt(
+    user_prompt: &str,
+    step: &crate::orchestrator::ParallelChildStepPlan,
+) -> String {
+    format!(
+        "Original user prompt:\n{user_prompt}\n\nParallel child step:\n{}\n\nScoped instruction:\n{}\n\nReturn only this child step's agent_result. Do not work outside the assigned Parallel File Scope.",
+        step.step_label, step.instruction
+    )
+}
+
+fn parallel_scope_policy_summary(scope: &ParallelFileScope) -> String {
+    format!(
+        "May write only exact files [{}]. May read roots [{}]. Out-of-scope actions are denied by Harness policy.",
+        scope.write_files.join(", "),
+        scope.read_roots.join(", ")
+    )
+}
+
+fn synthesize_parallel_group_result(
+    run_id: &str,
+    group_id: &str,
+    started_at: &str,
+    child_results: &[(&ParallelChildRuntimeState, AgentResult)],
+) -> ParallelGroupResult {
+    let mut counts = BTreeMap::new();
+    let mut changed_files = Vec::new();
+    let mut blocked_scopes = Vec::new();
+    let mut failed_scopes = Vec::new();
+    let mut approval_denials = Vec::new();
+    let mut children = Vec::new();
+    let mut successful = 0usize;
+
+    for (index, (child, result)) in child_results.iter().enumerate() {
+        let status_label = agent_status_key(&result.status).to_string();
+        *counts.entry(status_label).or_insert(0) += 1;
+        if matches!(
+            result.status,
+            AgentResultStatus::Completed | AgentResultStatus::NoChanges
+        ) {
+            successful += 1;
+        }
+        changed_files.extend(result.changed_files.iter().cloned());
+        if matches!(result.status, AgentResultStatus::Blocked) {
+            blocked_scopes.push(ParallelBlockedScope {
+                step_id: child.step_id.clone(),
+                step_label: child.step_label.clone(),
+                agent: child.agent_id.clone(),
+                file_scope: child.file_scope.clone(),
+                blocker: result
+                    .blocker
+                    .clone()
+                    .unwrap_or_else(|| result.summary.clone()),
+            });
+        }
+        if matches!(result.status, AgentResultStatus::ApprovalDenied) {
+            approval_denials.push(child.step_id.clone());
+        }
+        if matches!(
+            result.status,
+            AgentResultStatus::Failed | AgentResultStatus::ParseError
+        ) {
+            failed_scopes.push(ParallelFailedScope {
+                step_id: child.step_id.clone(),
+                step_label: child.step_label.clone(),
+                agent: child.agent_id.clone(),
+                file_scope: child.file_scope.clone(),
+                diagnostic: result
+                    .blocker
+                    .clone()
+                    .unwrap_or_else(|| result.summary.clone()),
+            });
+        }
+        children.push(ParallelChildResultRef {
+            step_id: child.step_id.clone(),
+            step_label: child.step_label.clone(),
+            agent: child.agent_id.clone(),
+            file_scope: child.file_scope.clone(),
+            status: result.status.clone(),
+            result_index: index,
+        });
+    }
+    changed_files.sort();
+    changed_files.dedup();
+
+    let status = if child_results.iter().all(|(_, result)| {
+        matches!(
+            result.status,
+            AgentResultStatus::Cancelled | AgentResultStatus::LimitReached
+        )
+    }) {
+        if child_results
+            .iter()
+            .any(|(_, result)| matches!(result.status, AgentResultStatus::LimitReached))
+        {
+            ParallelGroupStatus::LimitReached
+        } else {
+            ParallelGroupStatus::Cancelled
+        }
+    } else if successful == child_results.len() {
+        ParallelGroupStatus::Completed
+    } else if successful > 0 {
+        ParallelGroupStatus::CompletedWithIssues
+    } else {
+        ParallelGroupStatus::Failed
+    };
+    let summary = format!(
+        "Parallel group {group_id} joined with {successful}/{} successful child step(s).",
+        child_results.len()
+    );
+
+    ParallelGroupResult {
+        schema_version: 1,
+        group_id: group_id.to_string(),
+        run_id: run_id.to_string(),
+        status,
+        summary,
+        children,
+        counts,
+        changed_files,
+        blocked_scopes,
+        failed_scopes,
+        approval_denials,
+        started_at: started_at.to_string(),
+        completed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    }
+}
+
+fn failed_agent_result(agent: &str, step_id: &str, diagnostic: &str) -> AgentResult {
+    AgentResult {
+        schema_version: 1,
+        agent: agent.to_string(),
+        step_id: step_id.to_string(),
+        status: AgentResultStatus::Failed,
+        summary: diagnostic.to_string(),
+        findings: Vec::new(),
+        changed_files: Vec::new(),
+        commands: Vec::new(),
+        verification: Vec::new(),
+        blocker: Some(diagnostic.to_string()),
+        artifacts: Vec::new(),
+    }
+}
+
+fn limit_reached_agent_result(agent: &str, step_id: &str, diagnostic: &str) -> AgentResult {
+    AgentResult {
+        status: AgentResultStatus::LimitReached,
+        ..failed_agent_result(agent, step_id, diagnostic)
+    }
+}
+
+fn cancelled_agent_result(agent: &str, step_id: &str, diagnostic: &str) -> AgentResult {
+    AgentResult {
+        status: AgentResultStatus::Cancelled,
+        ..failed_agent_result(agent, step_id, diagnostic)
+    }
+}
+
+fn agent_status_key(status: &AgentResultStatus) -> &'static str {
+    match status {
+        AgentResultStatus::Completed => "completed",
+        AgentResultStatus::Blocked => "blocked",
+        AgentResultStatus::Failed => "failed",
+        AgentResultStatus::Cancelled => "cancelled",
+        AgentResultStatus::ParseError => "parse_error",
+        AgentResultStatus::LimitReached => "limit_reached",
+        AgentResultStatus::ApprovalDenied => "approval_denied",
+        AgentResultStatus::NoChanges => "no_changes",
+    }
+}
+
+fn review_fix_cycle_count(results: &[RunStepResult]) -> u32 {
     let mut saw_review_since_last_fix = false;
     let mut cycles = 0;
-    for result in results {
+    for result in agent_results(results) {
         match result.agent.as_str() {
             "reviewer" => saw_review_since_last_fix = true,
             "fixer" if saw_review_since_last_fix => {
@@ -3564,6 +4990,174 @@ runtime = "fake"
         .unwrap()
     }
 
+    fn fake_parallel_config(dir: &std::path::Path) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+[features]
+parallel_step_groups = true
+
+[limits]
+max_parallel_agent_steps = 2
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "fake"
+
+[agents.consul]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn fake_parallel_normal_approval_config(dir: &std::path::Path) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+approval_mode = "normal"
+
+[features]
+parallel_step_groups = true
+
+[limits]
+max_parallel_agent_steps = 2
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "fake"
+
+[agents.consul]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn fake_parallel_low_agent_step_config(dir: &std::path::Path) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+[features]
+parallel_step_groups = true
+
+[limits]
+max_agent_steps = 2
+max_parallel_agent_steps = 2
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "fake"
+
+[agents.consul]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn fake_parallel_reviewer_parse_error_config(dir: &std::path::Path) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+[features]
+parallel_step_groups = true
+
+[limits]
+max_parallel_agent_steps = 2
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+instructions = "fake parse error"
+
+[agents.oracle]
+runtime = "fake"
+
+[agents.consul]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
     fn fake_config_with_council_prompts(
         dir: &std::path::Path,
         architect_prompt: &str,
@@ -3635,6 +5229,15 @@ prompt = "{reviewer_prompt}"
             .unwrap()
     }
 
+    fn agent_status_from_state(state: &AppState, agent_id: &str) -> String {
+        state
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .map(|agent| agent.status.clone())
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn roster_places_orchestrator_first() {
         let dir = tempdir().unwrap();
@@ -3670,6 +5273,474 @@ prompt = "{reviewer_prompt}"
             .iter()
             .any(|event| event.kind == "runtime_stream_delta"));
         assert!(dir.path().join(".multiagent/runs").exists());
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_executes_parallel_group_and_synthesizes_result() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("parallel create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started" && event.group_id.is_some()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "parallel_child_started")
+                .count(),
+            2
+        );
+        let joined = events
+            .iter()
+            .find(|event| event.kind == "parallel_group_joined")
+            .unwrap();
+        assert_eq!(joined.payload["status"], "completed");
+        assert_eq!(joined.payload["children"].as_array().unwrap().len(), 2);
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.kind == "agent_result" && event.group_id.is_some())
+                .count()
+                >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_parallel_feature_records_group_rejection_without_children() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("parallel create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Failed);
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "parallel_group_rejected"
+                && event.group_id.is_some()
+                && event.payload["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("parallel step groups are disabled"))
+        }));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision_invalid"));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "parallel_child_started"));
+    }
+
+    #[tokio::test]
+    async fn parallel_group_stops_before_start_when_agent_step_limit_cannot_fit_children() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_low_agent_step_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("parallel create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::LimitReached);
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "run_limit_reached"
+                && event.group_id.is_some()
+                && event.payload["limit"] == "max_agent_steps"
+                && event.payload["requested_parallel_children"] == 2
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started"));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "parallel_child_started"));
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_publishes_two_parallel_live_steps() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("parallel create a feature")
+                .await
+                .unwrap();
+            app
+        });
+
+        let mut saw_two_live_steps = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let state = receiver.borrow_and_update().clone();
+                    if state.live_steps.len() == 2
+                        && state
+                            .live_steps
+                            .iter()
+                            .all(|step| step.group_id.is_some() && step.step_label.is_some())
+                    {
+                        saw_two_live_steps = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(saw_two_live_steps);
+        assert_eq!(app.state.run_state, RunState::Completed);
+    }
+
+    #[tokio::test]
+    async fn parallel_same_agent_profile_live_steps_are_distinguishable() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("parallel same agent create a feature")
+                .await
+                .unwrap();
+            app
+        });
+
+        let mut labels = Vec::new();
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let state = receiver.borrow_and_update().clone();
+                    let fixer_steps = state
+                        .live_steps
+                        .iter()
+                        .filter(|step| step.agent == "fixer")
+                        .collect::<Vec<_>>();
+                    if fixer_steps.len() == 2
+                        && fixer_steps.iter().all(|step| {
+                            step.group_id.is_some()
+                                && step.step_label.is_some()
+                                && step.file_scope.is_some()
+                        })
+                    {
+                        labels = fixer_steps
+                            .iter()
+                            .filter_map(|step| step.step_label.clone())
+                            .collect();
+                        assert_eq!(agent_status_from_state(&state, "fixer"), "running_parallel");
+                        break;
+                    }
+                }
+            }
+        }
+
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec![
+                "fix first scoped file".to_string(),
+                "fix second scoped file".to_string()
+            ]
+        );
+        assert_eq!(app.state.run_state, RunState::Completed);
+    }
+
+    #[tokio::test]
+    async fn parallel_two_fixers_write_disjoint_scoped_files() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("parallel scoped write action create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parallel-output/fixer-a.txt")).unwrap(),
+            "created by fake runtime\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parallel-output/fixer-b.txt")).unwrap(),
+            "created by fake runtime\n"
+        );
+        let events = app.history.read_events().unwrap();
+        let joined = events
+            .iter()
+            .find(|event| event.kind == "parallel_group_joined")
+            .unwrap();
+        let changed_files = joined.payload["changed_files"].as_array().unwrap();
+        assert!(changed_files
+            .iter()
+            .any(|path| path.as_str() == Some("parallel-output/fixer-a.txt")));
+        assert!(changed_files
+            .iter()
+            .any(|path| path.as_str() == Some("parallel-output/fixer-b.txt")));
+        assert_eq!(joined.payload["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn parallel_approval_queue_allows_unrelated_child_to_finish() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_normal_approval_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let approval_handle = app.approval_handle();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("parallel approval action create a feature")
+                .await
+                .unwrap();
+            app
+        });
+
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
+        let mut saw_pending_approval = false;
+        let mut saw_reviewer_complete_while_pending = false;
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let state = receiver.borrow_and_update().clone();
+                    if state.pending_approval.as_ref().is_some_and(|approval| {
+                        approval.agent == "fixer"
+                    }) {
+                        saw_pending_approval = true;
+                    }
+                    if state.pending_approval.is_some()
+                        && state.live_steps.iter().any(|step| {
+                            step.agent == "reviewer"
+                                && matches!(step.status, LiveStepStatus::Completed)
+                        })
+                    {
+                        saw_reviewer_complete_while_pending = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(saw_pending_approval);
+        assert!(saw_reviewer_complete_while_pending);
+        approval_handle.answer(false);
+
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert!(app.state.pending_approval.is_none());
+        let events = app.history.read_events().unwrap();
+        let approval_requested = events
+            .iter()
+            .position(|event| event.kind == "approval_requested" && event.group_id.is_some())
+            .unwrap();
+        let reviewer_finished = events
+            .iter()
+            .position(|event| {
+                event.kind == "parallel_child_completed"
+                    && event
+                        .payload
+                        .get("agent")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("reviewer")
+            })
+            .unwrap();
+        let approval_resolved = events
+            .iter()
+            .position(|event| event.kind == "approval_resolved" && event.group_id.is_some())
+            .unwrap();
+        assert!(approval_requested < reviewer_finished);
+        assert!(reviewer_finished < approval_resolved);
+        assert!(events.iter().any(|event| {
+            event.kind == "agent_result"
+                && event.group_id.is_some()
+                && event.payload["agent"] == "fixer"
+                && event.payload["status"] == "approval_denied"
+        }));
+        let joined = events
+            .iter()
+            .find(|event| event.kind == "parallel_group_joined")
+            .unwrap();
+        assert_eq!(joined.payload["status"], "completed_with_issues");
+        assert_eq!(
+            joined.payload["approval_denials"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_child_parse_error_joins_as_terminal_result() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_reviewer_parse_error_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("parallel create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "agent_result"
+                && event.group_id.is_some()
+                && event.payload["agent"] == "reviewer"
+                && event.payload["status"] == "parse_error"
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "parallel_child_failed"
+                && event.group_id.is_some()
+                && event.payload["agent"] == "reviewer"
+                && event.payload["status"] == "parse_error"
+        }));
+        let joined = events
+            .iter()
+            .find(|event| event.kind == "parallel_group_joined")
+            .unwrap();
+        assert_eq!(joined.payload["status"], "completed_with_issues");
+        assert!(!app
+            .state
+            .events
+            .iter()
+            .any(|event| event.contains("Runtime parse error queued for Orchestrator repair.")));
+    }
+
+    #[tokio::test]
+    async fn parallel_child_out_of_scope_write_is_denied_before_mutation() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("parallel write action create a feature")
+            .await
+            .unwrap();
+
+        assert!(!dir.path().join("multiagent-action-output.txt").exists());
+        let events = app.history.read_events().unwrap();
+        let denied = events
+            .iter()
+            .find(|event| event.kind == "action_denied" && event.group_id.is_some())
+            .unwrap();
+        assert!(denied
+            .payload
+            .get("diagnostic")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .contains("exact write_files"));
+        let blocked = events
+            .iter()
+            .find(|event| {
+                event.kind == "agent_result"
+                    && event.group_id.is_some()
+                    && event.payload["status"] == "blocked"
+            })
+            .unwrap();
+        assert_eq!(blocked.payload["agent"], "fixer");
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_active_parallel_children_and_joins_group() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let interrupt_handle = app.interrupt_handle();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("parallel interrupt create a feature")
+                .await
+                .unwrap();
+            app
+        });
+
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => panic!("parallel live steps did not start before deadline"),
+                changed = receiver.changed() => {
+                    changed.unwrap();
+                    let state = receiver.borrow_and_update().clone();
+                    if state.live_steps.len() == 2
+                        && state.live_steps.iter().all(|step| {
+                            !matches!(
+                                step.status,
+                                LiveStepStatus::Completed
+                                    | LiveStepStatus::Failed
+                                    | LiveStepStatus::Interrupted
+                            )
+                        })
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        interrupt_handle.request_interrupt();
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "step_cancelled"));
+        let joined = events
+            .iter()
+            .find(|event| event.kind == "parallel_group_joined")
+            .unwrap();
+        assert_eq!(joined.payload["status"], "cancelled");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "agent_result"
+                        && event.group_id.is_some()
+                        && event.payload["status"] == "cancelled"
+                })
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -4150,6 +6221,7 @@ prompt = "{reviewer_prompt}"
             status: DecisionStatus::Continue,
             plan: Vec::new(),
             next_agent: Some(COUNCIL_WORKFLOW_AGENT_ID.to_string()),
+            next_step: None,
             reason: "High-risk security council review is useful.".to_string(),
             required_capabilities: Vec::new(),
             stop_condition: "Council returns a recommendation.".to_string(),
@@ -4806,11 +6878,21 @@ runtime = "fake"
     #[test]
     fn review_fix_cycle_count_skips_initial_fixer_pass() {
         let results = vec![
-            AgentResult::completed("explorer", "s1", "explored"),
-            AgentResult::completed("fixer", "s2", "initial fix"),
-            AgentResult::completed("reviewer", "s3", "reviewed"),
-            AgentResult::completed("fixer", "s4", "review fix"),
-            AgentResult::completed("reviewer", "s5", "reviewed again"),
+            RunStepResult::Agent {
+                result: AgentResult::completed("explorer", "s1", "explored"),
+            },
+            RunStepResult::Agent {
+                result: AgentResult::completed("fixer", "s2", "initial fix"),
+            },
+            RunStepResult::Agent {
+                result: AgentResult::completed("reviewer", "s3", "reviewed"),
+            },
+            RunStepResult::Agent {
+                result: AgentResult::completed("fixer", "s4", "review fix"),
+            },
+            RunStepResult::Agent {
+                result: AgentResult::completed("reviewer", "s5", "reviewed again"),
+            },
         ];
         assert_eq!(review_fix_cycle_count(&results), 1);
     }
@@ -5520,7 +7602,7 @@ runtime = "fake"
         };
 
         let durable = app
-            .action_result_for_history("run", "step", &request, &result)
+            .action_result_for_history_with_group("run", None, "step", &request, &result)
             .unwrap();
 
         assert!(durable.artifact.is_some());

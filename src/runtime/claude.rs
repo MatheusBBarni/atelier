@@ -1838,6 +1838,7 @@ exec sleep 30
                 "agent_result"
             }
             .to_string(),
+            parallel_context: None,
             capability_constraints: vec![Capability::Read],
             limits: Limits::default(),
         }

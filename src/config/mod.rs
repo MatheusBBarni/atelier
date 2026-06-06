@@ -175,6 +175,7 @@ pub struct Limits {
     pub max_step_minutes: Limit,
     pub max_command_minutes: Limit,
     pub max_review_fix_cycles: Limit,
+    pub max_parallel_agent_steps: u32,
 }
 
 impl Default for Limits {
@@ -186,8 +187,14 @@ impl Default for Limits {
             max_step_minutes: Limit::default_minutes(10),
             max_command_minutes: Limit::default_minutes(10),
             max_review_fix_cycles: Limit::Value(2),
+            max_parallel_agent_steps: 2,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Features {
+    pub parallel_step_groups: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,6 +363,7 @@ pub struct EffectiveConfig {
     pub active_preset: Option<String>,
     pub approval_mode: ApprovalMode,
     pub workspace: WorkspacePolicy,
+    pub features: Features,
     pub limits: Limits,
     pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
@@ -369,6 +377,7 @@ struct RawConfig {
     preset: Option<String>,
     approval_mode: Option<ApprovalMode>,
     workspace: Option<RawWorkspacePolicy>,
+    features: Option<RawFeatures>,
     limits: Option<RawLimits>,
     council: Option<RawCouncilConfig>,
     runtimes: Option<BTreeMap<String, RawRuntimeConfig>>,
@@ -391,6 +400,12 @@ struct RawWorkspacePolicy {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawFeatures {
+    parallel_step_groups: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawLimits {
     max_agent_steps: Option<Limit>,
     max_step_actions: Option<Limit>,
@@ -398,6 +413,7 @@ struct RawLimits {
     max_step_minutes: Option<Limit>,
     max_command_minutes: Option<Limit>,
     max_review_fix_cycles: Option<Limit>,
+    max_parallel_agent_steps: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -539,6 +555,7 @@ struct MergedConfig {
     active_preset: Option<PendingPresetSelection>,
     approval_mode: ApprovalMode,
     workspace: WorkspacePolicy,
+    features: Features,
     limits: Limits,
     council: MergedCouncilConfig,
     runtimes: BTreeMap<String, MergedRuntimeConfig>,
@@ -739,6 +756,7 @@ impl MergedConfig {
             active_preset: None,
             approval_mode: ApprovalMode::Yolo,
             workspace: WorkspacePolicy::default(),
+            features: Features::default(),
             limits: Limits::default(),
             council: builtin_council_config(),
             runtimes,
@@ -774,6 +792,12 @@ impl MergedConfig {
             }
         }
 
+        if let Some(features) = raw.features {
+            if let Some(value) = features.parallel_step_groups {
+                self.features.parallel_step_groups = value;
+            }
+        }
+
         if let Some(limits) = raw.limits {
             if let Some(value) = limits.max_agent_steps {
                 self.limits.max_agent_steps = value;
@@ -792,6 +816,9 @@ impl MergedConfig {
             }
             if let Some(value) = limits.max_review_fix_cycles {
                 self.limits.max_review_fix_cycles = value;
+            }
+            if let Some(value) = limits.max_parallel_agent_steps {
+                self.limits.max_parallel_agent_steps = value;
             }
         }
 
@@ -1291,6 +1318,7 @@ impl MergedConfig {
             active_preset,
             approval_mode: self.approval_mode,
             workspace: self.workspace,
+            features: self.features,
             limits: self.limits,
             council,
             runtimes,
@@ -1745,6 +1773,7 @@ struct PrintableConfig {
     preset: Option<String>,
     approval_mode: ApprovalMode,
     workspace: WorkspacePolicy,
+    features: Features,
     limits: Limits,
     council: PrintableCouncilConfig,
     runtimes: BTreeMap<String, PrintableRuntime>,
@@ -1816,6 +1845,7 @@ pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
         preset: config.active_preset.clone(),
         approval_mode: config.approval_mode.clone(),
         workspace: config.workspace.clone(),
+        features: config.features.clone(),
         limits: config.limits.clone(),
         council: PrintableCouncilConfig {
             default_preset: config.council.default_preset.clone(),
@@ -1966,6 +1996,9 @@ fn starter_config_text() -> String {
     r#"schema_version = 1
 approval_mode = "yolo"
 
+[features]
+parallel_step_groups = false
+
 [runtimes.codex]
 type = "codex"
 command = "codex"
@@ -1996,6 +2029,7 @@ max_wall_clock_minutes = 30
 max_step_minutes = 10
 max_command_minutes = 10
 max_review_fix_cycles = 2
+max_parallel_agent_steps = 2
 
 [council]
 default_preset = "default"
@@ -2267,6 +2301,31 @@ mod tests {
 
         let err = toml::from_str::<RawLimits>("max_agent_steps = 0").unwrap_err();
         assert!(format!("{err:#}").contains("positive"));
+    }
+
+    #[test]
+    fn parallel_feature_defaults_disabled_with_conservative_limit() {
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+
+        assert!(!config.features.parallel_step_groups);
+        assert_eq!(config.limits.max_parallel_agent_steps, 2);
+    }
+
+    #[test]
+    fn max_parallel_agent_steps_accepts_zero_as_disable_signal() {
+        let config = load_from_temp(
+            r#"
+[features]
+parallel_step_groups = true
+
+[limits]
+max_parallel_agent_steps = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.features.parallel_step_groups);
+        assert_eq!(config.limits.max_parallel_agent_steps, 0);
     }
 
     #[test]

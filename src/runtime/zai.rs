@@ -992,6 +992,7 @@ mod tests {
             previous_results: Vec::new(),
             action_results: Vec::new(),
             output_schema: "agent_result".to_string(),
+            parallel_context: None,
             capability_constraints: vec![Capability::Read, Capability::Answer],
             limits: Limits::default(),
         }
