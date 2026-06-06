@@ -118,6 +118,7 @@ make the workspace stale by itself.
 - `/subtask <agent> <task>`: run one bounded child task through a specialized enabled agent.
 - `/agent:<name>`: prefix a prompt with a selected agent; in the TUI, type `/agent:` and use Up/Down plus Enter to insert an enabled agent id.
 - `/skill:<name>`: prefix a prompt with a selected skill; in the TUI, type `/skill:` and use Up/Down plus Enter to insert a cached project or personal skill.
+- `/reload:skills`: refresh cached skill names from project and personal skill folders.
 
 ## Configuration
 

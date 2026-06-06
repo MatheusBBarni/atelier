@@ -37,6 +37,7 @@ const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
 const AGENT_PREFIX: &str = "/agent:";
 const SKILL_PREFIX: &str = "/skill:";
+const RELOAD_SKILLS_COMMAND: &str = "/reload:skills";
 const DROPDOWN_MAX_ITEMS: usize = 6;
 const SKILL_DISCOVERY_MAX_DEPTH: usize = 4;
 const WORK_HINT: &str = "/help";
@@ -55,6 +56,7 @@ enum TuiCommand {
     MoveInputCursor(InputCursorCommand),
     AgentDropdown(DropdownCommand),
     SkillDropdown(DropdownCommand),
+    ReloadSkills,
     InputCharacter(char),
     InputBackspace,
 }
@@ -99,12 +101,14 @@ struct TuiUiState {
     event_content_lines: usize,
     event_viewport_lines: usize,
     event_area: Rect,
+    working_directory: Option<PathBuf>,
     input_cursor: usize,
     input_preferred_col: Option<usize>,
     input_width: usize,
     agent_selection_index: usize,
     skill_suggestions: Vec<SkillSuggestion>,
     skill_selection_index: usize,
+    status_message: Option<String>,
     work_spinner_frame: usize,
 }
 
@@ -118,20 +122,26 @@ impl Default for TuiUiState {
             event_content_lines: 0,
             event_viewport_lines: 1,
             event_area: Rect::ZERO,
+            working_directory: None,
             input_cursor: 0,
             input_preferred_col: None,
             input_width: 1,
             agent_selection_index: 0,
             skill_suggestions: Vec::new(),
             skill_selection_index: 0,
+            status_message: None,
             work_spinner_frame: 0,
         }
     }
 }
 
 impl TuiUiState {
-    fn with_skill_suggestions(skill_suggestions: Vec<SkillSuggestion>) -> Self {
+    fn with_skill_suggestions(
+        working_directory: PathBuf,
+        skill_suggestions: Vec<SkillSuggestion>,
+    ) -> Self {
         Self {
+            working_directory: Some(working_directory),
             skill_suggestions,
             ..Self::default()
         }
@@ -238,6 +248,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
                 state_receiver,
                 command_sender.clone(),
                 interrupt_handle,
+                working_directory,
                 skill_suggestions,
             )
             .await
@@ -267,10 +278,11 @@ async fn run_loop(
     mut state_receiver: watch::Receiver<AppState>,
     command_sender: mpsc::Sender<AppWorkerCommand>,
     interrupt_handle: InterruptHandle,
+    working_directory: PathBuf,
     skill_suggestions: Vec<SkillSuggestion>,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
-    let mut ui_state = TuiUiState::with_skill_suggestions(skill_suggestions);
+    let mut ui_state = TuiUiState::with_skill_suggestions(working_directory, skill_suggestions);
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
@@ -283,6 +295,9 @@ async fn run_loop(
                 _ => None,
             };
             if let Some(command) = command {
+                if matches!(&command, TuiCommand::ReloadSkills) {
+                    terminal.draw(render_skill_loading)?;
+                }
                 if !execute_tui_command_with_interrupt(
                     &mut state,
                     &mut ui_state,
@@ -343,6 +358,10 @@ async fn execute_tui_command_with_interrupt(
             apply_skill_dropdown_command(state, ui_state, command);
             Ok(true)
         }
+        TuiCommand::ReloadSkills => {
+            reload_skills(state, ui_state);
+            Ok(true)
+        }
         TuiCommand::InputCharacter(ch) => {
             insert_input_character(state, ui_state, ch);
             Ok(true)
@@ -381,6 +400,20 @@ async fn execute_tui_command_with_interrupt(
 
 fn matches_help_command(event: &AppEvent) -> bool {
     matches!(event, AppEvent::PromptSubmitted(prompt) if prompt.trim() == "/help")
+}
+
+fn reload_skills(state: &mut AppState, ui_state: &mut TuiUiState) {
+    let Some(working_directory) = ui_state.working_directory.as_deref() else {
+        clear_input(state, ui_state);
+        ui_state.status_message = Some("Skill reload unavailable".to_string());
+        return;
+    };
+    let skill_suggestions = reload_skill_suggestions(working_directory);
+    let skill_count = skill_suggestions.len();
+    ui_state.skill_suggestions = skill_suggestions;
+    ui_state.skill_selection_index = 0;
+    clear_input(state, ui_state);
+    ui_state.status_message = Some(format!("Skills reloaded: {skill_count}"));
 }
 
 fn sync_worker_state(state: &mut AppState, state_receiver: &mut watch::Receiver<AppState>) {
@@ -553,6 +586,10 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
         KeyEvent {
             code: KeyCode::Enter,
             ..
+        } if state.input.trim() == RELOAD_SKILLS_COMMAND => Some(TuiCommand::ReloadSkills),
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
         } if state.pending_approval.is_some() => Some(TuiCommand::Dispatch(
             AppEvent::ApprovalAnswered(approval_input_is_yes(&state.input)),
         )),
@@ -636,6 +673,7 @@ fn insert_input_character(state: &mut AppState, ui_state: &mut TuiUiState, ch: c
     state.input.insert(byte_index, ch);
     ui_state.input_cursor += 1;
     ui_state.input_preferred_col = None;
+    ui_state.status_message = None;
     reset_dropdown_selections(ui_state);
 }
 
@@ -651,6 +689,7 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     state.input.replace_range(start..end, "");
     ui_state.input_cursor = removed_char_index;
     ui_state.input_preferred_col = None;
+    ui_state.status_message = None;
     reset_dropdown_selections(ui_state);
 }
 
@@ -740,8 +779,22 @@ fn load_skill_suggestions(working_directory: &Path) -> Vec<SkillSuggestion> {
         return suggestions;
     }
 
-    let suggestions = discover_skill_suggestions_from_roots(&roots);
-    let _ = write_skill_suggestion_cache(working_directory, &fingerprint, &suggestions);
+    refresh_skill_suggestions(working_directory, &roots, &fingerprint)
+}
+
+fn reload_skill_suggestions(working_directory: &Path) -> Vec<SkillSuggestion> {
+    let roots = skill_roots(working_directory);
+    let fingerprint = skill_file_fingerprints(&roots);
+    refresh_skill_suggestions(working_directory, &roots, &fingerprint)
+}
+
+fn refresh_skill_suggestions(
+    working_directory: &Path,
+    roots: &[SkillRoot],
+    fingerprint: &[SkillFileFingerprint],
+) -> Vec<SkillSuggestion> {
+    let suggestions = discover_skill_suggestions_from_roots(roots);
+    let _ = write_skill_suggestion_cache(working_directory, fingerprint, &suggestions);
     suggestions
 }
 
@@ -1744,6 +1797,7 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("/help + Enter        toggle this help"),
         Line::from("/agent:<agent_name>  select enabled agent with Up/Down + Enter"),
         Line::from("/skill:<skill_name>  prefix prompt with skill name"),
+        Line::from("/reload:skills      refresh cached skill names"),
         Line::from("/goal <text> | /goal | /goal clear   manage session goal"),
         Line::from("/subtask <agent> <task>              run bounded child task"),
         Line::from("/config              show config files, preset, warnings"),
@@ -1936,8 +1990,13 @@ fn render_input_status(
         height: 1,
     };
     let line_width = usize::from(line_area.width);
+    let status_message = (!work_active)
+        .then_some(ui_state.status_message.as_deref())
+        .flatten();
     let left_width = if work_active {
         1 + 1 + WORK_LABEL.chars().count()
+    } else if let Some(message) = status_message {
+        message.chars().count()
     } else {
         0
     };
@@ -1958,6 +2017,12 @@ fn render_input_status(
         ]);
     } else {
         ui_state.work_spinner_frame = 0;
+        if let Some(message) = status_message {
+            spans.push(Span::styled(
+                message.to_string(),
+                Style::default().fg(Color::LightGreen),
+            ));
+        }
     }
     if line_width >= left_width.saturating_add(hint_width) {
         spans.push(Span::raw(
@@ -2475,6 +2540,74 @@ mod tests {
     }
 
     #[test]
+    fn reload_skills_command_is_local_tui_command() {
+        let state = state_with_input(RELOAD_SKILLS_COMMAND, false);
+
+        assert_eq!(
+            key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiCommand::ReloadSkills)
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_skills_command_refreshes_cache_and_clears_input() {
+        let dir = tempdir().unwrap();
+        let project_agents = dir.path().join(".agents/skills");
+        write_skill(&project_agents, "fresh-skill", "fresh-skill");
+        let fingerprint = skill_file_fingerprints(&skill_roots(dir.path()));
+        write_skill_suggestion_cache(
+            dir.path(),
+            &fingerprint,
+            &[SkillSuggestion {
+                id: "stale-skill".to_string(),
+                tag: SkillSourceTag::Project,
+                origin: ".agents/skills".to_string(),
+            }],
+        )
+        .unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input(RELOAD_SKILLS_COMMAND, false);
+        let mut ui_state = TuiUiState {
+            working_directory: Some(dir.path().to_path_buf()),
+            input_cursor: input_char_count(RELOAD_SKILLS_COMMAND),
+            skill_suggestions: vec![SkillSuggestion {
+                id: "stale-skill".to_string(),
+                tag: SkillSourceTag::Project,
+                origin: ".agents/skills".to_string(),
+            }],
+            ..TuiUiState::default()
+        };
+
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::ReloadSkills)
+            .await
+            .unwrap();
+
+        assert!(state.input.is_empty());
+        assert_eq!(ui_state.input_cursor, 0);
+        assert!(ui_state
+            .skill_suggestions
+            .iter()
+            .any(|skill| skill.id == "fresh-skill"));
+        assert!(!ui_state
+            .skill_suggestions
+            .iter()
+            .any(|skill| skill.id == "stale-skill"));
+        assert_eq!(
+            ui_state.status_message,
+            Some(format!(
+                "Skills reloaded: {}",
+                ui_state.skill_suggestions.len()
+            ))
+        );
+        assert_eq!(ui_state.skill_selection_index, 0);
+        assert!(receiver.try_recv().is_err());
+
+        let cached = read_cached_skill_suggestions(dir.path(), &fingerprint).unwrap();
+        assert!(cached.iter().any(|skill| skill.id == "fresh-skill"));
+        assert!(!cached.iter().any(|skill| skill.id == "stale-skill"));
+    }
+
+    #[test]
     fn renders_help_modal_commands() {
         let state = state_with_input("", false);
         let ui_state = TuiUiState {
@@ -2489,6 +2622,7 @@ mod tests {
         assert!(text.contains("/help + Enter"));
         assert!(text.contains("/agent:<agent_name>"));
         assert!(text.contains("/skill:<skill_name>"));
+        assert!(text.contains("/reload:skills"));
         assert!(text.contains("enabled agent"));
         assert!(text.contains("/goal <text>"));
         assert!(text.contains("/goal clear"));
