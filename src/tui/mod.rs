@@ -22,7 +22,9 @@ use ratatui::widgets::{
     ScrollbarState, Wrap,
 };
 use ratatui::{Frame, Terminal};
+use std::fs;
 use std::io::{self, IsTerminal};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -33,6 +35,7 @@ const INPUT_BOX_HEIGHT: u16 = 4;
 const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
 const SKILL_PREFIX: &str = "/skill:";
+const SKILL_DISCOVERY_MAX_DEPTH: usize = 4;
 const SKILL_DROPDOWN_MAX_ITEMS: usize = 6;
 const WORK_HINT: &str = "/help";
 const WORK_INDICATOR_HEIGHT: u16 = 1;
@@ -96,6 +99,7 @@ struct TuiUiState {
     input_cursor: usize,
     input_preferred_col: Option<usize>,
     input_width: usize,
+    skill_suggestions: Vec<SkillSuggestion>,
     skill_selection_index: usize,
     work_spinner_frame: usize,
 }
@@ -113,8 +117,18 @@ impl Default for TuiUiState {
             input_cursor: 0,
             input_preferred_col: None,
             input_width: 1,
+            skill_suggestions: Vec::new(),
             skill_selection_index: 0,
             work_spinner_frame: 0,
+        }
+    }
+}
+
+impl TuiUiState {
+    fn with_skill_suggestions(skill_suggestions: Vec<SkillSuggestion>) -> Self {
+        Self {
+            skill_suggestions,
+            ..Self::default()
         }
     }
 }
@@ -129,8 +143,8 @@ struct SkillToken {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SkillSuggestion {
     id: String,
-    name: String,
-    detail: String,
+    tag: SkillSourceTag,
+    origin: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,12 +154,35 @@ struct SkillDropdown {
     selected: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkillSourceTag {
+    Project,
+    Personal,
+}
+
+impl SkillSourceTag {
+    fn label(self) -> &'static str {
+        match self {
+            SkillSourceTag::Project => "Project",
+            SkillSourceTag::Personal => "Personal",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillRoot {
+    path: PathBuf,
+    tag: SkillSourceTag,
+    origin: &'static str,
+}
+
 pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()> {
     if !io::stdout().is_terminal() {
         println!("atelier TUI requires an interactive terminal. Use --doctor or --print-config for non-interactive checks.");
         return Ok(());
     }
 
+    let skill_suggestions = discover_skill_suggestions(&config.working_directory);
     let mut app = App::new_with_debug(config, debug_enabled).await?;
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
     app.attach_state_sender(state_sender);
@@ -164,6 +201,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
         state_receiver,
         command_sender.clone(),
         interrupt_handle,
+        skill_suggestions,
     )
     .await;
 
@@ -189,9 +227,10 @@ async fn run_loop(
     mut state_receiver: watch::Receiver<AppState>,
     command_sender: mpsc::Sender<AppWorkerCommand>,
     interrupt_handle: InterruptHandle,
+    skill_suggestions: Vec<SkillSuggestion>,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
-    let mut ui_state = TuiUiState::default();
+    let mut ui_state = TuiUiState::with_skill_suggestions(skill_suggestions);
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
@@ -378,7 +417,7 @@ fn key_event_to_tui_command_with_ui(
             } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
             _ => None,
         }
-    } else if skill_dropdown(state, ui_state).is_some() {
+    } else if skill_dropdown(&state.input, ui_state).is_some() {
         skill_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
     } else {
         key_event_to_tui_command(state, key)
@@ -631,6 +670,150 @@ fn event_max_scroll(ui_state: &TuiUiState) -> usize {
         .saturating_sub(ui_state.event_viewport_lines.max(1))
 }
 
+fn discover_skill_suggestions(working_directory: &Path) -> Vec<SkillSuggestion> {
+    let roots = skill_roots(working_directory);
+    discover_skill_suggestions_from_roots(&roots)
+}
+
+fn skill_roots(working_directory: &Path) -> Vec<SkillRoot> {
+    let mut roots = vec![
+        SkillRoot {
+            path: working_directory.join(".agents/skills"),
+            tag: SkillSourceTag::Project,
+            origin: ".agents/skills",
+        },
+        SkillRoot {
+            path: working_directory.join(".claude/skills"),
+            tag: SkillSourceTag::Project,
+            origin: ".claude/skills",
+        },
+    ];
+    if let Some(home) = dirs::home_dir() {
+        roots.extend([
+            SkillRoot {
+                path: home.join(".agents/skills"),
+                tag: SkillSourceTag::Personal,
+                origin: "~/.agents/skills",
+            },
+            SkillRoot {
+                path: home.join(".claude/skills"),
+                tag: SkillSourceTag::Personal,
+                origin: "~/.claude/skills",
+            },
+        ]);
+    }
+    roots
+}
+
+fn discover_skill_suggestions_from_roots(roots: &[SkillRoot]) -> Vec<SkillSuggestion> {
+    let mut suggestions = roots
+        .iter()
+        .flat_map(discover_skill_suggestions_from_root)
+        .collect::<Vec<_>>();
+    suggestions.sort_by(|left, right| {
+        (
+            skill_tag_rank(left.tag),
+            left.id.as_str(),
+            left.origin.as_str(),
+        )
+            .cmp(&(
+                skill_tag_rank(right.tag),
+                right.id.as_str(),
+                right.origin.as_str(),
+            ))
+    });
+    suggestions
+}
+
+fn discover_skill_suggestions_from_root(root: &SkillRoot) -> Vec<SkillSuggestion> {
+    let mut suggestions = Vec::new();
+    collect_skill_suggestions(&root.path, root, 0, &mut suggestions);
+    suggestions
+}
+
+fn collect_skill_suggestions(
+    directory: &Path,
+    root: &SkillRoot,
+    depth: usize,
+    suggestions: &mut Vec<SkillSuggestion>,
+) {
+    if depth > SKILL_DISCOVERY_MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(suggestion) = skill_suggestion_from_dir(&path, root) {
+            suggestions.push(suggestion);
+        }
+        collect_skill_suggestions(&path, root, depth + 1, suggestions);
+    }
+}
+
+fn skill_suggestion_from_dir(path: &Path, root: &SkillRoot) -> Option<SkillSuggestion> {
+    if !path.is_dir() {
+        return None;
+    }
+    let skill_file = path.join("SKILL.md");
+    if !skill_file.is_file() {
+        return None;
+    }
+    let id = skill_name_from_file(&skill_file).or_else(|| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .filter(|name| is_valid_skill_id(name))
+    })?;
+    Some(SkillSuggestion {
+        id,
+        tag: root.tag,
+        origin: root.origin.to_string(),
+    })
+}
+
+fn skill_name_from_file(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+    for line in lines.take(80) {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            return None;
+        }
+        if let Some(value) = trimmed.strip_prefix("name:") {
+            return clean_skill_name(value);
+        }
+    }
+    None
+}
+
+fn clean_skill_name(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    is_valid_skill_id(&value).then_some(value)
+}
+
+fn is_valid_skill_id(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_whitespace)
+}
+
+fn skill_tag_rank(tag: SkillSourceTag) -> u8 {
+    match tag {
+        SkillSourceTag::Project => 0,
+        SkillSourceTag::Personal => 1,
+    }
+}
+
 fn reset_skill_dropdown_selection(ui_state: &mut TuiUiState) {
     ui_state.skill_selection_index = 0;
 }
@@ -640,7 +823,7 @@ fn apply_skill_dropdown_command(
     ui_state: &mut TuiUiState,
     command: SkillDropdownCommand,
 ) {
-    let Some(dropdown) = skill_dropdown(state, ui_state) else {
+    let Some(dropdown) = skill_dropdown(&state.input, ui_state) else {
         return;
     };
     let suggestion_count = dropdown.suggestions.len();
@@ -691,9 +874,9 @@ fn apply_skill_suggestion(
     reset_skill_dropdown_selection(ui_state);
 }
 
-fn skill_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<SkillDropdown> {
-    let token = active_skill_token(&state.input, ui_state.input_cursor)?;
-    let suggestions = skill_suggestions(state, &token.query);
+fn skill_dropdown(input: &str, ui_state: &TuiUiState) -> Option<SkillDropdown> {
+    let token = active_skill_token(input, ui_state.input_cursor)?;
+    let suggestions = skill_suggestions(&ui_state.skill_suggestions, &token.query);
     if suggestions.is_empty() {
         return None;
     }
@@ -734,32 +917,13 @@ fn active_skill_token(input: &str, cursor: usize) -> Option<SkillToken> {
     })
 }
 
-fn skill_suggestions(state: &AppState, query: &str) -> Vec<SkillSuggestion> {
+fn skill_suggestions(skills: &[SkillSuggestion], query: &str) -> Vec<SkillSuggestion> {
     let query = query.to_ascii_lowercase();
-    state
-        .agents
+    skills
         .iter()
-        .filter(|agent| agent.status != "disabled")
-        .filter(|agent| {
-            query.is_empty()
-                || agent.id.to_ascii_lowercase().contains(&query)
-                || agent.name.to_ascii_lowercase().contains(&query)
-        })
-        .map(|agent| SkillSuggestion {
-            id: agent.id.clone(),
-            name: agent.name.clone(),
-            detail: skill_suggestion_detail(agent),
-        })
+        .filter(|skill| query.is_empty() || skill.id.to_ascii_lowercase().contains(&query))
+        .cloned()
         .collect()
-}
-
-fn skill_suggestion_detail(agent: &crate::app::AgentView) -> String {
-    let capabilities = if agent.capabilities.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", agent.capabilities.join(","))
-    };
-    format!("{}/{}{}", agent.runtime, agent.model, capabilities)
 }
 
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
@@ -851,7 +1015,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
     frame.render_widget(input, input_areas.input);
     render_input_status(frame, input_areas.status, ui_state, work_active);
-    if let Some(dropdown) = skill_dropdown(state, ui_state) {
+    if let Some(dropdown) = skill_dropdown(&state.input, ui_state) {
         render_skill_dropdown(frame, input_areas.input, &dropdown);
     }
     if ui_state.help_visible {
@@ -996,9 +1160,18 @@ fn skill_dropdown_item(suggestion: &SkillSuggestion, selected: bool) -> ListItem
         Span::styled(if selected { "> " } else { "  " }, marker_style),
         Span::styled(suggestion.id.clone(), id_style),
         Span::raw("  "),
-        Span::styled(suggestion.name.clone(), Style::default().fg(Color::White)),
+        Span::styled(
+            format!(" {} ", suggestion.tag.label()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(match suggestion.tag {
+                    SkillSourceTag::Project => Color::LightGreen,
+                    SkillSourceTag::Personal => Color::LightBlue,
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
-        Span::styled(suggestion.detail.clone(), Style::default().fg(Color::Gray)),
+        Span::styled(suggestion.origin.clone(), Style::default().fg(Color::Gray)),
     ]);
     let item = ListItem::new(line);
     if selected {
@@ -1200,7 +1373,7 @@ fn render_help_modal(frame: &mut Frame) {
             Span::styled(" commands", Style::default().fg(Color::White)),
         ]),
         Line::from("/help + Enter        toggle this help"),
-        Line::from("/skill:<agent>       select skill with Up/Down + Enter"),
+        Line::from("/skill:<skill>       select Project/Personal skill"),
         Line::from("/goal <text> | /goal | /goal clear   manage session goal"),
         Line::from("/subtask <agent> <task>              run bounded child task"),
         Line::from("/config              show config files, preset, warnings"),
@@ -1508,6 +1681,7 @@ mod tests {
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
     use ratatui::backend::TestBackend;
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn renders_empty_tui_surfaces() {
@@ -1925,7 +2099,8 @@ mod tests {
         let header = text.lines().find(|line| line.contains("Help")).unwrap();
         assert!(header.contains("Esc"));
         assert!(text.contains("/help + Enter"));
-        assert!(text.contains("/skill:<agent>"));
+        assert!(text.contains("/skill:<skill>"));
+        assert!(text.contains("Project/Personal"));
         assert!(text.contains("/goal <text>"));
         assert!(text.contains("/goal clear"));
         assert!(text.contains("/subtask <agent>"));
@@ -1942,40 +2117,43 @@ mod tests {
 
     #[test]
     fn renders_skill_dropdown_for_skill_prefix() {
-        let state = state_with_skill_agents("/skill:");
+        let state = state_with_input("/skill:", false);
         let ui_state = TuiUiState {
             roster_visible: false,
             input_cursor: input_char_count("/skill:"),
+            skill_suggestions: test_skill_suggestions(),
             ..TuiUiState::default()
         };
 
         let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
 
         assert!(text.contains("Skills"));
-        assert!(text.contains("explorer"));
-        assert!(text.contains("fixer"));
-        assert!(!text.contains("archived"));
+        assert!(text.contains("project-alpha"));
+        assert!(text.contains("personal-beta"));
+        assert!(text.contains("Project"));
+        assert!(text.contains("Personal"));
     }
 
     #[test]
     fn skill_dropdown_filters_by_typed_skill_query() {
-        let state = state_with_skill_agents("/skill:fix");
+        let state = state_with_input("/skill:personal", false);
         let ui_state = TuiUiState {
             roster_visible: false,
-            input_cursor: input_char_count("/skill:fix"),
+            input_cursor: input_char_count("/skill:personal"),
+            skill_suggestions: test_skill_suggestions(),
             ..TuiUiState::default()
         };
 
         let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
 
-        assert!(text.contains("fixer"));
-        assert!(!text.contains("explorer"));
+        assert!(text.contains("personal-beta"));
+        assert!(!text.contains("project-alpha"));
     }
 
     #[test]
     fn skill_dropdown_arrow_keys_override_wrapped_input_cursor_movement() {
-        let state = state_with_skill_agents("/skill:");
-        let ui_state = ui_state_with_cursor_at_end(&state.input);
+        let state = state_with_input("/skill:", false);
+        let ui_state = ui_state_with_skills_at_end(&state.input);
 
         assert_eq!(
             key_event_to_tui_command_with_ui(
@@ -1998,8 +2176,8 @@ mod tests {
     #[tokio::test]
     async fn skill_dropdown_selection_cycles_without_app_event() {
         let (sender, mut receiver) = mpsc::channel(1);
-        let mut state = state_with_skill_agents("/skill:");
-        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
+        let mut state = state_with_input("/skill:", false);
+        let mut ui_state = ui_state_with_skills_at_end(&state.input);
 
         execute_tui_command(
             &mut state,
@@ -2018,9 +2196,10 @@ mod tests {
     #[tokio::test]
     async fn skill_dropdown_accept_replaces_query_and_preserves_prompt_rest() {
         let (sender, mut receiver) = mpsc::channel(1);
-        let mut state = state_with_skill_agents("/skill:fi inspect docs");
+        let mut state = state_with_input("/skill:personal inspect docs", false);
         let mut ui_state = TuiUiState {
-            input_cursor: input_char_count("/skill:fi"),
+            input_cursor: input_char_count("/skill:personal"),
+            skill_suggestions: test_skill_suggestions(),
             ..TuiUiState::default()
         };
 
@@ -2033,15 +2212,18 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(state.input, "/skill:fixer inspect docs");
-        assert_eq!(ui_state.input_cursor, input_char_count("/skill:fixer "));
+        assert_eq!(state.input, "/skill:personal-beta inspect docs");
+        assert_eq!(
+            ui_state.input_cursor,
+            input_char_count("/skill:personal-beta ")
+        );
         assert!(receiver.try_recv().is_err());
     }
 
     #[test]
     fn enter_submits_after_skill_selection_has_trailing_space() {
-        let state = state_with_skill_agents("/skill:fixer inspect docs");
-        let ui_state = ui_state_with_cursor_at_end(&state.input);
+        let state = state_with_input("/skill:personal-beta inspect docs", false);
+        let ui_state = ui_state_with_skills_at_end(&state.input);
 
         assert_eq!(
             key_event_to_tui_command_with_ui(
@@ -2050,8 +2232,82 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "/skill:fixer inspect docs".to_string()
+                "/skill:personal-beta inspect docs".to_string()
             )))
+        );
+    }
+
+    #[test]
+    fn discovers_project_and_personal_skills_from_agent_and_claude_roots() {
+        let dir = tempdir().unwrap();
+        let project_agents = dir.path().join(".agents/skills");
+        let project_claude = dir.path().join(".claude/skills");
+        let personal_agents = dir.path().join("home/.agents/skills");
+        let personal_claude = dir.path().join("home/.claude/skills");
+        write_skill(&project_agents, "project-agent", "frontmatter-project");
+        write_skill(
+            &project_agents.join(".system"),
+            "project-system",
+            "nested-project",
+        );
+        write_skill_without_name(&project_claude, "project-claude");
+        write_skill(&personal_agents, "personal-agent", "frontmatter-personal");
+        write_skill(&personal_claude, "personal-claude", "personal-claude");
+
+        let roots = vec![
+            SkillRoot {
+                path: project_agents,
+                tag: SkillSourceTag::Project,
+                origin: ".agents/skills",
+            },
+            SkillRoot {
+                path: project_claude,
+                tag: SkillSourceTag::Project,
+                origin: ".claude/skills",
+            },
+            SkillRoot {
+                path: personal_agents,
+                tag: SkillSourceTag::Personal,
+                origin: "~/.agents/skills",
+            },
+            SkillRoot {
+                path: personal_claude,
+                tag: SkillSourceTag::Personal,
+                origin: "~/.claude/skills",
+            },
+        ];
+
+        let suggestions = discover_skill_suggestions_from_roots(&roots);
+
+        assert_eq!(
+            suggestions,
+            vec![
+                SkillSuggestion {
+                    id: "frontmatter-project".to_string(),
+                    tag: SkillSourceTag::Project,
+                    origin: ".agents/skills".to_string(),
+                },
+                SkillSuggestion {
+                    id: "nested-project".to_string(),
+                    tag: SkillSourceTag::Project,
+                    origin: ".agents/skills".to_string(),
+                },
+                SkillSuggestion {
+                    id: "project-claude".to_string(),
+                    tag: SkillSourceTag::Project,
+                    origin: ".claude/skills".to_string(),
+                },
+                SkillSuggestion {
+                    id: "frontmatter-personal".to_string(),
+                    tag: SkillSourceTag::Personal,
+                    origin: "~/.agents/skills".to_string(),
+                },
+                SkillSuggestion {
+                    id: "personal-claude".to_string(),
+                    tag: SkillSourceTag::Personal,
+                    origin: "~/.claude/skills".to_string(),
+                },
+            ]
         );
     }
 
@@ -2587,33 +2843,6 @@ mod tests {
         }
     }
 
-    fn state_with_skill_agents(input: &str) -> AppState {
-        let mut state = state_with_input(input, false);
-        state.agents = vec![
-            agent_view("explorer", "Explorer", "idle", &["read"]),
-            agent_view("fixer", "Fixer", "idle", &["read", "edit", "verify"]),
-            agent_view("archived", "Archived", "disabled", &["read"]),
-        ];
-        state
-    }
-
-    fn agent_view(id: &str, name: &str, status: &str, capabilities: &[&str]) -> AgentView {
-        AgentView {
-            id: id.to_string(),
-            name: name.to_string(),
-            runtime: "fake".to_string(),
-            model: "default".to_string(),
-            effort: "medium".to_string(),
-            thinking: false,
-            capabilities: capabilities
-                .iter()
-                .map(|capability| (*capability).to_string())
-                .collect(),
-            availability: None,
-            status: status.to_string(),
-        }
-    }
-
     fn render_to_text(state: &AppState, width: u16, height: u16) -> String {
         render_to_text_with_ui(state, &TuiUiState::default(), width, height)
     }
@@ -2623,6 +2852,49 @@ mod tests {
             input_cursor: input_char_count(input),
             ..TuiUiState::default()
         }
+    }
+
+    fn ui_state_with_skills_at_end(input: &str) -> TuiUiState {
+        TuiUiState {
+            input_cursor: input_char_count(input),
+            skill_suggestions: test_skill_suggestions(),
+            ..TuiUiState::default()
+        }
+    }
+
+    fn test_skill_suggestions() -> Vec<SkillSuggestion> {
+        vec![
+            SkillSuggestion {
+                id: "project-alpha".to_string(),
+                tag: SkillSourceTag::Project,
+                origin: ".agents/skills".to_string(),
+            },
+            SkillSuggestion {
+                id: "personal-beta".to_string(),
+                tag: SkillSourceTag::Personal,
+                origin: "~/.agents/skills".to_string(),
+            },
+        ]
+    }
+
+    fn write_skill(root: &Path, directory: &str, name: &str) {
+        let skill_dir = root.join(directory);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill\n---\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_skill_without_name(root: &Path, directory: &str) {
+        let skill_dir = root.join(directory);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: test skill\n---\n",
+        )
+        .unwrap();
     }
 
     fn render_to_text_with_ui(
