@@ -386,8 +386,16 @@ async fn execute_tui_command_with_interrupt(
                 AppEvent::PromptSubmitted(_) | AppEvent::ApprovalAnswered(_)
             );
             if let AppEvent::ApprovalAnswered(approved) = &event {
-                if let Some(approval_handle) = approval_handle {
+                if let (Some(approval_handle), Some(pending)) =
+                    (approval_handle, state.pending_approval.as_ref())
+                {
                     approval_handle.answer(*approved);
+                    if pending.group_id.is_some() {
+                        if clears_input {
+                            clear_input(state, ui_state);
+                        }
+                        return Ok(true);
+                    }
                 }
             }
             queue_app_event(command_sender, event).await?;
@@ -2163,6 +2171,7 @@ mod tests {
     use super::*;
     use crate::app::chat::ChatProjection;
     use crate::app::{AgentView, ConfigStatusView, LiveStepStatus, LiveStepView, LiveStreamView};
+    use crate::config::{load_effective_config, ConfigLoadOptions};
     use crate::history::HistoryEvent;
     use crate::orchestrator::RunState;
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
@@ -2532,6 +2541,7 @@ mod tests {
             live_steps: Vec::new(),
             pending_approval: Some(crate::app::PendingApprovalView {
                 run_id: "run".to_string(),
+                group_id: None,
                 step_id: "step".to_string(),
                 action_id: "action".to_string(),
                 agent: "fixer".to_string(),
@@ -3261,6 +3271,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn parallel_approval_answer_signals_without_queuing_stale_event() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+        let app = App::new(config).await.unwrap();
+        let approval_handle = app.approval_handle();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("yes", true);
+        state.pending_approval.as_mut().unwrap().group_id = Some("group".to_string());
+        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
+
+        let keep_running = execute_tui_command_with_interrupt(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            None,
+            Some(&approval_handle),
+            TuiCommand::Dispatch(AppEvent::ApprovalAnswered(true)),
+        )
+        .await
+        .unwrap();
+
+        assert!(keep_running);
+        assert!(state.input.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn edit_keys_become_local_input_commands() {
         let state = state_with_input("abc", false);
@@ -3673,6 +3714,7 @@ mod tests {
             live_steps: Vec::new(),
             pending_approval: pending_approval.then(|| crate::app::PendingApprovalView {
                 run_id: "run".to_string(),
+                group_id: None,
                 step_id: "step".to_string(),
                 action_id: "action".to_string(),
                 agent: "fixer".to_string(),

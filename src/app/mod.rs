@@ -121,6 +121,7 @@ pub struct ConfigStatusView {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingApprovalView {
     pub run_id: String,
+    pub group_id: Option<String>,
     pub step_id: String,
     pub action_id: String,
     pub agent: String,
@@ -1717,6 +1718,7 @@ impl App {
     fn publish_parallel_approval_head(&mut self, queue: &VecDeque<PendingParallelApproval>) {
         self.state.pending_approval = queue.front().map(|pending| PendingApprovalView {
             run_id: pending.run_id.clone(),
+            group_id: Some(pending.group_id.clone()),
             step_id: pending.step_id.clone(),
             action_id: pending.action_request.action_id.clone(),
             agent: pending.agent_profile.id.clone(),
@@ -2977,6 +2979,7 @@ impl App {
                         self.set_agent_status(&request.agent_profile.id, "waiting_approval");
                         let view = PendingApprovalView {
                             run_id: run_id.to_string(),
+                            group_id: None,
                             step_id: step_id.clone(),
                             action_id: action_request.action_id.clone(),
                             agent: request.agent_profile.id.clone(),
