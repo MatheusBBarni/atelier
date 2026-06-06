@@ -1177,19 +1177,30 @@ fn skill_dropdown(input: &str, ui_state: &TuiUiState) -> Option<SkillDropdown> {
 }
 
 fn active_prompt_token(input: &str, cursor: usize, prefix: &str) -> Option<PromptToken> {
-    if !input.starts_with(prefix) {
+    let input_len = input_char_count(input);
+    let cursor = cursor.min(input_len);
+    let token_start = input
+        .chars()
+        .enumerate()
+        .take(cursor)
+        .filter_map(|(index, ch)| ch.is_whitespace().then_some(index + 1))
+        .last()
+        .unwrap_or(0);
+    let prefix_len = input_char_count(prefix);
+    let value_start = token_start.saturating_add(prefix_len);
+    if cursor < value_start {
         return None;
     }
-    let prefix_len = input_char_count(prefix);
-    if cursor < prefix_len {
+    let prefix_start = byte_index_for_char(input, token_start);
+    let prefix_end = byte_index_for_char(input, value_start);
+    if input.get(prefix_start..prefix_end) != Some(prefix) {
         return None;
     }
 
-    let value_len = input[prefix.len()..]
+    let value_len = input[prefix_end..]
         .chars()
         .take_while(|ch| !ch.is_whitespace())
         .count();
-    let value_start = prefix_len;
     let value_end = value_start + value_len;
     if cursor > value_end {
         return None;
@@ -2688,6 +2699,22 @@ mod tests {
     }
 
     #[test]
+    fn renders_agent_dropdown_for_mid_prompt_agent_token() {
+        let state = state_with_agent_roster("please use /agent:fi then inspect");
+        let ui_state = TuiUiState {
+            roster_visible: false,
+            input_cursor: input_char_count("please use /agent:fi"),
+            ..TuiUiState::default()
+        };
+
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
+
+        assert!(text.contains("Agents"));
+        assert!(text.contains("fixer"));
+        assert!(!text.contains("explorer"));
+    }
+
+    #[test]
     fn agent_dropdown_filters_by_typed_agent_query() {
         let state = state_with_agent_roster("/agent:fix");
         let ui_state = TuiUiState {
@@ -2768,6 +2795,32 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn agent_dropdown_accept_replaces_mid_prompt_query_and_preserves_rest() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_agent_roster("please use /agent:fi then inspect");
+        let mut ui_state = TuiUiState {
+            input_cursor: input_char_count("please use /agent:fi"),
+            ..TuiUiState::default()
+        };
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::AgentDropdown(DropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.input, "please use /agent:fixer then inspect");
+        assert_eq!(
+            ui_state.input_cursor,
+            input_char_count("please use /agent:fixer ")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn renders_skill_dropdown_for_skill_prefix() {
         let state = state_with_input("/skill:", false);
@@ -2780,6 +2833,30 @@ mod tests {
         assert!(text.contains("personal-beta"));
         assert!(text.contains("Project"));
         assert!(text.contains("Personal"));
+    }
+
+    #[test]
+    fn renders_skill_dropdown_for_mid_prompt_skill_token() {
+        let state = state_with_input("test 123 /skill:personal then inspect", false);
+        let ui_state = TuiUiState {
+            input_cursor: input_char_count("test 123 /skill:personal"),
+            skill_suggestions: test_skill_suggestions(),
+            ..TuiUiState::default()
+        };
+
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
+
+        assert!(text.contains("Skills"));
+        assert!(text.contains("personal-beta"));
+        assert!(!text.contains("project-alpha"));
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SkillDropdown(DropdownCommand::Next))
+        );
     }
 
     #[test]
@@ -2882,6 +2959,33 @@ mod tests {
         assert_eq!(
             ui_state.input_cursor,
             input_char_count("/skill:personal-beta ")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn skill_dropdown_accept_replaces_mid_prompt_query_and_preserves_rest() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("test 123 /skill:personal then inspect", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: input_char_count("test 123 /skill:personal"),
+            skill_suggestions: test_skill_suggestions(),
+            ..TuiUiState::default()
+        };
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::SkillDropdown(DropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.input, "test 123 /skill:personal-beta then inspect");
+        assert_eq!(
+            ui_state.input_cursor,
+            input_char_count("test 123 /skill:personal-beta ")
         );
         assert!(receiver.try_recv().is_err());
     }
