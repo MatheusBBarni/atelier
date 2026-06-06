@@ -71,8 +71,13 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
         };
         let title = match runtime.kind {
             RuntimeKind::Codex => "Codex Runtime",
+            RuntimeKind::Claude => "Claude Runtime",
             RuntimeKind::Zai => "Z.ai Runtime",
             RuntimeKind::Fake => "Fake Runtime",
+        };
+        let protected_defaults = match runtime.kind {
+            RuntimeKind::Claude => Some(crate::runtime::claude::protected_defaults_summary()),
+            _ => None,
         };
         checks.push(DoctorCheck {
             id: format!("runtime.{}", runtime.id),
@@ -86,6 +91,7 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
                 "runtime_type": runtime.kind,
                 "api_key_env": runtime.api_key_env,
                 "command": runtime.command,
+                "protected_defaults": protected_defaults,
             })),
         });
     }
@@ -585,5 +591,58 @@ model = "default"
         assert!(check.message.contains("Logged in using ChatGPT"));
         assert!(json.contains("\"runtime_type\": \"codex\""));
         assert!(!json.contains("CODEX_ACCESS_TOKEN"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn doctor_reports_claude_runtime_with_protected_default_summary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("claude-status.sh");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'claude 2.0.0'; exit 0; fi\nif [ \"$1\" = \"--help\" ]; then echo '{}'; exit 0; fi\necho unexpected >&2\nexit 64\n",
+                crate::runtime::claude::REQUIRED_HELP_FLAGS.join(" ")
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let config_path = dir.path().join("multiagent.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[runtimes.claude]
+command = "{}"
+"#,
+                script_path.display()
+            ),
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let report = run_doctor(&config).await;
+        let json = render_json(&report).unwrap();
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "runtime.claude")
+            .unwrap();
+
+        assert_eq!(check.title, "Claude Runtime");
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.message.contains("claude 2.0.0"));
+        assert!(check.message.contains("tools disabled"));
+        assert!(json.contains("\"runtime_type\": \"claude\""));
+        assert!(json.contains("partial messages enabled"));
+        assert!(!json.contains("stream-json --include-partial-messages"));
+        assert!(!json.contains("CLAUDE_API_KEY"));
     }
 }

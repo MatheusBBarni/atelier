@@ -1,3 +1,4 @@
+pub mod claude;
 pub mod codex;
 pub mod fake;
 pub mod zai;
@@ -135,6 +136,8 @@ pub struct RuntimeStreamDelta {
     pub stream: String,
     pub content: String,
     pub final_delta: bool,
+    #[serde(default)]
+    pub transient: bool,
 }
 
 impl RuntimeStreamDelta {
@@ -144,6 +147,7 @@ impl RuntimeStreamDelta {
             stream: stream.into(),
             content: content.into(),
             final_delta: false,
+            transient: false,
         }
     }
 
@@ -157,6 +161,17 @@ impl RuntimeStreamDelta {
             stream: stream.into(),
             content: content.into(),
             final_delta: true,
+            transient: false,
+        }
+    }
+
+    pub fn transient(sequence: u32, stream: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            sequence,
+            stream: stream.into(),
+            content: content.into(),
+            final_delta: false,
+            transient: true,
         }
     }
 }
@@ -165,6 +180,11 @@ impl RuntimeStreamDelta {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RuntimeEvent {
     Delta {
+        sequence: u32,
+        stream: String,
+        content: String,
+    },
+    TransientDelta {
         sequence: u32,
         stream: String,
         content: String,
@@ -189,6 +209,7 @@ impl RuntimeEvent {
     pub fn sequence(&self) -> u32 {
         match self {
             Self::Delta { sequence, .. }
+            | Self::TransientDelta { sequence, .. }
             | Self::Status { sequence, .. }
             | Self::ToolCallProgress { sequence, .. }
             | Self::Diagnostic { sequence, .. } => *sequence,
@@ -197,7 +218,9 @@ impl RuntimeEvent {
 
     pub fn stream_name(&self) -> String {
         match self {
-            Self::Delta { stream, .. } | Self::Diagnostic { stream, .. } => stream.clone(),
+            Self::Delta { stream, .. }
+            | Self::TransientDelta { stream, .. }
+            | Self::Diagnostic { stream, .. } => stream.clone(),
             Self::Status { .. } => "status".to_string(),
             Self::ToolCallProgress { name, .. } => format!("tool:{name}"),
         }
@@ -205,10 +228,16 @@ impl RuntimeEvent {
 
     pub fn content(&self) -> String {
         match self {
-            Self::Delta { content, .. } | Self::Diagnostic { content, .. } => content.clone(),
+            Self::Delta { content, .. }
+            | Self::TransientDelta { content, .. }
+            | Self::Diagnostic { content, .. } => content.clone(),
             Self::Status { message, .. } => message.clone(),
             Self::ToolCallProgress { summary, .. } => summary.clone(),
         }
+    }
+
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::TransientDelta { .. })
     }
 }
 
@@ -239,6 +268,19 @@ impl RuntimeEventSink {
 
     pub async fn delta(&self, stream: impl Into<String>, content: impl Into<String>) -> Result<()> {
         self.send(RuntimeEvent::Delta {
+            sequence: self.next_sequence(),
+            stream: stream.into(),
+            content: content.into(),
+        })
+        .await
+    }
+
+    pub async fn transient_delta(
+        &self,
+        stream: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Result<()> {
+        self.send(RuntimeEvent::TransientDelta {
             sequence: self.next_sequence(),
             stream: stream.into(),
             content: content.into(),
@@ -362,6 +404,11 @@ pub async fn check_runtime_availability(runtime: &RuntimeConfig) -> RuntimeAvail
                 .check_availability()
                 .await
         }
+        RuntimeKind::Claude => {
+            claude::ClaudeRuntime::new(runtime.clone())
+                .check_availability()
+                .await
+        }
         RuntimeKind::Zai => {
             zai::ZaiRuntime::new(runtime.clone())
                 .check_availability()
@@ -397,12 +444,14 @@ pub async fn execute_runtime_step_streaming(
         .get(runtime_id)
         .ok_or_else(|| anyhow::anyhow!("agent references undefined runtime {runtime_id}"))?;
 
-    let availability = check_runtime_availability(runtime).await;
-    if matches!(availability.status, RuntimeAvailabilityStatus::Unavailable) {
-        bail!(
-            "runtime {runtime_id} is unavailable: {}",
-            availability.message
-        );
+    if !matches!(runtime.kind, RuntimeKind::Claude) {
+        let availability = check_runtime_availability(runtime).await;
+        if matches!(availability.status, RuntimeAvailabilityStatus::Unavailable) {
+            bail!(
+                "runtime {runtime_id} is unavailable: {}",
+                availability.message
+            );
+        }
     }
 
     let model_chain = request.agent_profile.model_chain();
@@ -449,6 +498,11 @@ async fn execute_runtime_step_once(
                 .stream_step(request, events, cancellation)
                 .await
         }
+        RuntimeKind::Claude => {
+            claude::ClaudeRuntime::new(runtime.clone())
+                .stream_step(request, events, cancellation)
+                .await
+        }
         RuntimeKind::Zai => {
             zai::ZaiRuntime::new(runtime.clone())
                 .stream_step(request, events, cancellation)
@@ -467,7 +521,11 @@ pub async fn emit_legacy_step_result(
     events: &RuntimeEventSink,
 ) -> Result<RuntimeOutput> {
     for delta in result.stream_deltas {
-        events.delta(delta.stream, delta.content).await?;
+        if delta.transient {
+            events.transient_delta(delta.stream, delta.content).await?;
+        } else {
+            events.delta(delta.stream, delta.content).await?;
+        }
     }
     Ok(result.output)
 }
@@ -508,6 +566,7 @@ where
                 stream: event.stream_name(),
                 content: event.content(),
                 final_delta: Some(sequence) == last_sequence,
+                transient: event.is_transient(),
             }
         })
         .collect();
@@ -525,6 +584,123 @@ pub fn is_retryable_provider_error(error: &anyhow::Error) -> bool {
             .map(RuntimeProviderError::is_retryable)
             .unwrap_or(false)
     })
+}
+
+pub(crate) fn parse_runtime_output(agent_id: &str, raw_output: String) -> Result<RuntimeOutput> {
+    if let Ok(request) = crate::orchestrator::parse_contract(&raw_output) {
+        return Ok(RuntimeOutput::ActionRequest { request });
+    }
+
+    if agent_id == "orchestrator" {
+        match crate::orchestrator::parse_orchestrator_decision(&raw_output) {
+            Ok(decision) => Ok(RuntimeOutput::OrchestratorDecision { decision }),
+            Err(error) => Ok(RuntimeOutput::ParseError {
+                agent: agent_id.to_string(),
+                raw_output,
+                diagnostic: error.to_string(),
+            }),
+        }
+    } else {
+        match crate::orchestrator::parse_agent_result(&raw_output) {
+            Ok(result) => Ok(RuntimeOutput::AgentResult { result }),
+            Err(error) => Ok(RuntimeOutput::ParseError {
+                agent: agent_id.to_string(),
+                raw_output,
+                diagnostic: error.to_string(),
+            }),
+        }
+    }
+}
+
+pub(crate) fn process_output_text(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match (stdout.trim(), stderr.trim()) {
+        ("", "") => "command produced no output".to_string(),
+        (stdout, "") => stdout.to_string(),
+        ("", stderr) => stderr.to_string(),
+        (stdout, stderr) => format!("{stdout}; {stderr}"),
+    }
+}
+
+pub(crate) fn concise_runtime_text(text: &str) -> String {
+    concise_runtime_text_with_limit(text, 240)
+}
+
+pub(crate) fn concise_runtime_text_with_limit(text: &str, max_chars: usize) -> String {
+    let text = redact_sensitive_text(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    format!(
+        "{}...",
+        text.chars()
+            .take(max_chars.saturating_sub(3))
+            .collect::<String>()
+    )
+}
+
+pub(crate) fn redact_sensitive_text(text: &str) -> String {
+    redact_raw_secret_tokens(&redact_bearer_tokens(text))
+}
+
+fn redact_bearer_tokens(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(auth_start) = remaining.to_ascii_lowercase().find("bearer ") {
+        output.push_str(&remaining[..auth_start]);
+        output.push_str("Bearer <redacted>");
+        let token_start = auth_start + "bearer ".len();
+        let token = &remaining[token_start..];
+        let token_len = token
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '"' | '\'' | '\\' | ',' | ';' | ')' | ']')
+            })
+            .unwrap_or(token.len());
+        remaining = &token[token_len..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn redact_raw_secret_tokens(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some((secret_start, _prefix)) = next_raw_secret_prefix(remaining) {
+        let absolute_start = text.len() - remaining.len() + secret_start;
+        let preceding_character = text[..absolute_start].chars().next_back();
+        if preceding_character.is_some_and(is_secret_token_character) {
+            output.push_str(&remaining[..secret_start + 1]);
+            remaining = &remaining[secret_start + 1..];
+            continue;
+        }
+
+        output.push_str(&remaining[..secret_start]);
+        output.push_str("<redacted secret>");
+        let token = &remaining[secret_start..];
+        let token_length = token
+            .find(|character: char| !is_secret_token_character(character))
+            .unwrap_or(token.len());
+        remaining = &token[token_length..];
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+fn next_raw_secret_prefix(text: &str) -> Option<(usize, &'static str)> {
+    const SECRET_PREFIXES: [&str; 2] = ["sk-", "zai-"];
+    let lower = text.to_ascii_lowercase();
+    SECRET_PREFIXES
+        .into_iter()
+        .filter_map(|prefix| lower.find(prefix).map(|index| (index, prefix)))
+        .min_by_key(|(index, _prefix)| *index)
+}
+
+fn is_secret_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
 
 pub fn prompt_envelope_json(request: &RuntimeRequest) -> Result<String> {

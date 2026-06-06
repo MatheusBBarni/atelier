@@ -200,6 +200,7 @@ pub struct WorkspacePolicy {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeKind {
     Codex,
+    Claude,
     Zai,
     Fake,
 }
@@ -553,6 +554,17 @@ impl MergedConfig {
             MergedRuntimeConfig {
                 kind: Some(RuntimeKind::Codex),
                 command: Some("codex".to_string()),
+                args: Some(Vec::new()),
+                prompt_mode: Some(PromptMode::Stdin),
+                base_url: None,
+                api_key_env: None,
+            },
+        );
+        runtimes.insert(
+            "claude".to_string(),
+            MergedRuntimeConfig {
+                kind: Some(RuntimeKind::Claude),
+                command: Some("claude".to_string()),
                 args: Some(Vec::new()),
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
@@ -1116,6 +1128,28 @@ impl MergedConfig {
                     base_url: None,
                     api_key_env: None,
                 },
+                RuntimeKind::Claude => {
+                    if runtime.api_key_env.is_some() {
+                        bail!(
+                            "claude runtime {id} cannot set api_key_env; Claude credentials are owned by the Claude CLI"
+                        );
+                    }
+                    let args = runtime.args.unwrap_or_default();
+                    validate_claude_runtime_args(&id, &args)?;
+                    let prompt_mode = runtime.prompt_mode.unwrap_or_default();
+                    match prompt_mode {
+                        PromptMode::Stdin => {}
+                    }
+                    RuntimeConfig {
+                        id: id.clone(),
+                        kind,
+                        command: Some(runtime.command.unwrap_or_else(|| "claude".to_string())),
+                        args,
+                        prompt_mode,
+                        base_url: None,
+                        api_key_env: None,
+                    }
+                }
                 RuntimeKind::Zai => {
                     let api_key_env = runtime
                         .api_key_env
@@ -1502,6 +1536,109 @@ fn validate_env_reference(value: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_claude_runtime_args(runtime_id: &str, args: &[String]) -> Result<()> {
+    for arg in args {
+        if let Some(flag) = claude_protected_arg(arg) {
+            bail!(
+                "claude runtime {runtime_id} args include protected flag {flag}; the Claude Runtime owns tool, session, prompt, model, budget, and output protocol flags"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn claude_protected_arg(arg: &str) -> Option<String> {
+    let flag = arg
+        .split_once('=')
+        .map(|(flag, _value)| flag)
+        .unwrap_or(arg);
+    if CLAUDE_PROTECTED_ARG_NAMES.contains(&flag)
+        || CLAUDE_PROTECTED_ARG_PREFIXES
+            .iter()
+            .any(|prefix| flag.starts_with(prefix))
+    {
+        Some(flag.to_string())
+    } else {
+        None
+    }
+}
+
+const CLAUDE_PROTECTED_ARG_NAMES: &[&str] = &[
+    "-p",
+    "--print",
+    "--output-format",
+    "--include-partial-messages",
+    "--no-session-persistence",
+    "--tools",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--model",
+    "-m",
+    "--fallback-model",
+    "--max-turns",
+    "--max-budget-usd",
+    "--continue",
+    "-c",
+    "--resume",
+    "-r",
+    "--session-id",
+    "--fork-session",
+    "--from-pr",
+    "--teleport",
+    "--mcp-config",
+    "--strict-mcp-config",
+    "--plugin-dir",
+    "--plugin-url",
+    "--channels",
+    "--setting-sources",
+    "--settings",
+    "--add-dir",
+    "--worktree",
+    "-w",
+    "--exec",
+    "--bg",
+    "--remote",
+    "--remote-control",
+    "--rc",
+    "--chrome",
+    "--no-chrome",
+    "--browser",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--dangerously-skip-permissions",
+    "--init",
+    "--init-only",
+    "--maintenance",
+    "--include-hook-events",
+    "--agent",
+    "--agents",
+    "--input-format",
+    "--prompt",
+    "--prompt-file",
+    "--replay-user-messages",
+    "--prompt-suggestions",
+    "--json-schema",
+    "--debug-file",
+];
+
+const CLAUDE_PROTECTED_ARG_PREFIXES: &[&str] = &[
+    "--plugin-",
+    "--mcp-",
+    "--tool-",
+    "--allowed-tool",
+    "--disallowed-tool",
+    "--permission-",
+    "--session-",
+    "--system-prompt",
+    "--append-system-prompt",
+];
+
 fn title_case_id(id: &str) -> String {
     let mut chars = id.chars();
     match chars.next() {
@@ -1640,7 +1777,9 @@ pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
                         command: runtime.command.clone(),
                         args: runtime.args.clone(),
                         prompt_mode: match runtime.kind {
-                            RuntimeKind::Codex => Some(runtime.prompt_mode.clone()),
+                            RuntimeKind::Codex | RuntimeKind::Claude => {
+                                Some(runtime.prompt_mode.clone())
+                            }
                             _ => None,
                         },
                         base_url: runtime.base_url.clone(),
@@ -1740,6 +1879,12 @@ approval_mode = "yolo"
 type = "codex"
 command = "codex"
 args = ["exec", "--skip-git-repo-check", "--color", "never"]
+prompt_mode = "stdin"
+
+[runtimes.claude]
+type = "claude"
+command = "claude"
+args = []
 prompt_mode = "stdin"
 
 [runtimes.zai]
@@ -1981,6 +2126,22 @@ mod tests {
     }
 
     #[test]
+    fn builtin_config_includes_opt_in_claude_runtime() {
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+        let claude = config.runtimes.get("claude").unwrap();
+
+        assert_eq!(claude.kind, RuntimeKind::Claude);
+        assert_eq!(claude.command.as_deref(), Some("claude"));
+        assert!(claude.args.is_empty());
+        assert_eq!(claude.prompt_mode, PromptMode::Stdin);
+        assert!(claude.api_key_env.is_none());
+        assert!(config
+            .agents
+            .values()
+            .all(|agent| agent.runtime != "claude"));
+    }
+
+    #[test]
     fn default_home_config_path_uses_dot_config_multiagent() {
         let path = default_home_config_path();
         assert!(path.ends_with(Path::new(".config/.multiagent/multiagent.toml")));
@@ -2192,6 +2353,95 @@ api_key_env = "ZAI_API_KEY"
     }
 
     #[test]
+    fn claude_runtime_type_deserializes() {
+        let config = load_from_temp(
+            r#"
+[runtimes.local_claude]
+type = "claude"
+
+[agents.explorer]
+runtime = "local_claude"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.runtimes["local_claude"].kind, RuntimeKind::Claude);
+        assert_eq!(
+            config.runtimes["local_claude"].command.as_deref(),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn claude_runtime_rejects_api_key_env() {
+        let error = load_from_temp(
+            r#"
+[runtimes.claude]
+api_key_env = "CLAUDE_API_KEY"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot set api_key_env"));
+    }
+
+    #[test]
+    fn claude_runtime_rejects_protected_args() {
+        for flag in [
+            "-p",
+            "--output-format",
+            "--tools",
+            "--allowedTools",
+            "--system-prompt",
+            "--model",
+            "--fallback-model",
+            "--max-turns",
+            "--max-budget-usd",
+            "--continue",
+            "--resume",
+            "--session-id",
+            "--mcp-config",
+            "--plugin-dir",
+            "--setting-sources",
+            "--add-dir",
+            "--worktree",
+            "--permission-mode",
+            "--dangerously-skip-permissions",
+            "--settings",
+            "--include-hook-events",
+            "--input-format",
+            "--json-schema",
+            "--debug-file",
+            "--from-pr",
+        ] {
+            let error = load_from_temp(&format!(
+                r#"
+[runtimes.claude]
+args = ["{flag}"]
+"#
+            ))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("protected flag"),
+                "flag {flag} produced {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_runtime_rejects_protected_args_with_values() {
+        let error = load_from_temp(
+            r#"
+[runtimes.claude]
+args = ["--tools=Bash"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("protected flag --tools"));
+    }
+
+    #[test]
     fn instruction_file_resolves_relative_to_declaring_config() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("agents")).unwrap();
@@ -2249,6 +2499,40 @@ api_key_env = "sk-secret"
         assert!(rendered.contains("prompt_source = \"inline_redacted\""));
         assert!(!rendered.contains("Own the run plan"));
         assert!(!rendered.contains("Bearer"));
+    }
+
+    #[test]
+    fn redacted_toml_prints_claude_authored_args_only() {
+        let config = load_from_temp(
+            r#"
+[runtimes.claude]
+args = ["--safe-compat"]
+"#,
+        )
+        .unwrap();
+
+        let rendered = to_redacted_toml(&config).unwrap();
+
+        assert!(rendered.contains("[runtimes.claude]"));
+        assert!(rendered.contains("type = \"claude\""));
+        assert!(rendered.contains("args = [\"--safe-compat\"]"));
+        assert!(rendered.contains("prompt_mode = \"stdin\""));
+        assert!(!rendered.contains("stream-json"));
+        assert!(!rendered.contains("--include-partial-messages"));
+        assert!(!rendered.contains("--no-session-persistence"));
+    }
+
+    #[test]
+    fn starter_config_includes_claude_runtime_without_protected_flags() {
+        let starter = starter_config_text();
+
+        assert!(starter.contains("[runtimes.claude]"));
+        assert!(starter.contains("type = \"claude\""));
+        assert!(starter.contains("command = \"claude\""));
+        assert!(starter.contains("args = []"));
+        assert!(starter.contains("prompt_mode = \"stdin\""));
+        assert!(!starter.contains("stream-json"));
+        assert!(!starter.contains("--include-partial-messages"));
     }
 
     #[test]
