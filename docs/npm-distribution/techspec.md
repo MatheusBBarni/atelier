@@ -268,6 +268,10 @@ npm-installed runtime.
 - reads `process.platform` and `process.arch`
 - maps to a supported target key
 - honors `ATELIER_BINARY_PATH`
+- handles standalone `--update` before native binary resolution
+- runs `npm install --global --include=optional --ignore-scripts --no-audit
+  --no-fund @matheusbbarni/atelier@latest` for updates, using the current npm
+  install prefix when it can be inferred from the package path
 - resolves the matching optional dependency binary with `require.resolve`
 - spawns the native binary with inherited stdio
 - passes argv, env, and cwd unchanged

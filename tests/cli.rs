@@ -33,3 +33,29 @@ fn init_config_tells_user_to_review_and_run_doctor() {
             ),
         );
 }
+
+#[test]
+fn help_lists_update_flag() {
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--update"));
+}
+
+#[test]
+fn native_update_points_to_npm_launcher() {
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .arg("--update")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("atelier --update is handled by the npm launcher").and(
+                predicate::str::contains(
+                    "npm install -g @matheusbbarni/atelier@latest --include=optional",
+                ),
+            ),
+        );
+}

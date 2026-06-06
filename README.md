@@ -46,6 +46,12 @@ installation. Supported npm targets are macOS arm64/x64, glibc Linux arm64/x64,
 and Windows arm64/x64. Alpine/musl Linux is not supported by the v1 npm
 packages.
 
+Update the npm-installed global command with:
+
+```bash
+atelier --update
+```
+
 Developer/source install:
 
 ```bash
@@ -79,6 +85,7 @@ atelier --codemap changes
 atelier --codemap update
 atelier --clean-sessions
 atelier --clean-sessions --yes
+atelier --update
 atelier --debug
 ```
 
@@ -89,6 +96,7 @@ Notes:
 - `--print-config` prints merged config with secrets redacted.
 - `--init-config` creates starter config/instruction files if missing.
 - `--codemap changes` reports stale maps without writing files.
+- `--update` is handled by the npm launcher and updates the global npm package.
 
 ## Codemaps
 

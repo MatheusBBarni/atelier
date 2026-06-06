@@ -14,3 +14,9 @@ glibc Linux, or Windows on arm64/x64.
 
 Installation does not initialize configuration, probe credentials, or start the
 TUI. Run `atelier --doctor` after installation to inspect runtime readiness.
+
+Update the global npm install with:
+
+```sh
+atelier --update
+```

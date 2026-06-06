@@ -36,6 +36,9 @@ pub struct Cli {
     #[arg(long)]
     pub clean_sessions: bool,
 
+    #[arg(long)]
+    pub update: bool,
+
     #[arg(long, value_enum)]
     pub codemap: Option<CodemapCommand>,
 
@@ -58,11 +61,31 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
     if cli.yes && !cli.clean_sessions {
         bail!("--yes is only valid with --clean-sessions");
     }
+    if cli.update
+        && (cli.cwd.is_some()
+            || cli.config.is_some()
+            || cli.doctor
+            || cli.json
+            || cli.print_config
+            || cli.init_config
+            || cli.clean_sessions
+            || cli.codemap.is_some()
+            || cli.yes
+            || cli.debug)
+    {
+        bail!("--update cannot be combined with other flags");
+    }
     if cli.codemap.is_some()
         && (cli.doctor || cli.print_config || cli.init_config || cli.clean_sessions)
     {
         bail!(
             "--codemap cannot be combined with --doctor, --print-config, --init-config, or --clean-sessions"
+        );
+    }
+
+    if cli.update {
+        bail!(
+            "atelier --update is handled by the npm launcher. Run `npm install -g @matheusbbarni/atelier@latest --include=optional` to update this native binary manually."
         );
     }
 
@@ -172,6 +195,7 @@ mod tests {
             print_config: true,
             init_config: false,
             clean_sessions: false,
+            update: false,
             codemap: None,
             yes: false,
             debug: false,
@@ -191,6 +215,7 @@ mod tests {
             print_config: false,
             init_config: false,
             clean_sessions: false,
+            update: false,
             codemap: Some(CodemapCommand::Init),
             yes: false,
             debug: false,
