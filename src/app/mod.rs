@@ -3318,10 +3318,22 @@ fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
     if !trimmed.starts_with('/') {
         return Ok(());
     }
+    if is_skill_prompt_prefix(trimmed) {
+        return Ok(());
+    }
     let command = trimmed.split_whitespace().next().unwrap_or(trimmed);
     bail!(
-        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>"
+        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>, /skill:<name>"
     )
+}
+
+fn is_skill_prompt_prefix(prompt: &str) -> bool {
+    let Some(rest) = prompt.strip_prefix("/skill:") else {
+        return false;
+    };
+    rest.split_whitespace()
+        .next()
+        .is_some_and(|name| !name.is_empty())
 }
 
 fn subtask_prompt(task: &str) -> String {
@@ -4369,6 +4381,31 @@ instructions_file = "agents/explorer.md"
         assert!(!events
             .iter()
             .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+    }
+
+    #[tokio::test]
+    async fn skill_prompt_prefix_is_allowed_as_agent_prompt() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/skill:fixer inspect README")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let history_events = app.history.read_events().unwrap();
+        let prompt = history_events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert_eq!(
+            prompt
+                .payload
+                .get("prompt")
+                .and_then(serde_json::Value::as_str),
+            Some("/skill:fixer inspect README")
+        );
     }
 
     #[tokio::test]

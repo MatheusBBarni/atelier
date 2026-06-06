@@ -32,6 +32,8 @@ const INPUT_COMPOSER_HEIGHT: u16 = 5;
 const INPUT_BOX_HEIGHT: u16 = 4;
 const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
+const SKILL_PREFIX: &str = "/skill:";
+const SKILL_DROPDOWN_MAX_ITEMS: usize = 6;
 const WORK_HINT: &str = "/help";
 const WORK_INDICATOR_HEIGHT: u16 = 1;
 const WORK_LABEL: &str = "Working";
@@ -46,6 +48,7 @@ enum TuiCommand {
     ToggleHelp,
     ScrollEvents(EventScrollCommand),
     MoveInputCursor(InputCursorCommand),
+    SkillDropdown(SkillDropdownCommand),
     InputCharacter(char),
     InputBackspace,
 }
@@ -68,6 +71,13 @@ enum InputCursorCommand {
     Down,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkillDropdownCommand {
+    Previous,
+    Next,
+    Accept,
+}
+
 #[derive(Debug)]
 enum AppWorkerCommand {
     Event(AppEvent),
@@ -86,6 +96,7 @@ struct TuiUiState {
     input_cursor: usize,
     input_preferred_col: Option<usize>,
     input_width: usize,
+    skill_selection_index: usize,
     work_spinner_frame: usize,
 }
 
@@ -102,9 +113,31 @@ impl Default for TuiUiState {
             input_cursor: 0,
             input_preferred_col: None,
             input_width: 1,
+            skill_selection_index: 0,
             work_spinner_frame: 0,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillToken {
+    value_start: usize,
+    value_end: usize,
+    query: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillSuggestion {
+    id: String,
+    name: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillDropdown {
+    token: SkillToken,
+    suggestions: Vec<SkillSuggestion>,
+    selected: usize,
 }
 
 pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()> {
@@ -223,6 +256,10 @@ async fn execute_tui_command_with_interrupt(
             move_input_cursor(ui_state, &state.input, command);
             Ok(true)
         }
+        TuiCommand::SkillDropdown(command) => {
+            apply_skill_dropdown_command(state, ui_state, command);
+            Ok(true)
+        }
         TuiCommand::InputCharacter(ch) => {
             insert_input_character(state, ui_state, ch);
             Ok(true)
@@ -329,19 +366,38 @@ fn key_event_to_tui_command_with_ui(
     ui_state: &TuiUiState,
     key: KeyEvent,
 ) -> Option<TuiCommand> {
-    if !ui_state.help_visible {
-        return key_event_to_tui_command(state, key);
+    if ui_state.help_visible {
+        match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => Some(TuiCommand::ToggleHelp),
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
+            _ => None,
+        }
+    } else if skill_dropdown(state, ui_state).is_some() {
+        skill_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+    } else {
+        key_event_to_tui_command(state, key)
     }
+}
 
+fn skill_dropdown_key_command(key: KeyEvent) -> Option<TuiCommand> {
     match key {
         KeyEvent {
-            code: KeyCode::Esc, ..
-        } => Some(TuiCommand::ToggleHelp),
+            code: KeyCode::Up, ..
+        } => Some(TuiCommand::SkillDropdown(SkillDropdownCommand::Previous)),
         KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers: KeyModifiers::CONTROL,
+            code: KeyCode::Down,
             ..
-        } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
+        } => Some(TuiCommand::SkillDropdown(SkillDropdownCommand::Next)),
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        } => Some(TuiCommand::SkillDropdown(SkillDropdownCommand::Accept)),
         _ => None,
     }
 }
@@ -453,6 +509,7 @@ fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
     state.input.clear();
     ui_state.input_cursor = 0;
     ui_state.input_preferred_col = None;
+    reset_skill_dropdown_selection(ui_state);
 }
 
 fn clamp_input_cursor(ui_state: &mut TuiUiState, input: &str) {
@@ -477,6 +534,7 @@ fn insert_input_character(state: &mut AppState, ui_state: &mut TuiUiState, ch: c
     state.input.insert(byte_index, ch);
     ui_state.input_cursor += 1;
     ui_state.input_preferred_col = None;
+    reset_skill_dropdown_selection(ui_state);
 }
 
 fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut TuiUiState) {
@@ -491,6 +549,7 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     state.input.replace_range(start..end, "");
     ui_state.input_cursor = removed_char_index;
     ui_state.input_preferred_col = None;
+    reset_skill_dropdown_selection(ui_state);
 }
 
 fn move_input_cursor(ui_state: &mut TuiUiState, input: &str, command: InputCursorCommand) {
@@ -509,6 +568,7 @@ fn move_input_cursor(ui_state: &mut TuiUiState, input: &str, command: InputCurso
             move_input_cursor_vertically(ui_state, input_len, command);
         }
     }
+    reset_skill_dropdown_selection(ui_state);
 }
 
 fn move_input_cursor_vertically(
@@ -569,6 +629,137 @@ fn event_max_scroll(ui_state: &TuiUiState) -> usize {
     ui_state
         .event_content_lines
         .saturating_sub(ui_state.event_viewport_lines.max(1))
+}
+
+fn reset_skill_dropdown_selection(ui_state: &mut TuiUiState) {
+    ui_state.skill_selection_index = 0;
+}
+
+fn apply_skill_dropdown_command(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    command: SkillDropdownCommand,
+) {
+    let Some(dropdown) = skill_dropdown(state, ui_state) else {
+        return;
+    };
+    let suggestion_count = dropdown.suggestions.len();
+    if suggestion_count == 0 {
+        return;
+    }
+
+    match command {
+        SkillDropdownCommand::Previous => {
+            ui_state.skill_selection_index = if dropdown.selected == 0 {
+                suggestion_count - 1
+            } else {
+                dropdown.selected - 1
+            };
+        }
+        SkillDropdownCommand::Next => {
+            ui_state.skill_selection_index = (dropdown.selected + 1) % suggestion_count;
+        }
+        SkillDropdownCommand::Accept => {
+            let suggestion = dropdown.suggestions[dropdown.selected].clone();
+            apply_skill_suggestion(state, ui_state, &dropdown.token, &suggestion);
+        }
+    }
+}
+
+fn apply_skill_suggestion(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    token: &SkillToken,
+    suggestion: &SkillSuggestion,
+) {
+    let start = byte_index_for_char(&state.input, token.value_start);
+    let end = byte_index_for_char(&state.input, token.value_end);
+    state.input.replace_range(start..end, &suggestion.id);
+
+    let inserted_len = input_char_count(&suggestion.id);
+    let skill_end = token.value_start + inserted_len;
+    let after_skill = byte_index_for_char(&state.input, skill_end);
+    if !state.input[after_skill..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        state.input.insert(after_skill, ' ');
+    }
+    ui_state.input_cursor = skill_end.saturating_add(1);
+    ui_state.input_preferred_col = None;
+    reset_skill_dropdown_selection(ui_state);
+}
+
+fn skill_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<SkillDropdown> {
+    let token = active_skill_token(&state.input, ui_state.input_cursor)?;
+    let suggestions = skill_suggestions(state, &token.query);
+    if suggestions.is_empty() {
+        return None;
+    }
+    let selected = ui_state
+        .skill_selection_index
+        .min(suggestions.len().saturating_sub(1));
+    Some(SkillDropdown {
+        token,
+        suggestions,
+        selected,
+    })
+}
+
+fn active_skill_token(input: &str, cursor: usize) -> Option<SkillToken> {
+    if !input.starts_with(SKILL_PREFIX) {
+        return None;
+    }
+    let prefix_len = input_char_count(SKILL_PREFIX);
+    if cursor < prefix_len {
+        return None;
+    }
+
+    let value_len = input[SKILL_PREFIX.len()..]
+        .chars()
+        .take_while(|ch| !ch.is_whitespace())
+        .count();
+    let value_start = prefix_len;
+    let value_end = value_start + value_len;
+    if cursor > value_end {
+        return None;
+    }
+    let start = byte_index_for_char(input, value_start);
+    let end = byte_index_for_char(input, value_end);
+    Some(SkillToken {
+        value_start,
+        value_end,
+        query: input[start..end].to_string(),
+    })
+}
+
+fn skill_suggestions(state: &AppState, query: &str) -> Vec<SkillSuggestion> {
+    let query = query.to_ascii_lowercase();
+    state
+        .agents
+        .iter()
+        .filter(|agent| agent.status != "disabled")
+        .filter(|agent| {
+            query.is_empty()
+                || agent.id.to_ascii_lowercase().contains(&query)
+                || agent.name.to_ascii_lowercase().contains(&query)
+        })
+        .map(|agent| SkillSuggestion {
+            id: agent.id.clone(),
+            name: agent.name.clone(),
+            detail: skill_suggestion_detail(agent),
+        })
+        .collect()
+}
+
+fn skill_suggestion_detail(agent: &crate::app::AgentView) -> String {
+    let capabilities = if agent.capabilities.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", agent.capabilities.join(","))
+    };
+    format!("{}/{}{}", agent.runtime, agent.model, capabilities)
 }
 
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
@@ -660,6 +851,9 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
     frame.render_widget(input, input_areas.input);
     render_input_status(frame, input_areas.status, ui_state, work_active);
+    if let Some(dropdown) = skill_dropdown(state, ui_state) {
+        render_skill_dropdown(frame, input_areas.input, &dropdown);
+    }
     if ui_state.help_visible {
         render_help_modal(frame);
     } else {
@@ -731,6 +925,86 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
             }),
             &mut scrollbar_state,
         );
+    }
+}
+
+fn render_skill_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &SkillDropdown) {
+    if input_area.y == 0 || input_area.width < 8 || dropdown.suggestions.is_empty() {
+        return;
+    }
+
+    let available_height = input_area.y.saturating_sub(frame.area().y);
+    if available_height < 3 {
+        return;
+    }
+    let visible_count = dropdown
+        .suggestions
+        .len()
+        .min(SKILL_DROPDOWN_MAX_ITEMS)
+        .min(usize::from(available_height.saturating_sub(2)));
+    if visible_count == 0 {
+        return;
+    }
+    let height = (visible_count as u16).saturating_add(2);
+    let selected = dropdown
+        .selected
+        .min(dropdown.suggestions.len().saturating_sub(1));
+    let first_visible = selected.saturating_sub(visible_count.saturating_sub(1));
+    let items = dropdown
+        .suggestions
+        .iter()
+        .enumerate()
+        .skip(first_visible)
+        .take(visible_count)
+        .map(|(index, suggestion)| skill_dropdown_item(suggestion, index == selected))
+        .collect::<Vec<_>>();
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width: input_area.width,
+        height,
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Skills ")
+            .title(Line::from(" Up/Down Enter ").right_aligned())
+            .title_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(Color::Yellow))
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
+}
+
+fn skill_dropdown_item(suggestion: &SkillSuggestion, selected: bool) -> ListItem<'static> {
+    let marker_style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let id_style = if selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let line = Line::from(vec![
+        Span::styled(if selected { "> " } else { "  " }, marker_style),
+        Span::styled(suggestion.id.clone(), id_style),
+        Span::raw("  "),
+        Span::styled(suggestion.name.clone(), Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled(suggestion.detail.clone(), Style::default().fg(Color::Gray)),
+    ]);
+    let item = ListItem::new(line);
+    if selected {
+        item.style(Style::default().bg(Color::DarkGray))
+    } else {
+        item
     }
 }
 
@@ -926,6 +1200,7 @@ fn render_help_modal(frame: &mut Frame) {
             Span::styled(" commands", Style::default().fg(Color::White)),
         ]),
         Line::from("/help + Enter        toggle this help"),
+        Line::from("/skill:<agent>       select skill with Up/Down + Enter"),
         Line::from("/goal <text> | /goal | /goal clear   manage session goal"),
         Line::from("/subtask <agent> <task>              run bounded child task"),
         Line::from("/config              show config files, preset, warnings"),
@@ -1650,6 +1925,7 @@ mod tests {
         let header = text.lines().find(|line| line.contains("Help")).unwrap();
         assert!(header.contains("Esc"));
         assert!(text.contains("/help + Enter"));
+        assert!(text.contains("/skill:<agent>"));
         assert!(text.contains("/goal <text>"));
         assert!(text.contains("/goal clear"));
         assert!(text.contains("/subtask <agent>"));
@@ -1662,6 +1938,121 @@ mod tests {
         assert!(text.contains("Home/End"));
         assert!(text.contains("atelier --doctor"));
         assert!(text.contains("atelier --clean-sessions"));
+    }
+
+    #[test]
+    fn renders_skill_dropdown_for_skill_prefix() {
+        let state = state_with_skill_agents("/skill:");
+        let ui_state = TuiUiState {
+            roster_visible: false,
+            input_cursor: input_char_count("/skill:"),
+            ..TuiUiState::default()
+        };
+
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
+
+        assert!(text.contains("Skills"));
+        assert!(text.contains("explorer"));
+        assert!(text.contains("fixer"));
+        assert!(!text.contains("archived"));
+    }
+
+    #[test]
+    fn skill_dropdown_filters_by_typed_skill_query() {
+        let state = state_with_skill_agents("/skill:fix");
+        let ui_state = TuiUiState {
+            roster_visible: false,
+            input_cursor: input_char_count("/skill:fix"),
+            ..TuiUiState::default()
+        };
+
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
+
+        assert!(text.contains("fixer"));
+        assert!(!text.contains("explorer"));
+    }
+
+    #[test]
+    fn skill_dropdown_arrow_keys_override_wrapped_input_cursor_movement() {
+        let state = state_with_skill_agents("/skill:");
+        let ui_state = ui_state_with_cursor_at_end(&state.input);
+
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SkillDropdown(SkillDropdownCommand::Previous))
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SkillDropdown(SkillDropdownCommand::Next))
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_dropdown_selection_cycles_without_app_event() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_skill_agents("/skill:");
+        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::SkillDropdown(SkillDropdownCommand::Next),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ui_state.skill_selection_index, 1);
+        assert_eq!(ui_state.input_cursor, input_char_count("/skill:"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn skill_dropdown_accept_replaces_query_and_preserves_prompt_rest() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_skill_agents("/skill:fi inspect docs");
+        let mut ui_state = TuiUiState {
+            input_cursor: input_char_count("/skill:fi"),
+            ..TuiUiState::default()
+        };
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::SkillDropdown(SkillDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.input, "/skill:fixer inspect docs");
+        assert_eq!(ui_state.input_cursor, input_char_count("/skill:fixer "));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn enter_submits_after_skill_selection_has_trailing_space() {
+        let state = state_with_skill_agents("/skill:fixer inspect docs");
+        let ui_state = ui_state_with_cursor_at_end(&state.input);
+
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+                "/skill:fixer inspect docs".to_string()
+            )))
+        );
     }
 
     #[tokio::test]
@@ -2193,6 +2584,33 @@ mod tests {
             chat_items: Vec::new(),
             events: Vec::new(),
             input: input.to_string(),
+        }
+    }
+
+    fn state_with_skill_agents(input: &str) -> AppState {
+        let mut state = state_with_input(input, false);
+        state.agents = vec![
+            agent_view("explorer", "Explorer", "idle", &["read"]),
+            agent_view("fixer", "Fixer", "idle", &["read", "edit", "verify"]),
+            agent_view("archived", "Archived", "disabled", &["read"]),
+        ];
+        state
+    }
+
+    fn agent_view(id: &str, name: &str, status: &str, capabilities: &[&str]) -> AgentView {
+        AgentView {
+            id: id.to_string(),
+            name: name.to_string(),
+            runtime: "fake".to_string(),
+            model: "default".to_string(),
+            effort: "medium".to_string(),
+            thinking: false,
+            capabilities: capabilities
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+            availability: None,
+            status: status.to_string(),
         }
     }
 
