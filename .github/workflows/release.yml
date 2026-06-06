@@ -284,13 +284,35 @@ jobs:
             throw new Error("manifest must include six platform packages and the top-level package");
           }
           for (const entry of [...platforms, top]) {
-            console.log(entry.filename);
+            console.log(`${entry.filename}\t${entry.package}@${entry.version}`);
           }
           NODE
 
-          while IFS= read -r filename; do
+          while IFS=$'\t' read -r filename package_version; do
+            if npm view "${package_version}" version >/dev/null 2>&1; then
+              echo "${package_version} is already published; skipping ${filename}"
+              continue
+            fi
+
             echo "Publishing ${filename}"
-            npm publish "target/npm-dist/${filename}" --access public --provenance
+            if npm publish "target/npm-dist/${filename}" --access public --provenance; then
+              continue
+            fi
+
+            echo "::warning::npm publish failed for ${package_version}; checking if the version became visible"
+            published=false
+            for attempt in {1..12}; do
+              if npm view "${package_version}" version >/dev/null 2>&1; then
+                published=true
+                break
+              fi
+              echo "Waiting for ${package_version} after publish failure (${attempt}/12)"
+              sleep 10
+            done
+            if [[ "${published}" != "true" ]]; then
+              echo "::error::npm publish failed and ${package_version} is not visible"
+              exit 1
+            fi
           done < /tmp/atelier-publish-order.txt
 
           node <<'NODE' > /tmp/atelier-view-order.txt
@@ -302,7 +324,19 @@ jobs:
           NODE
 
           while IFS= read -r package_version; do
-            npm view "${package_version}" version dist.integrity
+            visible=false
+            for attempt in {1..12}; do
+              if npm view "${package_version}" version dist.integrity; then
+                visible=true
+                break
+              fi
+              echo "Waiting for ${package_version} to become visible (${attempt}/12)"
+              sleep 10
+            done
+            if [[ "${visible}" != "true" ]]; then
+              echo "::error::${package_version} was not visible in the npm registry"
+              exit 1
+            fi
           done < /tmp/atelier-view-order.txt
 
   verify-registry-install:
