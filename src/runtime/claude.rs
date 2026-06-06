@@ -213,9 +213,22 @@ impl Runtime for ClaudeRuntime {
 
         let stdout_state = match stdout_state {
             Some(state) => state,
-            None => stdout_reader
+            None => match stdout_reader
                 .await
-                .context("claude stdout reader task failed")??,
+                .context("claude stdout reader task failed")?
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = stderr_reader.await;
+                    let _ = events
+                        .status(claude_failure_status(
+                            "Claude stream invalidated attempt",
+                            &error,
+                        ))
+                        .await;
+                    return Err(error);
+                }
+            },
         };
         let stderr = stderr_reader
             .await
