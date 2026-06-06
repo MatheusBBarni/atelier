@@ -3318,17 +3318,17 @@ fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
     if !trimmed.starts_with('/') {
         return Ok(());
     }
-    if is_skill_prompt_prefix(trimmed) {
+    if is_agent_prompt_prefix(trimmed) {
         return Ok(());
     }
     let command = trimmed.split_whitespace().next().unwrap_or(trimmed);
     bail!(
-        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>, /skill:<name>"
+        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>, /agent:<name>"
     )
 }
 
-fn is_skill_prompt_prefix(prompt: &str) -> bool {
-    let Some(rest) = prompt.strip_prefix("/skill:") else {
+fn is_agent_prompt_prefix(prompt: &str) -> bool {
+    let Some(rest) = prompt.strip_prefix("/agent:") else {
         return false;
     };
     rest.split_whitespace()
@@ -4384,12 +4384,12 @@ instructions_file = "agents/explorer.md"
     }
 
     #[tokio::test]
-    async fn skill_prompt_prefix_is_allowed_as_agent_prompt() {
+    async fn agent_prompt_prefix_is_allowed_as_agent_prompt() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
 
-        app.submit_prompt("/skill:fixer inspect README")
+        app.submit_prompt("/agent:fixer inspect README")
             .await
             .unwrap();
 
@@ -4404,7 +4404,7 @@ instructions_file = "agents/explorer.md"
                 .payload
                 .get("prompt")
                 .and_then(serde_json::Value::as_str),
-            Some("/skill:fixer inspect README")
+            Some("/agent:fixer inspect README")
         );
     }
 
