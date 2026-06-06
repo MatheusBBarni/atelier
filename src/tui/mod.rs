@@ -14,7 +14,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -22,8 +22,11 @@ use ratatui::widgets::{
     ScrollbarState, Wrap,
 };
 use ratatui::{Frame, Terminal};
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::io::{self, IsTerminal};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -33,7 +36,9 @@ const INPUT_BOX_HEIGHT: u16 = 4;
 const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
 const AGENT_PREFIX: &str = "/agent:";
-const AGENT_DROPDOWN_MAX_ITEMS: usize = 6;
+const SKILL_PREFIX: &str = "/skill:";
+const DROPDOWN_MAX_ITEMS: usize = 6;
+const SKILL_DISCOVERY_MAX_DEPTH: usize = 4;
 const WORK_HINT: &str = "/help";
 const WORK_INDICATOR_HEIGHT: u16 = 1;
 const WORK_LABEL: &str = "Working";
@@ -48,7 +53,8 @@ enum TuiCommand {
     ToggleHelp,
     ScrollEvents(EventScrollCommand),
     MoveInputCursor(InputCursorCommand),
-    AgentDropdown(AgentDropdownCommand),
+    AgentDropdown(DropdownCommand),
+    SkillDropdown(DropdownCommand),
     InputCharacter(char),
     InputBackspace,
 }
@@ -72,7 +78,7 @@ enum InputCursorCommand {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentDropdownCommand {
+enum DropdownCommand {
     Previous,
     Next,
     Accept,
@@ -97,6 +103,8 @@ struct TuiUiState {
     input_preferred_col: Option<usize>,
     input_width: usize,
     agent_selection_index: usize,
+    skill_suggestions: Vec<SkillSuggestion>,
+    skill_selection_index: usize,
     work_spinner_frame: usize,
 }
 
@@ -114,13 +122,24 @@ impl Default for TuiUiState {
             input_preferred_col: None,
             input_width: 1,
             agent_selection_index: 0,
+            skill_suggestions: Vec::new(),
+            skill_selection_index: 0,
             work_spinner_frame: 0,
         }
     }
 }
 
+impl TuiUiState {
+    fn with_skill_suggestions(skill_suggestions: Vec<SkillSuggestion>) -> Self {
+        Self {
+            skill_suggestions,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AgentToken {
+struct PromptToken {
     value_start: usize,
     value_end: usize,
     query: String,
@@ -135,9 +154,60 @@ struct AgentSuggestion {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentDropdown {
-    token: AgentToken,
+    token: PromptToken,
     suggestions: Vec<AgentSuggestion>,
     selected: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SkillSuggestion {
+    id: String,
+    tag: SkillSourceTag,
+    origin: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillDropdown {
+    token: PromptToken,
+    suggestions: Vec<SkillSuggestion>,
+    selected: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum SkillSourceTag {
+    Project,
+    Personal,
+}
+
+impl SkillSourceTag {
+    fn label(self) -> &'static str {
+        match self {
+            SkillSourceTag::Project => "Project",
+            SkillSourceTag::Personal => "Personal",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillRoot {
+    path: PathBuf,
+    tag: SkillSourceTag,
+    origin: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SkillFileFingerprint {
+    path: String,
+    byte_len: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SkillSuggestionCache {
+    schema_version: u32,
+    fingerprint: Vec<SkillFileFingerprint>,
+    suggestions: Vec<SkillSuggestion>,
 }
 
 pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()> {
@@ -146,6 +216,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
         return Ok(());
     }
 
+    let working_directory = config.working_directory.clone();
     let mut app = App::new_with_debug(config, debug_enabled).await?;
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
     app.attach_state_sender(state_sender);
@@ -159,13 +230,20 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let mut terminal = Terminal::new(backend)?;
     let worker = tokio::spawn(run_app_worker(app, command_receiver));
 
-    let result = run_loop(
-        &mut terminal,
-        state_receiver,
-        command_sender.clone(),
-        interrupt_handle,
-    )
-    .await;
+    let result = match terminal.draw(render_skill_loading) {
+        Ok(_) => {
+            let skill_suggestions = load_skill_suggestions(&working_directory);
+            run_loop(
+                &mut terminal,
+                state_receiver,
+                command_sender.clone(),
+                interrupt_handle,
+                skill_suggestions,
+            )
+            .await
+        }
+        Err(error) => Err(error).context("failed to render skill loading state"),
+    };
 
     let cleanup_result = (|| -> Result<()> {
         disable_raw_mode()?;
@@ -189,9 +267,10 @@ async fn run_loop(
     mut state_receiver: watch::Receiver<AppState>,
     command_sender: mpsc::Sender<AppWorkerCommand>,
     interrupt_handle: InterruptHandle,
+    skill_suggestions: Vec<SkillSuggestion>,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
-    let mut ui_state = TuiUiState::default();
+    let mut ui_state = TuiUiState::with_skill_suggestions(skill_suggestions);
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
@@ -258,6 +337,10 @@ async fn execute_tui_command_with_interrupt(
         }
         TuiCommand::AgentDropdown(command) => {
             apply_agent_dropdown_command(state, ui_state, command);
+            Ok(true)
+        }
+        TuiCommand::SkillDropdown(command) => {
+            apply_skill_dropdown_command(state, ui_state, command);
             Ok(true)
         }
         TuiCommand::InputCharacter(ch) => {
@@ -380,6 +463,8 @@ fn key_event_to_tui_command_with_ui(
         }
     } else if agent_dropdown(state, ui_state).is_some() {
         agent_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+    } else if skill_dropdown(&state.input, ui_state).is_some() {
+        skill_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
     } else {
         key_event_to_tui_command(state, key)
     }
@@ -389,15 +474,32 @@ fn agent_dropdown_key_command(key: KeyEvent) -> Option<TuiCommand> {
     match key {
         KeyEvent {
             code: KeyCode::Up, ..
-        } => Some(TuiCommand::AgentDropdown(AgentDropdownCommand::Previous)),
+        } => Some(TuiCommand::AgentDropdown(DropdownCommand::Previous)),
         KeyEvent {
             code: KeyCode::Down,
             ..
-        } => Some(TuiCommand::AgentDropdown(AgentDropdownCommand::Next)),
+        } => Some(TuiCommand::AgentDropdown(DropdownCommand::Next)),
         KeyEvent {
             code: KeyCode::Enter,
             ..
-        } => Some(TuiCommand::AgentDropdown(AgentDropdownCommand::Accept)),
+        } => Some(TuiCommand::AgentDropdown(DropdownCommand::Accept)),
+        _ => None,
+    }
+}
+
+fn skill_dropdown_key_command(key: KeyEvent) -> Option<TuiCommand> {
+    match key {
+        KeyEvent {
+            code: KeyCode::Up, ..
+        } => Some(TuiCommand::SkillDropdown(DropdownCommand::Previous)),
+        KeyEvent {
+            code: KeyCode::Down,
+            ..
+        } => Some(TuiCommand::SkillDropdown(DropdownCommand::Next)),
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        } => Some(TuiCommand::SkillDropdown(DropdownCommand::Accept)),
         _ => None,
     }
 }
@@ -509,7 +611,7 @@ fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
     state.input.clear();
     ui_state.input_cursor = 0;
     ui_state.input_preferred_col = None;
-    reset_agent_dropdown_selection(ui_state);
+    reset_dropdown_selections(ui_state);
 }
 
 fn clamp_input_cursor(ui_state: &mut TuiUiState, input: &str) {
@@ -534,7 +636,7 @@ fn insert_input_character(state: &mut AppState, ui_state: &mut TuiUiState, ch: c
     state.input.insert(byte_index, ch);
     ui_state.input_cursor += 1;
     ui_state.input_preferred_col = None;
-    reset_agent_dropdown_selection(ui_state);
+    reset_dropdown_selections(ui_state);
 }
 
 fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut TuiUiState) {
@@ -549,7 +651,7 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     state.input.replace_range(start..end, "");
     ui_state.input_cursor = removed_char_index;
     ui_state.input_preferred_col = None;
-    reset_agent_dropdown_selection(ui_state);
+    reset_dropdown_selections(ui_state);
 }
 
 fn move_input_cursor(ui_state: &mut TuiUiState, input: &str, command: InputCursorCommand) {
@@ -568,7 +670,7 @@ fn move_input_cursor(ui_state: &mut TuiUiState, input: &str, command: InputCurso
             move_input_cursor_vertically(ui_state, input_len, command);
         }
     }
-    reset_agent_dropdown_selection(ui_state);
+    reset_dropdown_selections(ui_state);
 }
 
 fn move_input_cursor_vertically(
@@ -631,14 +733,256 @@ fn event_max_scroll(ui_state: &TuiUiState) -> usize {
         .saturating_sub(ui_state.event_viewport_lines.max(1))
 }
 
+fn load_skill_suggestions(working_directory: &Path) -> Vec<SkillSuggestion> {
+    let roots = skill_roots(working_directory);
+    let fingerprint = skill_file_fingerprints(&roots);
+    if let Some(suggestions) = read_cached_skill_suggestions(working_directory, &fingerprint) {
+        return suggestions;
+    }
+
+    let suggestions = discover_skill_suggestions_from_roots(&roots);
+    let _ = write_skill_suggestion_cache(working_directory, &fingerprint, &suggestions);
+    suggestions
+}
+
+fn skill_cache_path(working_directory: &Path) -> PathBuf {
+    working_directory
+        .join(".multiagent")
+        .join("skills-cache.json")
+}
+
+fn read_cached_skill_suggestions(
+    working_directory: &Path,
+    fingerprint: &[SkillFileFingerprint],
+) -> Option<Vec<SkillSuggestion>> {
+    let contents = fs::read_to_string(skill_cache_path(working_directory)).ok()?;
+    let cache: SkillSuggestionCache = serde_json::from_str(&contents).ok()?;
+    if cache.schema_version == 1 && cache.fingerprint == fingerprint {
+        Some(cache.suggestions)
+    } else {
+        None
+    }
+}
+
+fn write_skill_suggestion_cache(
+    working_directory: &Path,
+    fingerprint: &[SkillFileFingerprint],
+    suggestions: &[SkillSuggestion],
+) -> Result<()> {
+    let path = skill_cache_path(working_directory);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let cache = SkillSuggestionCache {
+        schema_version: 1,
+        fingerprint: fingerprint.to_vec(),
+        suggestions: suggestions.to_vec(),
+    };
+    fs::write(&path, serde_json::to_vec_pretty(&cache)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn skill_roots(working_directory: &Path) -> Vec<SkillRoot> {
+    let mut roots = vec![
+        SkillRoot {
+            path: working_directory.join(".agents/skills"),
+            tag: SkillSourceTag::Project,
+            origin: ".agents/skills",
+        },
+        SkillRoot {
+            path: working_directory.join(".claude/skills"),
+            tag: SkillSourceTag::Project,
+            origin: ".claude/skills",
+        },
+    ];
+    if let Some(home) = dirs::home_dir() {
+        roots.extend([
+            SkillRoot {
+                path: home.join(".agents/skills"),
+                tag: SkillSourceTag::Personal,
+                origin: "~/.agents/skills",
+            },
+            SkillRoot {
+                path: home.join(".claude/skills"),
+                tag: SkillSourceTag::Personal,
+                origin: "~/.claude/skills",
+            },
+        ]);
+    }
+    roots
+}
+
+fn skill_file_fingerprints(roots: &[SkillRoot]) -> Vec<SkillFileFingerprint> {
+    let mut fingerprints = Vec::new();
+    for root in roots {
+        collect_skill_file_fingerprints(&root.path, 0, &mut fingerprints);
+    }
+    fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
+    fingerprints
+}
+
+fn collect_skill_file_fingerprints(
+    directory: &Path,
+    depth: usize,
+    fingerprints: &mut Vec<SkillFileFingerprint>,
+) {
+    if depth > SKILL_DISCOVERY_MAX_DEPTH {
+        return;
+    }
+    let skill_file = directory.join("SKILL.md");
+    if let Ok(metadata) = fs::metadata(&skill_file) {
+        if metadata.is_file() {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok());
+            fingerprints.push(SkillFileFingerprint {
+                path: skill_file.to_string_lossy().to_string(),
+                byte_len: metadata.len(),
+                modified_secs: modified.map_or(0, |duration| duration.as_secs()),
+                modified_nanos: modified.map_or(0, |duration| duration.subsec_nanos()),
+            });
+        }
+    }
+
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_skill_file_fingerprints(&path, depth + 1, fingerprints);
+        }
+    }
+}
+
+fn discover_skill_suggestions_from_roots(roots: &[SkillRoot]) -> Vec<SkillSuggestion> {
+    let mut suggestions = roots
+        .iter()
+        .flat_map(discover_skill_suggestions_from_root)
+        .collect::<Vec<_>>();
+    suggestions.sort_by(|left, right| {
+        (
+            skill_tag_rank(left.tag),
+            left.id.as_str(),
+            left.origin.as_str(),
+        )
+            .cmp(&(
+                skill_tag_rank(right.tag),
+                right.id.as_str(),
+                right.origin.as_str(),
+            ))
+    });
+    suggestions
+}
+
+fn discover_skill_suggestions_from_root(root: &SkillRoot) -> Vec<SkillSuggestion> {
+    let mut suggestions = Vec::new();
+    collect_skill_suggestions(&root.path, root, 0, &mut suggestions);
+    suggestions
+}
+
+fn collect_skill_suggestions(
+    directory: &Path,
+    root: &SkillRoot,
+    depth: usize,
+    suggestions: &mut Vec<SkillSuggestion>,
+) {
+    if depth > SKILL_DISCOVERY_MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(suggestion) = skill_suggestion_from_dir(&path, root) {
+            suggestions.push(suggestion);
+        }
+        collect_skill_suggestions(&path, root, depth + 1, suggestions);
+    }
+}
+
+fn skill_suggestion_from_dir(path: &Path, root: &SkillRoot) -> Option<SkillSuggestion> {
+    if !path.is_dir() {
+        return None;
+    }
+    let skill_file = path.join("SKILL.md");
+    if !skill_file.is_file() {
+        return None;
+    }
+    let id = skill_name_from_file(&skill_file).or_else(|| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .filter(|name| is_valid_skill_id(name))
+    })?;
+    Some(SkillSuggestion {
+        id,
+        tag: root.tag,
+        origin: root.origin.to_string(),
+    })
+}
+
+fn skill_name_from_file(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+    for line in lines.take(80) {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            return None;
+        }
+        if let Some(value) = trimmed.strip_prefix("name:") {
+            return clean_skill_name(value);
+        }
+    }
+    None
+}
+
+fn clean_skill_name(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    is_valid_skill_id(&value).then_some(value)
+}
+
+fn is_valid_skill_id(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_whitespace)
+}
+
+fn skill_tag_rank(tag: SkillSourceTag) -> u8 {
+    match tag {
+        SkillSourceTag::Project => 0,
+        SkillSourceTag::Personal => 1,
+    }
+}
+
+fn reset_dropdown_selections(ui_state: &mut TuiUiState) {
+    reset_agent_dropdown_selection(ui_state);
+    reset_skill_dropdown_selection(ui_state);
+}
+
 fn reset_agent_dropdown_selection(ui_state: &mut TuiUiState) {
     ui_state.agent_selection_index = 0;
+}
+
+fn reset_skill_dropdown_selection(ui_state: &mut TuiUiState) {
+    ui_state.skill_selection_index = 0;
 }
 
 fn apply_agent_dropdown_command(
     state: &mut AppState,
     ui_state: &mut TuiUiState,
-    command: AgentDropdownCommand,
+    command: DropdownCommand,
 ) {
     let Some(dropdown) = agent_dropdown(state, ui_state) else {
         return;
@@ -649,17 +993,17 @@ fn apply_agent_dropdown_command(
     }
 
     match command {
-        AgentDropdownCommand::Previous => {
+        DropdownCommand::Previous => {
             ui_state.agent_selection_index = if dropdown.selected == 0 {
                 suggestion_count - 1
             } else {
                 dropdown.selected - 1
             };
         }
-        AgentDropdownCommand::Next => {
+        DropdownCommand::Next => {
             ui_state.agent_selection_index = (dropdown.selected + 1) % suggestion_count;
         }
-        AgentDropdownCommand::Accept => {
+        DropdownCommand::Accept => {
             let suggestion = dropdown.suggestions[dropdown.selected].clone();
             apply_agent_suggestion(state, ui_state, &dropdown.token, &suggestion);
         }
@@ -669,7 +1013,7 @@ fn apply_agent_dropdown_command(
 fn apply_agent_suggestion(
     state: &mut AppState,
     ui_state: &mut TuiUiState,
-    token: &AgentToken,
+    token: &PromptToken,
     suggestion: &AgentSuggestion,
 ) {
     let start = byte_index_for_char(&state.input, token.value_start);
@@ -688,11 +1032,11 @@ fn apply_agent_suggestion(
     }
     ui_state.input_cursor = agent_end.saturating_add(1);
     ui_state.input_preferred_col = None;
-    reset_agent_dropdown_selection(ui_state);
+    reset_dropdown_selections(ui_state);
 }
 
 fn agent_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<AgentDropdown> {
-    let token = active_agent_token(&state.input, ui_state.input_cursor)?;
+    let token = active_prompt_token(&state.input, ui_state.input_cursor, AGENT_PREFIX)?;
     let suggestions = agent_suggestions(state, &token.query);
     if suggestions.is_empty() {
         return None;
@@ -707,16 +1051,88 @@ fn agent_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<AgentDropdo
     })
 }
 
-fn active_agent_token(input: &str, cursor: usize) -> Option<AgentToken> {
-    if !input.starts_with(AGENT_PREFIX) {
+fn apply_skill_dropdown_command(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    command: DropdownCommand,
+) {
+    let Some(dropdown) = skill_dropdown(&state.input, ui_state) else {
+        return;
+    };
+    let suggestion_count = dropdown.suggestions.len();
+    if suggestion_count == 0 {
+        return;
+    }
+
+    match command {
+        DropdownCommand::Previous => {
+            ui_state.skill_selection_index = if dropdown.selected == 0 {
+                suggestion_count - 1
+            } else {
+                dropdown.selected - 1
+            };
+        }
+        DropdownCommand::Next => {
+            ui_state.skill_selection_index = (dropdown.selected + 1) % suggestion_count;
+        }
+        DropdownCommand::Accept => {
+            let suggestion = dropdown.suggestions[dropdown.selected].clone();
+            apply_skill_suggestion(state, ui_state, &dropdown.token, &suggestion);
+        }
+    }
+}
+
+fn apply_skill_suggestion(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    token: &PromptToken,
+    suggestion: &SkillSuggestion,
+) {
+    let start = byte_index_for_char(&state.input, token.value_start);
+    let end = byte_index_for_char(&state.input, token.value_end);
+    state.input.replace_range(start..end, &suggestion.id);
+
+    let inserted_len = input_char_count(&suggestion.id);
+    let skill_end = token.value_start + inserted_len;
+    let after_skill = byte_index_for_char(&state.input, skill_end);
+    if !state.input[after_skill..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        state.input.insert(after_skill, ' ');
+    }
+    ui_state.input_cursor = skill_end.saturating_add(1);
+    ui_state.input_preferred_col = None;
+    reset_dropdown_selections(ui_state);
+}
+
+fn skill_dropdown(input: &str, ui_state: &TuiUiState) -> Option<SkillDropdown> {
+    let token = active_prompt_token(input, ui_state.input_cursor, SKILL_PREFIX)?;
+    let suggestions = skill_suggestions(&ui_state.skill_suggestions, &token.query);
+    if suggestions.is_empty() {
         return None;
     }
-    let prefix_len = input_char_count(AGENT_PREFIX);
+    let selected = ui_state
+        .skill_selection_index
+        .min(suggestions.len().saturating_sub(1));
+    Some(SkillDropdown {
+        token,
+        suggestions,
+        selected,
+    })
+}
+
+fn active_prompt_token(input: &str, cursor: usize, prefix: &str) -> Option<PromptToken> {
+    if !input.starts_with(prefix) {
+        return None;
+    }
+    let prefix_len = input_char_count(prefix);
     if cursor < prefix_len {
         return None;
     }
 
-    let value_len = input[AGENT_PREFIX.len()..]
+    let value_len = input[prefix.len()..]
         .chars()
         .take_while(|ch| !ch.is_whitespace())
         .count();
@@ -727,7 +1143,7 @@ fn active_agent_token(input: &str, cursor: usize) -> Option<AgentToken> {
     }
     let start = byte_index_for_char(input, value_start);
     let end = byte_index_for_char(input, value_end);
-    Some(AgentToken {
+    Some(PromptToken {
         value_start,
         value_end,
         query: input[start..end].to_string(),
@@ -753,6 +1169,15 @@ fn agent_suggestions(state: &AppState, query: &str) -> Vec<AgentSuggestion> {
         .collect()
 }
 
+fn skill_suggestions(skills: &[SkillSuggestion], query: &str) -> Vec<SkillSuggestion> {
+    let query = query.to_ascii_lowercase();
+    skills
+        .iter()
+        .filter(|skill| query.is_empty() || skill.id.to_ascii_lowercase().contains(&query))
+        .cloned()
+        .collect()
+}
+
 fn agent_suggestion_detail(agent: &crate::app::AgentView) -> String {
     let capabilities = if agent.capabilities.is_empty() {
         String::new()
@@ -760,6 +1185,34 @@ fn agent_suggestion_detail(agent: &crate::app::AgentView) -> String {
         format!(" {}", agent.capabilities.join(","))
     };
     format!("{}/{}{}", agent.runtime, agent.model, capabilities)
+}
+
+fn render_skill_loading(frame: &mut Frame) {
+    let area = frame.area();
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Loading skills",
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("...", Style::default().fg(Color::White)),
+        ]),
+        Line::from("Scanning project and personal skill folders"),
+    ];
+    let paragraph = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::Gray))
+        .block(
+            Block::default()
+                .title(" Atelier ")
+                .title_style(Style::default().fg(Color::Yellow))
+                .border_style(Style::default().fg(Color::Yellow))
+                .borders(Borders::ALL),
+        );
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
@@ -853,6 +1306,8 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     render_input_status(frame, input_areas.status, ui_state, work_active);
     if let Some(dropdown) = agent_dropdown(state, ui_state) {
         render_agent_dropdown(frame, input_areas.input, &dropdown);
+    } else if let Some(dropdown) = skill_dropdown(&state.input, ui_state) {
+        render_skill_dropdown(frame, input_areas.input, &dropdown);
     }
     if ui_state.help_visible {
         render_help_modal(frame);
@@ -940,7 +1395,7 @@ fn render_agent_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &AgentDr
     let visible_count = dropdown
         .suggestions
         .len()
-        .min(AGENT_DROPDOWN_MAX_ITEMS)
+        .min(DROPDOWN_MAX_ITEMS)
         .min(usize::from(available_height.saturating_sub(2)));
     if visible_count == 0 {
         return;
@@ -999,6 +1454,93 @@ fn agent_dropdown_item(suggestion: &AgentSuggestion, selected: bool) -> ListItem
         Span::styled(suggestion.name.clone(), Style::default().fg(Color::White)),
         Span::raw("  "),
         Span::styled(suggestion.detail.clone(), Style::default().fg(Color::Gray)),
+    ]);
+    let item = ListItem::new(line);
+    if selected {
+        item.style(Style::default().bg(Color::DarkGray))
+    } else {
+        item
+    }
+}
+
+fn render_skill_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &SkillDropdown) {
+    if input_area.y == 0 || input_area.width < 8 || dropdown.suggestions.is_empty() {
+        return;
+    }
+
+    let available_height = input_area.y.saturating_sub(frame.area().y);
+    if available_height < 3 {
+        return;
+    }
+    let visible_count = dropdown
+        .suggestions
+        .len()
+        .min(DROPDOWN_MAX_ITEMS)
+        .min(usize::from(available_height.saturating_sub(2)));
+    if visible_count == 0 {
+        return;
+    }
+    let height = (visible_count as u16).saturating_add(2);
+    let selected = dropdown
+        .selected
+        .min(dropdown.suggestions.len().saturating_sub(1));
+    let first_visible = selected.saturating_sub(visible_count.saturating_sub(1));
+    let items = dropdown
+        .suggestions
+        .iter()
+        .enumerate()
+        .skip(first_visible)
+        .take(visible_count)
+        .map(|(index, suggestion)| skill_dropdown_item(suggestion, index == selected))
+        .collect::<Vec<_>>();
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width: input_area.width,
+        height,
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Skills ")
+            .title(Line::from(" Up/Down Enter ").right_aligned())
+            .title_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(Color::Yellow))
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
+}
+
+fn skill_dropdown_item(suggestion: &SkillSuggestion, selected: bool) -> ListItem<'static> {
+    let marker_style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let id_style = if selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let tag_style = Style::default()
+        .fg(Color::Black)
+        .bg(match suggestion.tag {
+            SkillSourceTag::Project => Color::LightGreen,
+            SkillSourceTag::Personal => Color::LightBlue,
+        })
+        .add_modifier(Modifier::BOLD);
+    let line = Line::from(vec![
+        Span::styled(if selected { "> " } else { "  " }, marker_style),
+        Span::styled(suggestion.id.clone(), id_style),
+        Span::raw("  "),
+        Span::styled(format!(" {} ", suggestion.tag.label()), tag_style),
+        Span::raw("  "),
+        Span::styled(suggestion.origin.clone(), Style::default().fg(Color::Gray)),
     ]);
     let item = ListItem::new(line);
     if selected {
@@ -1509,6 +2051,7 @@ mod tests {
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
     use ratatui::backend::TestBackend;
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn renders_empty_tui_surfaces() {
@@ -1531,6 +2074,24 @@ mod tests {
         assert!(text.contains(">"));
         assert!(!text.contains("Input Composer"));
         assert!(text.contains("No chat yet."));
+    }
+
+    #[test]
+    fn renders_skill_loading_state() {
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(render_skill_loading).unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Loading skills"));
+        assert!(text.contains("Scanning project and personal skill folders"));
     }
 
     #[test]
@@ -1988,7 +2549,7 @@ mod tests {
                 &ui_state,
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
             ),
-            Some(TuiCommand::AgentDropdown(AgentDropdownCommand::Previous))
+            Some(TuiCommand::AgentDropdown(DropdownCommand::Previous))
         );
         assert_eq!(
             key_event_to_tui_command_with_ui(
@@ -1996,7 +2557,7 @@ mod tests {
                 &ui_state,
                 KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
             ),
-            Some(TuiCommand::AgentDropdown(AgentDropdownCommand::Next))
+            Some(TuiCommand::AgentDropdown(DropdownCommand::Next))
         );
     }
 
@@ -2010,7 +2571,7 @@ mod tests {
             &mut state,
             &mut ui_state,
             &sender,
-            TuiCommand::AgentDropdown(AgentDropdownCommand::Next),
+            TuiCommand::AgentDropdown(DropdownCommand::Next),
         )
         .await
         .unwrap();
@@ -2033,7 +2594,7 @@ mod tests {
             &mut state,
             &mut ui_state,
             &sender,
-            TuiCommand::AgentDropdown(AgentDropdownCommand::Accept),
+            TuiCommand::AgentDropdown(DropdownCommand::Accept),
         )
         .await
         .unwrap();
@@ -2041,6 +2602,219 @@ mod tests {
         assert_eq!(state.input, "/agent:fixer inspect docs");
         assert_eq!(ui_state.input_cursor, input_char_count("/agent:fixer "));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn renders_skill_dropdown_for_skill_prefix() {
+        let state = state_with_input("/skill:", false);
+        let ui_state = ui_state_with_skills_at_end(&state.input);
+
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
+
+        assert!(text.contains("Skills"));
+        assert!(text.contains("project-alpha"));
+        assert!(text.contains("personal-beta"));
+        assert!(text.contains("Project"));
+        assert!(text.contains("Personal"));
+    }
+
+    #[test]
+    fn skill_dropdown_filters_by_typed_skill_query() {
+        let state = state_with_input("/skill:personal", false);
+        let ui_state = ui_state_with_skills_at_end(&state.input);
+
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
+
+        assert!(text.contains("personal-beta"));
+        assert!(!text.contains("project-alpha"));
+    }
+
+    #[test]
+    fn skill_dropdown_arrow_keys_override_wrapped_input_cursor_movement() {
+        let state = state_with_input("/skill:", false);
+        let ui_state = ui_state_with_skills_at_end(&state.input);
+
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SkillDropdown(DropdownCommand::Previous))
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SkillDropdown(DropdownCommand::Next))
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_dropdown_selection_cycles_without_app_event() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/skill:", false);
+        let mut ui_state = ui_state_with_skills_at_end(&state.input);
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::SkillDropdown(DropdownCommand::Next),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ui_state.skill_selection_index, 1);
+        assert_eq!(ui_state.input_cursor, input_char_count("/skill:"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn skill_dropdown_accept_replaces_query_and_preserves_prompt_rest() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/skill:personal inspect docs", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: input_char_count("/skill:personal"),
+            skill_suggestions: test_skill_suggestions(),
+            ..TuiUiState::default()
+        };
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::SkillDropdown(DropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.input, "/skill:personal-beta inspect docs");
+        assert_eq!(
+            ui_state.input_cursor,
+            input_char_count("/skill:personal-beta ")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn discovers_project_and_personal_skills_from_agent_and_claude_roots() {
+        let dir = tempdir().unwrap();
+        let project_agents = dir.path().join(".agents/skills");
+        let project_claude = dir.path().join(".claude/skills");
+        let personal_agents = dir.path().join("home/.agents/skills");
+        let personal_claude = dir.path().join("home/.claude/skills");
+        write_skill(&project_agents, "project-agent", "frontmatter-project");
+        write_skill(
+            &project_agents.join(".system"),
+            "project-system",
+            "nested-project",
+        );
+        write_skill_without_name(&project_claude, "project-claude");
+        write_skill(&personal_agents, "personal-agent", "frontmatter-personal");
+        write_skill(&personal_claude, "personal-claude", "personal-claude");
+
+        let roots = vec![
+            SkillRoot {
+                path: project_agents,
+                tag: SkillSourceTag::Project,
+                origin: ".agents/skills",
+            },
+            SkillRoot {
+                path: project_claude,
+                tag: SkillSourceTag::Project,
+                origin: ".claude/skills",
+            },
+            SkillRoot {
+                path: personal_agents,
+                tag: SkillSourceTag::Personal,
+                origin: "~/.agents/skills",
+            },
+            SkillRoot {
+                path: personal_claude,
+                tag: SkillSourceTag::Personal,
+                origin: "~/.claude/skills",
+            },
+        ];
+
+        let suggestions = discover_skill_suggestions_from_roots(&roots);
+
+        assert_eq!(
+            suggestions,
+            vec![
+                SkillSuggestion {
+                    id: "frontmatter-project".to_string(),
+                    tag: SkillSourceTag::Project,
+                    origin: ".agents/skills".to_string(),
+                },
+                SkillSuggestion {
+                    id: "nested-project".to_string(),
+                    tag: SkillSourceTag::Project,
+                    origin: ".agents/skills".to_string(),
+                },
+                SkillSuggestion {
+                    id: "project-claude".to_string(),
+                    tag: SkillSourceTag::Project,
+                    origin: ".claude/skills".to_string(),
+                },
+                SkillSuggestion {
+                    id: "frontmatter-personal".to_string(),
+                    tag: SkillSourceTag::Personal,
+                    origin: "~/.agents/skills".to_string(),
+                },
+                SkillSuggestion {
+                    id: "personal-claude".to_string(),
+                    tag: SkillSourceTag::Personal,
+                    origin: "~/.claude/skills".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_cached_skill_suggestions_when_fingerprint_matches() {
+        let dir = tempdir().unwrap();
+        let fingerprint = vec![SkillFileFingerprint {
+            path: "project/SKILL.md".to_string(),
+            byte_len: 10,
+            modified_secs: 20,
+            modified_nanos: 30,
+        }];
+        let suggestions = test_skill_suggestions();
+
+        write_skill_suggestion_cache(dir.path(), &fingerprint, &suggestions).unwrap();
+
+        assert_eq!(
+            read_cached_skill_suggestions(dir.path(), &fingerprint),
+            Some(suggestions)
+        );
+    }
+
+    #[test]
+    fn ignores_cached_skill_suggestions_when_fingerprint_changes() {
+        let dir = tempdir().unwrap();
+        let cached_fingerprint = vec![SkillFileFingerprint {
+            path: "project/SKILL.md".to_string(),
+            byte_len: 10,
+            modified_secs: 20,
+            modified_nanos: 30,
+        }];
+        let current_fingerprint = vec![SkillFileFingerprint {
+            path: "project/SKILL.md".to_string(),
+            byte_len: 11,
+            modified_secs: 20,
+            modified_nanos: 30,
+        }];
+
+        write_skill_suggestion_cache(dir.path(), &cached_fingerprint, &test_skill_suggestions())
+            .unwrap();
+
+        assert_eq!(
+            read_cached_skill_suggestions(dir.path(), &current_fingerprint),
+            None
+        );
     }
 
     #[test]
@@ -2601,6 +3375,49 @@ mod tests {
             input_cursor: input_char_count(input),
             ..TuiUiState::default()
         }
+    }
+
+    fn ui_state_with_skills_at_end(input: &str) -> TuiUiState {
+        TuiUiState {
+            input_cursor: input_char_count(input),
+            skill_suggestions: test_skill_suggestions(),
+            ..TuiUiState::default()
+        }
+    }
+
+    fn test_skill_suggestions() -> Vec<SkillSuggestion> {
+        vec![
+            SkillSuggestion {
+                id: "project-alpha".to_string(),
+                tag: SkillSourceTag::Project,
+                origin: ".agents/skills".to_string(),
+            },
+            SkillSuggestion {
+                id: "personal-beta".to_string(),
+                tag: SkillSourceTag::Personal,
+                origin: "~/.agents/skills".to_string(),
+            },
+        ]
+    }
+
+    fn write_skill(root: &Path, directory: &str, name: &str) {
+        let skill_dir = root.join(directory);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill\n---\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_skill_without_name(root: &Path, directory: &str) {
+        let skill_dir = root.join(directory);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: test skill\n---\n",
+        )
+        .unwrap();
     }
 
     fn state_with_agent_roster(input: &str) -> AppState {
