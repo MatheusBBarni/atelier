@@ -12,8 +12,8 @@ agent profile select a Cursor-backed execution runtime without changing the
 harness action model, configuration layering, runtime availability reporting, or
 session history contract.
 
-The current harness supports `codex`, `zai`, and `fake` runtime kinds. Cursor is
-closest to Codex and the planned Claude runtime because it is a local child CLI
+The current harness supports `codex`, `claude`, `zai`, and `fake` runtime kinds. Cursor is
+closest to Codex and Claude because it is a local child CLI
 process with its own authentication and CLI-specific output formats. Cursor is
 not installed in this local environment yet, so implementation details must be
 validated with fake command fixtures and the official CLI contract before any
@@ -52,7 +52,7 @@ semantics, stream JSON events, tool-call events, and failure modes.
    runtime command is installed and authenticated, so setup failures are visible
    before a run.
 5. As a developer, I want missing Cursor authentication to point me to
-   `agent login`, `agent status`, or `CURSOR_API_KEY` setup, so I
+   `cursor-agent login`, `cursor-agent status`, or `CURSOR_API_KEY` setup, so I
    can fix auth through supported Cursor flows.
 6. As a developer, I want Cursor output parsed through the same
    action-request, orchestrator-decision, and agent-result contracts as other
@@ -69,19 +69,19 @@ semantics, stream JSON events, tool-call events, and failure modes.
 - Add `RuntimeKind::Cursor` and a `CursorRuntime` module instead of overloading
   the existing `CodexRuntime`.
 - Use `cursor` as the runtime kind and built-in runtime id. The local command is
-  configurable, with `agent` as the default Cursor Agent CLI executable.
+  configurable, with `cursor-agent` as the default Cursor Agent CLI executable.
 - Add a built-in runtime entry:
 
   ```toml
   [runtimes.cursor]
   type = "cursor"
-  command = "agent"
+  command = "cursor-agent"
   args = []
   prompt_mode = "stdin"
   ```
 
 - Do not add Cursor credential configuration for the first CLI integration.
-  Cursor-owned saved login through `agent login` is the primary setup
+  Cursor-owned saved login through `cursor-agent login` is the primary setup
   path. `CURSOR_API_KEY` may be used as an optional environment-owned automation
   fallback, but the harness should not require or persist a Cursor Credential
   Reference.
@@ -94,7 +94,7 @@ semantics, stream JSON events, tool-call events, and failure modes.
   Profiles, Custom Agents, Harness Configuration, or Local Configuration.
 - Use a prompt envelope equivalent to the Codex Runtime envelope, adjusted only
   where Cursor-specific wording is necessary.
-- Use `agent --print --output-format stream-json` as the first execution
+- Use `cursor-agent --print --output-format stream-json` as the first execution
   path. Parse safe progress from NDJSON events and parse only the terminal
   `result` event through the existing harness-owned structured output contract.
 - For `--doctor`, resolve the configured Cursor command, run `<command>
@@ -105,13 +105,15 @@ semantics, stream JSON events, tool-call events, and failure modes.
   plus harness-owned Session History for context.
 - Preserve Cursor `session_id` values from stream events only as diagnostic
   metadata.
-- Do not generate or mutate `.cursor/cli.json` permission files in the first
-  phase. Document how Cursor permissions interact with harness capabilities, but
-  keep Agent Capabilities and Action Approval as the authoritative policy.
-- Allow normal Cursor project context by default. Cursor project rules and
-  ambient instruction files may be loaded by the Cursor command, but Agent Profile
-  instructions, Capability Enforcement, Action Approval, and the structured
-  output contract remain higher priority.
+- Do not generate or mutate user or project `.cursor/cli.json` permission files.
+  Before spawning Cursor, create a harness-owned temporary Cursor CLI config and
+  temporary working directory with deny rules for Cursor-native Shell, Read,
+  Write, WebFetch, and MCP tools. Keep Agent Capabilities and Action Approval as
+  the authoritative policy.
+- Do not load normal Cursor project context by default. Cursor project rules and
+  ambient instruction files are not trusted policy inputs for this runtime
+  adapter; the harness prompt envelope provides the real working directory for
+  Harness Actions instead.
 - Map the Agent Profile model field to Cursor's `--model` flag when the model is
   not `default`.
 - Keep CLI args configurable for advanced users, but reject args that bypass
@@ -130,12 +132,12 @@ semantics, stream JSON events, tool-call events, and failure modes.
 - Setup remediation should point to Cursor-owned setup commands. Missing command
   remediation should tell users to install Cursor Agent CLI from official Cursor
   docs or set `[runtimes.cursor].command`. Authentication remediation should
-  tell users to run `agent login` and verify with `agent status`.
+  tell users to run `cursor-agent login` and verify with `cursor-agent status`.
   Mention `CURSOR_API_KEY` only as an optional automation fallback.
 - Pass the harness prompt envelope to the Cursor command over stdin by default. The
   envelope may be large and may include Session History, so stdin avoids argv
   length limits, shell quoting problems, and prompt leakage through process
-  arguments. If live Cursor smoke testing proves `agent --print` does not accept
+  arguments. If live Cursor smoke testing proves `cursor-agent --print` does not accept
   stdin input, add a narrow fallback to pass the envelope with `-p` through
   `Command::arg`, never through a shell string.
 
@@ -176,7 +178,7 @@ None.
 ## Final Decision
 
 Build a first-class `cursor` Execution Runtime backed by the installed Cursor
-Agent CLI command, defaulting to `agent`. The runtime should use Cursor-owned saved
+Agent CLI command, defaulting to `cursor-agent`. The runtime should use Cursor-owned saved
 login, strict harness-action mode, stdin prompt envelopes, stream JSON parsing,
 and harness-owned Session History. Cursor-native tools, session resume, project
 permission mutation, direct API integration, and stored Cursor credentials remain

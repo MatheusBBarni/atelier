@@ -10,6 +10,8 @@ an orchestrator and a sequence of specialized agent profiles.
 - Orchestrator-driven routing for planning, execution, clarifying questions, and completion.
 - Built-in multi-runtime support:
   - `codex` (Codex CLI runtime)
+  - `claude` (Claude CLI runtime)
+  - `cursor` (Cursor Agent CLI runtime)
   - `zai` (HTTP API runtime)
   - `fake` (test/runtime simulation)
 - Configurable agents with explicit capabilities and scopes.
@@ -24,6 +26,8 @@ an orchestrator and a sequence of specialized agent profiles.
 - Node.js 20+ and npm 10+ for the recommended npm install path.
 - Rust toolchain only if you build from source.
 - Optional: `codex` CLI with `codex login` completed if you plan to use the Codex runtime.
+- Optional: `claude` CLI if you plan to opt agents into the Claude runtime.
+- Optional: `cursor-agent` CLI with `cursor-agent login` completed if you plan to use the Cursor runtime.
 - Optional: `ZAI_API_KEY` (or another env var configured as `api_key_env`) for Z.ai runtime.
 
 ## Install
@@ -141,6 +145,16 @@ Important values:
   - Reuses Codex-owned login state, including ChatGPT subscription login when the CLI is signed in that way.
   - Defaults: `codex exec --skip-git-repo-check --color never`
   - Check setup with `codex login status`; sign in with `codex login` or `codex login --device-auth`.
+- `claude`
+  - Invokes the installed `claude` CLI as a child process.
+  - Keeps Claude credentials owned by the Claude CLI and user environment.
+  - Built-in agents do not use Claude unless you opt in through config.
+- `cursor`
+  - Invokes the installed `cursor-agent` CLI as a child process.
+  - Reuses Cursor-owned login state; check setup with `cursor-agent status` and sign in with `cursor-agent login`.
+  - Uses `cursor-agent --print --output-format stream-json` internally from an isolated deny-all Cursor permission sandbox.
+  - Keeps Cursor-native tool calls behind Harness Actions.
+  - Built-in agents do not use Cursor unless you opt in through config.
 - `zai`
   - Uses API key from env var (example: `ZAI_API_KEY`) and posts to `api.z.ai`.
 - `fake`
@@ -231,10 +245,3 @@ cargo build
 ## License
 
 MIT
-
-## Integration Roadmap
-
-The following runtime integrations are planned:
-
-- `Claude` (Anthropic): planned for a future release.
-- `Cursor`: planned for a future release.

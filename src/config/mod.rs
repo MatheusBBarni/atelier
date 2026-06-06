@@ -201,6 +201,7 @@ pub struct WorkspacePolicy {
 pub enum RuntimeKind {
     Codex,
     Claude,
+    Cursor,
     Zai,
     Fake,
 }
@@ -565,6 +566,17 @@ impl MergedConfig {
             MergedRuntimeConfig {
                 kind: Some(RuntimeKind::Claude),
                 command: Some("claude".to_string()),
+                args: Some(Vec::new()),
+                prompt_mode: Some(PromptMode::Stdin),
+                base_url: None,
+                api_key_env: None,
+            },
+        );
+        runtimes.insert(
+            "cursor".to_string(),
+            MergedRuntimeConfig {
+                kind: Some(RuntimeKind::Cursor),
+                command: Some("cursor-agent".to_string()),
                 args: Some(Vec::new()),
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
@@ -1150,6 +1162,32 @@ impl MergedConfig {
                         api_key_env: None,
                     }
                 }
+                RuntimeKind::Cursor => {
+                    if runtime.api_key_env.is_some() {
+                        bail!(
+                            "cursor runtime {id} cannot set api_key_env; Cursor credentials are owned by the Cursor CLI or environment"
+                        );
+                    }
+                    let args = runtime.args.unwrap_or_default();
+                    validate_cursor_runtime_args(&id, &args)?;
+                    let prompt_mode = runtime.prompt_mode.unwrap_or_default();
+                    match prompt_mode {
+                        PromptMode::Stdin => {}
+                    }
+                    RuntimeConfig {
+                        id: id.clone(),
+                        kind,
+                        command: Some(
+                            runtime
+                                .command
+                                .unwrap_or_else(|| "cursor-agent".to_string()),
+                        ),
+                        args,
+                        prompt_mode,
+                        base_url: None,
+                        api_key_env: None,
+                    }
+                }
                 RuntimeKind::Zai => {
                     let api_key_env = runtime
                         .api_key_env
@@ -1547,6 +1585,17 @@ pub(crate) fn validate_claude_runtime_args(runtime_id: &str, args: &[String]) ->
     Ok(())
 }
 
+pub(crate) fn validate_cursor_runtime_args(runtime_id: &str, args: &[String]) -> Result<()> {
+    for arg in args {
+        if let Some(flag) = cursor_protected_arg(arg) {
+            bail!(
+                "cursor runtime {runtime_id} args include protected flag {flag}; the Cursor Runtime owns policy, auth-secret, session, prompt, model, and output protocol flags"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn claude_protected_arg(arg: &str) -> Option<String> {
     let flag = arg
         .split_once('=')
@@ -1554,6 +1603,22 @@ fn claude_protected_arg(arg: &str) -> Option<String> {
         .unwrap_or(arg);
     if CLAUDE_PROTECTED_ARG_NAMES.contains(&flag)
         || CLAUDE_PROTECTED_ARG_PREFIXES
+            .iter()
+            .any(|prefix| flag.starts_with(prefix))
+    {
+        Some(flag.to_string())
+    } else {
+        None
+    }
+}
+
+fn cursor_protected_arg(arg: &str) -> Option<String> {
+    let flag = arg
+        .split_once('=')
+        .map(|(flag, _value)| flag)
+        .unwrap_or(arg);
+    if CURSOR_PROTECTED_ARG_NAMES.contains(&flag)
+        || CURSOR_PROTECTED_ARG_PREFIXES
             .iter()
             .any(|prefix| flag.starts_with(prefix))
     {
@@ -1637,6 +1702,32 @@ const CLAUDE_PROTECTED_ARG_PREFIXES: &[&str] = &[
     "--session-",
     "--system-prompt",
     "--append-system-prompt",
+];
+
+const CURSOR_PROTECTED_ARG_NAMES: &[&str] = &[
+    "-p",
+    "--print",
+    "--output-format",
+    "--model",
+    "-m",
+    "--api-key",
+    "-a",
+    "--force",
+    "-f",
+    "resume",
+    "--resume",
+    "ls",
+    "-b",
+    "--background",
+    "--fullscreen",
+];
+
+const CURSOR_PROTECTED_ARG_PREFIXES: &[&str] = &[
+    "--api-key",
+    "--resume",
+    "--model",
+    "--output-format",
+    "--force",
 ];
 
 fn title_case_id(id: &str) -> String {
@@ -1777,7 +1868,7 @@ pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
                         command: runtime.command.clone(),
                         args: runtime.args.clone(),
                         prompt_mode: match runtime.kind {
-                            RuntimeKind::Codex | RuntimeKind::Claude => {
+                            RuntimeKind::Codex | RuntimeKind::Claude | RuntimeKind::Cursor => {
                                 Some(runtime.prompt_mode.clone())
                             }
                             _ => None,
@@ -1884,6 +1975,12 @@ prompt_mode = "stdin"
 [runtimes.claude]
 type = "claude"
 command = "claude"
+args = []
+prompt_mode = "stdin"
+
+[runtimes.cursor]
+type = "cursor"
+command = "cursor-agent"
 args = []
 prompt_mode = "stdin"
 
@@ -2142,6 +2239,22 @@ mod tests {
     }
 
     #[test]
+    fn builtin_config_includes_opt_in_cursor_runtime() {
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+        let cursor = config.runtimes.get("cursor").unwrap();
+
+        assert_eq!(cursor.kind, RuntimeKind::Cursor);
+        assert_eq!(cursor.command.as_deref(), Some("cursor-agent"));
+        assert!(cursor.args.is_empty());
+        assert_eq!(cursor.prompt_mode, PromptMode::Stdin);
+        assert!(cursor.api_key_env.is_none());
+        assert!(config
+            .agents
+            .values()
+            .all(|agent| agent.runtime != "cursor"));
+    }
+
+    #[test]
     fn default_home_config_path_uses_dot_config_multiagent() {
         let path = default_home_config_path();
         assert!(path.ends_with(Path::new(".config/.multiagent/multiagent.toml")));
@@ -2373,11 +2486,44 @@ runtime = "local_claude"
     }
 
     #[test]
+    fn cursor_runtime_type_deserializes() {
+        let config = load_from_temp(
+            r#"
+[runtimes.local_cursor]
+type = "cursor"
+
+[agents.explorer]
+runtime = "local_cursor"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.runtimes["local_cursor"].kind, RuntimeKind::Cursor);
+        assert_eq!(
+            config.runtimes["local_cursor"].command.as_deref(),
+            Some("cursor-agent")
+        );
+    }
+
+    #[test]
     fn claude_runtime_rejects_api_key_env() {
         let error = load_from_temp(
             r#"
 [runtimes.claude]
 api_key_env = "CLAUDE_API_KEY"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot set api_key_env"));
+    }
+
+    #[test]
+    fn cursor_runtime_rejects_api_key_env() {
+        let error = load_from_temp(
+            r#"
+[runtimes.cursor]
+api_key_env = "CURSOR_API_KEY"
 "#,
         )
         .unwrap_err();
@@ -2439,6 +2585,51 @@ args = ["--tools=Bash"]
         .unwrap_err();
 
         assert!(error.to_string().contains("protected flag --tools"));
+    }
+
+    #[test]
+    fn cursor_runtime_rejects_protected_args() {
+        for flag in [
+            "-p",
+            "--print",
+            "--output-format",
+            "--model",
+            "-m",
+            "--api-key",
+            "-a",
+            "--force",
+            "-f",
+            "resume",
+            "--resume",
+            "ls",
+            "--background",
+            "--fullscreen",
+        ] {
+            let error = load_from_temp(&format!(
+                r#"
+[runtimes.cursor]
+args = ["{flag}"]
+"#
+            ))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("protected flag"),
+                "flag {flag} produced {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_runtime_rejects_protected_args_with_values() {
+        let error = load_from_temp(
+            r#"
+[runtimes.cursor]
+args = ["--api-key=secret"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("protected flag --api-key"));
     }
 
     #[test]
@@ -2523,6 +2714,28 @@ args = ["--safe-compat"]
     }
 
     #[test]
+    fn redacted_toml_prints_cursor_authored_args_only() {
+        let config = load_from_temp(
+            r#"
+[runtimes.cursor]
+args = ["--safe-compat"]
+"#,
+        )
+        .unwrap();
+
+        let rendered = to_redacted_toml(&config).unwrap();
+
+        assert!(rendered.contains("[runtimes.cursor]"));
+        assert!(rendered.contains("type = \"cursor\""));
+        assert!(rendered.contains("command = \"cursor-agent\""));
+        assert!(rendered.contains("args = [\"--safe-compat\"]"));
+        assert!(rendered.contains("prompt_mode = \"stdin\""));
+        assert!(!rendered.contains("CURSOR_API_KEY"));
+        assert!(!rendered.contains("stream-json"));
+        assert!(!rendered.contains("--print"));
+    }
+
+    #[test]
     fn starter_config_includes_claude_runtime_without_protected_flags() {
         let starter = starter_config_text();
 
@@ -2533,6 +2746,19 @@ args = ["--safe-compat"]
         assert!(starter.contains("prompt_mode = \"stdin\""));
         assert!(!starter.contains("stream-json"));
         assert!(!starter.contains("--include-partial-messages"));
+    }
+
+    #[test]
+    fn starter_config_includes_cursor_runtime_without_protected_flags() {
+        let starter = starter_config_text();
+
+        assert!(starter.contains("[runtimes.cursor]"));
+        assert!(starter.contains("type = \"cursor\""));
+        assert!(starter.contains("command = \"cursor-agent\""));
+        assert!(starter.contains("args = []"));
+        assert!(starter.contains("prompt_mode = \"stdin\""));
+        assert!(!starter.contains("CURSOR_API_KEY"));
+        assert!(!starter.contains("--output-format"));
     }
 
     #[test]

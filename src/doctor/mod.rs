@@ -72,11 +72,13 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
         let title = match runtime.kind {
             RuntimeKind::Codex => "Codex Runtime",
             RuntimeKind::Claude => "Claude Runtime",
+            RuntimeKind::Cursor => "Cursor Runtime",
             RuntimeKind::Zai => "Z.ai Runtime",
             RuntimeKind::Fake => "Fake Runtime",
         };
         let protected_defaults = match runtime.kind {
             RuntimeKind::Claude => Some(crate::runtime::claude::protected_defaults_summary()),
+            RuntimeKind::Cursor => Some(crate::runtime::cursor::protected_defaults_summary()),
             _ => None,
         };
         checks.push(DoctorCheck {
@@ -644,5 +646,66 @@ command = "{}"
         assert!(json.contains("partial messages enabled"));
         assert!(!json.contains("stream-json --include-partial-messages"));
         assert!(!json.contains("CLAUDE_API_KEY"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn doctor_reports_cursor_runtime_with_status_and_protected_default_summary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let script_path = dir.path().join("cursor-status.sh");
+        fs::write(
+            &script_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "cursor-agent 1.0.0"
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  echo "Authenticated as dev@example.com"
+  exit 0
+fi
+echo "unexpected args: $@" >&2
+exit 64
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let config_path = dir.path().join("multiagent.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[runtimes.cursor]
+command = "{}"
+"#,
+                script_path.display()
+            ),
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let report = run_doctor(&config).await;
+        let json = render_json(&report).unwrap();
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "runtime.cursor")
+            .unwrap();
+
+        assert_eq!(check.title, "Cursor Runtime");
+        assert_eq!(check.status, DoctorStatus::Ok);
+        assert!(check.message.contains("cursor-agent 1.0.0"));
+        assert!(check.message.contains("Authenticated"));
+        assert!(json.contains("\"runtime_type\": \"cursor\""));
+        assert!(json.contains("stream-json enabled"));
+        assert!(json.contains("Cursor tools must not bypass Harness Actions"));
+        assert!(!json.contains("CURSOR_API_KEY"));
     }
 }

@@ -5,6 +5,7 @@ use multiagent::config::{
 };
 use multiagent::runtime::claude::ClaudeRuntime;
 use multiagent::runtime::codex::CodexRuntime;
+use multiagent::runtime::cursor::CursorRuntime;
 use multiagent::runtime::zai::ZaiRuntime;
 use multiagent::runtime::{
     collect_runtime_step_result, Runtime, RuntimeOutput, RuntimeRecentContext, RuntimeRequest,
@@ -108,6 +109,40 @@ async fn claude_runtime_executes_real_agent_step() -> Result<()> {
     let model = std::env::var("MULTIAGENT_CLAUDE_MODEL").unwrap_or_else(|_| "default".to_string());
 
     let request = agent_request(dir.path().to_path_buf(), "explorer", "claude", &model);
+    let result = collect_runtime_step_result(|events, cancellation| {
+        runtime.stream_step(request, events, cancellation)
+    })
+    .await?;
+
+    assert_agent_result(result.output, "explorer")?;
+    assert!(!result.stream_deltas.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires MULTIAGENT_CURSOR_LIVE=1 and a working Cursor Agent CLI session"]
+async fn cursor_runtime_executes_real_agent_step() -> Result<()> {
+    if std::env::var_os("MULTIAGENT_CURSOR_LIVE").is_none() {
+        eprintln!("skipping Cursor integration test; set MULTIAGENT_CURSOR_LIVE=1");
+        return Ok(());
+    }
+
+    let dir = tempdir()?;
+    let runtime = CursorRuntime::new(RuntimeConfig {
+        id: "cursor".to_string(),
+        kind: RuntimeKind::Cursor,
+        command: Some(
+            std::env::var("MULTIAGENT_CURSOR_COMMAND")
+                .unwrap_or_else(|_| "cursor-agent".to_string()),
+        ),
+        args: integration_args("MULTIAGENT_CURSOR_ARGS_JSON")?,
+        prompt_mode: PromptMode::Stdin,
+        base_url: None,
+        api_key_env: None,
+    });
+    let model = std::env::var("MULTIAGENT_CURSOR_MODEL").unwrap_or_else(|_| "default".to_string());
+
+    let request = agent_request(dir.path().to_path_buf(), "explorer", "cursor", &model);
     let result = collect_runtime_step_result(|events, cancellation| {
         runtime.stream_step(request, events, cancellation)
     })

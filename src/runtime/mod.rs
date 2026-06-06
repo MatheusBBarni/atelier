@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod fake;
 pub mod zai;
 
@@ -409,6 +410,11 @@ pub async fn check_runtime_availability(runtime: &RuntimeConfig) -> RuntimeAvail
                 .check_availability()
                 .await
         }
+        RuntimeKind::Cursor => {
+            cursor::CursorRuntime::new(runtime.clone())
+                .check_availability()
+                .await
+        }
         RuntimeKind::Zai => {
             zai::ZaiRuntime::new(runtime.clone())
                 .check_availability()
@@ -500,6 +506,11 @@ async fn execute_runtime_step_once(
         }
         RuntimeKind::Claude => {
             claude::ClaudeRuntime::new(runtime.clone())
+                .stream_step(request, events, cancellation)
+                .await
+        }
+        RuntimeKind::Cursor => {
+            cursor::CursorRuntime::new(runtime.clone())
                 .stream_step(request, events, cancellation)
                 .await
         }
@@ -743,6 +754,7 @@ mod tests {
         load_effective_config, AgentEffort, AgentProfile, AgentPromptMetadata, Capability,
         ConfigLoadOptions, Limits,
     };
+    use crate::orchestrator::wrap_json_contract;
     use serde_json::json;
 
     #[tokio::test]
@@ -929,6 +941,114 @@ model_fallbacks = ["fallback-succeeds"]
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn execute_runtime_step_retries_cursor_provider_errors_with_fallback_model() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("cursor-fallback.sh");
+        let attempts_path = dir.path().join("attempts.txt");
+        let result = AgentResult::completed("explorer", "step", "fallback completed");
+        let final_frame = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": wrap_json_contract(&result).unwrap(),
+            "model": "fallback-succeeds"
+        });
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "cursor-agent 1.0.0"
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  echo "Authenticated"
+  exit 0
+fi
+printf '%s\n' "$@" >> "{}"
+cat >/dev/null
+case " $* " in
+  *" --model primary-fails "*)
+    echo "rate limit exceeded" >&2
+    exit 1
+    ;;
+  *" --model fallback-succeeds "*)
+    printf '%s\n' {}
+    exit 0
+    ;;
+  *)
+    echo "unexpected model args: $*" >&2
+    exit 64
+    ;;
+esac
+"#,
+                attempts_path.display(),
+                shell_single_quoted(&final_frame.to_string()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[runtimes.cursor]
+command = "{}"
+
+[agents.explorer]
+runtime = "cursor"
+model = "primary-fails"
+model_fallbacks = ["fallback-succeeds"]
+"#,
+                script_path.display()
+            ),
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let request = RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: "retry cursor provider error".to_string(),
+            session_goal: None,
+            working_directory: dir.path().to_path_buf(),
+            agent_profile: config.agents["explorer"].clone(),
+            session_events: Vec::new(),
+            recent_context: RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "agent_result".to_string(),
+            capability_constraints: vec![Capability::Read],
+            limits: Limits::default(),
+        };
+
+        let result = execute_runtime_step(&config, request).await.unwrap();
+
+        match result.output {
+            RuntimeOutput::AgentResult { result } => {
+                assert_eq!(result.summary, "fallback completed");
+            }
+            other => panic!("unexpected runtime output: {other:?}"),
+        }
+        let attempts = std::fs::read_to_string(attempts_path).unwrap();
+        assert!(attempts.contains("--model\nprimary-fails\n"));
+        assert!(attempts.contains("--model\nfallback-succeeds\n"));
+        assert!(result.stream_deltas.iter().any(|delta| {
+            delta.stream == "status"
+                && delta
+                    .content
+                    .contains("retryable provider error for model primary-fails")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn execute_runtime_step_blocks_codex_when_login_status_fails() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1001,6 +1121,11 @@ model = "default"
         assert!(message.contains("runtime codex is unavailable"));
         assert!(message.contains("Not logged in"));
         assert!(!message.contains("status 99"));
+    }
+
+    #[cfg(unix)]
+    fn shell_single_quoted(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 
     struct EnvGuard {
