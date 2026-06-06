@@ -7,7 +7,7 @@ use super::{
 use crate::app::{LiveStepStatus, LiveStepView, PendingApprovalView};
 use crate::history::HistoryEvent;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_SUMMARY_CHARS: usize = 240;
@@ -18,7 +18,7 @@ pub struct ChatProjection {
     items: Vec<ChatItemView>,
     index: BTreeMap<ChatLifecycleKey, usize>,
     action_context: BTreeMap<String, ActionContext>,
-    live_key: Option<ChatLifecycleKey>,
+    live_keys: BTreeSet<ChatLifecycleKey>,
     pending_key: Option<ChatLifecycleKey>,
 }
 
@@ -65,6 +65,7 @@ impl ChatProjection {
             "agent_result" | "councillor_agent_result" | "councillor_result" => {
                 self.apply_agent_result(event)
             }
+            "parallel_group_joined" => self.apply_parallel_group_joined(event),
             "run_completed" | "run_failed" | "run_limit_reached" | "run_interrupted"
             | "subtask_completed" => self.apply_run_summary(event),
             "diagnostic" => self.apply_diagnostic(event),
@@ -77,6 +78,12 @@ impl ChatProjection {
             | "council_started"
             | "council_synthesized"
             | "council_completed"
+            | "parallel_group_started"
+            | "parallel_group_rejected"
+            | "parallel_child_started"
+            | "parallel_child_blocked"
+            | "parallel_child_completed"
+            | "parallel_child_failed"
             | "step_cancel_requested"
             | "step_cancelled"
             | "orchestrator_decision_invalid" => self.apply_diagnostic(event),
@@ -85,20 +92,31 @@ impl ChatProjection {
     }
 
     pub fn apply_live_step(&mut self, live_step: Option<&LiveStepView>) {
-        let Some(live_step) = live_step else {
-            let previous_key = self.live_key.take();
-            self.remove_transient_key(previous_key);
-            return;
-        };
-        let key = ChatLifecycleKey::Step {
-            run_id: live_step.run_id.clone(),
-            step_id: live_step.step_id.clone(),
-            item_kind: ChatItemKind::AgentProgress,
-        };
-        if self.live_key.as_ref() != Some(&key) {
-            let previous_key = self.live_key.replace(key.clone());
-            self.remove_transient_key(previous_key);
+        match live_step {
+            Some(live_step) => self.apply_live_steps(std::slice::from_ref(live_step)),
+            None => self.apply_live_steps(&[]),
         }
+    }
+
+    pub fn apply_live_steps(&mut self, live_steps: &[LiveStepView]) {
+        let mut next_keys = BTreeSet::new();
+        for live_step in live_steps {
+            let key = live_step_key(live_step);
+            next_keys.insert(key.clone());
+            self.upsert_live_step(live_step, key);
+        }
+        let stale_keys = self
+            .live_keys
+            .difference(&next_keys)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale_keys {
+            self.remove_transient_key(Some(key));
+        }
+        self.live_keys = next_keys;
+    }
+
+    fn upsert_live_step(&mut self, live_step: &LiveStepView, key: ChatLifecycleKey) {
         let mut body = Vec::new();
         if live_step.streams.is_empty() {
             body.push(ChatLineView::muted(live_step_status_label(
@@ -117,6 +135,16 @@ impl ChatProjection {
         }
         let status = chat_status_for_live_step(&live_step.status);
         let severity = chat_severity_for_live_step(&live_step.status);
+        let title_agent = live_step
+            .step_label
+            .as_deref()
+            .map(|label| format!("{} ({label})", live_step.agent))
+            .unwrap_or_else(|| live_step.agent.clone());
+        let summary = live_step
+            .file_scope
+            .as_ref()
+            .map(|scope| format!("scope: {}", live_scope_summary(scope)))
+            .unwrap_or_else(|| format!("run:{} step:{}", live_step.run_id, live_step.step_id));
         self.upsert(ItemInput {
             lifecycle_key: Some(key),
             kind: ChatItemKind::AgentProgress,
@@ -124,13 +152,10 @@ impl ChatProjection {
             severity,
             title: format!(
                 "{} {}",
-                live_step.agent,
+                title_agent,
                 live_step_status_title_suffix(&live_step.status)
             ),
-            summary: Some(format!(
-                "run:{} step:{}",
-                live_step.run_id, live_step.step_id
-            )),
+            summary: Some(summary),
             body,
             details: Vec::new(),
             source: ChatSourceRef {
@@ -842,6 +867,52 @@ impl ChatProjection {
         });
     }
 
+    fn apply_parallel_group_joined(&mut self, event: &HistoryEvent) {
+        let group_id = string_field(&event.payload, "group_id")
+            .or_else(|| event.group_id.clone())
+            .unwrap_or_else(|| "parallel group".to_string());
+        let status =
+            string_field(&event.payload, "status").unwrap_or_else(|| "completed".to_string());
+        let summary = string_field(&event.payload, "summary");
+        let mut body = Vec::new();
+        if let Some(summary) = summary.as_deref() {
+            body.extend(message_body_lines(summary, ChatLineStyle::Plain));
+        }
+        if let Some(counts) = event.payload.get("counts").and_then(Value::as_object) {
+            for (status, count) in counts {
+                body.push(ChatLineView::muted(format!("{}: {}", status, count)));
+            }
+        }
+        let severity = match status.as_str() {
+            "completed" => ChatSeverity::Success,
+            "completed_with_issues" | "limit_reached" => ChatSeverity::Warning,
+            "failed" | "cancelled" => ChatSeverity::Error,
+            _ => ChatSeverity::Info,
+        };
+        self.upsert(ItemInput {
+            lifecycle_key: event.run_id.clone().map(|run_id| ChatLifecycleKey::Step {
+                run_id,
+                step_id: group_id.clone(),
+                item_kind: ChatItemKind::RunSummary,
+            }),
+            kind: ChatItemKind::RunSummary,
+            status: match severity {
+                ChatSeverity::Error => ChatItemStatus::Failed,
+                ChatSeverity::Warning | ChatSeverity::Success | ChatSeverity::Info => {
+                    ChatItemStatus::Completed
+                }
+            },
+            severity,
+            title: format!("Parallel group {}", status.replace('_', " ")),
+            summary,
+            body,
+            details: history_detail(event, "group result"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
     fn apply_run_summary(&mut self, event: &HistoryEvent) {
         let Some(run_id) = event.run_id.clone() else {
             return;
@@ -1344,6 +1415,24 @@ fn step_key(event: &HistoryEvent, item_kind: ChatItemKind) -> Option<ChatLifecyc
         step_id: event.step_id.clone()?,
         item_kind,
     })
+}
+
+fn live_step_key(live_step: &LiveStepView) -> ChatLifecycleKey {
+    ChatLifecycleKey::Step {
+        run_id: live_step.run_id.clone(),
+        step_id: live_step.step_id.clone(),
+        item_kind: ChatItemKind::AgentProgress,
+    }
+}
+
+fn live_scope_summary(scope: &crate::orchestrator::ParallelFileScope) -> String {
+    if !scope.write_files.is_empty() {
+        return format!("write {}", summarize_items(&scope.write_files, 3));
+    }
+    if !scope.read_roots.is_empty() {
+        return format!("read {}", summarize_items(&scope.read_roots, 3));
+    }
+    "no files".to_string()
 }
 
 fn source_from_event(event: &HistoryEvent, action_id: Option<String>) -> ChatSourceRef {
@@ -1967,10 +2056,12 @@ mod tests {
             event_id: format!("event-{kind}"),
             session_id: "session".to_string(),
             run_id: run_id.map(str::to_string),
+            group_id: None,
             step_id: step_id.map(str::to_string),
             timestamp: "2026-06-05T00:00:00.000Z".to_string(),
             kind: kind.to_string(),
             payload,
+            payload_truncated: false,
         }
     }
 

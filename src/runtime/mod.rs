@@ -8,7 +8,7 @@ use crate::actions::{ActionRequest, ActionResult};
 use crate::config::{
     AgentProfile, Capability, EffectiveConfig, Limits, RuntimeConfig, RuntimeKind,
 };
-use crate::orchestrator::{AgentResult, OrchestratorDecision};
+use crate::orchestrator::{AgentResult, OrchestratorDecision, ParallelFileScope, RunStepResult};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,7 @@ pub struct RuntimeHistoryEvent {
     pub event_id: String,
     pub session_id: String,
     pub run_id: Option<String>,
+    pub group_id: Option<String>,
     pub step_id: Option<String>,
     pub timestamp: String,
     pub kind: String,
@@ -124,11 +125,30 @@ pub struct RuntimeRequest {
     pub agent_profile: AgentProfile,
     pub session_events: Vec<RuntimeHistoryEvent>,
     pub recent_context: RuntimeRecentContext,
-    pub previous_results: Vec<AgentResult>,
+    pub previous_results: Vec<RunStepResult>,
     pub action_results: Vec<ActionResult>,
     pub output_schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_context: Option<ParallelRuntimeContext>,
     pub capability_constraints: Vec<Capability>,
     pub limits: Limits,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParallelRuntimeContext {
+    pub group_id: String,
+    pub step_label: String,
+    pub file_scope: ParallelFileScope,
+    pub parallel_siblings: Vec<ParallelSiblingContext>,
+    pub scope_policy_summary: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParallelSiblingContext {
+    pub step_id: String,
+    pub step_label: String,
+    pub agent: String,
+    pub file_scope: ParallelFileScope,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -736,6 +756,7 @@ pub fn prompt_envelope_json(request: &RuntimeRequest) -> Result<String> {
         "recent_context": request.recent_context,
         "previous_results": request.previous_results,
         "action_results": request.action_results,
+        "parallel_context": request.parallel_context,
         "capability_constraints": request.capability_constraints,
         "limits": request.limits,
         "output_schema": request.output_schema,
@@ -754,7 +775,10 @@ mod tests {
         load_effective_config, AgentEffort, AgentProfile, AgentPromptMetadata, Capability,
         ConfigLoadOptions, Limits,
     };
-    use crate::orchestrator::wrap_json_contract;
+    use crate::orchestrator::{
+        wrap_json_contract, AgentResultStatus, ParallelChildResultRef, ParallelGroupResult,
+        ParallelGroupStatus,
+    };
     use serde_json::json;
 
     #[tokio::test]
@@ -802,6 +826,7 @@ mod tests {
                 event_id: "event".to_string(),
                 session_id: "session".to_string(),
                 run_id: Some("previous-run".to_string()),
+                group_id: None,
                 step_id: Some("previous-step".to_string()),
                 timestamp: "2026-06-03T00:00:00.000Z".to_string(),
                 kind: "agent_result".to_string(),
@@ -826,6 +851,7 @@ mod tests {
             previous_results: Vec::new(),
             action_results: Vec::new(),
             output_schema: "agent_result".to_string(),
+            parallel_context: None,
             capability_constraints: vec![Capability::Read],
             limits: Limits::default(),
         };
@@ -845,6 +871,107 @@ mod tests {
         assert_eq!(
             envelope["session_events"][0]["payload"]["summary"],
             "prior finding"
+        );
+    }
+
+    #[test]
+    fn prompt_envelope_serializes_parallel_context_and_group_results() {
+        let scope = ParallelFileScope {
+            write_files: vec!["src/runtime/fake.rs".to_string()],
+            read_roots: vec!["src/runtime".to_string()],
+        };
+        let agent_result = AgentResult::completed(
+            "fixer".to_string(),
+            "child-step".to_string(),
+            "child completed".to_string(),
+        );
+        let request = RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "child-step".to_string(),
+            prompt: "parallel child".to_string(),
+            session_goal: None,
+            working_directory: PathBuf::from("/tmp/project"),
+            agent_profile: AgentProfile {
+                id: "fixer".to_string(),
+                name: "Fixer".to_string(),
+                runtime: "fake".to_string(),
+                model: "default".to_string(),
+                model_fallbacks: Vec::new(),
+                effort: AgentEffort::Medium,
+                thinking: false,
+                capabilities: vec![Capability::Read, Capability::Edit],
+                tools: None,
+                instructions: "Edit files.".to_string(),
+                orchestrator_description: None,
+                prompt_metadata: AgentPromptMetadata::default(),
+                enabled: true,
+            },
+            session_events: Vec::new(),
+            recent_context: RuntimeRecentContext::default(),
+            previous_results: vec![
+                RunStepResult::Agent {
+                    result: agent_result,
+                },
+                RunStepResult::ParallelGroup {
+                    result: ParallelGroupResult {
+                        schema_version: 1,
+                        group_id: "group".to_string(),
+                        run_id: "run".to_string(),
+                        status: ParallelGroupStatus::Completed,
+                        summary: "group joined".to_string(),
+                        children: vec![ParallelChildResultRef {
+                            step_id: "child-step".to_string(),
+                            step_label: "fix runtime".to_string(),
+                            agent: "fixer".to_string(),
+                            file_scope: scope.clone(),
+                            status: AgentResultStatus::Completed,
+                            result_index: 0,
+                        }],
+                        counts: BTreeMap::from([("completed".to_string(), 1)]),
+                        changed_files: vec!["src/runtime/fake.rs".to_string()],
+                        blocked_scopes: Vec::new(),
+                        failed_scopes: Vec::new(),
+                        approval_denials: Vec::new(),
+                        started_at: "2026-06-06T00:00:00.000Z".to_string(),
+                        completed_at: "2026-06-06T00:00:01.000Z".to_string(),
+                    },
+                },
+            ],
+            action_results: Vec::new(),
+            output_schema: "agent_result".to_string(),
+            parallel_context: Some(ParallelRuntimeContext {
+                group_id: "group".to_string(),
+                step_label: "fix runtime".to_string(),
+                file_scope: scope.clone(),
+                parallel_siblings: vec![ParallelSiblingContext {
+                    step_id: "sibling-step".to_string(),
+                    step_label: "review app".to_string(),
+                    agent: "reviewer".to_string(),
+                    file_scope: ParallelFileScope {
+                        write_files: Vec::new(),
+                        read_roots: vec!["src/app".to_string()],
+                    },
+                }],
+                scope_policy_summary: "Write files: src/runtime/fake.rs. Read roots: src/runtime."
+                    .to_string(),
+            }),
+            capability_constraints: vec![Capability::Read, Capability::Edit],
+            limits: Limits::default(),
+        };
+
+        let envelope: Value =
+            serde_json::from_str(&prompt_envelope_json(&request).unwrap()).unwrap();
+
+        assert_eq!(envelope["parallel_context"]["group_id"], "group");
+        assert_eq!(
+            envelope["parallel_context"]["parallel_siblings"][0]["agent"],
+            "reviewer"
+        );
+        assert_eq!(envelope["previous_results"][0]["kind"], "agent");
+        assert_eq!(envelope["previous_results"][1]["kind"], "parallel_group");
+        assert_eq!(
+            envelope["previous_results"][1]["result"]["children"][0]["file_scope"],
+            serde_json::to_value(scope).unwrap()
         );
     }
 
@@ -882,6 +1009,7 @@ model_fallbacks = ["fallback-succeeds"]
             previous_results: Vec::new(),
             action_results: Vec::new(),
             output_schema: "agent_result".to_string(),
+            parallel_context: None,
             capability_constraints: vec![Capability::Read],
             limits: Limits::default(),
         };
@@ -930,6 +1058,7 @@ model_fallbacks = ["fallback-succeeds"]
             previous_results: Vec::new(),
             action_results: Vec::new(),
             output_schema: "agent_result".to_string(),
+            parallel_context: None,
             capability_constraints: vec![Capability::Read],
             limits: Limits::default(),
         };
@@ -1024,6 +1153,7 @@ model_fallbacks = ["fallback-succeeds"]
             previous_results: Vec::new(),
             action_results: Vec::new(),
             output_schema: "agent_result".to_string(),
+            parallel_context: None,
             capability_constraints: vec![Capability::Read],
             limits: Limits::default(),
         };
@@ -1111,6 +1241,7 @@ model = "default"
             previous_results: Vec::new(),
             action_results: Vec::new(),
             output_schema: "agent_result".to_string(),
+            parallel_context: None,
             capability_constraints: vec![Capability::Read],
             limits: Limits::default(),
         };

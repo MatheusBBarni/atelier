@@ -2,10 +2,13 @@ use super::{
     Runtime, RuntimeAvailability, RuntimeAvailabilityStatus, RuntimeEventSink, RuntimeOutput,
     RuntimeProviderError, RuntimeRequest,
 };
-use crate::actions::{ActionKind, ActionRequest};
+use crate::actions::{ActionKind, ActionRequest, ActionStatus};
 use crate::config::{Capability, RuntimeConfig};
 use crate::ids::new_id;
-use crate::orchestrator::{AgentResult, AgentResultStatus, DecisionStatus, OrchestratorDecision};
+use crate::orchestrator::{
+    agent_results, AgentResult, AgentResultStatus, DecisionNextStep, DecisionStatus,
+    OrchestratorDecision, ParallelChildStepPlan, ParallelFileScope, ParallelGroupPlan,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::time::Duration;
@@ -68,6 +71,7 @@ impl Runtime for FakeRuntime {
                 },
             }
         } else if should_emit_fake_write_action_request(&request) {
+            let path = fake_write_action_path(&request);
             RuntimeOutput::ActionRequest {
                 request: ActionRequest {
                     schema_version: 1,
@@ -75,7 +79,7 @@ impl Runtime for FakeRuntime {
                     step_id: request.step_id.clone(),
                     kind: ActionKind::WriteFile,
                     params: serde_json::json!({
-                        "path": "multiagent-action-output.txt",
+                        "path": path,
                         "content": "created by fake runtime\n"
                     }),
                 },
@@ -142,7 +146,18 @@ async fn emit_fake_progress(
 }
 
 fn fake_stream_delay(request: &RuntimeRequest) -> Duration {
-    if request.prompt.to_ascii_lowercase().contains("slow stream") {
+    let prompt = request.prompt.to_ascii_lowercase();
+    if request.parallel_context.is_some() {
+        if prompt.contains("approval action") && request.agent_profile.id == "fixer" {
+            return Duration::from_millis(50);
+        }
+        if prompt.contains("approval action") {
+            return Duration::from_millis(250);
+        }
+        Duration::from_millis(500)
+    } else if prompt.contains("parallel") {
+        Duration::from_millis(50)
+    } else if prompt.contains("slow stream") {
         Duration::from_secs(5)
     } else {
         Duration::from_millis(5)
@@ -159,9 +174,104 @@ async fn sleep_or_cancel(cancellation: &CancellationToken, duration: Duration) -
 fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
     let last_agent = request
         .previous_results
-        .last()
-        .map(|result| result.agent.as_str());
+        .iter()
+        .next_back()
+        .map(|result| match result {
+            crate::orchestrator::RunStepResult::Agent { result } => result.agent.as_str(),
+            crate::orchestrator::RunStepResult::ParallelGroup { .. } => "parallel_group",
+        });
     let prompt = request.prompt.to_ascii_lowercase();
+    if last_agent.is_none() && prompt.contains("parallel") {
+        let steps = if prompt.contains("same agent") || prompt.contains("scoped write action") {
+            vec![
+                ParallelChildStepPlan {
+                    step_label: "fix first scoped file".to_string(),
+                    agent: "fixer".to_string(),
+                    instruction: "Handle the first fake scoped file.".to_string(),
+                    required_capabilities: vec![
+                        Capability::Read,
+                        Capability::Edit,
+                        Capability::Command,
+                        Capability::Verify,
+                    ],
+                    file_scope: ParallelFileScope {
+                        write_files: vec!["parallel-output/fixer-a.txt".to_string()],
+                        read_roots: vec!["src/runtime".to_string()],
+                    },
+                },
+                ParallelChildStepPlan {
+                    step_label: "fix second scoped file".to_string(),
+                    agent: "fixer".to_string(),
+                    instruction: "Handle the second fake scoped file.".to_string(),
+                    required_capabilities: vec![
+                        Capability::Read,
+                        Capability::Edit,
+                        Capability::Command,
+                        Capability::Verify,
+                    ],
+                    file_scope: ParallelFileScope {
+                        write_files: vec!["parallel-output/fixer-b.txt".to_string()],
+                        read_roots: vec!["src/app".to_string()],
+                    },
+                },
+            ]
+        } else {
+            vec![
+                ParallelChildStepPlan {
+                    step_label: "fix runtime scope".to_string(),
+                    agent: "fixer".to_string(),
+                    instruction: "Handle the fake runtime file scope.".to_string(),
+                    required_capabilities: vec![
+                        Capability::Read,
+                        Capability::Edit,
+                        Capability::Command,
+                        Capability::Verify,
+                    ],
+                    file_scope: ParallelFileScope {
+                        write_files: vec!["src/runtime/fake.rs".to_string()],
+                        read_roots: vec!["src/runtime".to_string()],
+                    },
+                },
+                ParallelChildStepPlan {
+                    step_label: "review app scope".to_string(),
+                    agent: "reviewer".to_string(),
+                    instruction: "Review the fake app file scope.".to_string(),
+                    required_capabilities: vec![
+                        Capability::Read,
+                        Capability::Command,
+                        Capability::Verify,
+                        Capability::Review,
+                    ],
+                    file_scope: ParallelFileScope {
+                        write_files: Vec::new(),
+                        read_roots: vec!["src/app".to_string()],
+                    },
+                },
+            ]
+        };
+        return OrchestratorDecision {
+            schema_version: 2,
+            decision_id: new_id(),
+            run_id: request.run_id.clone(),
+            status: DecisionStatus::Continue,
+            plan: vec![
+                "Split independent file-scoped work into a Parallel Step Group.".to_string(),
+                "Join child results before returning to the Orchestrator.".to_string(),
+            ],
+            next_agent: None,
+            next_step: Some(DecisionNextStep::ParallelGroup(ParallelGroupPlan {
+                group_id: new_id(),
+                reason: "Fake runtime selected disjoint file scopes for parallel execution."
+                    .to_string(),
+                steps,
+            })),
+            reason: "Independent fake scopes can run concurrently.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "All parallel children have terminal results.".to_string(),
+            clarifying_question: None,
+            final_summary: None,
+        };
+    }
     let (status, next_agent, required_capabilities, reason, stop_condition, final_summary) = match last_agent {
         None if prompt.contains("needs clarification") && !prompt.contains("user clarification:") => (
             DecisionStatus::WaitingForUser,
@@ -269,6 +379,7 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             "Review result and stop when complete.".to_string(),
         ],
         next_agent,
+        next_step: None,
         reason,
         required_capabilities,
         stop_condition,
@@ -284,6 +395,32 @@ fn fake_agent_result(request: &RuntimeRequest) -> AgentResult {
         request.step_id.clone(),
         format!("Fake {agent} step completed."),
     );
+    if let Some(denied) = request.action_results.iter().find(|result| {
+        matches!(result.status, ActionStatus::Denied)
+            && result.diagnostic.as_deref().is_some_and(|diagnostic| {
+                diagnostic.contains("parallel step")
+                    || diagnostic.contains("exact write_files")
+                    || diagnostic.contains("read roots")
+            })
+    }) {
+        result.status = AgentResultStatus::Blocked;
+        result.summary = "Fake runtime blocked after a harness action denial.".to_string();
+        result.blocker = denied.diagnostic.clone();
+        return result;
+    }
+    if request.parallel_context.is_some() {
+        if let Some(denied) = request
+            .action_results
+            .iter()
+            .find(|result| matches!(result.status, ActionStatus::Denied))
+        {
+            result.status = AgentResultStatus::ApprovalDenied;
+            result.summary =
+                "Fake runtime stopped after parallel action approval was denied.".to_string();
+            result.blocker = denied.diagnostic.clone();
+            return result;
+        }
+    }
     match agent.as_str() {
         "explorer" => {
             result.findings = vec![
@@ -292,10 +429,17 @@ fn fake_agent_result(request: &RuntimeRequest) -> AgentResult {
             ];
         }
         "fixer" => {
-            result.status = AgentResultStatus::NoChanges;
-            result.summary =
-                "Fake Fixer validated the requested change path without modifying files."
-                    .to_string();
+            let changed_files = completed_action_paths(request);
+            if changed_files.is_empty() {
+                result.status = AgentResultStatus::NoChanges;
+                result.summary =
+                    "Fake Fixer validated the requested change path without modifying files."
+                        .to_string();
+            } else {
+                result.status = AgentResultStatus::Completed;
+                result.summary = "Fake Fixer wrote its assigned scoped file.".to_string();
+                result.changed_files = changed_files;
+            }
             result.verification = vec!["fake verification passed".to_string()];
         }
         "reviewer" => {
@@ -360,6 +504,39 @@ fn should_emit_fake_write_action_request(request: &RuntimeRequest) -> bool {
         && request.prompt.to_ascii_lowercase().contains("write action")
 }
 
+fn fake_write_action_path(request: &RuntimeRequest) -> String {
+    if request
+        .prompt
+        .to_ascii_lowercase()
+        .contains("scoped write action")
+    {
+        if let Some(path) = request
+            .parallel_context
+            .as_ref()
+            .and_then(|context| context.file_scope.write_files.first())
+        {
+            return path.clone();
+        }
+    }
+    "multiagent-action-output.txt".to_string()
+}
+
+fn completed_action_paths(request: &RuntimeRequest) -> Vec<String> {
+    request
+        .action_results
+        .iter()
+        .filter(|result| matches!(result.status, ActionStatus::Completed))
+        .filter_map(|result| {
+            result
+                .content
+                .as_ref()
+                .and_then(|content| content.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
     let prompt = request.prompt.to_ascii_lowercase();
     if request
@@ -390,7 +567,7 @@ fn should_emit_fake_retryable_provider_error(request: &RuntimeRequest) -> bool {
 }
 
 fn has_prior_parse_error(request: &RuntimeRequest, agent_id: &str) -> bool {
-    request.previous_results.iter().any(|result| {
+    agent_results(&request.previous_results).any(|result| {
         result.agent == agent_id && matches!(result.status, AgentResultStatus::ParseError)
     })
 }

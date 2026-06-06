@@ -1,0 +1,446 @@
+---
+import "../styles/global.css";
+
+const basePath = import.meta.env.BASE_URL.endsWith("/")
+  ? import.meta.env.BASE_URL
+  : `${import.meta.env.BASE_URL}/`;
+const assetPath = (path) => `${basePath}${path.replace(/^\//, "")}`;
+
+const installCommands = [
+  "npm install -g @matheusbbarni/atelier",
+  "atelier --doctor",
+  "atelier",
+];
+
+const heroCommands = [
+  ["npm install -g", "@matheusbbarni/atelier"],
+  ["atelier --doctor"],
+  ["atelier"],
+];
+
+const featureGroups = [
+  {
+    title: "Run Orchestration",
+    kicker: "One prompt stays one run.",
+    items: [
+      "Orchestrator-owned run plans",
+      "Explorer, Oracle, Fixer, Reviewer, Consul, Librarian, and Designer profiles",
+      "Clarifying questions when scope is not safe enough",
+      "Serial council for high-risk architecture, security, and review calls",
+      "Parallel step groups for disjoint file scopes",
+      "Run, step, command, and review-fix limits",
+    ],
+  },
+  {
+    title: "Terminal Interface",
+    kicker: "A working TUI, not a detached log.",
+    items: [
+      "Chat for routing decisions, actions, diffs, diagnostics, and final results",
+      "Agent Roster with model, runtime, availability, and active step",
+      "Input Composer for prompts, answers, and interrupts",
+      "Live runtime stream snippets while an agent is working",
+      "Follow mode that respects manual scrolling",
+      "Slash commands for goals, config, subtasks, agents, and skills",
+    ],
+  },
+  {
+    title: "Runtime Choices",
+    kicker: "Use the CLIs and credentials you already have.",
+    items: [
+      "Codex CLI runtime with Codex-owned login",
+      "Claude CLI runtime with Claude-owned login",
+      "Cursor Agent CLI runtime with Cursor-owned login",
+      "Z.ai HTTP runtime through an environment credential reference",
+      "Fake runtime for deterministic tests",
+      "Per-agent model assignments and fallback chains",
+    ],
+  },
+  {
+    title: "Control Plane",
+    kicker: "The harness owns the actions.",
+    items: [
+      "Capability enforcement for read, edit, command, verify, and review work",
+      "Action approval for high-impact operations",
+      "Tool allowlists for narrower agent profiles",
+      "Credential references instead of secrets in config",
+      "Redacted TOML output from print-config",
+      "VCS actions only when explicitly requested",
+    ],
+  },
+  {
+    title: "Project Memory",
+    kicker: "Every run leaves useful evidence behind.",
+    items: [
+      "Session events under .multiagent/sessions",
+      "Artifacts for large output, diffs, and run material",
+      "Run records under .multiagent/runs",
+      "Context resume from harness-owned history",
+      "Clean-session command for local history cleanup",
+      "Codemap state for repository orientation",
+    ],
+  },
+  {
+    title: "Distribution",
+    kicker: "Install once, run where the work is.",
+    items: [
+      "Global npm package at @matheusbbarni/atelier",
+      "Prebuilt native platform binary packages",
+      "macOS, glibc Linux, and Windows arm64/x64 targets",
+      "GitHub Release archives and checksum manifests",
+      "Cargo install path for source builds",
+      "atelier --update through the npm launcher",
+    ],
+  },
+];
+
+const cliCommands = [
+  ["atelier", "Open the TUI in the current working directory."],
+  ["atelier --cwd <path>", "Start from a selected working directory."],
+  ["atelier --config <path>", "Use a specific harness configuration file."],
+  ["atelier --doctor", "Check runtime setup before work starts."],
+  ["atelier --doctor --json", "Emit doctor output for scripts and CI."],
+  ["atelier --print-config", "Print the merged config with secrets redacted."],
+  ["atelier --init-config", "Create starter config and instruction files."],
+  ["atelier --codemap init", "Write folder-level codemap docs and state."],
+  ["atelier --codemap changes", "Report stale codemaps without writing."],
+  ["atelier --codemap update", "Regenerate stale codemaps and refresh state."],
+  ["atelier --clean-sessions", "Delete project-local session history after confirmation."],
+  ["atelier --clean-sessions --yes", "Clean project-local history without a prompt."],
+  ["atelier --update", "Update the global npm install."],
+  ["atelier --debug", "Launch with extra diagnostics."],
+];
+
+const tuiCommands = [
+  ["/goal <text>", "Set the active session goal."],
+  ["/goal", "Show the current goal."],
+  ["/goal clear", "Clear the active goal."],
+  ["/config", "Show active config files, preset, and warnings."],
+  ["/subtask <agent> <task>", "Run a bounded child task through one enabled agent."],
+  ["/agent:<name>", "Route a prompt to a selected agent profile."],
+  ["/skill:<name>", "Prefix a prompt with a cached project or personal skill."],
+  ["/reload:skills", "Refresh cached skill names."],
+];
+
+const workflowSteps = [
+  ["01", "Prompt", "You type the work once. Atelier starts one run and records it."],
+  ["02", "Route", "The Orchestrator chooses a single agent, a council, or a parallel group."],
+  ["03", "Act", "Agents ask the harness for reads, edits, commands, approvals, and verification."],
+  ["04", "Review", "Reviewer findings go back to the Orchestrator instead of editing directly."],
+  ["05", "Record", "History, artifacts, diffs, diagnostics, and run results stay under .multiagent."],
+];
+
+const visualFrames = [
+  {
+    title: "The Run Surface",
+    text: "A single prompt turns into a visible run, with routing, agent work, approvals, and results in one place.",
+    src: "/images/atelier-command-center.png",
+    alt: "Dark Atelier command center with terminal panels, timelines, and review surfaces.",
+  },
+  {
+    title: "Agent Roster",
+    text: "You can see which agent is active, which runtime it uses, and what setup still needs attention.",
+    src: "/images/atelier-agent-roster.png",
+    alt: "Dark Atelier interface focused on agent roster, live chat, and status panels.",
+  },
+  {
+    title: "Parallel Scopes",
+    text: "Independent file scopes can move at the same time, then join before the Orchestrator decides the next step.",
+    src: "/images/atelier-parallel-scopes.png",
+    alt: "Dark Atelier dashboard showing parallel lanes joining into one run result.",
+  },
+  {
+    title: "Local Evidence",
+    text: "Session history, artifacts, run records, and codemaps stay local so later work has something solid to read.",
+    src: "/images/atelier-history-codemap.png",
+    alt: "Dark Atelier archive view with abstract history cards, artifacts, and repository map panels.",
+  },
+];
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Atelier is a terminal-native agent orchestration harness for local repositories."
+    />
+    <title>Atelier - Terminal-native agent orchestration</title>
+    <link rel="icon" href={assetPath("/favicon.svg")} />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <img
+          class="hero__image"
+          src={assetPath("/images/atelier-command-center.png")}
+          alt="Dark terminal command center with agent panels, timelines, and diff-like surfaces."
+        />
+        <div class="hero__shade" aria-hidden="true"></div>
+        <header class="nav" aria-label="Primary">
+          <a class="brand" href="#top" aria-label="Atelier home">
+            <span class="brand__mark" aria-hidden="true">A</span>
+            <span>Atelier</span>
+          </a>
+          <nav class="nav__links">
+            <a href="#features">Features</a>
+            <a href="#commands">Commands</a>
+            <a href="#install">Install</a>
+          </nav>
+        </header>
+
+        <div class="hero__content" id="top">
+          <p class="eyebrow">Terminal-native agent orchestration</p>
+          <h1 id="hero-title">Atelier</h1>
+          <p class="hero__lede">
+            Run one prompt in a local repo and let the harness route the work
+            through the right agents. You keep the terminal, the history, the
+            approvals, and the final call.
+          </p>
+          <div class="hero__actions" aria-label="Primary actions">
+            <a class="button button--primary" href="#install">
+              <span class="button__icon" aria-hidden="true">></span>
+              Install
+            </a>
+            <a class="button button--ghost" href="#features">
+              <span class="button__icon" aria-hidden="true">*</span>
+              See Features
+            </a>
+          </div>
+        </div>
+
+        <aside class="hero__terminal" aria-label="Install command preview">
+          {
+            heroCommands.map((lines) => (
+              <code>{lines.map((line) => <span>{line}</span>)}</code>
+            ))
+          }
+        </aside>
+      </section>
+
+      <section class="quick-band" aria-label="Product summary">
+        <div class="quick-band__inner">
+          <p>
+            Built for developers who already live in a terminal and want agents
+            to work inside the repo boundary, not around it.
+          </p>
+          <dl>
+            <div>
+              <dt>5</dt>
+              <dd>runtime paths</dd>
+            </div>
+            <div>
+              <dt>8</dt>
+              <dd>agent profiles</dd>
+            </div>
+            <div>
+              <dt>1</dt>
+              <dd>active run</dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="section section--split" aria-labelledby="why-title">
+        <div class="section__copy">
+          <p class="eyebrow">Why it exists</p>
+          <h2 id="why-title">Agent work needs a control plane.</h2>
+          <p>
+            Atelier treats agent activity as a run with routing, scopes,
+            results, and evidence. The runtime can think and stream. The
+            harness owns file edits, shell commands, approvals, limits, and the
+            durable record.
+          </p>
+        </div>
+
+        <div class="surface-map" aria-label="Atelier TUI surfaces">
+          <div class="surface-map__top">
+            <span>Chat</span>
+            <span>routing -> action -> result</span>
+          </div>
+          <div class="surface-map__grid">
+            <div class="surface-map__pane surface-map__pane--large">
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div class="surface-map__pane">
+              <b>Roster</b>
+              <i></i><i></i><i></i><i></i>
+            </div>
+            <div class="surface-map__pane">
+              <b>Composer</b>
+              <em></em>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="features" aria-labelledby="features-title">
+        <div class="section__heading">
+          <p class="eyebrow">Feature Map</p>
+          <h2 id="features-title">Everything Atelier is already shaped to do.</h2>
+          <p>
+            The site is pulling from the current README and project docs. That
+            means the boring but important pieces are here too: config,
+            distribution, history, limits, and tests.
+          </p>
+        </div>
+
+        <div class="feature-grid">
+          {
+            featureGroups.map((group) => (
+              <article class="feature-card">
+                <div class="feature-card__cap">
+                  <span aria-hidden="true"></span>
+                  <p>{group.kicker}</p>
+                </div>
+                <h3>{group.title}</h3>
+                <ul>
+                  {group.items.map((item) => (
+                    <li>{item}</li>
+                  ))}
+                </ul>
+              </article>
+            ))
+          }
+        </div>
+      </section>
+
+      <section class="section section--workflow" aria-labelledby="workflow-title">
+        <div class="section__heading section__heading--narrow">
+          <p class="eyebrow">How a run moves</p>
+          <h2 id="workflow-title">The loop is explicit.</h2>
+          <p>
+            No hidden handoff between agents. Each result comes back to the
+            Orchestrator, and the next step is a decision the harness can show,
+            persist, and bound.
+          </p>
+        </div>
+
+        <ol class="workflow">
+          {
+            workflowSteps.map(([number, title, body]) => (
+              <li>
+                <span>{number}</span>
+                <h3>{title}</h3>
+                <p>{body}</p>
+              </li>
+            ))
+          }
+        </ol>
+      </section>
+
+      <section class="section section--split section--image" aria-labelledby="runtime-title">
+        <figure class="product-visual">
+          <img
+            src={assetPath("/images/atelier-command-center.png")}
+            alt="Layered dark interface showing parallel agent activity and review panes."
+          />
+        </figure>
+        <div class="section__copy">
+          <p class="eyebrow">Runtimes</p>
+          <h2 id="runtime-title">Bring the agents you actually use.</h2>
+          <p>
+            Codex, Claude, and Cursor run through their local CLIs and login
+            state. Z.ai uses an API-key environment reference. The fake runtime
+            keeps tests deterministic. Atelier keeps those paths separate so
+            config stays readable and credentials stay out of project files.
+          </p>
+        </div>
+      </section>
+
+      <section class="section section--visuals" aria-labelledby="visuals-title">
+        <div class="section__heading">
+          <p class="eyebrow">Product Views</p>
+          <h2 id="visuals-title">Four views of the same control loop.</h2>
+          <p>
+            The UI is not trying to hide the work. It shows the run, the agent
+            roster, parallel scopes, and the evidence Atelier keeps on disk.
+          </p>
+        </div>
+
+        <div class="visual-grid">
+          {
+            visualFrames.map((frame) => (
+              <article class="visual-card">
+                <figure>
+                  <img src={assetPath(frame.src)} alt={frame.alt} loading="lazy" />
+                </figure>
+                <div>
+                  <h3>{frame.title}</h3>
+                  <p>{frame.text}</p>
+                </div>
+              </article>
+            ))
+          }
+        </div>
+      </section>
+
+      <section class="section" id="commands" aria-labelledby="commands-title">
+        <div class="section__heading">
+          <p class="eyebrow">Command Surface</p>
+          <h2 id="commands-title">The flags are part of the product.</h2>
+          <p>
+            The CLI is intentionally small. You can open the TUI, inspect setup,
+            print config, manage codemaps, clean history, and update the npm
+            install without learning a second tool.
+          </p>
+        </div>
+
+        <div class="command-layout">
+          <article class="command-table" aria-labelledby="cli-title">
+            <h3 id="cli-title">CLI</h3>
+            <dl>
+              {
+                cliCommands.map(([command, description]) => (
+                  <div>
+                    <dt><code>{command}</code></dt>
+                    <dd>{description}</dd>
+                  </div>
+                ))
+              }
+            </dl>
+          </article>
+
+          <article class="command-table" aria-labelledby="tui-title">
+            <h3 id="tui-title">TUI</h3>
+            <dl>
+              {
+                tuiCommands.map(([command, description]) => (
+                  <div>
+                    <dt><code>{command}</code></dt>
+                    <dd>{description}</dd>
+                  </div>
+                ))
+              }
+            </dl>
+          </article>
+        </div>
+      </section>
+
+      <section class="install" id="install" aria-labelledby="install-title">
+        <div>
+          <p class="eyebrow">Install</p>
+          <h2 id="install-title">Start with npm. Build from source when you need to.</h2>
+          <p>
+            The npm package installs a prebuilt native binary and leaves your
+            home config alone. Run doctor first, then open Atelier in the repo
+            you want agents to work on.
+          </p>
+        </div>
+        <div class="install__panel">
+          <pre><code>{installCommands.join("\n")}</code></pre>
+          <p>
+            Source build: <code>cargo install --path .</code>
+          </p>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

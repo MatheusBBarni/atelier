@@ -1,4 +1,5 @@
 use crate::config::{AgentProfile, ApprovalMode, Capability, ToolName, WorkspacePolicy};
+use crate::orchestrator::ParallelFileScope;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -96,6 +97,13 @@ pub struct ActionExecutionContext {
     pub approval_mode: ApprovalMode,
     pub command_timeout: Option<Duration>,
     pub user_prompt: Option<String>,
+    pub action_scope: ActionScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionScope {
+    Unrestricted,
+    ParallelFileScope(ParallelFileScope),
 }
 
 impl ActionExecutionContext {
@@ -110,6 +118,7 @@ impl ActionExecutionContext {
             approval_mode,
             command_timeout: Some(Duration::from_secs(10 * 60)),
             user_prompt: None,
+            action_scope: ActionScope::Unrestricted,
         }
     }
 }
@@ -118,6 +127,22 @@ pub fn validate_action_request(
     agent: &AgentProfile,
     workspace: &WorkspacePolicy,
     approval_mode: &ApprovalMode,
+    request: &ActionRequest,
+) -> ActionDecision {
+    validate_action_request_with_scope(
+        agent,
+        workspace,
+        approval_mode,
+        &ActionScope::Unrestricted,
+        request,
+    )
+}
+
+pub fn validate_action_request_with_scope(
+    agent: &AgentProfile,
+    workspace: &WorkspacePolicy,
+    approval_mode: &ApprovalMode,
+    action_scope: &ActionScope,
     request: &ActionRequest,
 ) -> ActionDecision {
     if request.schema_version != 1 {
@@ -144,7 +169,7 @@ pub fn validate_action_request(
         ));
     }
 
-    match request.kind {
+    let base_decision = match request.kind {
         ActionKind::ReadFile | ActionKind::ListFiles | ActionKind::SearchText => {
             if let Some(path) = path_param(&request.params) {
                 if let Err(error) = validate_model_path(path, &workspace.extra_read_roots) {
@@ -178,6 +203,59 @@ pub fn validate_action_request(
             decision_for_command(command, approval_mode)
         }
         ActionKind::RecordNote => ActionDecision::Allowed,
+    };
+
+    if !matches!(base_decision, ActionDecision::Allowed) {
+        return base_decision;
+    }
+
+    validate_action_scope(request, action_scope, workspace)
+}
+
+fn validate_action_scope(
+    request: &ActionRequest,
+    action_scope: &ActionScope,
+    workspace: &WorkspacePolicy,
+) -> ActionDecision {
+    let ActionScope::ParallelFileScope(scope) = action_scope else {
+        return ActionDecision::Allowed;
+    };
+
+    let result = match request.kind {
+        ActionKind::ReadFile => {
+            let Some(path) = path_param(&request.params) else {
+                return ActionDecision::Denied("read_file action is missing path".to_string());
+            };
+            validate_parallel_read_path(scope, path, workspace)
+        }
+        ActionKind::ListFiles | ActionKind::SearchText => {
+            let path = path_param(&request.params).unwrap_or(".");
+            validate_parallel_read_root(scope, path, workspace)
+        }
+        ActionKind::ApplyPatch => {
+            let Some(diff) = request.params.get("diff").and_then(Value::as_str) else {
+                return ActionDecision::Denied("apply_patch action is missing diff".to_string());
+            };
+            validate_parallel_patch_scope(scope, diff, workspace)
+        }
+        ActionKind::WriteFile => {
+            let Some(path) = path_param(&request.params) else {
+                return ActionDecision::Denied("write_file action is missing path".to_string());
+            };
+            validate_parallel_write_path(scope, path, workspace)
+        }
+        ActionKind::RunCommand => {
+            let Some(command) = request.params.get("command").and_then(Value::as_str) else {
+                return ActionDecision::Denied("run_command action is missing command".to_string());
+            };
+            validate_parallel_command(command)
+        }
+        ActionKind::RecordNote => Ok(()),
+    };
+
+    match result {
+        Ok(()) => ActionDecision::Allowed,
+        Err(error) => ActionDecision::Denied(error.to_string()),
     }
 }
 
@@ -198,7 +276,13 @@ pub async fn execute_action_request(
     context: &ActionExecutionContext,
     request: &ActionRequest,
 ) -> ActionResult {
-    match validate_action_request(agent, &context.workspace, &context.approval_mode, request) {
+    match validate_action_request_with_scope(
+        agent,
+        &context.workspace,
+        &context.approval_mode,
+        &context.action_scope,
+        request,
+    ) {
         ActionDecision::Denied(reason) => {
             return action_result(
                 request,
@@ -560,6 +644,131 @@ fn required_capability(kind: &ActionKind) -> Option<Capability> {
 
 fn path_param(params: &Value) -> Option<&str> {
     params.get("path").and_then(Value::as_str)
+}
+
+fn validate_parallel_read_path(
+    scope: &ParallelFileScope,
+    path: &str,
+    workspace: &WorkspacePolicy,
+) -> Result<()> {
+    let path = validate_model_path(path, &workspace.extra_read_roots)?;
+    if scope_path_matches_any(
+        &path,
+        &scope.write_files,
+        &workspace.extra_write_roots,
+        true,
+    )? || scope_path_is_under_any(&path, &scope.read_roots, &workspace.extra_read_roots)?
+    {
+        return Ok(());
+    }
+    bail!(
+        "path {} is outside this parallel step's file scope",
+        path.display()
+    )
+}
+
+fn validate_parallel_read_root(
+    scope: &ParallelFileScope,
+    path: &str,
+    workspace: &WorkspacePolicy,
+) -> Result<()> {
+    let path = validate_model_path(path, &workspace.extra_read_roots)?;
+    if scope_path_is_under_any(&path, &scope.read_roots, &workspace.extra_read_roots)? {
+        return Ok(());
+    }
+    bail!(
+        "path {} is outside this parallel step's read roots",
+        path.display()
+    )
+}
+
+fn validate_parallel_write_path(
+    scope: &ParallelFileScope,
+    path: &str,
+    workspace: &WorkspacePolicy,
+) -> Result<()> {
+    let path = validate_model_path(path, &workspace.extra_write_roots)?;
+    if scope_path_matches_any(
+        &path,
+        &scope.write_files,
+        &workspace.extra_write_roots,
+        true,
+    )? {
+        return Ok(());
+    }
+    bail!(
+        "path {} is outside this parallel step's exact write_files",
+        path.display()
+    )
+}
+
+fn validate_parallel_patch_scope(
+    scope: &ParallelFileScope,
+    diff: &str,
+    workspace: &WorkspacePolicy,
+) -> Result<()> {
+    for file_patch in parse_unified_diff(diff)? {
+        validate_parallel_write_path(scope, &file_patch.target_path, workspace)?;
+    }
+    Ok(())
+}
+
+fn validate_parallel_command(command: &str) -> Result<()> {
+    let lower = command.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        bail!("command is empty");
+    }
+    if has_shell_control_syntax(&lower) || !is_parallel_read_only_command(&lower) {
+        bail!("command is not allowed inside a parallel step group; schedule after group join");
+    }
+    Ok(())
+}
+
+fn is_parallel_read_only_command(lower: &str) -> bool {
+    let allow_prefixes = [
+        "git status",
+        "git diff",
+        "git log",
+        "git show",
+        "git grep",
+        "git blame",
+        "pwd",
+        "atelier --print-config",
+        "atelier --help",
+        "atelier --version",
+    ];
+    allow_prefixes
+        .iter()
+        .any(|prefix| command_has_prefix(lower, prefix))
+}
+
+fn scope_path_matches_any(
+    path: &Path,
+    allowed_paths: &[String],
+    extra_roots: &[PathBuf],
+    exact: bool,
+) -> Result<bool> {
+    for allowed_path in allowed_paths {
+        let allowed = validate_model_path(allowed_path, extra_roots)?;
+        if (exact && path == allowed) || (!exact && path.starts_with(&allowed)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn scope_path_is_under_any(
+    path: &Path,
+    allowed_roots: &[String],
+    extra_roots: &[PathBuf],
+) -> Result<bool> {
+    for allowed_root in allowed_roots {
+        let allowed = validate_model_path(allowed_root, extra_roots)?;
+        if path.starts_with(&allowed) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn action_result(
@@ -1198,6 +1407,7 @@ mod tests {
             approval_mode: config.approval_mode.clone(),
             command_timeout: Some(Duration::from_secs(5)),
             user_prompt: None,
+            action_scope: ActionScope::Unrestricted,
         }
     }
 
@@ -1587,6 +1797,119 @@ mod tests {
             validate_action_request(&fixer, &config.workspace, &config.approval_mode, &request);
         assert!(
             matches!(decision, ActionDecision::Denied(reason) if reason.contains("hunk line count mismatch"))
+        );
+    }
+
+    #[test]
+    fn parallel_file_scope_allows_only_exact_write_targets() {
+        let (config, fixer) = fixture_agent("fixer");
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "write".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::WriteFile,
+            params: json!({ "path": "src/other.rs", "content": "created\n" }),
+        };
+        let scope = ActionScope::ParallelFileScope(ParallelFileScope {
+            write_files: vec!["src/lib.rs".to_string()],
+            read_roots: vec!["src".to_string()],
+        });
+
+        let decision = validate_action_request_with_scope(
+            &fixer,
+            &config.workspace,
+            &config.approval_mode,
+            &scope,
+            &request,
+        );
+
+        assert!(
+            matches!(decision, ActionDecision::Denied(reason) if reason.contains("exact write_files"))
+        );
+    }
+
+    #[test]
+    fn parallel_file_scope_rejects_out_of_scope_patch_targets() {
+        let (config, fixer) = fixture_agent("fixer");
+        let patch = "--- a/src/other.rs\n+++ b/src/other.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "patch".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::ApplyPatch,
+            params: json!({ "diff": patch }),
+        };
+        let scope = ActionScope::ParallelFileScope(ParallelFileScope {
+            write_files: vec!["src/lib.rs".to_string()],
+            read_roots: vec!["src".to_string()],
+        });
+
+        let decision = validate_action_request_with_scope(
+            &fixer,
+            &config.workspace,
+            &config.approval_mode,
+            &scope,
+            &request,
+        );
+
+        assert!(
+            matches!(decision, ActionDecision::Denied(reason) if reason.contains("exact write_files"))
+        );
+    }
+
+    #[test]
+    fn parallel_command_policy_rejects_project_wide_mutation_commands() {
+        let (config, fixer) = fixture_agent("fixer");
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "command".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::RunCommand,
+            params: json!({ "command": "cargo test" }),
+        };
+        let scope = ActionScope::ParallelFileScope(ParallelFileScope {
+            write_files: vec!["src/lib.rs".to_string()],
+            read_roots: vec!["src".to_string()],
+        });
+
+        let decision = validate_action_request_with_scope(
+            &fixer,
+            &config.workspace,
+            &config.approval_mode,
+            &scope,
+            &request,
+        );
+
+        assert!(
+            matches!(decision, ActionDecision::Denied(reason) if reason.contains("schedule after group join"))
+        );
+    }
+
+    #[test]
+    fn parallel_command_policy_rejects_free_form_filesystem_commands() {
+        let (config, fixer) = fixture_agent("fixer");
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "command".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::RunCommand,
+            params: json!({ "command": "find . -delete" }),
+        };
+        let scope = ActionScope::ParallelFileScope(ParallelFileScope {
+            write_files: vec!["src/lib.rs".to_string()],
+            read_roots: vec!["src".to_string()],
+        });
+
+        let decision = validate_action_request_with_scope(
+            &fixer,
+            &config.workspace,
+            &config.approval_mode,
+            &scope,
+            &request,
+        );
+
+        assert!(
+            matches!(decision, ActionDecision::Denied(reason) if reason.contains("schedule after group join"))
         );
     }
 

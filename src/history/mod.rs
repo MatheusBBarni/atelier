@@ -15,10 +15,14 @@ pub struct HistoryEvent {
     pub event_id: String,
     pub session_id: String,
     pub run_id: Option<String>,
+    #[serde(default)]
+    pub group_id: Option<String>,
     pub step_id: Option<String>,
     pub timestamp: String,
     pub kind: String,
     pub payload: Value,
+    #[serde(default)]
+    pub payload_truncated: bool,
 }
 
 impl HistoryEvent {
@@ -29,15 +33,28 @@ impl HistoryEvent {
         kind: impl Into<String>,
         payload: Value,
     ) -> Self {
+        Self::new_with_group(session_id, run_id, None, step_id, kind, payload)
+    }
+
+    pub fn new_with_group(
+        session_id: impl Into<String>,
+        run_id: Option<String>,
+        group_id: Option<String>,
+        step_id: Option<String>,
+        kind: impl Into<String>,
+        payload: Value,
+    ) -> Self {
         Self {
             schema_version: 1,
             event_id: new_id(),
             session_id: session_id.into(),
             run_id,
+            group_id,
             step_id,
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             kind: kind.into(),
             payload,
+            payload_truncated: false,
         }
     }
 }
@@ -136,6 +153,7 @@ impl HistoryStore {
             "event_id": event.event_id,
             "session_id": event.session_id,
             "run_id": event.run_id,
+            "group_id": event.group_id,
             "step_id": event.step_id,
             "kind": event.kind,
             "payload": event.payload,
@@ -285,6 +303,23 @@ mod tests {
         store.append_event(&event).unwrap();
         let events = store.read_events().unwrap();
         assert_eq!(events, vec![event]);
+    }
+
+    #[test]
+    fn reads_legacy_jsonl_events_without_group_id() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let path = store.session_dir().join("events.jsonl");
+        fs::write(
+            &path,
+            r#"{"schema_version":1,"event_id":"event","session_id":"session","run_id":"run","step_id":"step","timestamp":"2026-06-06T00:00:00.000Z","kind":"agent_result","payload":{}}"#,
+        )
+        .unwrap();
+
+        let events = read_events_from_path(&path).unwrap();
+
+        assert_eq!(events[0].group_id, None);
+        assert!(!events[0].payload_truncated);
     }
 
     #[test]

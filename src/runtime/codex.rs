@@ -816,6 +816,7 @@ exit 65
             status: DecisionStatus::Continue,
             plan: vec!["Collect project context.".to_string()],
             next_agent: Some("explorer".to_string()),
+            next_step: None,
             reason: "The orchestrator delegates read work.".to_string(),
             required_capabilities: vec![Capability::Read],
             stop_condition: "Explorer returns context.".to_string(),
@@ -979,6 +980,7 @@ exit 65
                 "agent_result"
             }
             .to_string(),
+            parallel_context: None,
             capability_constraints: vec![Capability::Read],
             limits: Limits::default(),
         }

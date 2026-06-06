@@ -5,3 +5,4 @@ target/npm-dist/
 npm/**/*.tgz
 npm/platform/*/bin/
 SHA256SUMS
+.playwright-mcp

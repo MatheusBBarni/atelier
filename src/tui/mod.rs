@@ -1,7 +1,7 @@
 use crate::app::chat::{
     ChatDetailRef, ChatItemKind, ChatItemView, ChatLineStyle, ChatLineView, ChatSeverity,
 };
-use crate::app::{App, AppEvent, AppState, InterruptHandle};
+use crate::app::{App, AppEvent, AppState, ApprovalHandle, InterruptHandle};
 use crate::config::EffectiveConfig;
 use crate::orchestrator::RunState;
 use anyhow::{Context, Result};
@@ -231,6 +231,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
     app.attach_state_sender(state_sender);
     let interrupt_handle = app.interrupt_handle();
+    let approval_handle = app.approval_handle();
     let (command_sender, command_receiver) = mpsc::channel(1024);
 
     enable_raw_mode()?;
@@ -248,6 +249,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
                 state_receiver,
                 command_sender.clone(),
                 interrupt_handle,
+                approval_handle,
                 working_directory,
                 skill_suggestions,
             )
@@ -278,6 +280,7 @@ async fn run_loop(
     mut state_receiver: watch::Receiver<AppState>,
     command_sender: mpsc::Sender<AppWorkerCommand>,
     interrupt_handle: InterruptHandle,
+    approval_handle: ApprovalHandle,
     working_directory: PathBuf,
     skill_suggestions: Vec<SkillSuggestion>,
 ) -> Result<()> {
@@ -303,6 +306,7 @@ async fn run_loop(
                     &mut ui_state,
                     &command_sender,
                     Some(&interrupt_handle),
+                    Some(&approval_handle),
                     command,
                 )
                 .await?
@@ -322,7 +326,7 @@ async fn execute_tui_command(
     command_sender: &mpsc::Sender<AppWorkerCommand>,
     command: TuiCommand,
 ) -> Result<bool> {
-    execute_tui_command_with_interrupt(state, ui_state, command_sender, None, command).await
+    execute_tui_command_with_interrupt(state, ui_state, command_sender, None, None, command).await
 }
 
 async fn execute_tui_command_with_interrupt(
@@ -330,6 +334,7 @@ async fn execute_tui_command_with_interrupt(
     ui_state: &mut TuiUiState,
     command_sender: &mpsc::Sender<AppWorkerCommand>,
     interrupt_handle: Option<&InterruptHandle>,
+    approval_handle: Option<&ApprovalHandle>,
     command: TuiCommand,
 ) -> Result<bool> {
     match command {
@@ -380,6 +385,19 @@ async fn execute_tui_command_with_interrupt(
                 event,
                 AppEvent::PromptSubmitted(_) | AppEvent::ApprovalAnswered(_)
             );
+            if let AppEvent::ApprovalAnswered(approved) = &event {
+                if let (Some(approval_handle), Some(pending)) =
+                    (approval_handle, state.pending_approval.as_ref())
+                {
+                    approval_handle.answer(*approved);
+                    if pending.group_id.is_some() {
+                        if clears_input {
+                            clear_input(state, ui_state);
+                        }
+                        return Ok(true);
+                    }
+                }
+            }
             queue_app_event(command_sender, event).await?;
             if clears_input {
                 clear_input(state, ui_state);
@@ -1935,7 +1953,7 @@ fn legacy_chat_line(event: &str) -> Line<'_> {
 
 fn status_style(status: &str) -> Style {
     match status {
-        "running" | "streaming" => Style::default()
+        "running" | "streaming" | "running_parallel" => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
         "waiting_action" | "waiting_approval" | "waiting_for_user" | "cancelling" => {
@@ -1950,6 +1968,7 @@ fn status_style(status: &str) -> Style {
 fn agent_status_label(status: &str) -> &str {
     match status {
         "streaming" => "running",
+        "running_parallel" => "running parallel",
         _ => status,
     }
 }
@@ -2152,6 +2171,7 @@ mod tests {
     use super::*;
     use crate::app::chat::ChatProjection;
     use crate::app::{AgentView, ConfigStatusView, LiveStepStatus, LiveStepView, LiveStreamView};
+    use crate::config::{load_effective_config, ConfigLoadOptions};
     use crate::history::HistoryEvent;
     use crate::orchestrator::RunState;
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
@@ -2168,6 +2188,7 @@ mod tests {
             session_goal: None,
             config_status: default_config_status(),
             live_step: None,
+            live_steps: Vec::new(),
             pending_approval: None,
             agents: Vec::new(),
             chat_items: Vec::new(),
@@ -2209,6 +2230,7 @@ mod tests {
             session_goal: None,
             config_status: default_config_status(),
             live_step: None,
+            live_steps: Vec::new(),
             pending_approval: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
@@ -2341,9 +2363,12 @@ mod tests {
     #[test]
     fn renders_live_step_stream_detail_as_chat_progress() {
         let mut state = state_with_input("", false);
-        state.live_step = Some(LiveStepView {
+        let live_step = LiveStepView {
             run_id: "run".to_string(),
+            group_id: None,
             step_id: "step".to_string(),
+            step_label: None,
+            file_scope: None,
             agent: "fixer".to_string(),
             status: LiveStepStatus::Streaming,
             streams: vec![LiveStreamView {
@@ -2352,10 +2377,12 @@ mod tests {
                 sequence_end: 1,
                 final_delta: false,
             }],
-        });
+        };
+        state.live_step = Some(live_step.clone());
+        state.live_steps = vec![live_step];
         state.events = vec!["Fixer step started.".to_string()];
         let mut projection = ChatProjection::new();
-        projection.apply_live_step(state.live_step.as_ref());
+        projection.apply_live_steps(&state.live_steps);
         state.chat_items = projection.items().to_vec();
 
         let text = render_to_text(&state, 100, 24);
@@ -2368,15 +2395,20 @@ mod tests {
     #[test]
     fn renders_live_step_running_state_before_stream_content() {
         let mut state = state_with_input("", false);
-        state.live_step = Some(LiveStepView {
+        let live_step = LiveStepView {
             run_id: "run".to_string(),
+            group_id: None,
             step_id: "step".to_string(),
+            step_label: None,
+            file_scope: None,
             agent: "fixer".to_string(),
             status: LiveStepStatus::Running,
             streams: Vec::new(),
-        });
+        };
+        state.live_step = Some(live_step.clone());
+        state.live_steps = vec![live_step];
         let mut projection = ChatProjection::new();
-        projection.apply_live_step(state.live_step.as_ref());
+        projection.apply_live_steps(&state.live_steps);
         state.chat_items = projection.items().to_vec();
 
         let text = render_to_text(&state, 100, 24);
@@ -2416,6 +2448,7 @@ mod tests {
             session_goal: None,
             config_status: default_config_status(),
             live_step: None,
+            live_steps: Vec::new(),
             pending_approval: None,
             agents: Vec::new(),
             chat_items: Vec::new(),
@@ -2438,10 +2471,12 @@ mod tests {
             event_id: "event-prompt".to_string(),
             session_id: "session".to_string(),
             run_id: Some("run".to_string()),
+            group_id: None,
             step_id: None,
             timestamp: "2026-06-05T00:00:00.000Z".to_string(),
             kind: "prompt_submitted".to_string(),
             payload: json!({ "prompt": "build a feature" }),
+            payload_truncated: false,
         });
         state.chat_items = projection.items().to_vec();
 
@@ -2503,8 +2538,10 @@ mod tests {
             session_goal: None,
             config_status: default_config_status(),
             live_step: None,
+            live_steps: Vec::new(),
             pending_approval: Some(crate::app::PendingApprovalView {
                 run_id: "run".to_string(),
+                group_id: None,
                 step_id: "step".to_string(),
                 action_id: "action".to_string(),
                 agent: "fixer".to_string(),
@@ -3234,6 +3271,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn parallel_approval_answer_signals_without_queuing_stale_event() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+        let app = App::new(config).await.unwrap();
+        let approval_handle = app.approval_handle();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("yes", true);
+        state.pending_approval.as_mut().unwrap().group_id = Some("group".to_string());
+        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
+
+        let keep_running = execute_tui_command_with_interrupt(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            None,
+            Some(&approval_handle),
+            TuiCommand::Dispatch(AppEvent::ApprovalAnswered(true)),
+        )
+        .await
+        .unwrap();
+
+        assert!(keep_running);
+        assert!(state.input.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn edit_keys_become_local_input_commands() {
         let state = state_with_input("abc", false);
@@ -3536,6 +3604,7 @@ mod tests {
             session_goal: None,
             config_status: default_config_status(),
             live_step: None,
+            live_steps: Vec::new(),
             pending_approval: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
@@ -3642,8 +3711,10 @@ mod tests {
             session_goal: None,
             config_status: default_config_status(),
             live_step: None,
+            live_steps: Vec::new(),
             pending_approval: pending_approval.then(|| crate::app::PendingApprovalView {
                 run_id: "run".to_string(),
+                group_id: None,
                 step_id: "step".to_string(),
                 action_id: "action".to_string(),
                 agent: "fixer".to_string(),
