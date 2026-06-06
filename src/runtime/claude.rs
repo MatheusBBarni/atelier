@@ -265,13 +265,17 @@ impl ClaudeRuntime {
                 if !missing.is_empty() {
                     return RuntimeAvailability {
                         runtime_id: self.config.id.clone(),
-                        status: RuntimeAvailabilityStatus::Unavailable,
+                        status: RuntimeAvailabilityStatus::Unknown,
                         message: join_status_parts(
                             version_message,
-                            &format!("claude --help is missing required flags: {}", missing.join(", ")),
+                            &format!(
+                                "claude --help did not list protected default flags: {}; help output may be incomplete; protected defaults: {}",
+                                missing.join(", "),
+                                protected_defaults_summary().join(", ")
+                            ),
                         ),
                         remediation: Some(
-                            "Upgrade Claude Code so print mode supports stream-json, partial messages, disabled tools, and setting sources.".to_string(),
+                            "Run a normal agent step to verify Claude authentication and flag support; doctor does not run paid or interactive Claude probes.".to_string(),
                         ),
                     };
                 }
@@ -1049,7 +1053,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn claude_availability_reports_missing_required_help_flags() {
+    async fn claude_availability_warns_when_help_omits_default_flags() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
@@ -1064,13 +1068,16 @@ mod tests {
 
         let availability = runtime.check_availability().await;
 
-        assert_eq!(availability.status, RuntimeAvailabilityStatus::Unavailable);
+        assert_eq!(availability.status, RuntimeAvailabilityStatus::Unknown);
         assert!(availability.message.contains("--include-partial-messages"));
+        assert!(availability
+            .message
+            .contains("help output may be incomplete"));
         assert!(availability
             .remediation
             .as_deref()
             .unwrap()
-            .contains("Upgrade Claude Code"));
+            .contains("normal agent step"));
     }
 
     #[test]
