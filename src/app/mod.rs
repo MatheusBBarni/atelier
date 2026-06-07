@@ -24,6 +24,9 @@ use crate::runtime::{
     RuntimeRecentContext, RuntimeRecentFile, RuntimeRequest, RuntimeStreamDelta,
     RUNTIME_EVENT_CHANNEL_CAPACITY,
 };
+use crate::skills::{
+    self, CompiledPrompt, LoadedSkillMetadata, SkillLoadError, SkillPromptContext,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -31,6 +34,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::future::{pending, Future};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -229,7 +233,9 @@ struct ActiveStep {
 struct RunDriveContext {
     run_id: String,
     parent_run_id: Option<String>,
+    submitted_prompt: String,
     prompt: String,
+    skill_context: Option<SkillPromptContext>,
     subtask: Option<SubtaskContext>,
     previous_results: Vec<RunStepResult>,
     step_count: u32,
@@ -237,10 +243,58 @@ struct RunDriveContext {
     parse_repair_attempts: u32,
 }
 
+impl RunDriveContext {
+    fn new(
+        run_id: impl Into<String>,
+        parent_run_id: Option<String>,
+        submitted_prompt: impl Into<String>,
+        prompt: impl Into<String>,
+        skill_context: Option<SkillPromptContext>,
+        subtask: Option<SubtaskContext>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            parent_run_id,
+            submitted_prompt: submitted_prompt.into(),
+            prompt: prompt.into(),
+            skill_context,
+            subtask,
+            previous_results: Vec::new(),
+            step_count: 0,
+            started_at: Instant::now(),
+            parse_repair_attempts: 0,
+        }
+    }
+
+    fn from_compiled(
+        run_id: impl Into<String>,
+        parent_run_id: Option<String>,
+        compiled: CompiledPrompt,
+        subtask: Option<SubtaskContext>,
+    ) -> Self {
+        Self::new(
+            run_id,
+            parent_run_id,
+            compiled.submitted_prompt,
+            compiled.user_prompt,
+            compiled.skill_context,
+            subtask,
+        )
+    }
+
+    fn loaded_skill_metadata(&self) -> Vec<LoadedSkillMetadata> {
+        self.skill_context
+            .as_ref()
+            .map(SkillPromptContext::metadata)
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SubtaskContext {
     agent_id: String,
     request: String,
+    submitted_request: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -351,7 +405,9 @@ struct RunRecord {
     run_id: String,
     parent_run_id: Option<String>,
     session_id: String,
+    submitted_prompt: String,
     prompt: String,
+    loaded_skills: Vec<LoadedSkillMetadata>,
     session_goal: Option<String>,
     subtask: Option<SubtaskRecord>,
     state: RunState,
@@ -361,6 +417,7 @@ struct RunRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SubtaskRecord {
     agent_id: String,
+    submitted_request: String,
     request: String,
 }
 
@@ -547,6 +604,7 @@ impl App {
         ) {
             bail!("a run is already active");
         }
+        let compiled_prompt = compile_app_prompt(&self.config.working_directory, &prompt)?;
 
         self.reset_enabled_agent_statuses();
         let run_id = new_id();
@@ -563,20 +621,15 @@ impl App {
             Some(run_id.clone()),
             None,
             "prompt_submitted",
-            json!({ "prompt": prompt }),
-            user_event_display(&prompt),
+            json!({
+                "prompt": compiled_prompt.user_prompt.clone(),
+                "submitted_prompt": compiled_prompt.submitted_prompt.clone(),
+            }),
+            user_event_display(&compiled_prompt.user_prompt),
         )?;
+        self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
 
-        let run = RunDriveContext {
-            run_id,
-            parent_run_id: None,
-            prompt,
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 0,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+        let run = RunDriveContext::from_compiled(run_id, None, compiled_prompt, None);
         self.drive_run(run, None).await
     }
 
@@ -680,13 +733,15 @@ impl App {
         if !agent.enabled {
             bail!("subtask references disabled agent {agent_id}");
         }
+        let compiled_task = compile_app_prompt(&self.config.working_directory, task)?;
 
         self.reset_enabled_agent_statuses();
         let run_id = new_id();
         let parent_run_id = self.state.active_run_id.clone();
         self.state.active_run_id = Some(run_id.clone());
         self.state.run_state = RunState::Running;
-        let prompt = subtask_prompt(task);
+        let submitted_prompt = subtask_prompt(&compiled_task.submitted_prompt);
+        let prompt = subtask_prompt(&compiled_task.user_prompt);
         self.record_event(
             Some(run_id.clone()),
             None,
@@ -695,23 +750,24 @@ impl App {
                 "run_id": run_id,
                 "parent_run_id": parent_run_id,
                 "agent": agent_id,
-                "request": task,
+                "request": compiled_task.user_prompt.clone(),
+                "submitted_request": compiled_task.submitted_prompt.clone(),
             }),
             format!("Subtask started: {agent_id}."),
         )?;
-        let run = RunDriveContext {
+        self.record_skills_loaded(run_id.as_str(), compiled_task.skill_context.as_ref())?;
+        let run = RunDriveContext::new(
             run_id,
             parent_run_id,
+            submitted_prompt,
             prompt,
-            subtask: Some(SubtaskContext {
+            compiled_task.skill_context,
+            Some(SubtaskContext {
                 agent_id: agent.id.clone(),
-                request: task.to_string(),
+                request: compiled_task.user_prompt,
+                submitted_request: compiled_task.submitted_prompt,
             }),
-            previous_results: Vec::new(),
-            step_count: 0,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+        );
         self.drive_run(run, None).await
     }
 
@@ -2419,10 +2475,13 @@ impl App {
             run_id: run.run_id.clone(),
             parent_run_id: run.parent_run_id.clone(),
             session_id: self.history.session_id().to_string(),
+            submitted_prompt: run.submitted_prompt.clone(),
             prompt: run.prompt.clone(),
+            loaded_skills: run.loaded_skill_metadata(),
             session_goal: self.state.session_goal.clone(),
             subtask: run.subtask.as_ref().map(|subtask| SubtaskRecord {
                 agent_id: subtask.agent_id.clone(),
+                submitted_request: subtask.submitted_request.clone(),
                 request: subtask.request.clone(),
             }),
             state: self.state.run_state.clone(),
@@ -3124,6 +3183,24 @@ impl App {
         display: impl Into<String>,
     ) -> Result<()> {
         self.record_event_with_group(run_id, None, step_id, kind, payload, display)
+    }
+
+    fn record_skills_loaded(
+        &mut self,
+        run_id: &str,
+        skill_context: Option<&SkillPromptContext>,
+    ) -> Result<()> {
+        let Some(skill_context) = skill_context.filter(|context| !context.loaded.is_empty()) else {
+            return Ok(());
+        };
+        let metadata = skill_context.metadata();
+        self.record_event(
+            Some(run_id.to_string()),
+            None,
+            "skills_loaded",
+            skills_loaded_payload_from_metadata(&metadata),
+            loaded_skills_display(&metadata),
+        )
     }
 
     fn record_event_with_group(
@@ -4717,6 +4794,28 @@ fn user_event_display(message: &str) -> String {
     format!("You: {}", single_line_event_text(message))
 }
 
+fn compile_app_prompt(working_directory: &Path, prompt: &str) -> Result<CompiledPrompt> {
+    skills::compile_prompt(working_directory, prompt)
+        .map_err(|error| anyhow!(skill_load_diagnostic(&error)))
+}
+
+fn skill_load_diagnostic(error: &SkillLoadError) -> String {
+    format!("failed to load skill reference: {error}")
+}
+
+fn skills_loaded_payload_from_metadata(metadata: &[LoadedSkillMetadata]) -> Value {
+    json!({ "skills": metadata })
+}
+
+fn loaded_skills_display(metadata: &[LoadedSkillMetadata]) -> String {
+    let skills = metadata
+        .iter()
+        .map(|skill| format!("{} ({})", skill.display_name, skill.source_origin))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Skills loaded: {skills}.")
+}
+
 fn config_status_display(status: &ConfigStatusView) -> String {
     let sources = status.sources.join(", ");
     let preset = status.preset.as_deref().unwrap_or("none");
@@ -4747,7 +4846,7 @@ fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
     if !trimmed.starts_with('/') {
         return Ok(());
     }
-    if is_named_prompt_prefix(trimmed, "/agent:") || is_named_prompt_prefix(trimmed, "/skill:") {
+    if is_named_prompt_prefix(trimmed, "/agent:") || trimmed.starts_with("/skill:") {
         return Ok(());
     }
     let command = trimmed.split_whitespace().next().unwrap_or(trimmed);
@@ -4946,7 +5045,10 @@ mod tests {
     use super::*;
     use crate::app::chat::{ChatItemKind, ChatItemStatus, ChatSeverity};
     use crate::config::{load_effective_config, ConfigLoadOptions};
+    use crate::skills::{LoadedSkill, SkillLoadErrorKind};
+    use serde_json::Value;
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn fake_config(dir: &std::path::Path) -> EffectiveConfig {
@@ -4991,6 +5093,109 @@ runtime = "fake"
             config_path: Some(config_path),
         })
         .unwrap()
+    }
+
+    fn write_project_skill(
+        project_root: &Path,
+        directory_name: &str,
+        frontmatter_name: Option<&str>,
+        body: &str,
+    ) {
+        let skill_dir = project_root.join(".agents/skills").join(directory_name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        let contents = if let Some(name) = frontmatter_name {
+            format!("---\nname: {name}\ndescription: test skill\n---\n{body}\n")
+        } else {
+            format!("{body}\n")
+        };
+        fs::write(skill_dir.join("SKILL.md"), contents).unwrap();
+    }
+
+    fn test_loaded_skill(display_name: &str, content: &str) -> LoadedSkill {
+        LoadedSkill {
+            metadata: LoadedSkillMetadata {
+                requested_names: vec![display_name.to_string()],
+                display_name: display_name.to_string(),
+                canonical_id: format!(".agents/skills/{display_name}/SKILL.md"),
+                source_origin: ".agents/skills".to_string(),
+                source_path: format!(".agents/skills/{display_name}/SKILL.md"),
+                load_reason: "explicit".to_string(),
+            },
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn run_drive_context_stores_prompt_provenance_and_skill_context_only_in_memory() {
+        let skill_context = SkillPromptContext {
+            loaded: vec![test_loaded_skill(
+                "reviewer",
+                "SENTINEL_FULL_SKILL_BODY_PRIVATE",
+            )],
+        };
+
+        let run = RunDriveContext::new(
+            "run",
+            None,
+            "/skill:reviewer inspect README",
+            "inspect README",
+            Some(skill_context),
+            None,
+        );
+
+        assert_eq!(run.submitted_prompt, "/skill:reviewer inspect README");
+        assert_eq!(run.prompt, "inspect README");
+        assert!(!run.prompt.contains("/skill:reviewer"));
+        assert!(!run.prompt.contains("SENTINEL_FULL_SKILL_BODY_PRIVATE"));
+        assert!(!run.prompt.contains("<Skill:"));
+        assert_eq!(
+            run.skill_context
+                .as_ref()
+                .unwrap()
+                .loaded
+                .first()
+                .unwrap()
+                .content,
+            "SENTINEL_FULL_SKILL_BODY_PRIVATE"
+        );
+    }
+
+    #[test]
+    fn skills_loaded_payload_serializes_loaded_skill_metadata_only() {
+        let skill = test_loaded_skill("reviewer", "SENTINEL_FULL_SKILL_BODY_PRIVATE");
+
+        let payload = skills_loaded_payload_from_metadata(&[skill.metadata]);
+
+        let loaded = payload["skills"].as_array().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0]["requested_names"], json!(["reviewer"]));
+        assert_eq!(loaded[0]["display_name"], "reviewer");
+        assert_eq!(
+            loaded[0]["canonical_id"],
+            ".agents/skills/reviewer/SKILL.md"
+        );
+        assert_eq!(loaded[0]["source_origin"], ".agents/skills");
+        assert_eq!(loaded[0]["source_path"], ".agents/skills/reviewer/SKILL.md");
+        assert_eq!(loaded[0]["load_reason"], "explicit");
+        assert!(!payload
+            .to_string()
+            .contains("SENTINEL_FULL_SKILL_BODY_PRIVATE"));
+        assert!(loaded[0].get("content").is_none());
+    }
+
+    #[test]
+    fn skill_load_error_diagnostic_includes_resolver_suggestions() {
+        let error = SkillLoadError {
+            requested_name: "revier".to_string(),
+            kind: SkillLoadErrorKind::Unknown,
+            suggestions: vec!["reviewer".to_string()],
+        };
+
+        let diagnostic = skill_load_diagnostic(&error);
+
+        assert!(diagnostic.contains("failed to load skill reference"));
+        assert!(diagnostic.contains("unknown skill 'revier'"));
+        assert!(diagnostic.contains("Did you mean reviewer?"));
     }
 
     fn fake_parallel_config(dir: &std::path::Path) -> EffectiveConfig {
@@ -5899,16 +6104,8 @@ prompt = "{reviewer_prompt}"
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
-        let run = RunDriveContext {
-            run_id: "run".to_string(),
-            parent_run_id: None,
-            prompt: "prompt".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 1,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+        let mut run = RunDriveContext::new("run", None, "prompt", "prompt", None, None);
+        run.step_count = 1;
 
         app.set_active_step("run", "step", "explorer");
         app.record_runtime_stream_deltas(
@@ -6029,16 +6226,8 @@ prompt = "{reviewer_prompt}"
         let mut app = App::new(config).await.unwrap();
         app.state.active_run_id = Some("run".to_string());
         app.set_active_step("run", "step", "explorer");
-        let run = RunDriveContext {
-            run_id: "run".to_string(),
-            parent_run_id: None,
-            prompt: "slow stream".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 1,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+        let mut run = RunDriveContext::new("run", None, "slow stream", "slow stream", None, None);
+        run.step_count = 1;
         let elapsed = tokio::time::timeout(Duration::ZERO, pending::<Result<RuntimeOutput>>())
             .await
             .unwrap_err();
@@ -6207,16 +6396,7 @@ prompt = "{reviewer_prompt}"
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
-        let mut run = RunDriveContext {
-            run_id: "run".to_string(),
-            parent_run_id: None,
-            prompt: "fix a typo".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 0,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+        let mut run = RunDriveContext::new("run", None, "fix a typo", "fix a typo", None, None);
         let decision = crate::orchestrator::OrchestratorDecision {
             schema_version: 1,
             decision_id: "decision".to_string(),
@@ -6484,8 +6664,14 @@ instructions_file = "agents/explorer.md"
     }
 
     #[tokio::test]
-    async fn skill_prompt_prefix_is_allowed_as_agent_prompt() {
+    async fn skill_prompt_prefix_loads_skill_before_runtime_work() {
         let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "Review workflow guidance.",
+        );
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
 
@@ -6494,8 +6680,28 @@ instructions_file = "agents/explorer.md"
             .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
-        let history_events = app.history.read_events().unwrap();
-        let prompt = history_events
+        let events = app.history.read_events().unwrap();
+        let run_started_index = events
+            .iter()
+            .position(|event| event.kind == "run_started")
+            .unwrap();
+        let prompt_submitted_index = events
+            .iter()
+            .position(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        let skills_loaded_index = events
+            .iter()
+            .position(|event| event.kind == "skills_loaded")
+            .unwrap();
+        let runtime_index = events
+            .iter()
+            .position(|event| event.kind == "agent_step_started")
+            .unwrap();
+        assert!(run_started_index < prompt_submitted_index);
+        assert!(prompt_submitted_index < skills_loaded_index);
+        assert!(skills_loaded_index < runtime_index);
+
+        let prompt = events
             .iter()
             .find(|event| event.kind == "prompt_submitted")
             .unwrap();
@@ -6504,8 +6710,169 @@ instructions_file = "agents/explorer.md"
                 .payload
                 .get("prompt")
                 .and_then(serde_json::Value::as_str),
+            Some("inspect README")
+        );
+        assert_eq!(
+            prompt
+                .payload
+                .get("submitted_prompt")
+                .and_then(serde_json::Value::as_str),
             Some("/skill:reviewer inspect README")
         );
+        let skills_loaded = events
+            .iter()
+            .find(|event| event.kind == "skills_loaded")
+            .unwrap();
+        assert_eq!(skills_loaded.payload["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            skills_loaded.payload["skills"][0]["display_name"],
+            Value::String("reviewer".to_string())
+        );
+        assert_eq!(
+            skills_loaded.payload["skills"][0]["source_origin"],
+            Value::String(".agents/skills".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_skill_reference_fails_before_run_creation() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/skill:missing inspect README")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unknown skill 'missing'"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().all(|event| {
+            event.kind != "run_started"
+                && event.kind != "prompt_submitted"
+                && event.kind != "skills_loaded"
+        }));
+        let runs_dir = dir.path().join(".multiagent/runs");
+        assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_skill_reference_reports_skill_load_diagnostic() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/skill: inspect README")
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("empty /skill: reference"));
+        assert!(!message.contains("unknown command"));
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().all(|event| {
+            event.kind != "run_started"
+                && event.kind != "prompt_submitted"
+                && event.kind != "skills_loaded"
+        }));
+    }
+
+    #[tokio::test]
+    async fn mid_prompt_skill_reference_loads_and_normalizes_prompt() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "Review workflow guidance.",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("please use /skill:reviewer here")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let prompt = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert_eq!(prompt.payload["prompt"], "please use here");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "skills_loaded")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_skill_references_emit_one_loaded_skill_entry() {
+        let dir = tempdir().unwrap();
+        write_project_skill(dir.path(), "a", Some("a"), "Skill A guidance.");
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/skill:a do x /skill:a").await.unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let skills_loaded = events
+            .iter()
+            .find(|event| event.kind == "skills_loaded")
+            .unwrap();
+        let skills = skills_loaded.payload["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["requested_names"], json!(["a"]));
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.kind == "prompt_submitted")
+                .unwrap()
+                .payload["prompt"],
+            "do x"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_bodies_are_not_persisted_to_history_debug_log_or_run_record() {
+        let dir = tempdir().unwrap();
+        const SENTINEL: &str = "SENTINEL_FULL_SKILL_BODY_PRIVATE";
+        write_project_skill(dir.path(), "reviewer", Some("reviewer"), SENTINEL);
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.debug_enabled = true;
+
+        app.submit_prompt("/skill:reviewer inspect README")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let run_id = events
+            .iter()
+            .find(|event| event.kind == "run_started")
+            .and_then(|event| event.run_id.clone())
+            .unwrap();
+        let prompt_submitted = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert!(!prompt_submitted.payload.to_string().contains(SENTINEL));
+
+        let events_jsonl =
+            fs::read_to_string(app.history.session_dir().join("events.jsonl")).unwrap();
+        let debug_log = fs::read_to_string(dir.path().join(".multiagent/debug.log")).unwrap();
+        let run_record =
+            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+        assert!(!events_jsonl.contains(SENTINEL));
+        assert!(!debug_log.contains(SENTINEL));
+        assert!(!run_record.contains(SENTINEL));
+        assert!(run_record.contains("\"submitted_prompt\""));
+        assert!(run_record.contains("\"loaded_skills\""));
     }
 
     #[tokio::test]
@@ -6589,6 +6956,88 @@ instructions_file = "agents/explorer.md"
                 .and_then(|subtask| subtask.get("request"))
                 .and_then(serde_json::Value::as_str),
             Some("inspect src only")
+        );
+        assert_eq!(
+            record
+                .get("subtask")
+                .and_then(|subtask| subtask.get("submitted_request"))
+                .and_then(serde_json::Value::as_str),
+            Some("inspect src only")
+        );
+    }
+
+    #[tokio::test]
+    async fn subtask_skill_reference_loads_before_subtask_runtime_work() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "Review workflow guidance.",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/subtask explorer /skill:reviewer inspect README")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let subtask_started_index = events
+            .iter()
+            .position(|event| event.kind == "subtask_started")
+            .unwrap();
+        let skills_loaded_index = events
+            .iter()
+            .position(|event| event.kind == "skills_loaded")
+            .unwrap();
+        let runtime_index = events
+            .iter()
+            .position(|event| event.kind == "agent_step_started")
+            .unwrap();
+        assert!(subtask_started_index < skills_loaded_index);
+        assert!(skills_loaded_index < runtime_index);
+
+        let subtask_started = events
+            .iter()
+            .find(|event| event.kind == "subtask_started")
+            .unwrap();
+        assert_eq!(subtask_started.payload["request"], "inspect README");
+        assert_eq!(
+            subtask_started.payload["submitted_request"],
+            "/skill:reviewer inspect README"
+        );
+        let run_id = subtask_started.run_id.as_ref().unwrap();
+        let run_record =
+            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+        assert!(run_record.contains("\"request\": \"inspect README\""));
+        assert!(run_record.contains("\"submitted_request\": \"/skill:reviewer inspect README\""));
+        assert!(!run_record.contains("Review workflow guidance."));
+    }
+
+    #[tokio::test]
+    async fn failed_subtask_skill_reference_creates_no_subtask_run() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/subtask explorer /skill:missing inspect README")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unknown skill 'missing'"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .all(|event| event.kind != "subtask_started" && event.kind != "skills_loaded"));
+        assert_eq!(
+            fs::read_dir(dir.path().join(".multiagent/runs"))
+                .unwrap()
+                .count(),
+            0
         );
     }
 
@@ -6794,16 +7243,15 @@ runtime = "fake"
         let run_id = "expired-run".to_string();
         app.state.active_run_id = Some(run_id.clone());
         app.state.run_state = RunState::Planning;
-        let run = RunDriveContext {
+        let mut run = RunDriveContext::new(
             run_id,
-            parent_run_id: None,
-            prompt: "create a feature".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 0,
-            started_at: Instant::now() - Duration::from_secs(61),
-            parse_repair_attempts: 0,
-        };
+            None,
+            "create a feature",
+            "create a feature",
+            None,
+            None,
+        );
+        run.started_at = Instant::now() - Duration::from_secs(61);
 
         app.drive_run(run, None).await.unwrap();
 
@@ -6853,16 +7301,15 @@ runtime = "fake"
             .unwrap();
         app.state.active_run_id = Some(run_id.clone());
         app.state.run_state = RunState::Planning;
-        let run = RunDriveContext {
+        let mut run = RunDriveContext::new(
             run_id,
-            parent_run_id: None,
-            prompt: "create a feature".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 1,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+            None,
+            "create a feature",
+            "create a feature",
+            None,
+            None,
+        );
+        run.step_count = 1;
         let resume = StepResume {
             step: PausedStep::Orchestrator { step_id },
             step_started_at: Instant::now() - Duration::from_secs(61),
@@ -7356,6 +7803,42 @@ runtime = "fake"
                 .and_then(serde_json::Value::as_str),
             Some("/tmp/project")
         );
+        assert!(events.iter().all(|event| event.kind != "skills_loaded"));
+    }
+
+    #[tokio::test]
+    async fn clarifying_answer_with_skill_reference_does_not_load_new_skill() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "Review workflow guidance.",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        app.submit_prompt("/skill:reviewer").await.unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answer = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answer
+                .payload
+                .get("answer")
+                .and_then(serde_json::Value::as_str),
+            Some("/skill:reviewer")
+        );
+        assert!(events.iter().all(|event| event.kind != "skills_loaded"));
     }
 
     #[tokio::test]
@@ -7394,10 +7877,13 @@ runtime = "fake"
             .await
             .unwrap();
 
-        let error = app.submit_prompt("yes").await.unwrap_err();
+        let error = app.submit_prompt("/skill:missing yes").await.unwrap_err();
         assert!(error.to_string().contains("waiting for action approval"));
+        assert!(!error.to_string().contains("unknown skill"));
         assert_eq!(app.state.run_state, RunState::WaitingForUser);
         assert!(app.state.pending_approval.is_some());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().all(|event| event.kind != "skills_loaded"));
     }
 
     #[tokio::test]
