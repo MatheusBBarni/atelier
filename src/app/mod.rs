@@ -50,6 +50,9 @@ const RUNTIME_RECENT_CONTEXT_LIMIT: usize = 20;
 const LIVE_STREAM_CONTENT_LIMIT: usize = 16 * 1024;
 const STREAM_COALESCE_BYTES: usize = 2 * 1024;
 const STREAM_COALESCE_INTERVAL: Duration = Duration::from_millis(250);
+const WORKFLOW_COMMAND: &str = "/workflow";
+const WORKFLOW_USAGE: &str = "usage: /workflow <prompt>";
+const AVAILABLE_SLASH_COMMANDS: &str = "/help, /goal, /goal clear, /config, /subtask <agent> <task>, /workflow <prompt>, /agent:<name>, /skill:<name>";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentView {
@@ -241,6 +244,12 @@ struct RunDriveContext {
     step_count: u32,
     started_at: Instant,
     parse_repair_attempts: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkflowCommand {
+    original_command: String,
+    prompt: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -612,14 +621,25 @@ impl App {
                 return self.drive_run(pending.run, None).await;
             }
         }
-        reject_unknown_slash_command(&prompt)?;
+        let workflow_command = self.handle_workflow_command(&prompt)?;
+        if workflow_command.is_none() {
+            reject_unknown_slash_command(&prompt)?;
+        }
         if matches!(
             self.state.run_state,
             RunState::Planning | RunState::Running | RunState::WaitingForUser
         ) {
             bail!("a run is already active");
         }
-        let compiled_prompt = compile_app_prompt(&self.config.working_directory, &prompt)?;
+        let mut compiled_prompt = compile_app_prompt(
+            &self.config.working_directory,
+            workflow_command
+                .as_ref()
+                .map_or(prompt.as_str(), |command| command.prompt.as_str()),
+        )?;
+        if let Some(command) = workflow_command {
+            compiled_prompt.submitted_prompt = command.original_command;
+        }
 
         self.reset_enabled_agent_statuses();
         let run_id = new_id();
@@ -646,6 +666,14 @@ impl App {
 
         let run = RunDriveContext::from_compiled(run_id, None, compiled_prompt, None);
         self.drive_run(run, None).await
+    }
+
+    fn handle_workflow_command(&self, prompt: &str) -> Result<Option<WorkflowCommand>> {
+        let command = parse_workflow_command(prompt)?;
+        if command.is_some() {
+            preflight_workflow_prerequisites(&self.config)?;
+        }
+        Ok(command)
     }
 
     fn handle_goal_command(&mut self, prompt: &str) -> Result<bool> {
@@ -4846,6 +4874,41 @@ fn config_status_display(status: &ConfigStatusView) -> String {
     }
 }
 
+fn parse_workflow_command(input: &str) -> Result<Option<WorkflowCommand>> {
+    let trimmed = input.trim();
+    if trimmed == WORKFLOW_COMMAND {
+        bail!(WORKFLOW_USAGE);
+    }
+    let Some(rest) = trimmed.strip_prefix(WORKFLOW_COMMAND) else {
+        return Ok(None);
+    };
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return Ok(None);
+    }
+    let prompt = rest.trim();
+    if prompt.is_empty() {
+        bail!(WORKFLOW_USAGE);
+    }
+    Ok(Some(WorkflowCommand {
+        original_command: trimmed.to_string(),
+        prompt: prompt.to_string(),
+    }))
+}
+
+fn preflight_workflow_prerequisites(config: &EffectiveConfig) -> Result<()> {
+    if !config.features.parallel_step_groups {
+        bail!(
+            "workflow mode requires Parallel Step Groups; parallel step groups are disabled by features.parallel_step_groups"
+        );
+    }
+    if config.limits.max_parallel_agent_steps == 0 {
+        bail!(
+            "workflow mode requires Parallel Step Groups; parallel step groups are disabled by limits.max_parallel_agent_steps = 0"
+        );
+    }
+    Ok(())
+}
+
 fn parse_subtask_command(input: &str) -> Result<(&str, &str)> {
     let trimmed = input.trim();
     let Some((agent, task)) = trimmed.split_once(char::is_whitespace) else {
@@ -4867,9 +4930,7 @@ fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
         return Ok(());
     }
     let command = trimmed.split_whitespace().next().unwrap_or(trimmed);
-    bail!(
-        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>, /agent:<name>, /skill:<name>"
-    )
+    bail!("unknown command {command}. Available commands: {AVAILABLE_SLASH_COMMANDS}")
 }
 
 fn is_named_prompt_prefix(prompt: &str, prefix: &str) -> bool {
@@ -5456,6 +5517,39 @@ runtime = "fake"
         assert!(diagnostic.contains("Did you mean reviewer?"));
     }
 
+    #[test]
+    fn workflow_command_parser_extracts_prompt() {
+        let command =
+            parse_workflow_command("/workflow parallel scoped write action create a feature")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            command.prompt,
+            "parallel scoped write action create a feature"
+        );
+        assert_eq!(
+            command.original_command,
+            "/workflow parallel scoped write action create a feature"
+        );
+    }
+
+    #[test]
+    fn workflow_command_parser_rejects_empty_prompt() {
+        for input in ["/workflow", "/workflow     "] {
+            let error = parse_workflow_command(input).unwrap_err();
+
+            assert!(error.to_string().contains(WORKFLOW_USAGE));
+        }
+    }
+
+    #[test]
+    fn workflow_command_parser_does_not_match_longer_slash_command() {
+        assert!(parse_workflow_command("/workflowfoo create a feature")
+            .unwrap()
+            .is_none());
+    }
+
     fn fake_parallel_config(dir: &std::path::Path) -> EffectiveConfig {
         let config_path = dir.join("multiagent.toml");
         fs::write(
@@ -5495,6 +5589,14 @@ runtime = "fake"
             config_path: Some(config_path),
         })
         .unwrap()
+    }
+
+    fn assert_no_workflow_run_start_events(events: &[HistoryEvent]) {
+        assert!(events.iter().all(|event| {
+            event.kind != "run_started"
+                && event.kind != "workflow_started"
+                && event.kind != "prompt_submitted"
+        }));
     }
 
     fn fake_parallel_normal_approval_config(dir: &std::path::Path) -> EffectiveConfig {
@@ -6888,12 +6990,93 @@ instructions_file = "agents/explorer.md"
         let error = app.submit_prompt("/doctor").await.unwrap_err();
 
         assert!(error.to_string().contains("unknown command /doctor"));
+        assert!(error.to_string().contains("/workflow <prompt>"));
         assert_eq!(app.state.run_state, RunState::Idle);
         assert!(app.state.active_run_id.is_none());
         let events = app.history.read_events().unwrap();
         assert!(!events
             .iter()
             .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+    }
+
+    #[tokio::test]
+    async fn workflow_command_disabled_parallel_feature_fails_before_run_creation() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/workflow create a feature")
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("workflow mode requires Parallel Step Groups"));
+        assert!(message.contains("features.parallel_step_groups"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert_no_workflow_run_start_events(&events);
+        let runs_dir = dir.path().join(".multiagent/runs");
+        assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn workflow_command_zero_parallel_limit_fails_before_run_creation() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_parallel_config(dir.path());
+        config.limits.max_parallel_agent_steps = 0;
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/workflow create a feature")
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("workflow mode requires Parallel Step Groups"));
+        assert!(message.contains("limits.max_parallel_agent_steps = 0"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert_no_workflow_run_start_events(&events);
+        let runs_dir = dir.path().join(".multiagent/runs");
+        assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn workflow_command_with_enabled_parallel_prerequisites_submits_extracted_prompt() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel scoped write action create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let prompt = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert_eq!(
+            prompt
+                .payload
+                .get("prompt")
+                .and_then(serde_json::Value::as_str),
+            Some("parallel scoped write action create a feature")
+        );
+        assert_eq!(
+            prompt
+                .payload
+                .get("submitted_prompt")
+                .and_then(serde_json::Value::as_str),
+            Some("/workflow parallel scoped write action create a feature")
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started"));
     }
 
     #[tokio::test]
