@@ -5146,6 +5146,19 @@ runtime = "fake"
         haystack.match_indices(needle).count()
     }
 
+    fn chat_item_text(item: &ChatItemView) -> String {
+        let mut text = item.title.clone();
+        if let Some(summary) = item.summary.as_deref() {
+            text.push('\n');
+            text.push_str(summary);
+        }
+        for line in &item.body {
+            text.push('\n');
+            text.push_str(&line.text);
+        }
+        text
+    }
+
     fn runtime_skill_context(display_name: &str, content: &str) -> SkillPromptContext {
         SkillPromptContext {
             loaded: vec![test_loaded_skill(display_name, content)],
@@ -5312,6 +5325,17 @@ runtime = "fake"
             );
             assert!(request.prompt.contains("<User Prompt>"));
             assert!(request.prompt.contains(expected_prompt_text));
+            let envelope = crate::runtime::prompt_envelope_json(&request).unwrap();
+            assert_eq!(
+                count_occurrences(&envelope, "<Skill: reviewer"),
+                1,
+                "{label} envelope should contain one rendered skill section"
+            );
+            assert_eq!(
+                count_occurrences(&envelope, "SENTINEL_RUNTIME_SKILL_BODY_PRIVATE"),
+                1,
+                "{label} envelope should contain the skill body once"
+            );
         }
     }
 
@@ -7103,12 +7127,30 @@ instructions_file = "agents/explorer.md"
         let run_record =
             fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
         let chat_projection = serde_json::to_string(&app.state.chat_items).unwrap();
+        let skill_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.title == "Skills loaded")
+            .unwrap();
+        let skill_item_text = chat_item_text(skill_item);
         assert!(!events_jsonl.contains(SENTINEL));
         assert!(!debug_log.contains(SENTINEL));
         assert!(!run_record.contains(SENTINEL));
         assert!(!chat_projection.contains(SENTINEL));
+        assert!(events_jsonl.contains("\"kind\":\"skills_loaded\""));
+        assert!(events_jsonl.contains(".agents/skills/reviewer/SKILL.md"));
+        assert!(debug_log.contains("\"kind\":\"skills_loaded\""));
+        assert!(debug_log.contains(".agents/skills/reviewer/SKILL.md"));
         assert!(run_record.contains("\"submitted_prompt\""));
         assert!(run_record.contains("\"loaded_skills\""));
+        assert_eq!(skill_item.kind, ChatItemKind::SkillContext);
+        assert_eq!(skill_item.status, ChatItemStatus::Completed);
+        assert_eq!(skill_item.severity, ChatSeverity::Info);
+        assert!(skill_item_text.contains("reviewer"));
+        assert!(skill_item_text.contains(".agents/skills"));
+        assert!(skill_item_text.contains(".agents/skills/reviewer/SKILL.md"));
+        assert!(!skill_item_text.contains(SENTINEL));
     }
 
     #[tokio::test]

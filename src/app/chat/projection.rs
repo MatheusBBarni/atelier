@@ -62,6 +62,7 @@ impl ChatProjection {
             "action_denied" => self.apply_action_denied(event),
             "action_completed" => self.apply_action_completed(event),
             "artifact_written" => self.apply_artifact_written(event),
+            "skills_loaded" => self.apply_skills_loaded(event),
             "agent_result" | "councillor_agent_result" | "councillor_result" => {
                 self.apply_agent_result(event)
             }
@@ -817,6 +818,35 @@ impl ChatProjection {
         });
     }
 
+    fn apply_skills_loaded(&mut self, event: &HistoryEvent) {
+        let rows = skills_loaded_rows(&event.payload);
+        if rows.is_empty() {
+            self.apply_projection_warning(event, "Malformed skills loaded event");
+            return;
+        }
+        let names = rows
+            .iter()
+            .map(|row| row.display_name.clone())
+            .collect::<Vec<_>>();
+        let body = rows
+            .iter()
+            .map(|row| ChatLineView::muted(row.display_line()))
+            .collect::<Vec<_>>();
+        self.upsert(ItemInput {
+            lifecycle_key: None,
+            kind: ChatItemKind::SkillContext,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "Skills loaded".to_string(),
+            summary: Some(summarize_items(&names, 4)),
+            body,
+            details: history_detail(event, "skills"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
     fn apply_agent_result(&mut self, event: &HistoryEvent) {
         let agent = string_field(&event.payload, "agent")
             .or_else(|| string_field(&event.payload, "member_id"))
@@ -1137,6 +1167,61 @@ struct ItemInput {
     source: ChatSourceRef,
     updated_at: String,
     fallback_event_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoadedSkillProjectionRow {
+    display_name: String,
+    canonical_id: String,
+    source_origin: String,
+    source_path: String,
+    load_reason: Option<String>,
+}
+
+impl LoadedSkillProjectionRow {
+    fn display_line(&self) -> String {
+        let mut line = format!(
+            "{} - {} ({})",
+            self.display_name, self.source_origin, self.source_path
+        );
+        if let Some(load_reason) = self.load_reason.as_deref() {
+            line.push_str(&format!(" [{load_reason}]"));
+        }
+        line
+    }
+}
+
+fn skills_loaded_rows(payload: &Value) -> Vec<LoadedSkillProjectionRow> {
+    let Some(skills) = payload.get("skills").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    for skill in skills {
+        let Some(row) = skill_loaded_row(skill) else {
+            continue;
+        };
+        if seen.insert(row.canonical_id.clone()) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+fn skill_loaded_row(skill: &Value) -> Option<LoadedSkillProjectionRow> {
+    let display_name = string_field(skill, "display_name")?;
+    let canonical_id = string_field(skill, "canonical_id")
+        .or_else(|| string_field(skill, "source_path"))
+        .filter(|value| !value.trim().is_empty())?;
+    let source_origin = string_field(skill, "source_origin")?;
+    let source_path = string_field(skill, "source_path")?;
+    Some(LoadedSkillProjectionRow {
+        display_name,
+        canonical_id,
+        source_origin,
+        source_path,
+        load_reason: string_field(skill, "load_reason"),
+    })
 }
 
 fn action_requested_view(
@@ -2065,6 +2150,35 @@ mod tests {
         }
     }
 
+    fn skill_payload(
+        display_name: &str,
+        canonical_id: &str,
+        source_origin: &str,
+        source_path: &str,
+    ) -> Value {
+        json!({
+            "requested_names": [display_name],
+            "display_name": display_name,
+            "canonical_id": canonical_id,
+            "source_origin": source_origin,
+            "source_path": source_path,
+            "load_reason": "explicit"
+        })
+    }
+
+    fn item_text(item: &ChatItemView) -> String {
+        let mut text = item.title.clone();
+        if let Some(summary) = item.summary.as_deref() {
+            text.push('\n');
+            text.push_str(summary);
+        }
+        for line in &item.body {
+            text.push('\n');
+            text.push_str(&line.text);
+        }
+        text
+    }
+
     #[test]
     fn rebuild_produces_stable_prompt_id() {
         let events = vec![event(
@@ -2077,6 +2191,156 @@ mod tests {
         let projection = ChatProjection::rebuild(&events);
 
         assert_eq!(projection.items()[0].id, "chat:prompt:run");
+    }
+
+    #[test]
+    fn skills_loaded_with_one_skill_renders_concise_standalone_item() {
+        let events = vec![event(
+            "skills_loaded",
+            Some("run"),
+            None,
+            json!({
+                "skills": [
+                    skill_payload(
+                        "reviewer",
+                        ".agents/skills/reviewer/SKILL.md",
+                        ".agents/skills",
+                        ".agents/skills/reviewer/SKILL.md"
+                    )
+                ]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.title, "Skills loaded");
+        assert_eq!(item.lifecycle_key, None);
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.summary.as_deref(), Some("reviewer"));
+        assert!(item.body.iter().any(|line| {
+            line.text == "reviewer - .agents/skills (.agents/skills/reviewer/SKILL.md) [explicit]"
+        }));
+    }
+
+    #[test]
+    fn skills_loaded_with_multiple_skills_preserves_first_use_order() {
+        let events = vec![event(
+            "skills_loaded",
+            Some("run"),
+            None,
+            json!({
+                "skills": [
+                    skill_payload(
+                        "reviewer",
+                        ".agents/skills/reviewer/SKILL.md",
+                        ".agents/skills",
+                        ".agents/skills/reviewer/SKILL.md"
+                    ),
+                    skill_payload(
+                        "planner",
+                        "~/.agents/skills/planner/SKILL.md",
+                        "~/.agents/skills",
+                        "~/.agents/skills/planner/SKILL.md"
+                    )
+                ]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.summary.as_deref(), Some("reviewer, planner"));
+        let lines = item
+            .body
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "reviewer - .agents/skills (.agents/skills/reviewer/SKILL.md) [explicit]",
+                "planner - ~/.agents/skills (~/.agents/skills/planner/SKILL.md) [explicit]"
+            ]
+        );
+    }
+
+    #[test]
+    fn skills_loaded_duplicate_aliases_do_not_create_duplicate_visible_rows() {
+        let events = vec![event(
+            "skills_loaded",
+            Some("run"),
+            None,
+            json!({
+                "skills": [
+                    {
+                        "requested_names": ["reviewer", "review"],
+                        "display_name": "reviewer",
+                        "canonical_id": ".agents/skills/reviewer/SKILL.md",
+                        "source_origin": ".agents/skills",
+                        "source_path": ".agents/skills/reviewer/SKILL.md",
+                        "load_reason": "explicit"
+                    },
+                    {
+                        "requested_names": ["review"],
+                        "display_name": "reviewer",
+                        "canonical_id": ".agents/skills/reviewer/SKILL.md",
+                        "source_origin": ".agents/skills",
+                        "source_path": ".agents/skills/reviewer/SKILL.md",
+                        "load_reason": "explicit"
+                    }
+                ]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.body.len(), 1);
+        assert_eq!(item.summary.as_deref(), Some("reviewer"));
+        assert!(item.body[0].text.contains("reviewer - .agents/skills"));
+    }
+
+    #[test]
+    fn skills_loaded_malformed_body_fields_are_not_displayed_by_projection() {
+        const SENTINEL: &str = "SENTINEL_FULL_SKILL_BODY_PRIVATE";
+        let events = vec![event(
+            "skills_loaded",
+            Some("run"),
+            None,
+            json!({
+                "content": SENTINEL,
+                "body": SENTINEL,
+                "skills": [
+                    {
+                        "requested_names": ["reviewer"],
+                        "display_name": "reviewer",
+                        "canonical_id": ".agents/skills/reviewer/SKILL.md",
+                        "source_origin": ".agents/skills",
+                        "source_path": ".agents/skills/reviewer/SKILL.md",
+                        "load_reason": "explicit",
+                        "content": SENTINEL,
+                        "body": SENTINEL
+                    },
+                    {
+                        "requested_names": ["malformed"],
+                        "display_name": "malformed",
+                        "content": SENTINEL,
+                        "body": SENTINEL
+                    }
+                ]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        let text = item_text(item);
+        assert!(text.contains("reviewer"));
+        assert!(text.contains(".agents/skills/reviewer/SKILL.md"));
+        assert!(!text.contains(SENTINEL));
+        assert!(!text.contains("malformed"));
     }
 
     #[test]

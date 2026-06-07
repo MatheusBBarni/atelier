@@ -1654,6 +1654,7 @@ fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
         ChatItemKind::FileEdit => "file edit",
         ChatItemKind::Approval => "approval",
         ChatItemKind::Diagnostic => "diagnostic",
+        ChatItemKind::SkillContext => "skills",
         ChatItemKind::AgentResult => "agent",
         ChatItemKind::RunSummary => "run",
     }
@@ -1699,7 +1700,7 @@ fn render_help_modal(frame: &mut Frame) {
         ]),
         Line::from("/help + Enter        toggle this help"),
         Line::from("/agent:<agent_name>  select enabled agent with Up/Down + Enter"),
-        Line::from("/skill:<skill_name>  prefix prompt with skill name"),
+        Line::from("/skill:<skill_name>  load skill context"),
         Line::from("/reload:skills      refresh cached skill names"),
         Line::from("/goal <text> | /goal | /goal clear   manage session goal"),
         Line::from("/subtask <agent> <task>              run bounded child task"),
@@ -2539,6 +2540,8 @@ mod tests {
         assert!(text.contains("/help + Enter"));
         assert!(text.contains("/agent:<agent_name>"));
         assert!(text.contains("/skill:<skill_name>"));
+        assert!(text.contains("load skill context"));
+        assert!(!text.contains("prefix prompt with skill name"));
         assert!(text.contains("/reload:skills"));
         assert!(text.contains("enabled agent"));
         assert!(text.contains("/goal <text>"));
@@ -2553,6 +2556,24 @@ mod tests {
         assert!(text.contains("Home/End"));
         assert!(text.contains("atelier --doctor"));
         assert!(text.contains("atelier --clean-sessions"));
+    }
+
+    #[test]
+    fn readme_skill_command_wording_matches_help_language() {
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        let help_text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+
+        assert!(help_text.contains("/skill:<skill_name>"));
+        assert!(readme.contains("`/skill:<skill_name>`"));
+        assert!(help_text.contains("load skill context"));
+        assert!(readme.contains("load skill context"));
+        assert!(!readme.contains("prefix a prompt with a selected skill"));
+        assert!(!readme.contains("prefix prompt with skill name"));
     }
 
     #[test]

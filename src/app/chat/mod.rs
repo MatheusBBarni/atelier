@@ -32,6 +32,7 @@ pub enum ChatItemKind {
     FileEdit,
     Approval,
     Diagnostic,
+    SkillContext,
     AgentResult,
     RunSummary,
 }
@@ -215,6 +216,7 @@ impl ChatItemKind {
             ChatItemKind::FileEdit => "file_edit",
             ChatItemKind::Approval => "approval",
             ChatItemKind::Diagnostic => "diagnostic",
+            ChatItemKind::SkillContext => "skill_context",
             ChatItemKind::AgentResult => "agent_result",
             ChatItemKind::RunSummary => "run_summary",
         }
