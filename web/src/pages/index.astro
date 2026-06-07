@@ -131,28 +131,28 @@ const workflowSteps = [
 
 const visualFrames = [
   {
-    title: "The Run Surface",
-    text: "A single prompt turns into a visible run, with routing, agent work, approvals, and results in one place.",
-    src: "/images/atelier-command-center.png",
-    alt: "Dark Atelier command center with terminal panels, timelines, and review surfaces.",
+    title: "Run Surface",
+    text: "Agents, chat, and the prompt composer stay visible in one terminal workspace.",
+    src: "/images/atelier-tui-run-surface.png",
+    alt: "Atelier TUI with agent roster, empty chat pane, and prompt composer.",
   },
   {
-    title: "Agent Roster",
-    text: "You can see which agent is active, which runtime it uses, and what setup still needs attention.",
-    src: "/images/atelier-agent-roster.png",
-    alt: "Dark Atelier interface focused on agent roster, live chat, and status panels.",
+    title: "Skill Picker",
+    text: "/skill: opens cached project and personal skills without leaving the run.",
+    src: "/images/atelier-tui-skill-picker.png",
+    alt: "Atelier TUI showing the skill picker for project and personal skills.",
   },
   {
-    title: "Parallel Scopes",
-    text: "Independent file scopes can move at the same time, then join before the Orchestrator decides the next step.",
-    src: "/images/atelier-parallel-scopes.png",
-    alt: "Dark Atelier dashboard showing parallel lanes joining into one run result.",
+    title: "Agent Picker",
+    text: "/agent: shows enabled agent profiles, runtimes, and capability sets before routing work.",
+    src: "/images/atelier-tui-agent-picker.png",
+    alt: "Atelier TUI showing the agent picker with runtimes and capability sets.",
   },
   {
-    title: "Local Evidence",
-    text: "Session history, artifacts, run records, and codemaps stay local so later work has something solid to read.",
-    src: "/images/atelier-history-codemap.png",
-    alt: "Dark Atelier archive view with abstract history cards, artifacts, and repository map panels.",
+    title: "Help Overlay",
+    text: "/help keeps TUI and CLI commands available while the session stays underneath.",
+    src: "/images/atelier-tui-help.png",
+    alt: "Atelier TUI showing the help overlay with TUI and CLI commands.",
   },
 ];
 ---
@@ -189,11 +189,38 @@ const visualFrames = [
             <span class="brand__mark" aria-hidden="true">A</span>
             <span>Atelier</span>
           </a>
-          <nav class="nav__links">
-            <a href="#features">Features</a>
-            <a href="#commands">Commands</a>
-            <a href="#install">Install</a>
-          </nav>
+          <div class="nav__right">
+            <nav class="nav__links">
+              <a href="#features">Features</a>
+              <a href="#commands">Commands</a>
+              <a href="#install">Install</a>
+            </nav>
+            <a
+              class="github-star"
+              href="https://github.com/MatheusBBarni/atelier"
+              target="_blank"
+              rel="noreferrer"
+              aria-label="Star Atelier on GitHub"
+              data-github-star
+            >
+              <span class="github-star__github" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false">
+                  <path
+                    d="M12 1.8c-5.7 0-10.3 4.6-10.3 10.3 0 4.5 2.9 8.4 7 9.8.5.1.7-.2.7-.5v-1.8c-2.8.6-3.4-1.2-3.4-1.2-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 .1 1.6 1.1 1.6 1.1.9 1.6 2.4 1.1 2.9.9.1-.7.4-1.1.7-1.4-2.3-.3-4.6-1.1-4.6-5 0-1.1.4-2 1.1-2.8-.1-.3-.5-1.3.1-2.8 0 0 .9-.3 2.8 1.1.8-.2 1.6-.3 2.5-.3s1.7.1 2.5.3c1.9-1.3 2.8-1.1 2.8-1.1.6 1.5.2 2.5.1 2.8.7.8 1.1 1.7 1.1 2.8 0 3.9-2.4 4.7-4.6 5 .4.3.7.9.7 1.8v2.7c0 .3.2.6.7.5 4.1-1.4 7-5.3 7-9.8 0-5.7-4.6-10.3-10.3-10.3z"
+                  />
+                </svg>
+              </span>
+              <span class="github-star__label">Star on GitHub</span>
+              <span class="github-star__count" data-github-star-count hidden></span>
+              <span class="github-star__star" aria-hidden="true">
+                <svg viewBox="0 0 24 24" focusable="false">
+                  <path
+                    d="m12 2.5 2.9 5.9 6.5 1-4.7 4.5 1.1 6.4L12 17.2l-5.8 3.1 1.1-6.4-4.7-4.5 6.5-1L12 2.5z"
+                  />
+                </svg>
+              </span>
+            </a>
+          </div>
         </header>
 
         <div class="hero__content" id="top">
@@ -260,25 +287,13 @@ const visualFrames = [
           </p>
         </div>
 
-        <div class="surface-map" aria-label="Atelier TUI surfaces">
-          <div class="surface-map__top">
-            <span>Chat</span>
-            <span>routing -> action -> result</span>
-          </div>
-          <div class="surface-map__grid">
-            <div class="surface-map__pane surface-map__pane--large">
-              <span></span><span></span><span></span><span></span><span></span>
-            </div>
-            <div class="surface-map__pane">
-              <b>Roster</b>
-              <i></i><i></i><i></i><i></i>
-            </div>
-            <div class="surface-map__pane">
-              <b>Composer</b>
-              <em></em>
-            </div>
-          </div>
-        </div>
+        <figure class="surface-map" aria-label="Atelier TUI run surface">
+          <img
+            src={assetPath("/images/atelier-tui-run-surface.png")}
+            alt="Atelier TUI showing the agent roster, chat panel, and prompt composer."
+            loading="lazy"
+          />
+        </figure>
       </section>
 
       <section class="section" id="features" aria-labelledby="features-title">
@@ -360,8 +375,8 @@ const visualFrames = [
           <p class="eyebrow">Product Views</p>
           <h2 id="visuals-title">Four views of the same control loop.</h2>
           <p>
-            The UI is not trying to hide the work. It shows the run, the agent
-            roster, parallel scopes, and the evidence Atelier keeps on disk.
+            The UI is not trying to hide the work. These real TUI states show
+            the run surface, pickers, and command reference inside the product.
           </p>
         </div>
 
@@ -442,5 +457,44 @@ const visualFrames = [
         </div>
       </section>
     </main>
+    <script is:inline>
+      (() => {
+        const button = document.querySelector("[data-github-star]");
+        const count = document.querySelector("[data-github-star-count]");
+        if (!button || !count) {
+          return;
+        }
+
+        const formatter = new Intl.NumberFormat("en-US", {
+          maximumFractionDigits: 0,
+        });
+
+        fetch("https://api.github.com/repos/MatheusBBarni/atelier", {
+          headers: {
+            Accept: "application/vnd.github+json",
+          },
+        })
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error("GitHub star count unavailable");
+            }
+            return response.json();
+          })
+          .then((repo) => {
+            if (typeof repo.stargazers_count !== "number") {
+              throw new Error("GitHub star count missing");
+            }
+            count.textContent = formatter.format(repo.stargazers_count);
+            count.hidden = false;
+            button.setAttribute(
+              "aria-label",
+              `Star Atelier on GitHub, ${formatter.format(repo.stargazers_count)} stars`,
+            );
+          })
+          .catch(() => {
+            count.hidden = true;
+          });
+      })();
+    </script>
   </body>
 </html>
