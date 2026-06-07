@@ -454,38 +454,72 @@ pub fn discover_skill_metadata(
     Ok(skills)
 }
 
+pub fn discover_skill_suggestions(
+    roots: &[SkillRoot],
+) -> Result<Vec<SkillSuggestion>, SkillDiscoveryError> {
+    discover_skill_metadata(roots).map(|metadata| skill_suggestions_from_metadata(&metadata))
+}
+
 pub fn skill_suggestions_from_metadata(skills: &[SkillMetadata]) -> Vec<SkillSuggestion> {
+    let mut winning_precedence_by_alias = HashMap::new();
+    for skill in skills {
+        for alias in &skill.aliases {
+            winning_precedence_by_alias
+                .entry(alias.clone())
+                .and_modify(|precedence: &mut usize| {
+                    *precedence = (*precedence).min(skill.root_precedence);
+                })
+                .or_insert(skill.root_precedence);
+        }
+    }
+
     let mut suggestions = skills
         .iter()
         .flat_map(|skill| {
-            skill.aliases.iter().map(move |alias| SkillSuggestion {
-                alias: alias.clone(),
-                display_name: skill.display_name.clone(),
-                description: skill.description.clone(),
-                source_tag: skill.source_tag,
-                source_origin: skill.source_origin.clone(),
-                canonical_id: skill.identity.canonical_id.clone(),
-                skill_dir: skill.skill_dir.clone(),
-                source_path: skill.skill_file.clone(),
-            })
+            skill
+                .aliases
+                .iter()
+                .filter(|alias| {
+                    winning_precedence_by_alias
+                        .get(*alias)
+                        .is_some_and(|precedence| *precedence == skill.root_precedence)
+                })
+                .map(move |alias| {
+                    (
+                        skill.root_precedence,
+                        SkillSuggestion {
+                            alias: alias.clone(),
+                            display_name: skill.display_name.clone(),
+                            description: skill.description.clone(),
+                            source_tag: skill.source_tag,
+                            source_origin: skill.source_origin.clone(),
+                            canonical_id: skill.identity.canonical_id.clone(),
+                            skill_dir: skill.skill_dir.clone(),
+                            source_path: skill.skill_file.clone(),
+                        },
+                    )
+                })
         })
         .collect::<Vec<_>>();
 
     suggestions.sort_by(|left, right| {
         (
-            left.source_tag.scope_rank(),
-            left.alias.as_str(),
-            left.source_origin.as_str(),
-            left.canonical_id.as_str(),
+            left.0,
+            left.1.alias.as_str(),
+            left.1.source_origin.as_str(),
+            left.1.canonical_id.as_str(),
         )
             .cmp(&(
-                right.source_tag.scope_rank(),
-                right.alias.as_str(),
-                right.source_origin.as_str(),
-                right.canonical_id.as_str(),
+                right.0,
+                right.1.alias.as_str(),
+                right.1.source_origin.as_str(),
+                right.1.canonical_id.as_str(),
             ))
     });
     suggestions
+        .into_iter()
+        .map(|(_precedence, suggestion)| suggestion)
+        .collect()
 }
 
 pub fn compile_prompt(
@@ -1188,6 +1222,21 @@ mod tests {
                 source_path: skill_dir.join(SKILL_FILE_NAME),
             }
         );
+
+        let suggestions = skill_suggestions_from_metadata(&[metadata]);
+        assert_eq!(
+            suggestions
+                .iter()
+                .map(|suggestion| (suggestion.alias.as_str(), suggestion.canonical_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("directory-alias", ".agents/skills/directory-alias/SKILL.md"),
+                (
+                    "frontmatter-alias",
+                    ".agents/skills/directory-alias/SKILL.md"
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1280,6 +1329,49 @@ mod tests {
                 && suggestion.source_tag == SkillSourceTag::Personal
                 && suggestion.source_origin == "~/.claude/skills"
         }));
+    }
+
+    #[test]
+    fn suggestion_alias_duplicates_follow_resolver_precedence() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let roots = skill_roots_with_home(&project, Some(&home));
+        write_skill_file(
+            &project.join(".agents/skills/family-agents"),
+            "---\nname: family-shared\n---\nAgents body.\n",
+        );
+        write_skill_file(
+            &project.join(".claude/skills/family-claude"),
+            "---\nname: family-shared\n---\nClaude body.\n",
+        );
+        write_skill_file(
+            &project.join(".claude/skills/project-shared"),
+            "---\nname: project-shared\n---\nProject body.\n",
+        );
+        write_skill_file(
+            &home.join(".agents/skills/project-shared"),
+            "---\nname: project-shared\n---\nPersonal body.\n",
+        );
+
+        let suggestions = discover_skill_suggestions(&roots).unwrap();
+
+        assert_eq!(
+            suggestions
+                .iter()
+                .filter(|suggestion| suggestion.alias == "family-shared")
+                .map(|suggestion| suggestion.source_origin.as_str())
+                .collect::<Vec<_>>(),
+            vec![".agents/skills"]
+        );
+        assert_eq!(
+            suggestions
+                .iter()
+                .filter(|suggestion| suggestion.alias == "project-shared")
+                .map(|suggestion| suggestion.source_origin.as_str())
+                .collect::<Vec<_>>(),
+            vec![".claude/skills"]
+        );
     }
 
     #[test]

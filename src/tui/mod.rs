@@ -4,6 +4,10 @@ use crate::app::chat::{
 use crate::app::{App, AppEvent, AppState, ApprovalHandle, InterruptHandle};
 use crate::config::EffectiveConfig;
 use crate::orchestrator::RunState;
+use crate::skills::{
+    self, SkillSourceTag, SkillSuggestion, SKILL_DISCOVERY_MAX_DEPTH, SKILL_FILE_NAME,
+    SKILL_SUGGESTION_CACHE_SCHEMA_VERSION,
+};
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -39,7 +43,6 @@ const AGENT_PREFIX: &str = "/agent:";
 const SKILL_PREFIX: &str = "/skill:";
 const RELOAD_SKILLS_COMMAND: &str = "/reload:skills";
 const DROPDOWN_MAX_ITEMS: usize = 6;
-const SKILL_DISCOVERY_MAX_DEPTH: usize = 4;
 const WORK_HINT: &str = "/help";
 const WORK_INDICATOR_HEIGHT: u16 = 1;
 const WORK_LABEL: &str = "Working";
@@ -169,40 +172,11 @@ struct AgentDropdown {
     selected: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct SkillSuggestion {
-    id: String,
-    tag: SkillSourceTag,
-    origin: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SkillDropdown {
     token: PromptToken,
     suggestions: Vec<SkillSuggestion>,
     selected: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum SkillSourceTag {
-    Project,
-    Personal,
-}
-
-impl SkillSourceTag {
-    fn label(self) -> &'static str {
-        match self {
-            SkillSourceTag::Project => "Project",
-            SkillSourceTag::Personal => "Personal",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SkillRoot {
-    path: PathBuf,
-    tag: SkillSourceTag,
-    origin: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,27 +765,34 @@ fn event_max_scroll(ui_state: &TuiUiState) -> usize {
 }
 
 fn load_skill_suggestions(working_directory: &Path) -> Vec<SkillSuggestion> {
-    let roots = skill_roots(working_directory);
-    let fingerprint = skill_file_fingerprints(&roots);
+    let roots = skills::skill_roots(working_directory);
+    load_skill_suggestions_from_roots(working_directory, &roots)
+}
+
+fn load_skill_suggestions_from_roots(
+    working_directory: &Path,
+    roots: &[skills::SkillRoot],
+) -> Vec<SkillSuggestion> {
+    let fingerprint = skill_file_fingerprints(roots);
     if let Some(suggestions) = read_cached_skill_suggestions(working_directory, &fingerprint) {
         return suggestions;
     }
 
-    refresh_skill_suggestions(working_directory, &roots, &fingerprint)
+    refresh_skill_suggestions(working_directory, roots, &fingerprint)
 }
 
 fn reload_skill_suggestions(working_directory: &Path) -> Vec<SkillSuggestion> {
-    let roots = skill_roots(working_directory);
+    let roots = skills::skill_roots(working_directory);
     let fingerprint = skill_file_fingerprints(&roots);
     refresh_skill_suggestions(working_directory, &roots, &fingerprint)
 }
 
 fn refresh_skill_suggestions(
     working_directory: &Path,
-    roots: &[SkillRoot],
+    roots: &[skills::SkillRoot],
     fingerprint: &[SkillFileFingerprint],
 ) -> Vec<SkillSuggestion> {
-    let suggestions = discover_skill_suggestions_from_roots(roots);
+    let suggestions = skills::discover_skill_suggestions(roots).unwrap_or_default();
     let _ = write_skill_suggestion_cache(working_directory, fingerprint, &suggestions);
     suggestions
 }
@@ -828,7 +809,9 @@ fn read_cached_skill_suggestions(
 ) -> Option<Vec<SkillSuggestion>> {
     let contents = fs::read_to_string(skill_cache_path(working_directory)).ok()?;
     let cache: SkillSuggestionCache = serde_json::from_str(&contents).ok()?;
-    if cache.schema_version == 1 && cache.fingerprint == fingerprint {
+    if cache.schema_version == SKILL_SUGGESTION_CACHE_SCHEMA_VERSION
+        && cache.fingerprint == fingerprint
+    {
         Some(cache.suggestions)
     } else {
         None
@@ -846,7 +829,7 @@ fn write_skill_suggestion_cache(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let cache = SkillSuggestionCache {
-        schema_version: 1,
+        schema_version: SKILL_SUGGESTION_CACHE_SCHEMA_VERSION,
         fingerprint: fingerprint.to_vec(),
         suggestions: suggestions.to_vec(),
     };
@@ -854,37 +837,7 @@ fn write_skill_suggestion_cache(
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn skill_roots(working_directory: &Path) -> Vec<SkillRoot> {
-    let mut roots = vec![
-        SkillRoot {
-            path: working_directory.join(".agents/skills"),
-            tag: SkillSourceTag::Project,
-            origin: ".agents/skills",
-        },
-        SkillRoot {
-            path: working_directory.join(".claude/skills"),
-            tag: SkillSourceTag::Project,
-            origin: ".claude/skills",
-        },
-    ];
-    if let Some(home) = dirs::home_dir() {
-        roots.extend([
-            SkillRoot {
-                path: home.join(".agents/skills"),
-                tag: SkillSourceTag::Personal,
-                origin: "~/.agents/skills",
-            },
-            SkillRoot {
-                path: home.join(".claude/skills"),
-                tag: SkillSourceTag::Personal,
-                origin: "~/.claude/skills",
-            },
-        ]);
-    }
-    roots
-}
-
-fn skill_file_fingerprints(roots: &[SkillRoot]) -> Vec<SkillFileFingerprint> {
+fn skill_file_fingerprints(roots: &[skills::SkillRoot]) -> Vec<SkillFileFingerprint> {
     let mut fingerprints = Vec::new();
     for root in roots {
         collect_skill_file_fingerprints(&root.path, 0, &mut fingerprints);
@@ -901,7 +854,7 @@ fn collect_skill_file_fingerprints(
     if depth > SKILL_DISCOVERY_MAX_DEPTH {
         return;
     }
-    let skill_file = directory.join("SKILL.md");
+    let skill_file = directory.join(SKILL_FILE_NAME);
     if let Ok(metadata) = fs::metadata(&skill_file) {
         if metadata.is_file() {
             let modified = metadata
@@ -925,115 +878,6 @@ fn collect_skill_file_fingerprints(
         if path.is_dir() {
             collect_skill_file_fingerprints(&path, depth + 1, fingerprints);
         }
-    }
-}
-
-fn discover_skill_suggestions_from_roots(roots: &[SkillRoot]) -> Vec<SkillSuggestion> {
-    let mut suggestions = roots
-        .iter()
-        .flat_map(discover_skill_suggestions_from_root)
-        .collect::<Vec<_>>();
-    suggestions.sort_by(|left, right| {
-        (
-            skill_tag_rank(left.tag),
-            left.id.as_str(),
-            left.origin.as_str(),
-        )
-            .cmp(&(
-                skill_tag_rank(right.tag),
-                right.id.as_str(),
-                right.origin.as_str(),
-            ))
-    });
-    suggestions
-}
-
-fn discover_skill_suggestions_from_root(root: &SkillRoot) -> Vec<SkillSuggestion> {
-    let mut suggestions = Vec::new();
-    collect_skill_suggestions(&root.path, root, 0, &mut suggestions);
-    suggestions
-}
-
-fn collect_skill_suggestions(
-    directory: &Path,
-    root: &SkillRoot,
-    depth: usize,
-    suggestions: &mut Vec<SkillSuggestion>,
-) {
-    if depth > SKILL_DISCOVERY_MAX_DEPTH {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if let Some(suggestion) = skill_suggestion_from_dir(&path, root) {
-            suggestions.push(suggestion);
-        }
-        collect_skill_suggestions(&path, root, depth + 1, suggestions);
-    }
-}
-
-fn skill_suggestion_from_dir(path: &Path, root: &SkillRoot) -> Option<SkillSuggestion> {
-    if !path.is_dir() {
-        return None;
-    }
-    let skill_file = path.join("SKILL.md");
-    if !skill_file.is_file() {
-        return None;
-    }
-    let id = skill_name_from_file(&skill_file).or_else(|| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-            .filter(|name| is_valid_skill_id(name))
-    })?;
-    Some(SkillSuggestion {
-        id,
-        tag: root.tag,
-        origin: root.origin.to_string(),
-    })
-}
-
-fn skill_name_from_file(path: &Path) -> Option<String> {
-    let contents = fs::read_to_string(path).ok()?;
-    let mut lines = contents.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
-    }
-    for line in lines.take(80) {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            return None;
-        }
-        if let Some(value) = trimmed.strip_prefix("name:") {
-            return clean_skill_name(value);
-        }
-    }
-    None
-}
-
-fn clean_skill_name(value: &str) -> Option<String> {
-    let value = value
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string();
-    is_valid_skill_id(&value).then_some(value)
-}
-
-fn is_valid_skill_id(value: &str) -> bool {
-    !value.is_empty() && !value.chars().any(char::is_whitespace)
-}
-
-fn skill_tag_rank(tag: SkillSourceTag) -> u8 {
-    match tag {
-        SkillSourceTag::Project => 0,
-        SkillSourceTag::Personal => 1,
     }
 }
 
@@ -1161,9 +1005,9 @@ fn apply_skill_suggestion(
 ) {
     let start = byte_index_for_char(&state.input, token.value_start);
     let end = byte_index_for_char(&state.input, token.value_end);
-    state.input.replace_range(start..end, &suggestion.id);
+    state.input.replace_range(start..end, &suggestion.alias);
 
-    let inserted_len = input_char_count(&suggestion.id);
+    let inserted_len = input_char_count(&suggestion.alias);
     let skill_end = token.value_start + inserted_len;
     let after_skill = byte_index_for_char(&state.input, skill_end);
     if !state.input[after_skill..]
@@ -1255,7 +1099,7 @@ fn skill_suggestions(skills: &[SkillSuggestion], query: &str) -> Vec<SkillSugges
     let query = query.to_ascii_lowercase();
     skills
         .iter()
-        .filter(|skill| query.is_empty() || skill.id.to_ascii_lowercase().contains(&query))
+        .filter(|skill| query.is_empty() || skill.alias.to_ascii_lowercase().contains(&query))
         .cloned()
         .collect()
 }
@@ -1616,23 +1460,23 @@ fn skill_dropdown_item(
     };
     let tag_style = Style::default()
         .fg(Color::Black)
-        .bg(match suggestion.tag {
+        .bg(match suggestion.source_tag {
             SkillSourceTag::Project => Color::LightGreen,
             SkillSourceTag::Personal => Color::LightBlue,
         })
         .add_modifier(Modifier::BOLD);
-    let tag = format!(" {} ", suggestion.tag.label());
+    let tag = format!(" {} ", suggestion.source_tag.label());
     let tag_width = input_char_count(&tag);
     let marker = if selected { "> " } else { "  " };
     let marker_width = input_char_count(marker);
     let row_width = usize::from(row_width);
     let content_width = row_width.saturating_sub(marker_width + tag_width + 1);
-    let id = truncate_to_char_width(&suggestion.id, content_width);
+    let id = truncate_to_char_width(&suggestion.alias, content_width);
     let id_width = input_char_count(&id);
     let remaining_width = content_width.saturating_sub(id_width);
     let origin_width = remaining_width.saturating_sub(2);
     let origin = if origin_width > 0 && id_width < content_width {
-        truncate_to_char_width(&suggestion.origin, origin_width)
+        truncate_to_char_width(&suggestion.source_origin, origin_width)
     } else {
         String::new()
     };
@@ -2632,15 +2476,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let project_agents = dir.path().join(".agents/skills");
         write_skill(&project_agents, "fresh-skill", "fresh-skill");
-        let fingerprint = skill_file_fingerprints(&skill_roots(dir.path()));
+        let roots = skills::skill_roots(dir.path());
+        let fingerprint = skill_file_fingerprints(&roots);
+        let stale_suggestion =
+            test_skill_suggestion("stale-skill", SkillSourceTag::Project, ".agents/skills");
         write_skill_suggestion_cache(
             dir.path(),
             &fingerprint,
-            &[SkillSuggestion {
-                id: "stale-skill".to_string(),
-                tag: SkillSourceTag::Project,
-                origin: ".agents/skills".to_string(),
-            }],
+            std::slice::from_ref(&stale_suggestion),
         )
         .unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
@@ -2648,11 +2491,7 @@ mod tests {
         let mut ui_state = TuiUiState {
             working_directory: Some(dir.path().to_path_buf()),
             input_cursor: input_char_count(RELOAD_SKILLS_COMMAND),
-            skill_suggestions: vec![SkillSuggestion {
-                id: "stale-skill".to_string(),
-                tag: SkillSourceTag::Project,
-                origin: ".agents/skills".to_string(),
-            }],
+            skill_suggestions: vec![stale_suggestion],
             ..TuiUiState::default()
         };
 
@@ -2665,11 +2504,11 @@ mod tests {
         assert!(ui_state
             .skill_suggestions
             .iter()
-            .any(|skill| skill.id == "fresh-skill"));
+            .any(|skill| skill.alias == "fresh-skill"));
         assert!(!ui_state
             .skill_suggestions
             .iter()
-            .any(|skill| skill.id == "stale-skill"));
+            .any(|skill| skill.alias == "stale-skill"));
         assert_eq!(
             ui_state.status_message,
             Some(format!(
@@ -2681,8 +2520,8 @@ mod tests {
         assert!(receiver.try_recv().is_err());
 
         let cached = read_cached_skill_suggestions(dir.path(), &fingerprint).unwrap();
-        assert!(cached.iter().any(|skill| skill.id == "fresh-skill"));
-        assert!(!cached.iter().any(|skill| skill.id == "stale-skill"));
+        assert!(cached.iter().any(|skill| skill.alias == "fresh-skill"));
+        assert!(!cached.iter().any(|skill| skill.alias == "stale-skill"));
     }
 
     #[test]
@@ -2920,6 +2759,46 @@ mod tests {
     }
 
     #[test]
+    fn skill_dropdown_limits_visible_rows_and_truncates_narrow_rows() {
+        let state = state_with_input("/skill:", false);
+        let skill_suggestions = (0..8)
+            .map(|index| {
+                test_skill_suggestion(
+                    &format!("skill-{index}"),
+                    SkillSourceTag::Project,
+                    ".agents/skills",
+                )
+            })
+            .collect::<Vec<_>>();
+        let ui_state = TuiUiState {
+            input_cursor: input_char_count("/skill:"),
+            skill_suggestions,
+            ..TuiUiState::default()
+        };
+
+        let mut ui_state_for_rows = ui_state.clone();
+        let lines = render_to_lines_with_ui_mut(&state, &mut ui_state_for_rows, 100, 24);
+        let visible_skill_rows = lines.iter().filter(|line| line.contains("skill-")).count();
+
+        assert_eq!(visible_skill_rows, DROPDOWN_MAX_ITEMS);
+
+        let narrow_ui_state = TuiUiState {
+            input_cursor: input_char_count("/skill:"),
+            skill_suggestions: vec![test_skill_suggestion(
+                "very-long-project-alpha-overflow",
+                SkillSourceTag::Project,
+                ".agents/skills/very-long-project-alpha-overflow",
+            )],
+            ..TuiUiState::default()
+        };
+        let narrow = render_to_text_with_ui(&state, &narrow_ui_state, 36, 24);
+
+        assert!(narrow.contains("Skills"));
+        assert!(narrow.contains("Project"));
+        assert!(!narrow.contains("very-long-project-alpha-overflow"));
+    }
+
+    #[test]
     fn skill_dropdown_filters_by_typed_skill_query() {
         let state = state_with_input("/skill:personal", false);
         let ui_state = ui_state_with_skills_at_end(&state.input);
@@ -3030,10 +2909,12 @@ mod tests {
     #[test]
     fn discovers_project_and_personal_skills_from_agent_and_claude_roots() {
         let dir = tempdir().unwrap();
-        let project_agents = dir.path().join(".agents/skills");
-        let project_claude = dir.path().join(".claude/skills");
-        let personal_agents = dir.path().join("home/.agents/skills");
-        let personal_claude = dir.path().join("home/.claude/skills");
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let project_agents = project.join(".agents/skills");
+        let project_claude = project.join(".claude/skills");
+        let personal_agents = home.join(".agents/skills");
+        let personal_claude = home.join(".claude/skills");
         write_skill(&project_agents, "project-agent", "frontmatter-project");
         write_skill(
             &project_agents.join(".system"),
@@ -3044,61 +2925,36 @@ mod tests {
         write_skill(&personal_agents, "personal-agent", "frontmatter-personal");
         write_skill(&personal_claude, "personal-claude", "personal-claude");
 
-        let roots = vec![
-            SkillRoot {
-                path: project_agents,
-                tag: SkillSourceTag::Project,
-                origin: ".agents/skills",
-            },
-            SkillRoot {
-                path: project_claude,
-                tag: SkillSourceTag::Project,
-                origin: ".claude/skills",
-            },
-            SkillRoot {
-                path: personal_agents,
-                tag: SkillSourceTag::Personal,
-                origin: "~/.agents/skills",
-            },
-            SkillRoot {
-                path: personal_claude,
-                tag: SkillSourceTag::Personal,
-                origin: "~/.claude/skills",
-            },
-        ];
-
-        let suggestions = discover_skill_suggestions_from_roots(&roots);
+        let roots = skills::skill_roots_with_home(&project, Some(&home));
+        let suggestions = skills::discover_skill_suggestions(&roots).unwrap();
 
         assert_eq!(
-            suggestions,
+            suggestion_aliases(&suggestions),
             vec![
-                SkillSuggestion {
-                    id: "frontmatter-project".to_string(),
-                    tag: SkillSourceTag::Project,
-                    origin: ".agents/skills".to_string(),
-                },
-                SkillSuggestion {
-                    id: "nested-project".to_string(),
-                    tag: SkillSourceTag::Project,
-                    origin: ".agents/skills".to_string(),
-                },
-                SkillSuggestion {
-                    id: "project-claude".to_string(),
-                    tag: SkillSourceTag::Project,
-                    origin: ".claude/skills".to_string(),
-                },
-                SkillSuggestion {
-                    id: "frontmatter-personal".to_string(),
-                    tag: SkillSourceTag::Personal,
-                    origin: "~/.agents/skills".to_string(),
-                },
-                SkillSuggestion {
-                    id: "personal-claude".to_string(),
-                    tag: SkillSourceTag::Personal,
-                    origin: "~/.claude/skills".to_string(),
-                },
+                (
+                    "frontmatter-project".to_string(),
+                    ".agents/skills".to_string()
+                ),
+                ("nested-project".to_string(), ".agents/skills".to_string()),
+                ("project-agent".to_string(), ".agents/skills".to_string()),
+                ("project-system".to_string(), ".agents/skills".to_string()),
+                ("project-claude".to_string(), ".claude/skills".to_string()),
+                (
+                    "frontmatter-personal".to_string(),
+                    "~/.agents/skills".to_string()
+                ),
+                ("personal-agent".to_string(), "~/.agents/skills".to_string()),
+                (
+                    "personal-claude".to_string(),
+                    "~/.claude/skills".to_string()
+                ),
             ]
         );
+        assert!(suggestions.iter().any(|skill| {
+            skill.alias == "project-agent"
+                && skill.display_name == "frontmatter-project"
+                && skill.canonical_id == ".agents/skills/project-agent/SKILL.md"
+        }));
     }
 
     #[test]
@@ -3143,6 +2999,91 @@ mod tests {
             read_cached_skill_suggestions(dir.path(), &current_fingerprint),
             None
         );
+    }
+
+    #[test]
+    fn load_skill_suggestions_uses_cache_only_when_fingerprint_matches() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let roots = skills::skill_roots_with_home(&project, None);
+        write_skill(
+            &project.join(".agents/skills"),
+            "fresh-skill",
+            "fresh-skill",
+        );
+        let cached_only =
+            test_skill_suggestion("cached-only", SkillSourceTag::Project, ".agents/skills");
+        let original_fingerprint = skill_file_fingerprints(&roots);
+        write_skill_suggestion_cache(&project, &original_fingerprint, &[cached_only]).unwrap();
+
+        let cached = load_skill_suggestions_from_roots(&project, &roots);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].alias, "cached-only");
+
+        write_skill_with_body(
+            &project.join(".agents/skills"),
+            "fresh-skill",
+            "fresh-skill",
+            "UPDATED_SKILL_BODY_WITH_EXTRA_BYTES",
+        );
+
+        let refreshed = load_skill_suggestions_from_roots(&project, &roots);
+
+        assert!(refreshed.iter().any(|skill| skill.alias == "fresh-skill"));
+        assert!(!refreshed.iter().any(|skill| skill.alias == "cached-only"));
+    }
+
+    #[test]
+    fn writes_metadata_only_skill_suggestion_cache() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let roots = skills::skill_roots_with_home(&project, None);
+        write_skill_with_body(
+            &project.join(".agents/skills"),
+            "metadata-skill",
+            "metadata-skill",
+            "SECRET_SKILL_BODY_SHOULD_NOT_BE_CACHED",
+        );
+        let fingerprint = skill_file_fingerprints(&roots);
+
+        let suggestions = refresh_skill_suggestions(&project, &roots, &fingerprint);
+        let cache = fs::read_to_string(skill_cache_path(&project)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&cache).unwrap();
+
+        assert!(suggestions
+            .iter()
+            .any(|skill| skill.alias == "metadata-skill"));
+        assert!(cache.contains("\"alias\": \"metadata-skill\""));
+        assert!(cache.contains("\"source_origin\": \".agents/skills\""));
+        assert!(cache.contains("metadata-skill/SKILL.md"));
+        assert!(!cache.contains("SECRET_SKILL_BODY_SHOULD_NOT_BE_CACHED"));
+        assert!(value["suggestions"][0].get("content").is_none());
+        assert!(value["suggestions"][0].get("body").is_none());
+    }
+
+    #[test]
+    fn cached_tui_suggestion_is_not_authoritative_for_app_resolution() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        let roots = skills::skill_roots_with_home(&project, Some(&home));
+        write_skill_with_body(
+            &project.join(".agents/skills"),
+            "cached-skill",
+            "cached-skill",
+            "Cached skill body.",
+        );
+        let fingerprint = skill_file_fingerprints(&roots);
+        refresh_skill_suggestions(&project, &roots, &fingerprint);
+
+        fs::remove_dir_all(project.join(".agents/skills/cached-skill")).unwrap();
+        let cached = read_cached_skill_suggestions(&project, &fingerprint).unwrap();
+        let error =
+            skills::compile_prompt_with_home(&project, Some(&home), "/skill:cached-skill inspect")
+                .unwrap_err();
+
+        assert!(cached.iter().any(|skill| skill.alias == "cached-skill"));
+        assert!(matches!(error.kind, skills::SkillLoadErrorKind::Unknown));
     }
 
     #[test]
@@ -3749,25 +3690,49 @@ mod tests {
 
     fn test_skill_suggestions() -> Vec<SkillSuggestion> {
         vec![
-            SkillSuggestion {
-                id: "project-alpha".to_string(),
-                tag: SkillSourceTag::Project,
-                origin: ".agents/skills".to_string(),
-            },
-            SkillSuggestion {
-                id: "personal-beta".to_string(),
-                tag: SkillSourceTag::Personal,
-                origin: "~/.agents/skills".to_string(),
-            },
+            test_skill_suggestion("project-alpha", SkillSourceTag::Project, ".agents/skills"),
+            test_skill_suggestion(
+                "personal-beta",
+                SkillSourceTag::Personal,
+                "~/.agents/skills",
+            ),
         ]
     }
 
+    fn test_skill_suggestion(
+        alias: &str,
+        source_tag: SkillSourceTag,
+        source_origin: &str,
+    ) -> SkillSuggestion {
+        SkillSuggestion {
+            alias: alias.to_string(),
+            display_name: alias.to_string(),
+            description: None,
+            source_tag,
+            source_origin: source_origin.to_string(),
+            canonical_id: format!("{source_origin}/{alias}/SKILL.md"),
+            skill_dir: PathBuf::from(format!("{source_origin}/{alias}")),
+            source_path: PathBuf::from(format!("{source_origin}/{alias}/SKILL.md")),
+        }
+    }
+
+    fn suggestion_aliases(suggestions: &[SkillSuggestion]) -> Vec<(String, String)> {
+        suggestions
+            .iter()
+            .map(|suggestion| (suggestion.alias.clone(), suggestion.source_origin.clone()))
+            .collect()
+    }
+
     fn write_skill(root: &Path, directory: &str, name: &str) {
+        write_skill_with_body(root, directory, name, "");
+    }
+
+    fn write_skill_with_body(root: &Path, directory: &str, name: &str, body: &str) {
         let skill_dir = root.join(directory);
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            format!("---\nname: {name}\ndescription: test skill\n---\n"),
+            format!("---\nname: {name}\ndescription: test skill\n---\n{body}\n"),
         )
         .unwrap();
     }
