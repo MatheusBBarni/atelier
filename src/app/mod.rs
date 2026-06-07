@@ -252,6 +252,18 @@ struct WorkflowCommand {
     prompt: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkflowStart {
+    command: WorkflowCommand,
+    preflight: WorkflowPreflight,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct WorkflowPreflight {
+    parallel_step_groups: bool,
+    max_parallel_agent_steps: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RuntimePrompt<'a> {
     text: &'a str,
@@ -288,22 +300,6 @@ impl RunDriveContext {
             started_at: Instant::now(),
             parse_repair_attempts: 0,
         }
-    }
-
-    fn from_compiled(
-        run_id: impl Into<String>,
-        parent_run_id: Option<String>,
-        compiled: CompiledPrompt,
-        subtask: Option<SubtaskContext>,
-    ) -> Self {
-        Self::new(
-            run_id,
-            parent_run_id,
-            compiled.submitted_prompt,
-            compiled.user_prompt,
-            compiled.skill_context,
-            subtask,
-        )
     }
 
     fn loaded_skill_metadata(&self) -> Vec<LoadedSkillMetadata> {
@@ -621,8 +617,8 @@ impl App {
                 return self.drive_run(pending.run, None).await;
             }
         }
-        let workflow_command = self.handle_workflow_command(&prompt)?;
-        if workflow_command.is_none() {
+        let workflow_start = self.handle_workflow_command(&prompt)?;
+        if workflow_start.is_none() {
             reject_unknown_slash_command(&prompt)?;
         }
         if matches!(
@@ -631,14 +627,23 @@ impl App {
         ) {
             bail!("a run is already active");
         }
-        let mut compiled_prompt = compile_app_prompt(
+        let compiled_prompt = compile_app_prompt(
             &self.config.working_directory,
-            workflow_command
+            workflow_start
                 .as_ref()
-                .map_or(prompt.as_str(), |command| command.prompt.as_str()),
+                .map_or(prompt.as_str(), |start| start.command.prompt.as_str()),
         )?;
-        if let Some(command) = workflow_command {
-            compiled_prompt.submitted_prompt = command.original_command;
+        let mut visible_prompt = compiled_prompt.user_prompt.clone();
+        let mut run_prompt = compiled_prompt.user_prompt.clone();
+        let mut submitted_prompt = compiled_prompt.submitted_prompt.clone();
+        if let Some(start) = workflow_start.as_ref() {
+            visible_prompt = start.command.original_command.clone();
+            submitted_prompt = start.command.original_command.clone();
+            run_prompt = workflow_runtime_prompt(
+                &start.command,
+                &compiled_prompt.user_prompt,
+                &start.preflight,
+            );
         }
 
         self.reset_enabled_agent_statuses();
@@ -652,28 +657,46 @@ impl App {
             json!({ "run_id": run_id }),
             "Run started.",
         )?;
+        if let Some(start) = workflow_start.as_ref() {
+            self.record_event(
+                Some(run_id.clone()),
+                None,
+                "workflow_started",
+                workflow_started_payload(&run_id, start),
+                "Workflow started.",
+            )?;
+        }
         self.record_event(
             Some(run_id.clone()),
             None,
             "prompt_submitted",
             json!({
-                "prompt": compiled_prompt.user_prompt.clone(),
-                "submitted_prompt": compiled_prompt.submitted_prompt.clone(),
+                "prompt": visible_prompt.clone(),
+                "submitted_prompt": submitted_prompt.clone(),
             }),
-            user_event_display(&compiled_prompt.user_prompt),
+            user_event_display(&visible_prompt),
         )?;
         self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
 
-        let run = RunDriveContext::from_compiled(run_id, None, compiled_prompt, None);
+        let run = RunDriveContext::new(
+            run_id,
+            None,
+            submitted_prompt,
+            run_prompt,
+            compiled_prompt.skill_context,
+            None,
+        );
         self.drive_run(run, None).await
     }
 
-    fn handle_workflow_command(&self, prompt: &str) -> Result<Option<WorkflowCommand>> {
+    fn handle_workflow_command(&self, prompt: &str) -> Result<Option<WorkflowStart>> {
         let command = parse_workflow_command(prompt)?;
-        if command.is_some() {
-            preflight_workflow_prerequisites(&self.config)?;
-        }
-        Ok(command)
+        command
+            .map(|command| {
+                let preflight = preflight_workflow_prerequisites(&self.config)?;
+                Ok(WorkflowStart { command, preflight })
+            })
+            .transpose()
     }
 
     fn handle_goal_command(&mut self, prompt: &str) -> Result<bool> {
@@ -4895,7 +4918,7 @@ fn parse_workflow_command(input: &str) -> Result<Option<WorkflowCommand>> {
     }))
 }
 
-fn preflight_workflow_prerequisites(config: &EffectiveConfig) -> Result<()> {
+fn preflight_workflow_prerequisites(config: &EffectiveConfig) -> Result<WorkflowPreflight> {
     if !config.features.parallel_step_groups {
         bail!(
             "workflow mode requires Parallel Step Groups; parallel step groups are disabled by features.parallel_step_groups"
@@ -4906,7 +4929,50 @@ fn preflight_workflow_prerequisites(config: &EffectiveConfig) -> Result<()> {
             "workflow mode requires Parallel Step Groups; parallel step groups are disabled by limits.max_parallel_agent_steps = 0"
         );
     }
-    Ok(())
+    Ok(WorkflowPreflight {
+        parallel_step_groups: config.features.parallel_step_groups,
+        max_parallel_agent_steps: config.limits.max_parallel_agent_steps,
+    })
+}
+
+fn workflow_started_payload(run_id: &str, start: &WorkflowStart) -> Value {
+    json!({
+        "run_id": run_id,
+        "original_command": start.command.original_command.as_str(),
+        "user_prompt": start.command.prompt.as_str(),
+        "mode": "workflow",
+        "preflight": &start.preflight,
+    })
+}
+
+fn workflow_runtime_prompt(
+    command: &WorkflowCommand,
+    user_prompt: &str,
+    preflight: &WorkflowPreflight,
+) -> String {
+    format!(
+        r#"Workflow mode instructions:
+- Treat this as one normal app Run in workflow mode.
+- Decompose the user's broad request into a concrete Run Plan before mutation-capable work.
+- Execute safe specialized-agent steps, using Parallel Step Groups only when file scopes are exact, disjoint, and policy-compliant.
+- Validate completed work with appropriate checks, or explain skipped checks with reasons.
+- Account for planned file-edit targets explicitly: completed, skipped, blocked, or failed.
+- Final synthesis must include plan evidence, child outcomes, changed files, verification evidence, skipped checks, and residual risks.
+
+Workflow preflight:
+- parallel_step_groups: {parallel_step_groups}
+- max_parallel_agent_steps: {max_parallel_agent_steps}
+
+Original command:
+{original_command}
+
+Extracted user prompt:
+{user_prompt}"#,
+        parallel_step_groups = preflight.parallel_step_groups,
+        max_parallel_agent_steps = preflight.max_parallel_agent_steps,
+        original_command = command.original_command,
+        user_prompt = user_prompt,
+    )
 }
 
 fn parse_subtask_command(input: &str) -> Result<(&str, &str)> {
@@ -5548,6 +5614,51 @@ runtime = "fake"
         assert!(parse_workflow_command("/workflowfoo create a feature")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn workflow_prompt_envelope_includes_user_prompt_and_evidence_requirements() {
+        let command = WorkflowCommand {
+            original_command: "/workflow parallel create a feature".to_string(),
+            prompt: "parallel create a feature".to_string(),
+        };
+        let preflight = WorkflowPreflight {
+            parallel_step_groups: true,
+            max_parallel_agent_steps: 2,
+        };
+
+        let envelope = workflow_runtime_prompt(&command, &command.prompt, &preflight);
+
+        assert!(envelope.contains("Workflow mode instructions"));
+        assert!(envelope.contains("Decompose the user's broad request"));
+        assert!(envelope.contains("Execute safe specialized-agent steps"));
+        assert!(envelope.contains("Validate completed work"));
+        assert!(envelope.contains("planned file-edit targets"));
+        assert!(envelope.contains("verification evidence"));
+        assert!(envelope.contains("Extracted user prompt:\nparallel create a feature"));
+    }
+
+    #[test]
+    fn workflow_started_payload_includes_mode_and_preflight_details() {
+        let start = WorkflowStart {
+            command: WorkflowCommand {
+                original_command: "/workflow migrate auth module".to_string(),
+                prompt: "migrate auth module".to_string(),
+            },
+            preflight: WorkflowPreflight {
+                parallel_step_groups: true,
+                max_parallel_agent_steps: 2,
+            },
+        };
+
+        let payload = workflow_started_payload("run-123", &start);
+
+        assert_eq!(payload["run_id"], "run-123");
+        assert_eq!(payload["original_command"], "/workflow migrate auth module");
+        assert_eq!(payload["user_prompt"], "migrate auth module");
+        assert_eq!(payload["mode"], "workflow");
+        assert_eq!(payload["preflight"]["parallel_step_groups"], true);
+        assert_eq!(payload["preflight"]["max_parallel_agent_steps"], 2);
     }
 
     fn fake_parallel_config(dir: &std::path::Path) -> EffectiveConfig {
@@ -7045,17 +7156,54 @@ instructions_file = "agents/explorer.md"
     }
 
     #[tokio::test]
-    async fn workflow_command_with_enabled_parallel_prerequisites_submits_extracted_prompt() {
+    async fn workflow_command_start_records_workflow_event_and_preserves_visible_command() {
         let dir = tempdir().unwrap();
         let config = fake_parallel_config(dir.path());
         let mut app = App::new(config).await.unwrap();
 
-        app.submit_prompt("/workflow parallel scoped write action create a feature")
+        app.submit_prompt("/workflow parallel create a feature")
             .await
             .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
+        let run_started_index = events
+            .iter()
+            .position(|event| event.kind == "run_started")
+            .unwrap();
+        let workflow_started_index = events
+            .iter()
+            .position(|event| event.kind == "workflow_started")
+            .unwrap();
+        let prompt_submitted_index = events
+            .iter()
+            .position(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert!(run_started_index < workflow_started_index);
+        assert!(workflow_started_index < prompt_submitted_index);
+
+        let run_id = events[run_started_index].run_id.as_ref().unwrap();
+        let workflow_started = &events[workflow_started_index];
+        assert_eq!(workflow_started.run_id.as_ref(), Some(run_id));
+        assert_eq!(workflow_started.payload["run_id"], run_id.as_str());
+        assert_eq!(
+            workflow_started.payload["original_command"],
+            "/workflow parallel create a feature"
+        );
+        assert_eq!(
+            workflow_started.payload["user_prompt"],
+            "parallel create a feature"
+        );
+        assert_eq!(workflow_started.payload["mode"], "workflow");
+        assert_eq!(
+            workflow_started.payload["preflight"]["parallel_step_groups"],
+            true
+        );
+        assert_eq!(
+            workflow_started.payload["preflight"]["max_parallel_agent_steps"],
+            2
+        );
+
         let prompt = events
             .iter()
             .find(|event| event.kind == "prompt_submitted")
@@ -7065,14 +7213,60 @@ instructions_file = "agents/explorer.md"
                 .payload
                 .get("prompt")
                 .and_then(serde_json::Value::as_str),
-            Some("parallel scoped write action create a feature")
+            Some("/workflow parallel create a feature")
         );
         assert_eq!(
             prompt
                 .payload
                 .get("submitted_prompt")
                 .and_then(serde_json::Value::as_str),
-            Some("/workflow parallel scoped write action create a feature")
+            Some("/workflow parallel create a feature")
+        );
+        assert!(!prompt
+            .payload
+            .to_string()
+            .contains("Workflow mode instructions"));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started"));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision"));
+
+        let run_record =
+            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+        assert!(
+            run_record.contains("\"submitted_prompt\": \"/workflow parallel create a feature\"")
+        );
+        assert!(run_record.contains("Workflow mode instructions"));
+        assert!(run_record.contains("Extracted user prompt:\\nparallel create a feature"));
+        assert!(run_record.contains("planned file-edit targets"));
+        assert!(run_record.contains("verification evidence"));
+    }
+
+    #[tokio::test]
+    async fn normal_parallel_prompt_records_no_workflow_started_event() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("parallel create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(!events.iter().any(|event| event.kind == "workflow_started"));
+        let prompt = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert_eq!(
+            prompt
+                .payload
+                .get("prompt")
+                .and_then(serde_json::Value::as_str),
+            Some("parallel create a feature")
         );
         assert!(events
             .iter()
