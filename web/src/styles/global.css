@@ -415,7 +415,7 @@ h3 {
   width: min(var(--max), calc(100% - 40px));
   min-width: 0;
   margin: 0 auto;
-  padding: clamp(70px, 10vw, 118px) 0;
+  padding: clamp(56px, 7vw, 88px) 0;
 }
 
 .section--split {
@@ -438,15 +438,44 @@ h3 {
 
 .section__heading {
   display: grid;
-  grid-template-columns: minmax(0, 0.88fr) minmax(360px, 0.72fr);
-  gap: 40px;
-  align-items: end;
+  grid-template-columns: minmax(0, 0.95fr) minmax(320px, 0.72fr);
+  column-gap: clamp(32px, 6vw, 76px);
+  row-gap: 16px;
+  align-items: start;
   margin-bottom: 34px;
+}
+
+.section__heading .eyebrow {
+  grid-column: 1 / -1;
+  margin-bottom: 0;
+}
+
+.section__heading h2 {
+  grid-column: 1;
+  max-width: 760px;
+  margin-bottom: 0;
+  font-size: clamp(2.35rem, 5.2vw, 4.75rem);
+}
+
+.section__heading > p:not(.eyebrow) {
+  grid-column: 2;
+  align-self: end;
+  max-width: 620px;
+  margin-bottom: 8px;
 }
 
 .section__heading--narrow {
   display: block;
   max-width: 780px;
+}
+
+.section__heading--narrow .eyebrow {
+  margin-bottom: 14px;
+}
+
+.section__heading--narrow h2 {
+  max-width: 780px;
+  margin-bottom: 22px;
 }
 
 .surface-map {
@@ -746,6 +775,17 @@ h3 {
   .command-layout,
   .install {
     grid-template-columns: 1fr;
+  }
+
+  .section__heading .eyebrow,
+  .section__heading h2,
+  .section__heading > p:not(.eyebrow) {
+    grid-column: auto;
+  }
+
+  .section__heading > p:not(.eyebrow) {
+    align-self: start;
+    margin-bottom: 0;
   }
 
   .feature-grid {
