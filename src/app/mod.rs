@@ -243,6 +243,21 @@ struct RunDriveContext {
     parse_repair_attempts: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RuntimePrompt<'a> {
+    text: &'a str,
+    skill_context: Option<&'a SkillPromptContext>,
+}
+
+impl<'a> RuntimePrompt<'a> {
+    fn new(text: &'a str, skill_context: Option<&'a SkillPromptContext>) -> Self {
+        Self {
+            text,
+            skill_context,
+        }
+    }
+}
+
 impl RunDriveContext {
     fn new(
         run_id: impl Into<String>,
@@ -1494,10 +1509,11 @@ impl App {
             }
             let agent = self.agent(&step.agent)?.clone();
             run.step_count += 1;
+            let prompt = parallel_child_prompt(&run.prompt, step);
             let mut request = self.runtime_request(
                 &run.run_id,
                 &step_id,
-                &parallel_child_prompt(&run.prompt, step),
+                RuntimePrompt::new(&prompt, run.skill_context.as_ref()),
                 agent,
                 run.previous_results.clone(),
                 "agent_result",
@@ -1563,7 +1579,7 @@ impl App {
             workspace: self.config.workspace.clone(),
             approval_mode: self.config.approval_mode.clone(),
             command_timeout: command_timeout(&self.config.limits.max_command_minutes),
-            user_prompt: Some(child.request.prompt.clone()),
+            user_prompt: Some(run.prompt.clone()),
             action_scope: crate::actions::ActionScope::ParallelFileScope(child.file_scope.clone()),
         };
         self.record_command_started_if_executable_with_group(
@@ -1951,7 +1967,7 @@ impl App {
             let request = self.runtime_request(
                 &run.run_id,
                 &step_id,
-                &run.prompt,
+                RuntimePrompt::new(&run.prompt, run.skill_context.as_ref()),
                 orchestrator,
                 run.previous_results.clone(),
                 "orchestrator_decision",
@@ -2096,7 +2112,7 @@ impl App {
             let request = self.runtime_request(
                 &run.run_id,
                 &step_id,
-                &run.prompt,
+                RuntimePrompt::new(&run.prompt, run.skill_context.as_ref()),
                 agent,
                 run.previous_results.clone(),
                 "agent_result",
@@ -2265,7 +2281,7 @@ impl App {
             let request = self.runtime_request(
                 &run.run_id,
                 &step_id,
-                &prompt,
+                RuntimePrompt::new(&prompt, run.skill_context.as_ref()),
                 agent,
                 run.previous_results.clone(),
                 "agent_result",
@@ -2811,7 +2827,7 @@ impl App {
         &self,
         run_id: &str,
         step_id: &str,
-        prompt: &str,
+        prompt: RuntimePrompt<'_>,
         agent_profile: AgentProfile,
         previous_results: Vec<RunStepResult>,
         output_schema: &str,
@@ -2820,10 +2836,11 @@ impl App {
         if agent_profile.id == "orchestrator" {
             agent_profile.instructions = build_orchestrator_prompt(&self.config);
         }
+        let prompt = skills::render_runtime_prompt(prompt.skill_context, prompt.text);
         Ok(RuntimeRequest {
             run_id: run_id.to_string(),
             step_id: step_id.to_string(),
-            prompt: prompt.to_string(),
+            prompt,
             session_goal: self.state.session_goal.clone(),
             working_directory: self.config.working_directory.clone(),
             capability_constraints: agent_profile.capabilities.clone(),
@@ -3007,7 +3024,7 @@ impl App {
                         workspace: self.config.workspace.clone(),
                         approval_mode: self.config.approval_mode.clone(),
                         command_timeout: command_timeout(&self.config.limits.max_command_minutes),
-                        user_prompt: Some(request.prompt.clone()),
+                        user_prompt: Some(run.prompt.clone()),
                         action_scope: crate::actions::ActionScope::Unrestricted,
                     };
                     self.record_command_started_if_executable(
@@ -5125,6 +5142,16 @@ runtime = "fake"
         }
     }
 
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    fn runtime_skill_context(display_name: &str, content: &str) -> SkillPromptContext {
+        SkillPromptContext {
+            loaded: vec![test_loaded_skill(display_name, content)],
+        }
+    }
+
     #[test]
     fn run_drive_context_stores_prompt_provenance_and_skill_context_only_in_memory() {
         let skill_context = SkillPromptContext {
@@ -5181,6 +5208,213 @@ runtime = "fake"
             .to_string()
             .contains("SENTINEL_FULL_SKILL_BODY_PRIVATE"));
         assert!(loaded[0].get("content").is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_request_renders_skill_context_once_for_runtime_prompt_shapes() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+        let skill_context =
+            runtime_skill_context("reviewer", "SENTINEL_RUNTIME_SKILL_BODY_PRIVATE");
+        let parallel_step = crate::orchestrator::ParallelChildStepPlan {
+            step_label: "inspect docs".to_string(),
+            agent: "explorer".to_string(),
+            instruction: "Inspect README only.".to_string(),
+            required_capabilities: vec![Capability::Read],
+            file_scope: ParallelFileScope {
+                write_files: Vec::new(),
+                read_roots: vec![".".to_string()],
+            },
+        };
+        let decision = crate::orchestrator::OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: Vec::new(),
+            next_agent: Some(COUNCIL_WORKFLOW_AGENT_ID.to_string()),
+            next_step: None,
+            reason: "High-risk architecture review requested.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Council returns a recommendation.".to_string(),
+            clarifying_question: None,
+            final_summary: None,
+        };
+        let council_member = app
+            .config
+            .council
+            .presets
+            .get("default")
+            .unwrap()
+            .get("architect")
+            .unwrap();
+
+        let cases = vec![
+            (
+                "orchestrator",
+                "inspect README".to_string(),
+                app.agent("orchestrator").unwrap().clone(),
+                "orchestrator_decision",
+                "inspect README",
+            ),
+            (
+                "specialized",
+                "inspect README".to_string(),
+                app.agent("explorer").unwrap().clone(),
+                "agent_result",
+                "inspect README",
+            ),
+            (
+                "parallel",
+                parallel_child_prompt("inspect README", &parallel_step),
+                app.agent("explorer").unwrap().clone(),
+                "agent_result",
+                "Parallel child step:",
+            ),
+            (
+                "council",
+                council_member_prompt("inspect README", &decision),
+                council_member_agent("architect", council_member),
+                "agent_result",
+                "Council review request:",
+            ),
+            (
+                "subtask",
+                subtask_prompt("inspect README"),
+                app.agent("explorer").unwrap().clone(),
+                "agent_result",
+                "Scope guard:",
+            ),
+        ];
+
+        for (label, prompt, agent, output_schema, expected_prompt_text) in cases {
+            let request = app
+                .runtime_request(
+                    "run",
+                    &format!("step-{label}"),
+                    RuntimePrompt::new(&prompt, Some(&skill_context)),
+                    agent,
+                    Vec::new(),
+                    output_schema,
+                )
+                .unwrap();
+
+            assert_eq!(
+                count_occurrences(&request.prompt, "<Skill: reviewer"),
+                1,
+                "{label} request should render one skill section"
+            );
+            assert_eq!(
+                count_occurrences(&request.prompt, "SENTINEL_RUNTIME_SKILL_BODY_PRIVATE"),
+                1,
+                "{label} request should render the skill body once"
+            );
+            assert!(request.prompt.contains("<User Prompt>"));
+            assert!(request.prompt.contains(expected_prompt_text));
+        }
+    }
+
+    #[test]
+    fn derived_prompt_helpers_keep_skill_sections_out_of_helper_strings() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "SENTINEL_DERIVED_SKILL_BODY_PRIVATE",
+        );
+        let compiled = compile_app_prompt(dir.path(), "/skill:reviewer inspect README").unwrap();
+        let parallel_step = crate::orchestrator::ParallelChildStepPlan {
+            step_label: "inspect docs".to_string(),
+            agent: "explorer".to_string(),
+            instruction: "Inspect README only.".to_string(),
+            required_capabilities: vec![Capability::Read],
+            file_scope: ParallelFileScope {
+                write_files: Vec::new(),
+                read_roots: vec![".".to_string()],
+            },
+        };
+        let decision = crate::orchestrator::OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: Vec::new(),
+            next_agent: Some(COUNCIL_WORKFLOW_AGENT_ID.to_string()),
+            next_step: None,
+            reason: "High-risk architecture review requested.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Council returns a recommendation.".to_string(),
+            clarifying_question: None,
+            final_summary: None,
+        };
+
+        let prompts = [
+            parallel_child_prompt(&compiled.user_prompt, &parallel_step),
+            council_member_prompt(&compiled.user_prompt, &decision),
+            subtask_prompt(&compiled.user_prompt),
+        ];
+
+        for prompt in prompts {
+            assert!(prompt.contains("inspect README"));
+            assert!(!prompt.contains("/skill:reviewer"));
+            assert!(!prompt.contains("<Skill:"));
+            assert!(!prompt.contains("SENTINEL_DERIVED_SKILL_BODY_PRIVATE"));
+        }
+    }
+
+    #[tokio::test]
+    async fn action_authorization_uses_normalized_prompt_not_rendered_skill_body() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+        let agent = app.agent("fixer").unwrap().clone();
+        let skill_context = runtime_skill_context(
+            "reviewer",
+            "This workflow body mentions commit, but it is not user intent.",
+        );
+        let request = app
+            .runtime_request(
+                "run",
+                "step",
+                RuntimePrompt::new("inspect README", Some(&skill_context)),
+                agent.clone(),
+                Vec::new(),
+                "agent_result",
+            )
+            .unwrap();
+        let action_request = ActionRequest {
+            schema_version: 1,
+            action_id: "commit".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::RunCommand,
+            params: json!({ "command": "git commit -m test" }),
+        };
+        let normalized_context = ActionExecutionContext {
+            working_directory: app.config.working_directory.clone(),
+            workspace: app.config.workspace.clone(),
+            approval_mode: app.config.approval_mode.clone(),
+            command_timeout: None,
+            user_prompt: Some("inspect README".to_string()),
+            action_scope: crate::actions::ActionScope::Unrestricted,
+        };
+        let rendered_context = ActionExecutionContext {
+            user_prompt: Some(request.prompt.clone()),
+            ..normalized_context.clone()
+        };
+
+        assert!(request.prompt.contains("commit"));
+        assert!(!action_executable_without_approval(
+            &agent,
+            &normalized_context,
+            &action_request
+        ));
+        assert!(action_executable_without_approval(
+            &agent,
+            &rendered_context,
+            &action_request
+        ));
     }
 
     #[test]
@@ -6449,7 +6683,7 @@ prompt = "{reviewer_prompt}"
             .runtime_request(
                 "current-run",
                 "current-step",
-                "create another feature",
+                RuntimePrompt::new("create another feature", None),
                 orchestrator,
                 Vec::new(),
                 "orchestrator_decision",
@@ -6490,7 +6724,7 @@ prompt = "{reviewer_prompt}"
             .runtime_request(
                 "next-run",
                 "next-step",
-                "continue",
+                RuntimePrompt::new("continue", None),
                 orchestrator,
                 Vec::new(),
                 "orchestrator_decision",
@@ -6868,11 +7102,40 @@ instructions_file = "agents/explorer.md"
         let debug_log = fs::read_to_string(dir.path().join(".multiagent/debug.log")).unwrap();
         let run_record =
             fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+        let chat_projection = serde_json::to_string(&app.state.chat_items).unwrap();
         assert!(!events_jsonl.contains(SENTINEL));
         assert!(!debug_log.contains(SENTINEL));
         assert!(!run_record.contains(SENTINEL));
+        assert!(!chat_projection.contains(SENTINEL));
         assert!(run_record.contains("\"submitted_prompt\""));
         assert!(run_record.contains("\"loaded_skills\""));
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_ignores_skill_body_trigger_words_for_fixture_routing() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "trigger",
+            Some("trigger"),
+            "SENTINEL_TRIGGER_SKILL_BODY_PRIVATE parallel use action approval action command action write action retryable provider error needs clarification high-risk architecture typo",
+        );
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/skill:trigger inspect README")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "skills_loaded"));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started"));
+        assert!(!events.iter().any(|event| event.kind == "action_requested"));
+        assert!(!events.iter().any(|event| event.kind == "blocker_reported"));
+        assert!(!events.iter().any(|event| event.kind == "council_started"));
     }
 
     #[tokio::test]
@@ -7069,7 +7332,7 @@ instructions_file = "agents/explorer.md"
             .runtime_request(
                 "run",
                 "step",
-                "create a feature",
+                RuntimePrompt::new("create a feature", None),
                 orchestrator,
                 Vec::new(),
                 "orchestrator_decision",
@@ -7293,7 +7556,7 @@ runtime = "fake"
             .runtime_request(
                 &run_id,
                 &step_id,
-                "create a feature",
+                RuntimePrompt::new("create a feature", None),
                 orchestrator,
                 Vec::new(),
                 "orchestrator_decision",
@@ -7839,6 +8102,84 @@ runtime = "fake"
             Some("/skill:reviewer")
         );
         assert!(events.iter().all(|event| event.kind != "skills_loaded"));
+    }
+
+    #[tokio::test]
+    async fn clarification_resume_preserves_existing_skill_context_without_resolving_answer_skill()
+    {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "base",
+            Some("base"),
+            "SENTINEL_BASE_SKILL_BODY_PRIVATE",
+        );
+        write_project_skill(
+            dir.path(),
+            "new",
+            Some("new"),
+            "SENTINEL_NEW_SKILL_BODY_PRIVATE",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/skill:base needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let pending = app.pending_clarification.as_ref().unwrap();
+        let resume_prompt = format!(
+            "{}\n\nUser clarification: /skill:new use the CLI path",
+            pending.run.prompt
+        );
+        let resume_request = app
+            .runtime_request(
+                &pending.run.run_id,
+                "resume-step",
+                RuntimePrompt::new(&resume_prompt, pending.run.skill_context.as_ref()),
+                app.agent("orchestrator").unwrap().clone(),
+                pending.run.previous_results.clone(),
+                "orchestrator_decision",
+            )
+            .unwrap();
+        assert_eq!(
+            count_occurrences(&resume_request.prompt, "SENTINEL_BASE_SKILL_BODY_PRIVATE"),
+            1
+        );
+        assert!(!resume_request
+            .prompt
+            .contains("SENTINEL_NEW_SKILL_BODY_PRIVATE"));
+        assert!(resume_request
+            .prompt
+            .contains("/skill:new use the CLI path"));
+
+        app.submit_prompt("/skill:new use the CLI path")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let loaded_events = events
+            .iter()
+            .filter(|event| event.kind == "skills_loaded")
+            .collect::<Vec<_>>();
+        assert_eq!(loaded_events.len(), 1);
+        assert_eq!(
+            loaded_events[0].payload["skills"][0]["display_name"],
+            Value::String("base".to_string())
+        );
+        let answer = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answer
+                .payload
+                .get("answer")
+                .and_then(serde_json::Value::as_str),
+            Some("/skill:new use the CLI path")
+        );
     }
 
     #[tokio::test]

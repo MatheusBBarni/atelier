@@ -27,10 +27,46 @@ fn rendered_skill_prompt_fits_existing_runtime_request_prompt_field() {
         .as_str()
         .unwrap()
         .contains("<Skill: reviewer"));
+    assert_eq!(
+        count_occurrences(envelope["prompt"].as_str().unwrap(), "<Skill: reviewer"),
+        1
+    );
     assert!(envelope["prompt"]
         .as_str()
         .unwrap()
         .contains("<User Prompt>"));
+    let mut envelope_without_prompt = envelope.clone();
+    envelope_without_prompt
+        .as_object_mut()
+        .unwrap()
+        .remove("prompt");
+    let non_prompt_fields = serde_json::to_string(&envelope_without_prompt).unwrap();
+    assert!(!non_prompt_fields.contains("<Skill: reviewer"));
+    assert!(!non_prompt_fields.contains("Review with care."));
+}
+
+#[test]
+fn duplicate_skill_references_render_once_per_runtime_request() {
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("project");
+    write_skill(
+        &project.join(".agents/skills/reviewer"),
+        "---\nname: reviewer\n---\nReview with care.\n",
+    );
+    let compiled = compile_prompt_with_home(
+        &project,
+        None,
+        "/skill:reviewer inspect README /skill:reviewer",
+    )
+    .unwrap();
+    let rendered = render_runtime_prompt(compiled.skill_context.as_ref(), &compiled.user_prompt);
+    let request = runtime_request(project, rendered);
+
+    assert_eq!(request.prompt.matches("<Skill: reviewer").count(), 1);
+    assert_eq!(request.prompt.matches("Review with care.").count(), 1);
+    assert!(request
+        .prompt
+        .contains("<User Prompt>\ninspect README\n</User Prompt>"));
 }
 
 #[test]
@@ -88,4 +124,8 @@ fn runtime_request(working_directory: std::path::PathBuf, prompt: String) -> Run
 fn write_skill(skill_dir: &Path, contents: &str) {
     fs::create_dir_all(skill_dir).unwrap();
     fs::write(skill_dir.join(SKILL_FILE_NAME), contents).unwrap();
+}
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.match_indices(needle).count()
 }

@@ -11,6 +11,7 @@ use crate::orchestrator::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -146,7 +147,7 @@ async fn emit_fake_progress(
 }
 
 fn fake_stream_delay(request: &RuntimeRequest) -> Duration {
-    let prompt = request.prompt.to_ascii_lowercase();
+    let prompt = fake_control_text(request);
     if request.parallel_context.is_some() {
         if prompt.contains("approval action") && request.agent_profile.id == "fixer" {
             return Duration::from_millis(50);
@@ -180,7 +181,7 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             crate::orchestrator::RunStepResult::Agent { result } => result.agent.as_str(),
             crate::orchestrator::RunStepResult::ParallelGroup { .. } => "parallel_group",
         });
-    let prompt = request.prompt.to_ascii_lowercase();
+    let prompt = fake_control_text(request);
     if last_agent.is_none() && prompt.contains("parallel") {
         let steps = if prompt.contains("same agent") || prompt.contains("scoped write action") {
             vec![
@@ -474,42 +475,32 @@ fn looks_like_code_change(prompt: &str) -> bool {
 fn should_emit_fake_action_request(request: &RuntimeRequest) -> bool {
     request.action_results.is_empty()
         && request.agent_profile.has_capability(&Capability::Read)
-        && request.prompt.to_ascii_lowercase().contains("use action")
+        && fake_control_text(request).contains("use action")
 }
 
 fn should_emit_fake_approval_action_request(request: &RuntimeRequest) -> bool {
     request.action_results.is_empty()
         && request.agent_profile.id == "fixer"
         && request.agent_profile.has_capability(&Capability::Command)
-        && request
-            .prompt
-            .to_ascii_lowercase()
-            .contains("approval action")
+        && fake_control_text(request).contains("approval action")
 }
 
 fn should_emit_fake_command_action_request(request: &RuntimeRequest) -> bool {
     request.action_results.is_empty()
         && request.agent_profile.id == "fixer"
         && request.agent_profile.has_capability(&Capability::Command)
-        && request
-            .prompt
-            .to_ascii_lowercase()
-            .contains("command action")
+        && fake_control_text(request).contains("command action")
 }
 
 fn should_emit_fake_write_action_request(request: &RuntimeRequest) -> bool {
     request.action_results.is_empty()
         && request.agent_profile.id == "fixer"
         && request.agent_profile.has_capability(&Capability::Edit)
-        && request.prompt.to_ascii_lowercase().contains("write action")
+        && fake_control_text(request).contains("write action")
 }
 
 fn fake_write_action_path(request: &RuntimeRequest) -> String {
-    if request
-        .prompt
-        .to_ascii_lowercase()
-        .contains("scoped write action")
-    {
+    if fake_control_text(request).contains("scoped write action") {
         if let Some(path) = request
             .parallel_context
             .as_ref()
@@ -538,7 +529,7 @@ fn completed_action_paths(request: &RuntimeRequest) -> Vec<String> {
 }
 
 fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
-    let prompt = request.prompt.to_ascii_lowercase();
+    let prompt = fake_control_text(request);
     if request
         .agent_profile
         .instructions
@@ -559,11 +550,36 @@ fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
 }
 
 fn should_emit_fake_retryable_provider_error(request: &RuntimeRequest) -> bool {
-    request
-        .prompt
-        .to_ascii_lowercase()
-        .contains("retryable provider error")
+    fake_control_text(request).contains("retryable provider error")
         && request.agent_profile.model == "primary-fails"
+}
+
+fn fake_control_text(request: &RuntimeRequest) -> String {
+    fake_control_prompt(request).to_ascii_lowercase()
+}
+
+fn fake_control_prompt(request: &RuntimeRequest) -> Cow<'_, str> {
+    const SYSTEM_PROMPT_OPEN: &str = "<System Prompt>\n";
+    const USER_PROMPT_OPEN: &str = "<User Prompt>\n";
+    const USER_PROMPT_CLOSE: &str = "\n</User Prompt>";
+
+    let prompt = request.prompt.as_str();
+    if !prompt.starts_with(SYSTEM_PROMPT_OPEN) {
+        return Cow::Borrowed(prompt);
+    }
+    let Some(body_start) = prompt
+        .find(USER_PROMPT_OPEN)
+        .map(|start| start + USER_PROMPT_OPEN.len())
+    else {
+        return Cow::Borrowed(prompt);
+    };
+    let Some(body_end) = prompt[body_start..]
+        .find(USER_PROMPT_CLOSE)
+        .map(|end| body_start + end)
+    else {
+        return Cow::Borrowed(prompt);
+    };
+    Cow::Borrowed(&prompt[body_start..body_end])
 }
 
 fn has_prior_parse_error(request: &RuntimeRequest, agent_id: &str) -> bool {
