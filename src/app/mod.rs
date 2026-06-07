@@ -34,7 +34,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::future::{pending, Future};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -240,10 +240,49 @@ struct RunDriveContext {
     prompt: String,
     skill_context: Option<SkillPromptContext>,
     subtask: Option<SubtaskContext>,
+    workflow: Option<WorkflowRunContext>,
     previous_results: Vec<RunStepResult>,
     step_count: u32,
     started_at: Instant,
     parse_repair_attempts: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowRunContext {
+    original_command: String,
+    user_prompt: String,
+    target_ledger: BTreeMap<String, Vec<WorkflowTarget>>,
+    verification: Vec<String>,
+    skipped_checks: Vec<String>,
+    residual_risks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowTarget {
+    path: String,
+    source_group_id: String,
+    source_step_id: Option<String>,
+    source_step_label: String,
+    status: WorkflowTargetStatus,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkflowTargetStatus {
+    Planned,
+    Completed,
+    Skipped,
+    Blocked,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCompletionStatus {
+    Completed,
+    CompletedWithIssues,
+    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,6 +326,7 @@ impl RunDriveContext {
         prompt: impl Into<String>,
         skill_context: Option<SkillPromptContext>,
         subtask: Option<SubtaskContext>,
+        workflow: Option<WorkflowRunContext>,
     ) -> Self {
         Self {
             run_id: run_id.into(),
@@ -295,6 +335,7 @@ impl RunDriveContext {
             prompt: prompt.into(),
             skill_context,
             subtask,
+            workflow,
             previous_results: Vec::new(),
             step_count: 0,
             started_at: Instant::now(),
@@ -307,6 +348,46 @@ impl RunDriveContext {
             .as_ref()
             .map(SkillPromptContext::metadata)
             .unwrap_or_default()
+    }
+}
+
+impl WorkflowRunContext {
+    fn new(command: &WorkflowCommand) -> Self {
+        Self {
+            original_command: command.original_command.clone(),
+            user_prompt: command.prompt.clone(),
+            target_ledger: BTreeMap::new(),
+            verification: Vec::new(),
+            skipped_checks: Vec::new(),
+            residual_risks: Vec::new(),
+        }
+    }
+
+    fn record_planned_targets(
+        &mut self,
+        group_id: &str,
+        step_id: Option<&str>,
+        step_label: &str,
+        file_scope: &ParallelFileScope,
+        working_directory: &Path,
+        extra_write_roots: &[PathBuf],
+    ) -> Result<usize> {
+        let mut recorded = 0usize;
+        for write_file in &file_scope.write_files {
+            let path =
+                normalize_workflow_target_key(write_file, working_directory, extra_write_roots)?;
+            let target = WorkflowTarget {
+                path: path.clone(),
+                source_group_id: group_id.to_string(),
+                source_step_id: step_id.map(str::to_string),
+                source_step_label: step_label.to_string(),
+                status: WorkflowTargetStatus::Planned,
+                reason: None,
+            };
+            self.target_ledger.entry(path).or_default().push(target);
+            recorded += 1;
+        }
+        Ok(recorded)
     }
 }
 
@@ -429,6 +510,8 @@ struct RunRecord {
     prompt: String,
     loaded_skills: Vec<LoadedSkillMetadata>,
     session_goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow: Option<WorkflowRunContext>,
     subtask: Option<SubtaskRecord>,
     state: RunState,
     results: Vec<RunStepResult>,
@@ -685,6 +768,9 @@ impl App {
             run_prompt,
             compiled_prompt.skill_context,
             None,
+            workflow_start
+                .as_ref()
+                .map(|start| WorkflowRunContext::new(&start.command)),
         );
         self.drive_run(run, None).await
     }
@@ -833,6 +919,7 @@ impl App {
                 request: compiled_task.user_prompt,
                 submitted_request: compiled_task.submitted_prompt,
             }),
+            None,
         );
         self.drive_run(run, None).await
     }
@@ -1205,6 +1292,18 @@ impl App {
         )?;
 
         let child_specs = self.prepare_parallel_children(run, &group)?;
+        if let Some(workflow) = run.workflow.as_mut() {
+            for child in &child_specs {
+                workflow.record_planned_targets(
+                    &group.group_id,
+                    Some(&child.step_id),
+                    &child.step_label,
+                    &child.file_scope,
+                    &self.config.working_directory,
+                    &self.config.workspace.extra_write_roots,
+                )?;
+            }
+        }
         let (sender, mut receiver) =
             mpsc::channel(RUNTIME_EVENT_CHANNEL_CAPACITY * child_specs.len().max(1));
         let resume_handle = ParallelRuntimeResumeHandle {
@@ -2546,6 +2645,7 @@ impl App {
             prompt: run.prompt.clone(),
             loaded_skills: run.loaded_skill_metadata(),
             session_goal: self.state.session_goal.clone(),
+            workflow: run.workflow.clone(),
             subtask: run.subtask.as_ref().map(|subtask| SubtaskRecord {
                 agent_id: subtask.agent_id.clone(),
                 submitted_request: subtask.submitted_request.clone(),
@@ -4935,6 +5035,60 @@ fn preflight_workflow_prerequisites(config: &EffectiveConfig) -> Result<Workflow
     })
 }
 
+fn normalize_workflow_target_key(
+    path: &str,
+    working_directory: &Path,
+    extra_write_roots: &[PathBuf],
+) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        bail!("workflow target path is empty");
+    }
+    if trimmed.split('/').any(|component| component == ".") {
+        bail!("current-directory components are not allowed in workflow target path: {path}");
+    }
+
+    let candidate = Path::new(trimmed);
+    let relative = if candidate.is_absolute() {
+        if !extra_write_roots
+            .iter()
+            .any(|root| candidate.starts_with(root))
+        {
+            bail!("absolute paths are not allowed in workflow target paths: {path}");
+        }
+        candidate.strip_prefix(working_directory).with_context(|| {
+            format!(
+                "workflow target path must be inside the workspace: {}",
+                candidate.display()
+            )
+        })?
+    } else {
+        candidate
+    };
+
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::ParentDir => {
+                bail!("path traversal is not allowed in workflow target path: {path}")
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                bail!("rooted paths are not allowed in workflow target paths: {path}")
+            }
+            Component::CurDir => {
+                bail!(
+                    "current-directory components are not allowed in workflow target path: {path}"
+                )
+            }
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+        }
+    }
+    if parts.is_empty() {
+        bail!("workflow target path is empty");
+    }
+    Ok(parts.join("/"))
+}
+
 fn workflow_started_payload(run_id: &str, start: &WorkflowStart) -> Value {
     json!({
         "run_id": run_id,
@@ -5308,6 +5462,7 @@ runtime = "fake"
             "inspect README",
             Some(skill_context),
             None,
+            None,
         );
 
         assert_eq!(run.submitted_prompt, "/skill:reviewer inspect README");
@@ -5659,6 +5814,164 @@ runtime = "fake"
         assert_eq!(payload["mode"], "workflow");
         assert_eq!(payload["preflight"]["parallel_step_groups"], true);
         assert_eq!(payload["preflight"]["max_parallel_agent_steps"], 2);
+    }
+
+    fn test_workflow_context() -> WorkflowRunContext {
+        WorkflowRunContext::new(&WorkflowCommand {
+            original_command: "/workflow parallel create a feature".to_string(),
+            prompt: "parallel create a feature".to_string(),
+        })
+    }
+
+    #[test]
+    fn workflow_ledger_records_child_write_file_as_planned_target() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let scope = ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-a.txt".to_string()],
+            read_roots: vec!["src/runtime".to_string()],
+        };
+
+        let recorded = workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "fix first scoped file",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        assert_eq!(recorded, 1);
+        let targets = workflow
+            .target_ledger
+            .get("parallel-output/fixer-a.txt")
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].path, "parallel-output/fixer-a.txt");
+        assert_eq!(targets[0].source_group_id, "group-1");
+        assert_eq!(targets[0].source_step_id.as_deref(), Some("step-1"));
+        assert_eq!(targets[0].source_step_label, "fix first scoped file");
+        assert_eq!(targets[0].status, WorkflowTargetStatus::Planned);
+        assert_eq!(targets[0].reason, None);
+    }
+
+    #[test]
+    fn workflow_ledger_ignores_read_only_child_without_write_files() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let scope = ParallelFileScope {
+            write_files: Vec::new(),
+            read_roots: vec!["src/app".to_string()],
+        };
+
+        let recorded = workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-review"),
+                "review app scope",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        assert_eq!(recorded, 0);
+        assert!(workflow.target_ledger.is_empty());
+    }
+
+    #[test]
+    fn workflow_ledger_records_multiple_write_files_with_same_source_metadata() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let scope = ParallelFileScope {
+            write_files: vec![
+                "parallel-output/fixer-a.txt".to_string(),
+                "parallel-output/fixer-b.txt".to_string(),
+            ],
+            read_roots: vec!["src".to_string()],
+        };
+
+        let recorded = workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "fix scoped files",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        assert_eq!(recorded, 2);
+        for path in ["parallel-output/fixer-a.txt", "parallel-output/fixer-b.txt"] {
+            let target = workflow.target_ledger.get(path).unwrap().first().unwrap();
+            assert_eq!(target.source_group_id, "group-1");
+            assert_eq!(target.source_step_id.as_deref(), Some("step-1"));
+            assert_eq!(target.source_step_label, "fix scoped files");
+            assert_eq!(target.status, WorkflowTargetStatus::Planned);
+        }
+    }
+
+    #[test]
+    fn workflow_target_keys_normalize_workspace_relative_paths() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+
+        let key = normalize_workflow_target_key(
+            " parallel-output//nested/fixer-a.txt ",
+            &config.working_directory,
+            &config.workspace.extra_write_roots,
+        )
+        .unwrap();
+
+        assert_eq!(key, "parallel-output/nested/fixer-a.txt");
+    }
+
+    #[test]
+    fn workflow_ledger_retains_duplicate_path_source_evidence_across_groups() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let scope = ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-a.txt".to_string()],
+            read_roots: vec!["src".to_string()],
+        };
+
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "first pass",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_planned_targets(
+                "group-2",
+                Some("step-2"),
+                "second pass",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let targets = workflow
+            .target_ledger
+            .get("parallel-output/fixer-a.txt")
+            .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].source_group_id, "group-1");
+        assert_eq!(targets[0].source_step_label, "first pass");
+        assert_eq!(targets[1].source_group_id, "group-2");
+        assert_eq!(targets[1].source_step_label, "second pass");
     }
 
     fn fake_parallel_config(dir: &std::path::Path) -> EffectiveConfig {
@@ -6575,7 +6888,7 @@ prompt = "{reviewer_prompt}"
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
-        let mut run = RunDriveContext::new("run", None, "prompt", "prompt", None, None);
+        let mut run = RunDriveContext::new("run", None, "prompt", "prompt", None, None, None);
         run.step_count = 1;
 
         app.set_active_step("run", "step", "explorer");
@@ -6697,7 +7010,8 @@ prompt = "{reviewer_prompt}"
         let mut app = App::new(config).await.unwrap();
         app.state.active_run_id = Some("run".to_string());
         app.set_active_step("run", "step", "explorer");
-        let mut run = RunDriveContext::new("run", None, "slow stream", "slow stream", None, None);
+        let mut run =
+            RunDriveContext::new("run", None, "slow stream", "slow stream", None, None, None);
         run.step_count = 1;
         let elapsed = tokio::time::timeout(Duration::ZERO, pending::<Result<RuntimeOutput>>())
             .await
@@ -6867,7 +7181,8 @@ prompt = "{reviewer_prompt}"
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
-        let mut run = RunDriveContext::new("run", None, "fix a typo", "fix a typo", None, None);
+        let mut run =
+            RunDriveContext::new("run", None, "fix a typo", "fix a typo", None, None, None);
         let decision = crate::orchestrator::OrchestratorDecision {
             schema_version: 1,
             decision_id: "decision".to_string(),
@@ -7242,6 +7557,65 @@ instructions_file = "agents/explorer.md"
         assert!(run_record.contains("Extracted user prompt:\\nparallel create a feature"));
         assert!(run_record.contains("planned file-edit targets"));
         assert!(run_record.contains("verification evidence"));
+    }
+
+    #[tokio::test]
+    async fn workflow_parallel_prompt_persists_planned_targets_from_fake_group() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let run_id = events
+            .iter()
+            .find(|event| event.kind == "run_started")
+            .and_then(|event| event.payload["run_id"].as_str())
+            .unwrap();
+        let record_path = dir.path().join(format!(".multiagent/runs/{run_id}.json"));
+        let record: Value =
+            serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
+        let ledger = record["workflow"]["target_ledger"].as_object().unwrap();
+        let targets = ledger["src/runtime/fake.rs"].as_array().unwrap();
+
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["path"], "src/runtime/fake.rs");
+        assert_eq!(targets[0]["source_step_label"], "fix runtime scope");
+        assert_eq!(targets[0]["status"], "planned");
+        assert_eq!(targets[0]["reason"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn workflow_parallel_prompt_excludes_read_only_reviewer_from_planned_targets() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel create a feature")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let run_id = events
+            .iter()
+            .find(|event| event.kind == "run_started")
+            .and_then(|event| event.payload["run_id"].as_str())
+            .unwrap();
+        let record_path = dir.path().join(format!(".multiagent/runs/{run_id}.json"));
+        let record: Value =
+            serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
+        let ledger = record["workflow"]["target_ledger"].as_object().unwrap();
+
+        assert!(!ledger.values().any(|targets| {
+            targets.as_array().unwrap().iter().any(|target| {
+                target["source_step_label"] == "review app scope" || target["path"] == "src/app"
+            })
+        }));
     }
 
     #[tokio::test]
@@ -7932,6 +8306,7 @@ runtime = "fake"
             "create a feature",
             None,
             None,
+            None,
         );
         run.started_at = Instant::now() - Duration::from_secs(61);
 
@@ -7988,6 +8363,7 @@ runtime = "fake"
             None,
             "create a feature",
             "create a feature",
+            None,
             None,
             None,
         );
