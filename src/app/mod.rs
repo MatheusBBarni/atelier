@@ -255,6 +255,8 @@ struct WorkflowRunContext {
     verification: Vec<String>,
     skipped_checks: Vec<String>,
     residual_risks: Vec<String>,
+    #[serde(skip)]
+    completion_recorded: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,6 +285,36 @@ pub enum WorkflowCompletionStatus {
     Completed,
     CompletedWithIssues,
     Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowTargetCounts {
+    planned: usize,
+    completed: usize,
+    skipped: usize,
+    blocked: usize,
+    failed: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowUnfinishedTarget {
+    path: String,
+    source_group_id: String,
+    source_step_id: Option<String>,
+    source_step_label: String,
+    status: WorkflowTargetStatus,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowCompletionPayload {
+    run_id: String,
+    status: WorkflowCompletionStatus,
+    target_counts: WorkflowTargetCounts,
+    unfinished_targets: Vec<WorkflowUnfinishedTarget>,
+    verification: Vec<String>,
+    skipped_checks: Vec<String>,
+    residual_risks: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -360,6 +392,7 @@ impl WorkflowRunContext {
             verification: Vec::new(),
             skipped_checks: Vec::new(),
             residual_risks: Vec::new(),
+            completion_recorded: false,
         }
     }
 
@@ -388,6 +421,103 @@ impl WorkflowRunContext {
             recorded += 1;
         }
         Ok(recorded)
+    }
+
+    fn record_child_result(
+        &mut self,
+        group_id: &str,
+        step_id: &str,
+        file_scope: &ParallelFileScope,
+        result: &AgentResult,
+        working_directory: &Path,
+        extra_write_roots: &[PathBuf],
+    ) -> Result<()> {
+        self.record_verification(result);
+        let (status, reason) = workflow_target_status_from_agent_result(result);
+        for write_file in &file_scope.write_files {
+            let path =
+                normalize_workflow_target_key(write_file, working_directory, extra_write_roots)?;
+            if let Some(targets) = self.target_ledger.get_mut(&path) {
+                for target in targets.iter_mut().filter(|target| {
+                    target.source_group_id == group_id
+                        && target.source_step_id.as_deref() == Some(step_id)
+                }) {
+                    target.status = status.clone();
+                    target.reason = reason.clone();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_verification(&mut self, result: &AgentResult) {
+        for item in result.commands.iter().chain(result.verification.iter()) {
+            if !item.trim().is_empty() && !self.verification.contains(item) {
+                self.verification.push(item.clone());
+            }
+        }
+    }
+
+    fn completion_payload(&self, run_id: &str, interrupted: bool) -> WorkflowCompletionPayload {
+        let target_counts = self.target_counts();
+        let unfinished_targets = self.unfinished_targets();
+        let status =
+            derive_workflow_completion_status(&target_counts, &unfinished_targets, interrupted);
+        WorkflowCompletionPayload {
+            run_id: run_id.to_string(),
+            status,
+            target_counts,
+            unfinished_targets,
+            verification: self.verification.clone(),
+            skipped_checks: self.skipped_checks.clone(),
+            residual_risks: self.residual_risks.clone(),
+        }
+    }
+
+    fn target_counts(&self) -> WorkflowTargetCounts {
+        let mut counts = WorkflowTargetCounts {
+            planned: 0,
+            completed: 0,
+            skipped: 0,
+            blocked: 0,
+            failed: 0,
+        };
+        for target in self.targets() {
+            match target.status {
+                WorkflowTargetStatus::Planned => counts.planned += 1,
+                WorkflowTargetStatus::Completed => counts.completed += 1,
+                WorkflowTargetStatus::Skipped => counts.skipped += 1,
+                WorkflowTargetStatus::Blocked => counts.blocked += 1,
+                WorkflowTargetStatus::Failed => counts.failed += 1,
+            }
+        }
+        counts
+    }
+
+    fn unfinished_targets(&self) -> Vec<WorkflowUnfinishedTarget> {
+        self.targets()
+            .filter(|target| target.status != WorkflowTargetStatus::Completed)
+            .map(|target| WorkflowUnfinishedTarget {
+                path: target.path.clone(),
+                source_group_id: target.source_group_id.clone(),
+                source_step_id: target.source_step_id.clone(),
+                source_step_label: target.source_step_label.clone(),
+                status: target.status.clone(),
+                reason: target.reason.clone().unwrap_or_else(|| {
+                    if matches!(target.status, WorkflowTargetStatus::Planned) {
+                        "planned target did not receive terminal workflow evidence".to_string()
+                    } else {
+                        "workflow target did not include a reason".to_string()
+                    }
+                }),
+            })
+            .collect()
+    }
+
+    fn targets(&self) -> impl Iterator<Item = &WorkflowTarget> {
+        self.target_ledger
+            .values()
+            .flat_map(|targets| targets.iter())
     }
 }
 
@@ -1066,6 +1196,12 @@ impl App {
     ) -> Result<()> {
         let drive_result = self.drive_run_inner(&mut run, resume).await;
         if drive_result.is_ok() {
+            if !matches!(self.state.run_state, RunState::WaitingForUser) {
+                self.record_workflow_completed(
+                    &mut run,
+                    matches!(self.state.run_state, RunState::Interrupted),
+                )?;
+            }
             self.write_run_record(&run)?;
             if !matches!(self.state.run_state, RunState::WaitingForUser) {
                 self.state.active_run_id = None;
@@ -1183,6 +1319,7 @@ impl App {
             }
             DecisionStatus::Complete => {
                 self.state.run_state = RunState::Completed;
+                self.record_workflow_completed(run, false)?;
                 self.record_event(
                     Some(run.run_id.clone()),
                     None,
@@ -1194,6 +1331,7 @@ impl App {
             }
             DecisionStatus::Failed => {
                 self.state.run_state = RunState::Failed;
+                self.record_workflow_completed(run, false)?;
                 self.record_event(
                     Some(run.run_id.clone()),
                     None,
@@ -1588,6 +1726,7 @@ impl App {
         self.sync_chat_items();
         self.publish_state();
         if interrupted {
+            self.record_workflow_completed(run, true)?;
             return Ok(AgentStepOutcome::Stop);
         }
         Ok(AgentStepOutcome::Completed)
@@ -2020,7 +2159,7 @@ impl App {
 
     fn record_parallel_child_result(
         &mut self,
-        run: &RunDriveContext,
+        run: &mut RunDriveContext,
         group_id: &str,
         child: &mut ParallelChildRuntimeState,
         result: AgentResult,
@@ -2073,6 +2212,16 @@ impl App {
                 LiveStepStatus::Failed
             },
         );
+        if let Some(workflow) = run.workflow.as_mut() {
+            workflow.record_child_result(
+                group_id,
+                &child.step_id,
+                &child.file_scope,
+                &result,
+                &self.config.working_directory,
+                &self.config.workspace.extra_write_roots,
+            )?;
+        }
         child.terminal_result = Some(result);
         child.result_recorded = true;
         Ok(())
@@ -3368,6 +3517,28 @@ impl App {
             "skills_loaded",
             skills_loaded_payload_from_metadata(&metadata),
             loaded_skills_display(&metadata),
+        )
+    }
+
+    fn record_workflow_completed(
+        &mut self,
+        run: &mut RunDriveContext,
+        interrupted: bool,
+    ) -> Result<()> {
+        let Some(workflow) = run.workflow.as_mut() else {
+            return Ok(());
+        };
+        if workflow.completion_recorded {
+            return Ok(());
+        }
+        let payload = workflow.completion_payload(&run.run_id, interrupted);
+        workflow.completion_recorded = true;
+        self.record_event(
+            Some(run.run_id.clone()),
+            None,
+            "workflow_completed",
+            serde_json::to_value(payload)?,
+            "Workflow completed.",
         )
     }
 
@@ -5099,6 +5270,56 @@ fn workflow_started_payload(run_id: &str, start: &WorkflowStart) -> Value {
     })
 }
 
+fn workflow_target_status_from_agent_result(
+    result: &AgentResult,
+) -> (WorkflowTargetStatus, Option<String>) {
+    match result.status {
+        AgentResultStatus::Completed | AgentResultStatus::NoChanges => {
+            (WorkflowTargetStatus::Completed, None)
+        }
+        AgentResultStatus::Blocked | AgentResultStatus::ApprovalDenied => (
+            WorkflowTargetStatus::Blocked,
+            Some(workflow_result_diagnostic(result)),
+        ),
+        AgentResultStatus::Failed
+        | AgentResultStatus::ParseError
+        | AgentResultStatus::LimitReached
+        | AgentResultStatus::Cancelled => (
+            WorkflowTargetStatus::Failed,
+            Some(workflow_result_diagnostic(result)),
+        ),
+    }
+}
+
+fn workflow_result_diagnostic(result: &AgentResult) -> String {
+    result
+        .blocker
+        .clone()
+        .filter(|diagnostic| !diagnostic.trim().is_empty())
+        .unwrap_or_else(|| result.summary.clone())
+}
+
+fn derive_workflow_completion_status(
+    counts: &WorkflowTargetCounts,
+    unfinished_targets: &[WorkflowUnfinishedTarget],
+    interrupted: bool,
+) -> WorkflowCompletionStatus {
+    if interrupted || counts.planned > 0 || counts.total() == 0 {
+        return WorkflowCompletionStatus::Failed;
+    }
+    if unfinished_targets.is_empty() {
+        WorkflowCompletionStatus::Completed
+    } else {
+        WorkflowCompletionStatus::CompletedWithIssues
+    }
+}
+
+impl WorkflowTargetCounts {
+    fn total(&self) -> usize {
+        self.planned + self.completed + self.skipped + self.blocked + self.failed
+    }
+}
+
 fn workflow_runtime_prompt(
     command: &WorkflowCommand,
     user_prompt: &str,
@@ -5823,6 +6044,55 @@ runtime = "fake"
         })
     }
 
+    fn workflow_test_scope() -> ParallelFileScope {
+        ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-a.txt".to_string()],
+            read_roots: vec!["src/runtime".to_string()],
+        }
+    }
+
+    fn workflow_test_result(status: AgentResultStatus, summary: &str) -> AgentResult {
+        let mut result = AgentResult::completed("fixer", "step-1", summary);
+        result.status = status;
+        result.summary = summary.to_string();
+        result
+    }
+
+    fn workflow_test_result_with_blocker(
+        status: AgentResultStatus,
+        summary: &str,
+        blocker: &str,
+    ) -> AgentResult {
+        let mut result = workflow_test_result(status, summary);
+        result.blocker = Some(blocker.to_string());
+        result
+    }
+
+    fn workflow_with_planned_test_target(
+        config: &EffectiveConfig,
+        scope: &ParallelFileScope,
+    ) -> WorkflowRunContext {
+        let mut workflow = test_workflow_context();
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "fix scoped file",
+                scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+    }
+
+    fn first_workflow_target<'a>(
+        workflow: &'a WorkflowRunContext,
+        path: &str,
+    ) -> &'a WorkflowTarget {
+        workflow.target_ledger.get(path).unwrap().first().unwrap()
+    }
+
     #[test]
     fn workflow_ledger_records_child_write_file_as_planned_target() {
         let dir = tempdir().unwrap();
@@ -5974,6 +6244,315 @@ runtime = "fake"
         assert_eq!(targets[1].source_step_label, "second pass");
     }
 
+    #[test]
+    fn workflow_child_completed_marks_planned_targets_completed() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let mut workflow = workflow_with_planned_test_target(&config, &scope);
+        let result = workflow_test_result(AgentResultStatus::Completed, "done");
+
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &scope,
+                &result,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+        assert_eq!(target.status, WorkflowTargetStatus::Completed);
+        assert_eq!(target.reason, None);
+    }
+
+    #[test]
+    fn workflow_child_no_changes_marks_planned_targets_completed() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let mut workflow = workflow_with_planned_test_target(&config, &scope);
+        let result = workflow_test_result(AgentResultStatus::NoChanges, "validated no changes");
+
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &scope,
+                &result,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+        assert_eq!(target.status, WorkflowTargetStatus::Completed);
+        assert_eq!(target.reason, None);
+    }
+
+    #[test]
+    fn workflow_child_blocked_marks_planned_targets_blocked_with_reason() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let mut workflow = workflow_with_planned_test_target(&config, &scope);
+        let result = workflow_test_result_with_blocker(
+            AgentResultStatus::Blocked,
+            "blocked summary",
+            "scope needs clarification",
+        );
+
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &scope,
+                &result,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+        assert_eq!(target.status, WorkflowTargetStatus::Blocked);
+        assert_eq!(target.reason.as_deref(), Some("scope needs clarification"));
+    }
+
+    #[test]
+    fn workflow_child_approval_denied_marks_planned_targets_blocked_with_reason() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let mut workflow = workflow_with_planned_test_target(&config, &scope);
+        let result = workflow_test_result_with_blocker(
+            AgentResultStatus::ApprovalDenied,
+            "approval stopped",
+            "user denied action approval",
+        );
+
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &scope,
+                &result,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+        assert_eq!(target.status, WorkflowTargetStatus::Blocked);
+        assert_eq!(
+            target.reason.as_deref(),
+            Some("user denied action approval")
+        );
+    }
+
+    #[test]
+    fn workflow_child_failed_statuses_mark_planned_targets_failed() {
+        for status in [
+            AgentResultStatus::Failed,
+            AgentResultStatus::ParseError,
+            AgentResultStatus::LimitReached,
+            AgentResultStatus::Cancelled,
+        ] {
+            let dir = tempdir().unwrap();
+            let config = fake_parallel_config(dir.path());
+            let scope = workflow_test_scope();
+            let mut workflow = workflow_with_planned_test_target(&config, &scope);
+            let result =
+                workflow_test_result_with_blocker(status, "failed summary", "terminal diagnostic");
+
+            workflow
+                .record_child_result(
+                    "group-1",
+                    "step-1",
+                    &scope,
+                    &result,
+                    &config.working_directory,
+                    &config.workspace.extra_write_roots,
+                )
+                .unwrap();
+
+            let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+            assert_eq!(target.status, WorkflowTargetStatus::Failed);
+            assert_eq!(target.reason.as_deref(), Some("terminal diagnostic"));
+        }
+    }
+
+    #[test]
+    fn workflow_completion_status_derives_completed_with_issues_for_terminal_unfinished_targets() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let completed_scope = ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-a.txt".to_string()],
+            read_roots: vec!["src/runtime".to_string()],
+        };
+        let blocked_scope = ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-b.txt".to_string()],
+            read_roots: vec!["src/app".to_string()],
+        };
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "fix first scoped file",
+                &completed_scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-2"),
+                "fix second scoped file",
+                &blocked_scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &completed_scope,
+                &workflow_test_result(AgentResultStatus::Completed, "done"),
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-2",
+                &blocked_scope,
+                &workflow_test_result_with_blocker(
+                    AgentResultStatus::Blocked,
+                    "blocked",
+                    "blocked by dependency",
+                ),
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let payload = workflow.completion_payload("run-1", false);
+
+        assert_eq!(
+            payload.status,
+            WorkflowCompletionStatus::CompletedWithIssues
+        );
+        assert_eq!(payload.target_counts.completed, 1);
+        assert_eq!(payload.target_counts.blocked, 1);
+        assert_eq!(payload.unfinished_targets.len(), 1);
+        assert_eq!(
+            payload.unfinished_targets[0].path,
+            "parallel-output/fixer-b.txt"
+        );
+    }
+
+    #[test]
+    fn workflow_completion_status_derives_failed_for_unaccounted_planned_targets() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let workflow = workflow_with_planned_test_target(&config, &scope);
+
+        let payload = workflow.completion_payload("run-1", false);
+
+        assert_eq!(payload.status, WorkflowCompletionStatus::Failed);
+        assert_eq!(payload.target_counts.planned, 1);
+        assert_eq!(payload.unfinished_targets.len(), 1);
+        assert_eq!(
+            payload.unfinished_targets[0].reason,
+            "planned target did not receive terminal workflow evidence"
+        );
+    }
+
+    #[test]
+    fn workflow_completion_payload_includes_unfinished_blocked_and_failed_reasons() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let blocked_scope = ParallelFileScope {
+            write_files: vec!["parallel-output/blocked.txt".to_string()],
+            read_roots: vec!["src/runtime".to_string()],
+        };
+        let failed_scope = ParallelFileScope {
+            write_files: vec!["parallel-output/failed.txt".to_string()],
+            read_roots: vec!["src/app".to_string()],
+        };
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-blocked"),
+                "blocked scoped file",
+                &blocked_scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-failed"),
+                "failed scoped file",
+                &failed_scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-blocked",
+                &blocked_scope,
+                &workflow_test_result_with_blocker(
+                    AgentResultStatus::Blocked,
+                    "blocked",
+                    "waiting on user decision",
+                ),
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-failed",
+                &failed_scope,
+                &workflow_test_result_with_blocker(
+                    AgentResultStatus::Failed,
+                    "failed",
+                    "test command failed",
+                ),
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let payload = workflow.completion_payload("run-1", false);
+        let reasons = payload
+            .unfinished_targets
+            .iter()
+            .map(|target| (target.path.as_str(), target.reason.as_str()))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            reasons.get("parallel-output/blocked.txt").copied(),
+            Some("waiting on user decision")
+        );
+        assert_eq!(
+            reasons.get("parallel-output/failed.txt").copied(),
+            Some("test command failed")
+        );
+    }
+
     fn fake_parallel_config(dir: &std::path::Path) -> EffectiveConfig {
         let config_path = dir.join("multiagent.toml");
         fs::write(
@@ -6021,6 +6600,13 @@ runtime = "fake"
                 && event.kind != "workflow_started"
                 && event.kind != "prompt_submitted"
         }));
+    }
+
+    fn workflow_completed_event(events: &[HistoryEvent]) -> &HistoryEvent {
+        events
+            .iter()
+            .find(|event| event.kind == "workflow_completed")
+            .unwrap()
     }
 
     fn fake_parallel_normal_approval_config(dir: &std::path::Path) -> EffectiveConfig {
@@ -7586,8 +8172,166 @@ instructions_file = "agents/explorer.md"
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0]["path"], "src/runtime/fake.rs");
         assert_eq!(targets[0]["source_step_label"], "fix runtime scope");
-        assert_eq!(targets[0]["status"], "planned");
+        assert_eq!(targets[0]["status"], "completed");
         assert_eq!(targets[0]["reason"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn workflow_parallel_scoped_write_action_records_completed_workflow_evidence() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel scoped write action create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let completed = workflow_completed_event(&events);
+        assert_eq!(completed.payload["status"], "completed");
+        assert_eq!(completed.payload["target_counts"]["completed"], 2);
+        assert_eq!(completed.payload["target_counts"]["planned"], 0);
+        assert_eq!(completed.payload["unfinished_targets"], json!([]));
+        assert!(completed.payload["verification"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("fake verification passed")));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parallel-output/fixer-a.txt")).unwrap(),
+            "created by fake runtime\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parallel-output/fixer-b.txt")).unwrap(),
+            "created by fake runtime\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_parallel_approval_denial_records_completed_with_issues_evidence() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_normal_approval_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let approval_handle = app.approval_handle();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("/workflow parallel approval action create a feature")
+                .await
+                .unwrap();
+            app
+        });
+
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => panic!("workflow approval did not become pending before deadline"),
+                changed = receiver.changed() => {
+                    changed.unwrap();
+                    let state = receiver.borrow_and_update().clone();
+                    if state.pending_approval.as_ref().is_some_and(|approval| {
+                        approval.agent == "fixer"
+                    }) {
+                        break;
+                    }
+                }
+            }
+        }
+        approval_handle.answer(false);
+
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let completed = workflow_completed_event(&events);
+        assert_eq!(completed.payload["status"], "completed_with_issues");
+        assert_eq!(completed.payload["target_counts"]["blocked"], 1);
+        let unfinished = completed.payload["unfinished_targets"].as_array().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0]["path"], "src/runtime/fake.rs");
+        assert_eq!(unfinished[0]["status"], "blocked");
+        assert!(unfinished[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("approval"));
+    }
+
+    #[tokio::test]
+    async fn workflow_completed_event_precedes_generic_run_completed_event() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel scoped write action create a feature")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let workflow_completed_index = events
+            .iter()
+            .position(|event| event.kind == "workflow_completed")
+            .unwrap();
+        let run_completed_index = events
+            .iter()
+            .position(|event| event.kind == "run_completed")
+            .unwrap();
+        assert!(workflow_completed_index < run_completed_index);
+    }
+
+    #[tokio::test]
+    async fn interrupted_workflow_records_failed_workflow_evidence() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let interrupt_handle = app.interrupt_handle();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("/workflow parallel interrupt create a feature")
+                .await
+                .unwrap();
+            app
+        });
+
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => panic!("workflow parallel live steps did not start before deadline"),
+                changed = receiver.changed() => {
+                    changed.unwrap();
+                    let state = receiver.borrow_and_update().clone();
+                    if state.live_steps.len() == 2 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        interrupt_handle.request_interrupt();
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        let events = app.history.read_events().unwrap();
+        let completed = workflow_completed_event(&events);
+        assert_eq!(completed.payload["status"], "failed");
+        assert_eq!(completed.payload["target_counts"]["failed"], 1);
+        let unfinished = completed.payload["unfinished_targets"].as_array().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0]["path"], "src/runtime/fake.rs");
+        assert_eq!(unfinished[0]["status"], "failed");
+        assert!(unfinished[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"));
     }
 
     #[tokio::test]
