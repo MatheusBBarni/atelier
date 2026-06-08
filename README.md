@@ -116,6 +116,7 @@ make the workspace stale by itself.
 - `/goal <text>`, `/goal`, `/goal clear`: manage the active session goal.
 - `/config`: show active config files, selected preset, and warnings without raw prompt bodies.
 - `/subtask <agent> <task>`: run one bounded child task through a specialized enabled agent.
+- `/workflow <prompt>`: execute a broad implementation or refactor prompt inside one normal run with plan, child-outcome, verification, and risk evidence. V1 does not support saved workflow scripts, worktree-isolated workflow children, or background workflow execution.
 - `/agent:<name>`: prefix a prompt with a selected agent; in the TUI, type `/agent:` and use Up/Down plus Enter to insert an enabled agent id.
 - `/skill:<skill_name>`: load skill context from a selected project or personal skill; in the TUI, type `/skill:` and use Up/Down plus Enter to insert a cached project or personal skill.
 - `/reload:skills`: refresh cached skill names from project and personal skill folders.

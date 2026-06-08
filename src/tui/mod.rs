@@ -1704,6 +1704,7 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("/reload:skills      refresh cached skill names"),
         Line::from("/goal <text> | /goal | /goal clear   manage session goal"),
         Line::from("/subtask <agent> <task>              run bounded child task"),
+        Line::from("/workflow <prompt>  execute a broad prompt with workflow evidence"),
         Line::from("/config              show config files, preset, warnings"),
         Line::from("Enter                submit prompt or answer approval"),
         Line::from("Ctrl-L               show or hide Agent Roster"),
@@ -2547,6 +2548,8 @@ mod tests {
         assert!(text.contains("/goal <text>"));
         assert!(text.contains("/goal clear"));
         assert!(text.contains("/subtask <agent>"));
+        assert!(text.contains("/workflow <prompt>"));
+        assert!(text.contains("execute a broad prompt with workflow evidence"));
         assert!(text.contains("/config"));
         assert!(text.contains("Mouse wheel"));
         assert!(!text.contains("close this help"));
@@ -2574,6 +2577,28 @@ mod tests {
         assert!(readme.contains("load skill context"));
         assert!(!readme.contains("prefix a prompt with a selected skill"));
         assert!(!readme.contains("prefix prompt with skill name"));
+    }
+
+    #[test]
+    fn readme_workflow_command_wording_matches_v1_limits() {
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        let help_text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+
+        assert!(help_text.contains("/workflow <prompt>"));
+        assert!(readme.contains("`/workflow <prompt>`"));
+        assert!(readme.contains("one normal run"));
+        assert!(readme.contains("plan, child-outcome, verification, and risk evidence"));
+        assert!(readme.contains(
+            "V1 does not support saved workflow scripts, worktree-isolated workflow children, or background workflow execution"
+        ));
+        assert!(!readme.contains("supports saved workflow"));
+        assert!(!readme.contains("supports worktree-isolated workflow"));
+        assert!(!readme.contains("supports background workflow"));
     }
 
     #[test]
