@@ -6,8 +6,9 @@ use crate::actions::{ActionKind, ActionRequest, ActionStatus};
 use crate::config::{Capability, RuntimeConfig};
 use crate::ids::new_id;
 use crate::orchestrator::{
-    agent_results, AgentResult, AgentResultStatus, DecisionNextStep, DecisionStatus,
-    OrchestratorDecision, ParallelChildStepPlan, ParallelFileScope, ParallelGroupPlan,
+    agent_results, AgentResult, AgentResultStatus, ClarificationOption, DecisionNextStep,
+    DecisionStatus, OrchestratorDecision, ParallelChildStepPlan, ParallelFileScope,
+    ParallelGroupPlan,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -365,11 +366,39 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             Some("Fake runtime completed the run through the orchestrator and specialized agents.".to_string()),
         ),
     };
-    let clarifying_question = if matches!(status, DecisionStatus::WaitingForUser) {
-        Some("Which target or constraint should guide this run?".to_string())
-    } else {
-        None
-    };
+    let (clarifying_question, clarifying_options, recommended_option_id) =
+        if matches!(status, DecisionStatus::WaitingForUser) {
+            (
+                Some("Which target or constraint should guide this run?".to_string()),
+                vec![
+                    ClarificationOption {
+                        id: "target_scope".to_string(),
+                        label: "Clarify the target scope".to_string(),
+                        description: Some(
+                            "Specify the file, workflow, or product area to prioritize."
+                                .to_string(),
+                        ),
+                    },
+                    ClarificationOption {
+                        id: "success_criteria".to_string(),
+                        label: "Clarify success criteria".to_string(),
+                        description: Some(
+                            "Describe the outcome that should make the run complete.".to_string(),
+                        ),
+                    },
+                    ClarificationOption {
+                        id: "constraints".to_string(),
+                        label: "Clarify constraints".to_string(),
+                        description: Some(
+                            "Call out limits, dependencies, or risky areas.".to_string(),
+                        ),
+                    },
+                ],
+                Some("target_scope".to_string()),
+            )
+        } else {
+            (None, Vec::new(), None)
+        };
 
     OrchestratorDecision {
         schema_version: 1,
@@ -387,8 +416,8 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
         required_capabilities,
         stop_condition,
         clarifying_question,
-        clarifying_options: Vec::new(),
-        recommended_option_id: None,
+        clarifying_options,
+        recommended_option_id,
         final_summary,
     }
 }
@@ -685,5 +714,34 @@ parallel scoped write action create a feature"#;
     #[test]
     fn non_workflow_prompt_matching_still_recognizes_parallel_scoped_write_action() {
         assert_scoped_parallel_write_plan("parallel scoped write action create a feature");
+    }
+
+    #[test]
+    fn needs_clarification_decision_has_deterministic_options() {
+        let request = orchestrator_request("needs clarification create a feature");
+
+        let decision = fake_decision(&request);
+
+        assert_eq!(decision.status, DecisionStatus::WaitingForUser);
+        assert_eq!(
+            decision.clarifying_question.as_deref(),
+            Some("Which target or constraint should guide this run?")
+        );
+        assert_eq!(
+            decision
+                .clarifying_options
+                .iter()
+                .map(|option| (option.id.as_str(), option.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("target_scope", "Clarify the target scope"),
+                ("success_criteria", "Clarify success criteria"),
+                ("constraints", "Clarify constraints"),
+            ]
+        );
+        assert_eq!(
+            decision.recommended_option_id.as_deref(),
+            Some("target_scope")
+        );
     }
 }

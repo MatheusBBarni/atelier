@@ -9663,6 +9663,40 @@ runtime = "fake"
         assert_eq!(agent_status(&app, "orchestrator"), "waiting_for_user");
         let events = app.state.events.join("\n");
         assert!(events.contains("Orchestrator asked a clarifying question."));
+        let history_events = app.history.read_events().unwrap();
+        let decision_event = history_events
+            .iter()
+            .find(|event| event.kind == "orchestrator_decision")
+            .unwrap();
+        let options = decision_event
+            .payload
+            .get("clarifying_options")
+            .and_then(Value::as_array)
+            .unwrap();
+        let option_pairs = options
+            .iter()
+            .map(|option| {
+                (
+                    option.get("id").and_then(Value::as_str).unwrap(),
+                    option.get("label").and_then(Value::as_str).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            option_pairs,
+            vec![
+                ("target_scope", "Clarify the target scope"),
+                ("success_criteria", "Clarify success criteria"),
+                ("constraints", "Clarify constraints"),
+            ]
+        );
+        assert_eq!(
+            decision_event
+                .payload
+                .get("recommended_option_id")
+                .and_then(Value::as_str),
+            Some("target_scope")
+        );
 
         app.submit_prompt("use the CLI path").await.unwrap();
 
