@@ -115,6 +115,9 @@ pub enum ChatLifecycleKey {
     Run {
         run_id: String,
     },
+    Workflow {
+        run_id: String,
+    },
     Step {
         run_id: String,
         step_id: String,
@@ -191,6 +194,7 @@ impl ChatLifecycleKey {
         match self {
             ChatLifecycleKey::Prompt { run_id } => format!("chat:prompt:{run_id}"),
             ChatLifecycleKey::Run { run_id } => format!("chat:run:{run_id}"),
+            ChatLifecycleKey::Workflow { run_id } => format!("chat:workflow:{run_id}"),
             ChatLifecycleKey::Step {
                 run_id,
                 step_id,

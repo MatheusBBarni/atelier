@@ -5562,7 +5562,7 @@ fn single_line_event_text(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::chat::{ChatItemKind, ChatItemStatus, ChatSeverity};
+    use crate::app::chat::{ChatItemKind, ChatItemStatus, ChatLifecycleKey, ChatSeverity};
     use crate::config::{load_effective_config, ConfigLoadOptions};
     use crate::skills::{LoadedSkill, SkillLoadErrorKind};
     use serde_json::Value;
@@ -8259,6 +8259,22 @@ instructions_file = "agents/explorer.md"
             .as_str()
             .unwrap()
             .contains("approval"));
+        let workflow_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.title == "Workflow completed with issues")
+            .unwrap();
+        assert_eq!(workflow_item.kind, ChatItemKind::RunSummary);
+        assert_eq!(workflow_item.severity, ChatSeverity::Warning);
+        let workflow_text = workflow_item
+            .body
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(workflow_text.contains("targets:"));
+        assert!(workflow_text.contains("unfinished target: src/runtime/fake.rs (blocked)"));
     }
 
     #[tokio::test]
@@ -8375,6 +8391,29 @@ instructions_file = "agents/explorer.md"
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
         assert!(!events.iter().any(|event| event.kind == "workflow_started"));
+        let run_id = events
+            .iter()
+            .find(|event| event.kind == "run_started")
+            .and_then(|event| event.payload["run_id"].as_str())
+            .unwrap()
+            .to_string();
+        let generic_run_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| {
+                item.lifecycle_key.as_ref()
+                    == Some(&ChatLifecycleKey::Run {
+                        run_id: run_id.clone(),
+                    })
+            })
+            .unwrap();
+        assert_eq!(generic_run_item.title, "Run completed");
+        assert_eq!(generic_run_item.severity, ChatSeverity::Success);
+        assert!(!app.state.chat_items.iter().any(|item| matches!(
+            item.lifecycle_key.as_ref(),
+            Some(ChatLifecycleKey::Workflow { .. })
+        )));
         let prompt = events
             .iter()
             .find(|event| event.kind == "prompt_submitted")

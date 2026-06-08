@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_SUMMARY_CHARS: usize = 240;
 const MAX_BODY_LINES: usize = 12;
+const MAX_WORKFLOW_UNFINISHED_TARGET_LINES: usize = 3;
+const MAX_WORKFLOW_EVIDENCE_LINES: usize = 1;
 
 #[derive(Clone, Debug, Default)]
 pub struct ChatProjection {
@@ -67,6 +69,8 @@ impl ChatProjection {
                 self.apply_agent_result(event)
             }
             "parallel_group_joined" => self.apply_parallel_group_joined(event),
+            "workflow_started" => self.apply_workflow_started(event),
+            "workflow_completed" => self.apply_workflow_completed(event),
             "run_completed" | "run_failed" | "run_limit_reached" | "run_interrupted"
             | "subtask_completed" => self.apply_run_summary(event),
             "diagnostic" => self.apply_diagnostic(event),
@@ -943,6 +947,62 @@ impl ChatProjection {
         });
     }
 
+    fn apply_workflow_started(&mut self, event: &HistoryEvent) {
+        let Some(key) = workflow_key(event) else {
+            return;
+        };
+        let original_command = string_field(&event.payload, "original_command");
+        let user_prompt = string_field(&event.payload, "user_prompt");
+        let mut body = Vec::new();
+        if let Some(command) = original_command.as_deref() {
+            body.push(ChatLineView::code(command));
+        }
+        if let Some(prompt) = user_prompt.as_deref() {
+            body.push(ChatLineView::plain(format!("prompt: {prompt}")));
+        }
+        if let Some(preflight) = workflow_preflight_line(&event.payload) {
+            body.push(ChatLineView::muted(preflight));
+        }
+        self.upsert(ItemInput {
+            lifecycle_key: Some(key),
+            kind: ChatItemKind::RunSummary,
+            status: ChatItemStatus::Running,
+            severity: ChatSeverity::Info,
+            title: "Workflow started".to_string(),
+            summary: user_prompt
+                .or(original_command)
+                .map(|summary| message_summary(&summary)),
+            body,
+            details: history_detail(event, "workflow"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    fn apply_workflow_completed(&mut self, event: &HistoryEvent) {
+        let Some(key) = workflow_key(event) else {
+            return;
+        };
+        let status =
+            string_field(&event.payload, "status").unwrap_or_else(|| "completed".to_string());
+        let (item_status, severity, title) = workflow_completion_view(&status);
+        let body = workflow_completion_body(&event.payload);
+        self.upsert(ItemInput {
+            lifecycle_key: Some(key),
+            kind: ChatItemKind::RunSummary,
+            status: item_status,
+            severity,
+            title,
+            summary: Some(workflow_completion_summary(&event.payload, &status)),
+            body,
+            details: history_detail(event, "workflow"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
     fn apply_run_summary(&mut self, event: &HistoryEvent) {
         let Some(run_id) = event.run_id.clone() else {
             return;
@@ -1502,6 +1562,15 @@ fn step_key(event: &HistoryEvent, item_kind: ChatItemKind) -> Option<ChatLifecyc
     })
 }
 
+fn workflow_key(event: &HistoryEvent) -> Option<ChatLifecycleKey> {
+    Some(ChatLifecycleKey::Workflow {
+        run_id: event
+            .run_id
+            .clone()
+            .or_else(|| string_field(&event.payload, "run_id"))?,
+    })
+}
+
 fn live_step_key(live_step: &LiveStepView) -> ChatLifecycleKey {
     ChatLifecycleKey::Step {
         run_id: live_step.run_id.clone(),
@@ -1596,6 +1665,165 @@ fn append_string_array(body: &mut Vec<ChatLineView>, payload: &Value, field: &st
     };
     for value in values.iter().filter_map(Value::as_str).take(3) {
         body.push(ChatLineView::muted(format!("{label}: {value}")));
+    }
+}
+
+fn workflow_completion_view(status: &str) -> (ChatItemStatus, ChatSeverity, String) {
+    match status {
+        "completed" => (
+            ChatItemStatus::Completed,
+            ChatSeverity::Success,
+            "Workflow completed".to_string(),
+        ),
+        "completed_with_issues" => (
+            ChatItemStatus::Completed,
+            ChatSeverity::Warning,
+            "Workflow completed with issues".to_string(),
+        ),
+        "failed" => (
+            ChatItemStatus::Failed,
+            ChatSeverity::Error,
+            "Workflow failed".to_string(),
+        ),
+        other => (
+            ChatItemStatus::Completed,
+            ChatSeverity::Info,
+            format!("Workflow {}", other.replace('_', " ")),
+        ),
+    }
+}
+
+fn workflow_completion_summary(payload: &Value, status: &str) -> String {
+    workflow_target_counts_text(payload).unwrap_or_else(|| status.replace('_', " "))
+}
+
+fn workflow_completion_body(payload: &Value) -> Vec<ChatLineView> {
+    let mut body = Vec::new();
+    if let Some(counts) = workflow_target_counts_text(payload) {
+        body.push(ChatLineView::muted(counts));
+    }
+    append_unfinished_targets(&mut body, payload);
+    append_workflow_string_array(
+        &mut body,
+        payload,
+        "verification",
+        "verification",
+        ChatLineStyle::Muted,
+        MAX_WORKFLOW_EVIDENCE_LINES,
+    );
+    append_workflow_string_array(
+        &mut body,
+        payload,
+        "skipped_checks",
+        "skipped check",
+        ChatLineStyle::Warning,
+        MAX_WORKFLOW_EVIDENCE_LINES,
+    );
+    append_workflow_string_array(
+        &mut body,
+        payload,
+        "residual_risks",
+        "residual risk",
+        ChatLineStyle::Warning,
+        MAX_WORKFLOW_EVIDENCE_LINES,
+    );
+    body
+}
+
+fn workflow_target_counts_text(payload: &Value) -> Option<String> {
+    let counts = payload.get("target_counts")?.as_object()?;
+    let mut parts = Vec::new();
+    for key in ["completed", "skipped", "blocked", "failed", "planned"] {
+        if let Some(count) = counts.get(key).and_then(Value::as_u64) {
+            parts.push(format!("{} {}", count, key.replace('_', " ")));
+        }
+    }
+    (!parts.is_empty()).then(|| format!("targets: {}", parts.join(", ")))
+}
+
+fn append_unfinished_targets(body: &mut Vec<ChatLineView>, payload: &Value) {
+    let Some(targets) = payload.get("unfinished_targets").and_then(Value::as_array) else {
+        return;
+    };
+    for target in targets.iter().take(MAX_WORKFLOW_UNFINISHED_TARGET_LINES) {
+        if let Some(line) = unfinished_target_line(target) {
+            body.push(line);
+        }
+    }
+    if targets.len() > MAX_WORKFLOW_UNFINISHED_TARGET_LINES {
+        body.push(ChatLineView::warning(format!(
+            "unfinished targets: +{} more",
+            targets.len() - MAX_WORKFLOW_UNFINISHED_TARGET_LINES
+        )));
+    }
+}
+
+fn unfinished_target_line(target: &Value) -> Option<ChatLineView> {
+    let path = string_field(target, "path").unwrap_or_else(|| "<unknown target>".to_string());
+    let status = string_field(target, "status").unwrap_or_else(|| "unfinished".to_string());
+    let mut text = format!("unfinished target: {} ({})", path, status.replace('_', " "));
+    if let Some(label) = string_field(target, "source_step_label").filter(|label| !label.is_empty())
+    {
+        text.push_str(&format!(" from {label}"));
+    }
+    if let Some(reason) = string_field(target, "reason").filter(|reason| !reason.is_empty()) {
+        text.push_str(&format!(" - {reason}"));
+    }
+    let style = if status == "failed" {
+        ChatLineStyle::Error
+    } else {
+        ChatLineStyle::Warning
+    };
+    Some(styled_line(style, text))
+}
+
+fn append_workflow_string_array(
+    body: &mut Vec<ChatLineView>,
+    payload: &Value,
+    field: &str,
+    label: &str,
+    style: ChatLineStyle,
+    limit: usize,
+) {
+    let Some(values) = payload.get(field).and_then(Value::as_array) else {
+        return;
+    };
+    for value in values.iter().filter_map(Value::as_str).take(limit) {
+        body.push(styled_line(style.clone(), format!("{label}: {value}")));
+    }
+    let visible = values
+        .iter()
+        .filter(|value| value.as_str().is_some())
+        .count();
+    if visible > limit {
+        body.push(styled_line(
+            style,
+            format!("{label}: +{} more", visible - limit),
+        ));
+    }
+}
+
+fn workflow_preflight_line(payload: &Value) -> Option<String> {
+    let preflight = payload.get("preflight")?.as_object()?;
+    let parallel = preflight
+        .get("parallel_step_groups")
+        .and_then(Value::as_bool)
+        .map(|enabled| {
+            if enabled {
+                "parallel groups enabled".to_string()
+            } else {
+                "parallel groups disabled".to_string()
+            }
+        });
+    let max_steps = preflight
+        .get("max_parallel_agent_steps")
+        .and_then(Value::as_u64)
+        .map(|max| format!("max parallel agent steps: {max}"));
+    match (parallel, max_steps) {
+        (Some(parallel), Some(max_steps)) => Some(format!("{parallel}, {max_steps}")),
+        (Some(parallel), None) => Some(parallel),
+        (None, Some(max_steps)) => Some(max_steps),
+        (None, None) => None,
     }
 }
 
@@ -2191,6 +2419,267 @@ mod tests {
         let projection = ChatProjection::rebuild(&events);
 
         assert_eq!(projection.items()[0].id, "chat:prompt:run");
+    }
+
+    #[test]
+    fn workflow_started_projects_lifecycle_item() {
+        let events = vec![event(
+            "workflow_started",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "original_command": "/workflow migrate auth",
+                "user_prompt": "migrate auth",
+                "mode": "workflow",
+                "preflight": {
+                    "parallel_step_groups": true,
+                    "max_parallel_agent_steps": 2
+                }
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:workflow:run");
+        assert_eq!(
+            item.lifecycle_key,
+            Some(ChatLifecycleKey::Workflow {
+                run_id: "run".to_string()
+            })
+        );
+        assert_eq!(item.kind, ChatItemKind::RunSummary);
+        assert_eq!(item.status, ChatItemStatus::Running);
+        assert_eq!(item.severity, ChatSeverity::Info);
+        assert_eq!(item.title, "Workflow started");
+        let text = item_text(item);
+        assert!(text.contains("/workflow migrate auth"));
+        assert!(text.contains("prompt: migrate auth"));
+        assert!(text.contains("parallel groups enabled, max parallel agent steps: 2"));
+    }
+
+    #[test]
+    fn workflow_completed_projects_completed_as_success() {
+        let events = vec![event(
+            "workflow_completed",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "status": "completed",
+                "target_counts": {
+                    "completed": 2,
+                    "skipped": 0,
+                    "blocked": 0,
+                    "failed": 0,
+                    "planned": 0
+                }
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:workflow:run");
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.severity, ChatSeverity::Success);
+        assert_eq!(item.title, "Workflow completed");
+    }
+
+    #[test]
+    fn workflow_completed_projects_completed_with_issues_as_warning() {
+        let events = vec![event(
+            "workflow_completed",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "status": "completed_with_issues",
+                "target_counts": {
+                    "completed": 1,
+                    "skipped": 0,
+                    "blocked": 1,
+                    "failed": 0,
+                    "planned": 0
+                }
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.severity, ChatSeverity::Warning);
+        assert_eq!(item.title, "Workflow completed with issues");
+    }
+
+    #[test]
+    fn workflow_completed_projects_failed_as_error() {
+        let events = vec![event(
+            "workflow_completed",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "status": "failed",
+                "target_counts": {
+                    "completed": 0,
+                    "skipped": 0,
+                    "blocked": 0,
+                    "failed": 1,
+                    "planned": 0
+                }
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Failed);
+        assert_eq!(item.severity, ChatSeverity::Error);
+        assert_eq!(item.title, "Workflow failed");
+    }
+
+    #[test]
+    fn workflow_completed_body_includes_target_and_evidence_payload() {
+        let events = vec![event(
+            "workflow_completed",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "status": "completed_with_issues",
+                "target_counts": {
+                    "completed": 2,
+                    "skipped": 0,
+                    "blocked": 4,
+                    "failed": 0,
+                    "planned": 0
+                },
+                "unfinished_targets": [
+                    {
+                        "path": "src/app/mod.rs",
+                        "source_group_id": "group-1",
+                        "source_step_id": "step-1",
+                        "source_step_label": "fix app",
+                        "status": "blocked",
+                        "reason": "approval denied"
+                    },
+                    {
+                        "path": "src/app/chat/mod.rs",
+                        "source_group_id": "group-1",
+                        "source_step_id": "step-2",
+                        "source_step_label": "fix chat",
+                        "status": "blocked",
+                        "reason": "scope changed"
+                    },
+                    {
+                        "path": "src/tui/mod.rs",
+                        "source_group_id": "group-1",
+                        "source_step_id": "step-3",
+                        "source_step_label": "fix tui",
+                        "status": "blocked",
+                        "reason": "pending review"
+                    },
+                    {
+                        "path": "README.md",
+                        "source_group_id": "group-1",
+                        "source_step_id": "step-4",
+                        "source_step_label": "fix docs",
+                        "status": "skipped",
+                        "reason": "out of scope"
+                    }
+                ],
+                "verification": ["cargo test workflow", "cargo clippy"],
+                "skipped_checks": ["clippy unavailable", "coverage skipped"],
+                "residual_risks": ["docs not reviewed", "manual QA pending"]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let text = item_text(&projection.items()[0]);
+        assert!(text.contains("targets: 2 completed, 0 skipped, 4 blocked, 0 failed, 0 planned"));
+        assert!(text.contains(
+            "unfinished target: src/app/mod.rs (blocked) from fix app - approval denied"
+        ));
+        assert!(text.contains("unfinished targets: +1 more"));
+        assert!(text.contains("verification: cargo test workflow"));
+        assert!(text.contains("verification: +1 more"));
+        assert!(text.contains("skipped check: clippy unavailable"));
+        assert!(text.contains("skipped check: +1 more"));
+        assert!(text.contains("residual risk: docs not reviewed"));
+        assert!(text.contains("residual risk: +1 more"));
+    }
+
+    #[test]
+    fn workflow_completed_stays_separate_after_later_run_completed() {
+        let events = vec![
+            event(
+                "workflow_completed",
+                Some("run"),
+                None,
+                json!({
+                    "run_id": "run",
+                    "status": "completed_with_issues",
+                    "target_counts": {
+                        "completed": 1,
+                        "skipped": 0,
+                        "blocked": 1,
+                        "failed": 0,
+                        "planned": 0
+                    }
+                }),
+            ),
+            event(
+                "run_completed",
+                Some("run"),
+                None,
+                json!({ "summary": "generic completion summary" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 2);
+        let workflow = projection
+            .items()
+            .iter()
+            .find(|item| item.id == "chat:workflow:run")
+            .unwrap();
+        let generic = projection
+            .items()
+            .iter()
+            .find(|item| item.id == "chat:run:run")
+            .unwrap();
+        assert_eq!(workflow.title, "Workflow completed with issues");
+        assert_eq!(workflow.severity, ChatSeverity::Warning);
+        assert_eq!(generic.title, "Run completed");
+        assert_eq!(generic.severity, ChatSeverity::Success);
+    }
+
+    #[test]
+    fn workflow_completed_missing_optional_arrays_renders_without_panic() {
+        let events = vec![event(
+            "workflow_completed",
+            None,
+            None,
+            json!({
+                "run_id": "run",
+                "status": "completed"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:workflow:run");
+        assert_eq!(item.severity, ChatSeverity::Success);
+        assert_eq!(item.summary.as_deref(), Some("completed"));
+        assert!(item.body.is_empty());
     }
 
     #[test]
