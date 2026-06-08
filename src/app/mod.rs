@@ -5755,6 +5755,8 @@ runtime = "fake"
             required_capabilities: Vec::new(),
             stop_condition: "Council returns a recommendation.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
         let council_member = app
@@ -5874,6 +5876,8 @@ runtime = "fake"
             required_capabilities: Vec::new(),
             stop_condition: "Council returns a recommendation.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 
@@ -7784,6 +7788,8 @@ prompt = "{reviewer_prompt}"
             required_capabilities: Vec::new(),
             stop_condition: "Council returns a recommendation.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 

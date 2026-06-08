@@ -821,6 +821,8 @@ exit 65
             required_capabilities: vec![Capability::Read],
             stop_condition: "Explorer returns context.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
         let raw_output = format!(

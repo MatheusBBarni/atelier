@@ -62,7 +62,19 @@ pub struct OrchestratorDecision {
     pub required_capabilities: Vec<Capability>,
     pub stop_condition: String,
     pub clarifying_question: Option<String>,
+    #[serde(default)]
+    pub clarifying_options: Vec<ClarificationOption>,
+    #[serde(default)]
+    pub recommended_option_id: Option<String>,
     pub final_summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClarificationOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -763,6 +775,8 @@ mod tests {
             required_capabilities: vec![Capability::Read],
             stop_condition: "Context gathered.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
         let wrapped = wrap_json_contract(&decision).unwrap();
@@ -792,6 +806,121 @@ mod tests {
 
         assert_eq!(decision.next_agent.as_deref(), Some("explorer"));
         assert_eq!(decision.required_capabilities, vec![Capability::Read]);
+    }
+
+    #[test]
+    fn parses_decision_omitting_structured_clarification_fields() {
+        let raw = r#"{
+  "schema_version": 1,
+  "decision_id": "decision",
+  "run_id": "run",
+  "status": "continue",
+  "plan": ["Read context."],
+  "next_agent": "explorer",
+  "next_step": null,
+  "reason": "Need repository context.",
+  "required_capabilities": ["read"],
+  "stop_condition": "Explorer returns context.",
+  "clarifying_question": null,
+  "final_summary": null
+}"#;
+
+        let decision = parse_orchestrator_decision(raw).unwrap();
+
+        assert!(decision.clarifying_options.is_empty());
+        assert_eq!(decision.recommended_option_id, None);
+    }
+
+    #[test]
+    fn parses_waiting_decision_with_structured_clarification_options() {
+        let raw = r#"{
+  "schema_version": 1,
+  "decision_id": "decision",
+  "run_id": "run",
+  "status": "waiting_for_user",
+  "plan": ["Clarify the target."],
+  "next_agent": null,
+  "next_step": null,
+  "reason": "The requested target is ambiguous.",
+  "required_capabilities": [],
+  "stop_condition": "User provides clarification.",
+  "clarifying_question": "Which target should this run prioritize?",
+  "clarifying_options": [
+    {
+      "id": "tests",
+      "label": "Prioritize tests",
+      "description": "Focus on regression coverage first."
+    },
+    {
+      "id": "docs",
+      "label": "Prioritize docs"
+    }
+  ],
+  "recommended_option_id": "tests",
+  "final_summary": null
+}"#;
+
+        let decision = parse_orchestrator_decision(raw).unwrap();
+
+        assert_eq!(decision.status, DecisionStatus::WaitingForUser);
+        assert_eq!(decision.clarifying_options.len(), 2);
+        assert_eq!(decision.clarifying_options[0].id, "tests");
+        assert_eq!(decision.clarifying_options[0].label, "Prioritize tests");
+        assert_eq!(
+            decision.clarifying_options[0].description.as_deref(),
+            Some("Focus on regression coverage first.")
+        );
+        assert_eq!(decision.clarifying_options[1].id, "docs");
+        assert_eq!(decision.clarifying_options[1].description, None);
+        assert_eq!(decision.recommended_option_id.as_deref(), Some("tests"));
+    }
+
+    #[test]
+    fn serializes_decision_with_structured_clarification_fields() {
+        let decision = OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::WaitingForUser,
+            plan: vec!["Clarify the target.".to_string()],
+            next_agent: None,
+            next_step: None,
+            reason: "The requested target is ambiguous.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "User provides clarification.".to_string(),
+            clarifying_question: Some("Which target should this run prioritize?".to_string()),
+            clarifying_options: vec![
+                ClarificationOption {
+                    id: "tests".to_string(),
+                    label: "Prioritize tests".to_string(),
+                    description: Some("Focus on regression coverage first.".to_string()),
+                },
+                ClarificationOption {
+                    id: "docs".to_string(),
+                    label: "Prioritize docs".to_string(),
+                    description: None,
+                },
+            ],
+            recommended_option_id: Some("tests".to_string()),
+            final_summary: None,
+        };
+
+        let value = serde_json::to_value(&decision).unwrap();
+
+        assert!(value.get("clarifying_options").is_some());
+        assert_eq!(
+            value
+                .get("clarifying_options")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            value
+                .get("recommended_option_id")
+                .and_then(|value| value.as_str()),
+            Some("tests")
+        );
     }
 
     #[test]
@@ -837,6 +966,8 @@ mod tests {
             required_capabilities: vec![Capability::Edit],
             stop_condition: "Done.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
         let error = validate_orchestrator_decision(&decision, &config).unwrap_err();
@@ -857,6 +988,8 @@ mod tests {
             required_capabilities: vec![Capability::Read],
             stop_condition: "Explorer returns context.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 
@@ -886,6 +1019,8 @@ mod tests {
             required_capabilities: vec![Capability::Read],
             stop_condition: "Explorer returns context.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 
@@ -939,6 +1074,8 @@ mod tests {
             required_capabilities: Vec::new(),
             stop_condition: "Group joins.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 
@@ -1135,6 +1272,8 @@ orchestrator_description = "Use for official documentation and API lookup."
             required_capabilities: vec![Capability::Read, Capability::Challenge],
             stop_condition: "Council returns a recommendation.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 

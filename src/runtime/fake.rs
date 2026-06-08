@@ -270,6 +270,8 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             required_capabilities: Vec::new(),
             stop_condition: "All parallel children have terminal results.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
     }
@@ -385,6 +387,8 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
         required_capabilities,
         stop_condition,
         clarifying_question,
+        clarifying_options: Vec::new(),
+        recommended_option_id: None,
         final_summary,
     }
 }
