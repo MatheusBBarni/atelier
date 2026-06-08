@@ -541,6 +541,17 @@ fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
     if prompt.contains("always parse error") {
         return true;
     }
+    if prompt.contains("child parse error")
+        && request.parallel_context.as_ref().is_some_and(|context| {
+            context
+                .file_scope
+                .write_files
+                .iter()
+                .any(|path| path == "parallel-output/fixer-b.txt")
+        })
+    {
+        return true;
+    }
 
     let agent_id = request.agent_profile.id.as_str();
     let requested_once = (agent_id == "orchestrator"
@@ -562,8 +573,15 @@ fn fake_control_prompt(request: &RuntimeRequest) -> Cow<'_, str> {
     const SYSTEM_PROMPT_OPEN: &str = "<System Prompt>\n";
     const USER_PROMPT_OPEN: &str = "<User Prompt>\n";
     const USER_PROMPT_CLOSE: &str = "\n</User Prompt>";
+    const WORKFLOW_USER_PROMPT_OPEN: &str = "\nExtracted user prompt:\n";
 
     let prompt = request.prompt.as_str();
+    if let Some(body_start) = prompt
+        .find(WORKFLOW_USER_PROMPT_OPEN)
+        .map(|start| start + WORKFLOW_USER_PROMPT_OPEN.len())
+    {
+        return Cow::Borrowed(&prompt[body_start..]);
+    }
     if !prompt.starts_with(SYSTEM_PROMPT_OPEN) {
         return Cow::Borrowed(prompt);
     }
@@ -586,4 +604,82 @@ fn has_prior_parse_error(request: &RuntimeRequest, agent_id: &str) -> bool {
     agent_results(&request.previous_results).any(|result| {
         result.agent == agent_id && matches!(result.status, AgentResultStatus::ParseError)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AgentEffort, AgentPromptMetadata, Limits};
+    use std::path::PathBuf;
+
+    fn orchestrator_request(prompt: &str) -> RuntimeRequest {
+        RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: prompt.to_string(),
+            session_goal: None,
+            working_directory: PathBuf::from("/tmp/project"),
+            agent_profile: crate::config::AgentProfile {
+                id: "orchestrator".to_string(),
+                name: "Orchestrator".to_string(),
+                runtime: "fake".to_string(),
+                model: "default".to_string(),
+                model_fallbacks: Vec::new(),
+                effort: AgentEffort::Medium,
+                thinking: false,
+                capabilities: Vec::new(),
+                tools: None,
+                instructions: String::new(),
+                orchestrator_description: None,
+                prompt_metadata: AgentPromptMetadata::default(),
+                enabled: true,
+            },
+            session_events: Vec::new(),
+            recent_context: crate::runtime::RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "orchestrator_decision".to_string(),
+            parallel_context: None,
+            capability_constraints: Vec::new(),
+            limits: Limits::default(),
+        }
+    }
+
+    fn assert_scoped_parallel_write_plan(prompt: &str) {
+        let request = orchestrator_request(prompt);
+        let decision = fake_decision(&request);
+        let Some(DecisionNextStep::ParallelGroup(group)) = decision.next_step else {
+            panic!("expected fake runtime to select a parallel group");
+        };
+
+        assert_eq!(group.steps.len(), 2);
+        assert_eq!(
+            group.steps[0].file_scope.write_files,
+            ["parallel-output/fixer-a.txt"]
+        );
+        assert_eq!(
+            group.steps[1].file_scope.write_files,
+            ["parallel-output/fixer-b.txt"]
+        );
+    }
+
+    #[test]
+    fn workflow_envelope_prompt_matching_recognizes_parallel_scoped_write_action() {
+        let prompt = r#"Workflow mode instructions:
+- Treat this as one normal app Run in workflow mode.
+- Execute safe specialized-agent steps, using Parallel Step Groups only when file scopes are exact.
+
+Original command:
+/workflow parallel scoped write action create a feature
+
+Extracted user prompt:
+parallel scoped write action create a feature"#;
+
+        assert_scoped_parallel_write_plan(prompt);
+    }
+
+    #[test]
+    fn non_workflow_prompt_matching_still_recognizes_parallel_scoped_write_action() {
+        assert_scoped_parallel_write_plan("parallel scoped write action create a feature");
+    }
 }

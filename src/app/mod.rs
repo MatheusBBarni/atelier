@@ -7075,6 +7075,9 @@ prompt = "{reviewer_prompt}"
             "created by fake runtime\n"
         );
         let events = app.history.read_events().unwrap();
+        assert!(!events.iter().any(|event| {
+            event.kind == "workflow_started" || event.kind == "workflow_completed"
+        }));
         let joined = events
             .iter()
             .find(|event| event.kind == "parallel_group_joined")
@@ -8188,6 +8191,7 @@ instructions_file = "agents/explorer.md"
 
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "workflow_started"));
         let completed = workflow_completed_event(&events);
         assert_eq!(completed.payload["status"], "completed");
         assert_eq!(completed.payload["target_counts"]["completed"], 2);
@@ -8275,6 +8279,53 @@ instructions_file = "agents/explorer.md"
             .join("\n");
         assert!(workflow_text.contains("targets:"));
         assert!(workflow_text.contains("unfinished target: src/runtime/fake.rs (blocked)"));
+    }
+
+    #[tokio::test]
+    async fn workflow_scoped_write_child_parse_error_records_failed_target_evidence() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt(
+            "/workflow parallel scoped write action child parse error create a feature",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parallel-output/fixer-a.txt")).unwrap(),
+            "created by fake runtime\n"
+        );
+        assert!(!dir.path().join("parallel-output/fixer-b.txt").exists());
+
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "parallel_child_failed"
+                && event.group_id.is_some()
+                && event.payload["status"] == "parse_error"
+                && event.payload["file_scope"]["write_files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path.as_str() == Some("parallel-output/fixer-b.txt"))
+        }));
+
+        let completed = workflow_completed_event(&events);
+        assert_eq!(completed.payload["status"], "completed_with_issues");
+        assert_eq!(completed.payload["target_counts"]["completed"], 1);
+        assert_eq!(completed.payload["target_counts"]["failed"], 1);
+        assert_eq!(completed.payload["target_counts"]["blocked"], 0);
+        assert_eq!(completed.payload["target_counts"]["planned"], 0);
+        let unfinished = completed.payload["unfinished_targets"].as_array().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0]["path"], "parallel-output/fixer-b.txt");
+        assert_eq!(unfinished[0]["status"], "failed");
+        assert!(unfinished[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("fake runtime emitted malformed control output"));
     }
 
     #[tokio::test]
