@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Extend Fake Runtime Workflow Fixtures And Integration Coverage
 type: test
 complexity: medium
@@ -31,13 +31,13 @@ Add deterministic fake-runtime workflow scenarios and app-level integration cove
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Extend fake-runtime prompt matching only where needed for workflow prompt envelopes.
-- [ ] 6.2 Add app tests for workflow happy-path completion and target counts.
-- [ ] 6.3 Add app tests for workflow completed-with-issues from approval denial.
-- [ ] 6.4 Add app tests for workflow completed-with-issues from parse error or failed child.
-- [ ] 6.5 Add app tests for disabled feature and zero parallel limit preflight.
-- [ ] 6.6 Add non-workflow regression tests or extend existing tests to prove behavior remains unchanged.
-- [ ] 6.7 Add or adapt a write-scoped fake child fixture for parse-error target accounting.
+- [x] 6.1 Extend fake-runtime prompt matching only where needed for workflow prompt envelopes.
+- [x] 6.2 Add app tests for workflow happy-path completion and target counts.
+- [x] 6.3 Add app tests for workflow completed-with-issues from approval denial.
+- [x] 6.4 Add app tests for workflow completed-with-issues from parse error or failed child.
+- [x] 6.5 Add app tests for disabled feature and zero parallel limit preflight.
+- [x] 6.6 Add non-workflow regression tests or extend existing tests to prove behavior remains unchanged.
+- [x] 6.7 Add or adapt a write-scoped fake child fixture for parse-error target accounting.
 
 ## Implementation Details
 Use existing fake-runtime patterns in `src/runtime/fake.rs` and existing app integration tests in `src/app/mod.rs`. Reference TechSpec "Testing Approach" and "Development Sequencing" for the exact cases required.
@@ -68,15 +68,15 @@ Use existing fake-runtime patterns in `src/runtime/fake.rs` and existing app int
 
 ## Tests
 - Unit tests:
-  - [ ] Fake prompt matching recognizes workflow envelopes containing `parallel scoped write action`.
-  - [ ] Fake prompt matching still recognizes existing non-workflow `parallel` prompts.
+  - [x] Fake prompt matching recognizes workflow envelopes containing `parallel scoped write action`.
+  - [x] Fake prompt matching still recognizes existing non-workflow `parallel` prompts.
 - Integration tests:
-  - [ ] `/workflow parallel scoped write action create a feature` writes both scoped fake output files.
-  - [ ] The happy-path workflow records `workflow_started` and `workflow_completed.status = completed`.
-  - [ ] `/workflow parallel approval action create a feature` records `workflow_completed.status = completed_with_issues`.
-  - [ ] Workflow parse-error scenario with a write-scoped child records `workflow_completed.status = completed_with_issues` and a failed target count.
-  - [ ] Disabled Parallel Step Groups rejects workflow before `run_started`.
-  - [ ] Existing `parallel scoped write action create a feature` non-workflow test still passes without workflow events.
+  - [x] `/workflow parallel scoped write action create a feature` writes both scoped fake output files.
+  - [x] The happy-path workflow records `workflow_started` and `workflow_completed.status = completed`.
+  - [x] `/workflow parallel approval action create a feature` records `workflow_completed.status = completed_with_issues`.
+  - [x] Workflow parse-error scenario with a write-scoped child records `workflow_completed.status = completed_with_issues` and a failed target count.
+  - [x] Disabled Parallel Step Groups rejects workflow before `run_started`.
+  - [x] Existing `parallel scoped write action create a feature` non-workflow test still passes without workflow events.
 - Test coverage target: >=80%
 - All tests must pass
 

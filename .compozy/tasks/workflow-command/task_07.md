@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add TUI Help For Workflow Command
 type: docs
 complexity: low
@@ -29,11 +29,11 @@ Update the TUI help modal so users can discover `/workflow <prompt>` from the ex
 </requirements>
 
 ## Subtasks
-- [ ] 7.1 Add `/workflow <prompt>` to the TUI command list.
-- [ ] 7.2 Keep wording aligned with the PRD's executing workflow behavior.
-- [ ] 7.3 Extend the existing help modal rendering test.
-- [ ] 7.4 Confirm `/help + Enter` still toggles help without dispatching an app event.
-- [ ] 7.5 Update README command help if its slash-command section is still current.
+- [x] 7.1 Add `/workflow <prompt>` to the TUI command list.
+- [x] 7.2 Keep wording aligned with the PRD's executing workflow behavior.
+- [x] 7.3 Extend the existing help modal rendering test.
+- [x] 7.4 Confirm `/help + Enter` still toggles help without dispatching an app event.
+- [x] 7.5 Update README command help if its slash-command section is still current.
 
 ## Implementation Details
 Implement this in `src/tui/mod.rs` near `render_help_modal` and its tests. Reference the TechSpec "Impact Analysis" section for the intended scope: help text only.
@@ -62,11 +62,11 @@ Implement this in `src/tui/mod.rs` near `render_help_modal` and its tests. Refer
 
 ## Tests
 - Unit tests:
-  - [ ] `renders_help_modal_commands` includes `/workflow <prompt>`.
-  - [ ] `help_command_toggles_modal_without_app_event` remains unchanged and still passes.
+  - [x] `renders_help_modal_commands` includes `/workflow <prompt>`.
+  - [x] `help_command_toggles_modal_without_app_event` remains unchanged and still passes.
 - Integration tests:
-  - [ ] Rendering the help modal at the existing tested dimensions includes the workflow command without dropping existing command entries.
-  - [ ] README command reference, if updated, does not describe saved workflows, worktrees, or background execution as V1 capabilities.
+  - [x] Rendering the help modal at the existing tested dimensions includes the workflow command without dropping existing command entries.
+  - [x] README command reference, if updated, does not describe saved workflows, worktrees, or background execution as V1 capabilities.
 - Test coverage target: >=80%
 - All tests must pass
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Route TUI Skill Suggestions Through Shared Module"
 type: backend
 complexity: medium
@@ -32,13 +32,13 @@ Replace TUI-local skill discovery with the shared skills module while preserving
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Replace TUI-local discovery calls with shared skills-module suggestion APIs.
-- [ ] 5.2 Preserve skill cache fingerprinting, loading, saving, and reload behavior.
-- [ ] 5.3 Preserve dropdown activation and filtering for prefix and mid-prompt `/skill:` references.
-- [ ] 5.4 Preserve dropdown keyboard selection and active-token replacement behavior.
-- [ ] 5.5 Preserve rendered source tags, origins, truncation, and max-visible-row behavior.
-- [ ] 5.6 Remove duplicate TUI-only frontmatter and root parsing logic.
-- [ ] 5.7 Update TUI tests for shared aliases, precedence, cache, reload, and dropdown behavior.
+- [x] 5.1 Replace TUI-local discovery calls with shared skills-module suggestion APIs.
+- [x] 5.2 Preserve skill cache fingerprinting, loading, saving, and reload behavior.
+- [x] 5.3 Preserve dropdown activation and filtering for prefix and mid-prompt `/skill:` references.
+- [x] 5.4 Preserve dropdown keyboard selection and active-token replacement behavior.
+- [x] 5.5 Preserve rendered source tags, origins, truncation, and max-visible-row behavior.
+- [x] 5.6 Remove duplicate TUI-only frontmatter and root parsing logic.
+- [x] 5.7 Update TUI tests for shared aliases, precedence, cache, reload, and dropdown behavior.
 
 ## Implementation Details
 Use the TechSpec "TUI skill dropdown" and ADR-003 shared-discovery decision. The TUI should consume shared metadata/suggestions, while cache ownership, reload command handling, and rendering state remain in `src/tui/mod.rs`.
@@ -68,20 +68,20 @@ Use the TechSpec "TUI skill dropdown" and ADR-003 shared-discovery decision. The
 
 ## Tests
 - Unit tests:
-  - [ ] Shared discovery returns TUI suggestions for project `.agents/skills`, project `.claude/skills`, personal `~/.agents/skills`, and personal `~/.claude/skills`.
-  - [ ] Suggestions include frontmatter `name` aliases and directory-name aliases for the same skill identity.
-  - [ ] Project suggestions display ahead of personal suggestions.
-  - [ ] `.agents/skills` precedence is reflected when aliases collide with `.claude/skills`.
-  - [ ] Cached suggestions contain metadata only and no full skill body text.
+  - [x] Shared discovery returns TUI suggestions for project `.agents/skills`, project `.claude/skills`, personal `~/.agents/skills`, and personal `~/.claude/skills`.
+  - [x] Suggestions include frontmatter `name` aliases and directory-name aliases for the same skill identity.
+  - [x] Project suggestions display ahead of personal suggestions.
+  - [x] `.agents/skills` precedence is reflected when aliases collide with `.claude/skills`.
+  - [x] Cached suggestions contain metadata only and no full skill body text.
 - Integration tests:
-  - [ ] `load_skill_suggestions` uses cache only when the fingerprint matches.
-  - [ ] `/reload:skills` bypasses stale cache, writes fresh suggestions, clears input, resets `skill_selection_index`, and sends no app event.
-  - [ ] Dropdown renders for `/skill:` and mid-prompt `/skill:query`.
-  - [ ] Dropdown filters by typed query.
-  - [ ] Arrow keys cycle through visible skill suggestions.
-  - [ ] Enter replaces only the active token and preserves prompt suffix and trailing space/cursor behavior.
-  - [ ] Rendered dropdown preserves `Skills` title, `Project`/`Personal` tags, origin text, row-end tag alignment, narrow-row truncation, and max visible items.
-  - [ ] Deleting or mutating skill files after cache creation does not make cache authoritative for app-side resolution.
+  - [x] `load_skill_suggestions` uses cache only when the fingerprint matches.
+  - [x] `/reload:skills` bypasses stale cache, writes fresh suggestions, clears input, resets `skill_selection_index`, and sends no app event.
+  - [x] Dropdown renders for `/skill:` and mid-prompt `/skill:query`.
+  - [x] Dropdown filters by typed query.
+  - [x] Arrow keys cycle through visible skill suggestions.
+  - [x] Enter replaces only the active token and preserves prompt suffix and trailing space/cursor behavior.
+  - [x] Rendered dropdown preserves `Skills` title, `Project`/`Personal` tags, origin text, row-end tag alignment, narrow-row truncation, and max visible items.
+  - [x] Deleting or mutating skill files after cache creation does not make cache authoritative for app-side resolution.
 - Test coverage target: >=80%
 - All tests must pass
 

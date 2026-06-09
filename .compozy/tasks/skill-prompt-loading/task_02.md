@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add Skill Resolver, Dedupe, Diagnostics, And Renderer"
 type: backend
 complexity: high
@@ -34,13 +34,13 @@ Implement the authoritative resolver and renderer in the shared skills module. T
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add `/skill:<id>` parsing and normalized prompt stripping.
-- [ ] 2.2 Build the alias index and precedence-aware resolver.
-- [ ] 2.3 Add canonical-identity dedupe with requested-name tracking.
-- [ ] 2.4 Add fail-closed resolver diagnostics and typo suggestions.
-- [ ] 2.5 Add in-memory skill content loading and validation.
-- [ ] 2.6 Add `compile_prompt` and `render_runtime_prompt` outputs for downstream app integration.
-- [ ] 2.7 Add parser, resolver, diagnostic, dedupe, and renderer tests.
+- [x] 2.1 Add `/skill:<id>` parsing and normalized prompt stripping.
+- [x] 2.2 Build the alias index and precedence-aware resolver.
+- [x] 2.3 Add canonical-identity dedupe with requested-name tracking.
+- [x] 2.4 Add fail-closed resolver diagnostics and typo suggestions.
+- [x] 2.5 Add in-memory skill content loading and validation.
+- [x] 2.6 Add `compile_prompt` and `render_runtime_prompt` outputs for downstream app integration.
+- [x] 2.7 Add parser, resolver, diagnostic, dedupe, and renderer tests.
 
 ## Implementation Details
 Use the TechSpec "Core Interfaces", "Parsing And Resolution", and "Prompt Rendering" sections as the source of truth for public function names and rendering shape. Keep renderer output as text suitable for the existing `RuntimeRequest.prompt` field; do not add structured skill fields to `RuntimeRequest`.
@@ -73,23 +73,23 @@ Use the TechSpec "Core Interfaces", "Parsing And Resolution", and "Prompt Render
 
 ## Tests
 - Unit tests:
-  - [ ] Parser detects multiple `/skill:name` occurrences anywhere in a prompt.
-  - [ ] Parser treats empty `/skill:` as invalid.
-  - [ ] Parser stops identifiers at whitespace and common punctuation.
-  - [ ] Normalized prompt removes skill references while preserving surrounding user text.
-  - [ ] Directory name and frontmatter `name` both resolve to the same canonical skill.
-  - [ ] Requesting both aliases for one canonical skill loads one skill and records all requested names.
-  - [ ] Project `.agents/skills` beats project `.claude/skills`.
-  - [ ] Project roots beat personal roots.
-  - [ ] Personal `.agents/skills` beats personal `.claude/skills`.
-  - [ ] Same-alias ambiguity in the same effective precedence tier fails with source details.
-  - [ ] Unknown typo diagnostics include close-match suggestions.
-  - [ ] Invalid YAML, unreadable `SKILL.md`, and missing skill content fail with descriptive errors.
-  - [ ] Renderer emits `<System Prompt>`, ordered `<Skill: ... source="...">`, and `<User Prompt>` sections once.
-  - [ ] Skill body text that resembles closing delimiters is safely framed according to the TechSpec.
+  - [x] Parser detects multiple `/skill:name` occurrences anywhere in a prompt.
+  - [x] Parser treats empty `/skill:` as invalid.
+  - [x] Parser stops identifiers at whitespace and common punctuation.
+  - [x] Normalized prompt removes skill references while preserving surrounding user text.
+  - [x] Directory name and frontmatter `name` both resolve to the same canonical skill.
+  - [x] Requesting both aliases for one canonical skill loads one skill and records all requested names.
+  - [x] Project `.agents/skills` beats project `.claude/skills`.
+  - [x] Project roots beat personal roots.
+  - [x] Personal `.agents/skills` beats personal `.claude/skills`.
+  - [x] Same-alias ambiguity in the same effective precedence tier fails with source details.
+  - [x] Unknown typo diagnostics include close-match suggestions.
+  - [x] Invalid YAML, unreadable `SKILL.md`, and missing skill content fail with descriptive errors.
+  - [x] Renderer emits `<System Prompt>`, ordered `<Skill: ... source="...">`, and `<User Prompt>` sections once.
+  - [x] Skill body text that resembles closing delimiters is safely framed according to the TechSpec.
 - Integration tests:
-  - [ ] Rendering output can be placed in `RuntimeRequest.prompt` without requiring new runtime request fields.
-  - [ ] Metadata returned from compilation excludes full skill body content.
+  - [x] Rendering output can be placed in `RuntimeRequest.prompt` without requiring new runtime request fields.
+  - [x] Metadata returned from compilation excludes full skill body content.
 - Test coverage target: >=80%
 - All tests must pass
 

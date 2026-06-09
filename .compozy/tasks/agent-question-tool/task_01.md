@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add Clarification Option Schema Fields"
 type: backend
 complexity: medium
@@ -29,11 +29,11 @@ Add the shared structured option model required by the Clarification Select UI. 
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Add the structured clarification option model.
-- [ ] 1.2 Add option fields to the orchestrator decision contract.
-- [ ] 1.3 Update existing decision literals and fixture constructors to include the new fields or defaults.
-- [ ] 1.4 Preserve parse compatibility for existing decisions without structured options.
-- [ ] 1.5 Add focused schema parse/serialization coverage.
+- [x] 1.1 Add the structured clarification option model.
+- [x] 1.2 Add option fields to the orchestrator decision contract.
+- [x] 1.3 Update existing decision literals and fixture constructors to include the new fields or defaults.
+- [x] 1.4 Preserve parse compatibility for existing decisions without structured options.
+- [x] 1.5 Add focused schema parse/serialization coverage.
 
 ## Implementation Details
 Start from TechSpec sections "Core Interfaces" and "Data Models". Keep this task to schema shape and compatibility only; validation rules and fake runtime behavior belong to task 02.
@@ -64,12 +64,12 @@ Start from TechSpec sections "Core Interfaces" and "Data Models". Keep this task
 
 ## Tests
 - Unit tests:
-  - [ ] Parse an existing orchestrator decision JSON payload that omits `clarifying_options` and `recommended_option_id`.
-  - [ ] Parse a waiting-for-user decision containing two clarification options and a recommended option id.
-  - [ ] Serialize an `OrchestratorDecision` with structured options and confirm the expected field names are present.
-  - [ ] Existing non-clarification decision tests continue to pass with default option fields.
+  - [x] Parse an existing orchestrator decision JSON payload that omits `clarifying_options` and `recommended_option_id`.
+  - [x] Parse a waiting-for-user decision containing two clarification options and a recommended option id.
+  - [x] Serialize an `OrchestratorDecision` with structured options and confirm the expected field names are present.
+  - [x] Existing non-clarification decision tests continue to pass with default option fields.
 - Integration tests:
-  - [ ] Fake runtime and app test fixtures compile with the expanded decision schema.
+  - [x] Fake runtime and app test fixtures compile with the expanded decision schema.
 - Test coverage target: >=80%
 - All tests must pass
 

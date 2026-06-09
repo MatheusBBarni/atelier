@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Emit Workflow Completion Evidence
 type: backend
 complexity: medium
@@ -32,13 +32,13 @@ Convert workflow ledger state into terminal workflow evidence and persist it as 
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Add helpers that map child terminal results to workflow target terminal statuses.
-- [ ] 4.2 Update ledger targets when parallel child/group results are recorded.
-- [ ] 4.3 Aggregate verification commands, skipped-check reasons, and residual risks into workflow context where available.
-- [ ] 4.4 Derive workflow completion status from target counts and interrupted/unaccounted states.
-- [ ] 4.5 Record `workflow_completed` before or near generic terminal run completion.
-- [ ] 4.6 Add explicit ordering coverage for `workflow_completed` before `run_completed`.
-- [ ] 4.7 Add tests for every target-status mapping and completion status.
+- [x] 4.1 Add helpers that map child terminal results to workflow target terminal statuses.
+- [x] 4.2 Update ledger targets when parallel child/group results are recorded.
+- [x] 4.3 Aggregate verification commands, skipped-check reasons, and residual risks into workflow context where available.
+- [x] 4.4 Derive workflow completion status from target counts and interrupted/unaccounted states.
+- [x] 4.5 Record `workflow_completed` before or near generic terminal run completion.
+- [x] 4.6 Add explicit ordering coverage for `workflow_completed` before `run_completed`.
+- [x] 4.7 Add tests for every target-status mapping and completion status.
 
 ## Implementation Details
 Implement completion accounting in `src/app/mod.rs` around parallel child result recording, group join synthesis, and `DecisionStatus::Complete` handling. Reference TechSpec "Data Models", "Event Payloads", and ADR-004 for terminal event behavior.
@@ -68,19 +68,19 @@ Implement completion accounting in `src/app/mod.rs` around parallel child result
 
 ## Tests
 - Unit tests:
-  - [ ] `AgentResultStatus::Completed` maps planned targets to completed.
-  - [ ] `AgentResultStatus::NoChanges` maps planned targets to completed.
-  - [ ] `AgentResultStatus::Blocked` maps planned targets to blocked with blocker text.
-  - [ ] `AgentResultStatus::ApprovalDenied` maps planned targets to blocked with approval denial reason.
-  - [ ] `AgentResultStatus::Failed`, `ParseError`, `LimitReached`, and `Cancelled` map planned targets to failed.
-  - [ ] Mixed completed and blocked targets derive `completed_with_issues`.
-  - [ ] Unaccounted planned targets derive `failed`.
-  - [ ] Workflow completion payload includes unfinished target reasons for blocked and failed targets.
+  - [x] `AgentResultStatus::Completed` maps planned targets to completed.
+  - [x] `AgentResultStatus::NoChanges` maps planned targets to completed.
+  - [x] `AgentResultStatus::Blocked` maps planned targets to blocked with blocker text.
+  - [x] `AgentResultStatus::ApprovalDenied` maps planned targets to blocked with approval denial reason.
+  - [x] `AgentResultStatus::Failed`, `ParseError`, `LimitReached`, and `Cancelled` map planned targets to failed.
+  - [x] Mixed completed and blocked targets derive `completed_with_issues`.
+  - [x] Unaccounted planned targets derive `failed`.
+  - [x] Workflow completion payload includes unfinished target reasons for blocked and failed targets.
 - Integration tests:
-  - [ ] `/workflow parallel scoped write action create a feature` records `workflow_completed.status = completed`.
-  - [ ] `/workflow parallel approval action create a feature` records `workflow_completed.status = completed_with_issues`.
-  - [ ] Workflow `workflow_completed` event appears before generic `run_completed`.
-  - [ ] Interrupted workflow records failed or interrupted workflow evidence without hiding unfinished targets.
+  - [x] `/workflow parallel scoped write action create a feature` records `workflow_completed.status = completed`.
+  - [x] `/workflow parallel approval action create a feature` records `workflow_completed.status = completed_with_issues`.
+  - [x] Workflow `workflow_completed` event appears before generic `run_completed`.
+  - [x] Interrupted workflow records failed or interrupted workflow evidence without hiding unfinished targets.
 - Test coverage target: >=80%
 - All tests must pass
 

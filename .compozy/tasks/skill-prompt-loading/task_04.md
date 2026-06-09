@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Render Skill Context For Runtime And Derived Prompts"
 type: backend
 complexity: high
@@ -32,13 +32,13 @@ Render loaded skill context into the prompt text used by runtime requests while 
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Update app runtime request construction to render skill context at the final boundary.
-- [ ] 4.2 Thread existing `SkillPromptContext` through orchestrator and specialized agent requests.
-- [ ] 4.3 Thread existing `SkillPromptContext` through parallel child prompts.
-- [ ] 4.4 Thread existing `SkillPromptContext` through council prompts.
-- [ ] 4.5 Thread existing `SkillPromptContext` through subtask runtime prompts.
-- [ ] 4.6 Keep action authorization and VCS explicit-request checks based on normalized user prompt text.
-- [ ] 4.7 Add runtime envelope, derived prompt, double-rendering, and leakage tests.
+- [x] 4.1 Update app runtime request construction to render skill context at the final boundary.
+- [x] 4.2 Thread existing `SkillPromptContext` through orchestrator and specialized agent requests.
+- [x] 4.3 Thread existing `SkillPromptContext` through parallel child prompts.
+- [x] 4.4 Thread existing `SkillPromptContext` through council prompts.
+- [x] 4.5 Thread existing `SkillPromptContext` through subtask runtime prompts.
+- [x] 4.6 Keep action authorization and VCS explicit-request checks based on normalized user prompt text.
+- [x] 4.7 Add runtime envelope, derived prompt, double-rendering, and leakage tests.
 
 ## Implementation Details
 Use the TechSpec "Prompt Rendering", "Integration Points", and ADR-003. `runtime_request` in `src/app/mod.rs` is the intended render point. Do not render in `parallel_child_prompt`, `council_member_prompt`, or `subtask_prompt`; those helpers should operate on normalized user prompt text and let the final runtime request boundary render the skill sections.

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Project Skill-Loaded Feedback And Update Help Text"
 type: docs
 complexity: medium
@@ -34,12 +34,12 @@ Add the visible user feedback for successfully loaded skills and update command 
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Add explicit `skills_loaded` handling to chat projection.
-- [ ] 6.2 Render concise loaded-skill feedback with names and source metadata.
-- [ ] 6.3 Add projection safeguards for duplicate aliases and malformed payloads.
-- [ ] 6.4 Update TUI help text and related tests.
-- [ ] 6.5 Update README command wording for `/skill:<skill_name>`.
-- [ ] 6.6 Add producer-side and projection-side leakage regression tests.
+- [x] 6.1 Add explicit `skills_loaded` handling to chat projection.
+- [x] 6.2 Render concise loaded-skill feedback with names and source metadata.
+- [x] 6.3 Add projection safeguards for duplicate aliases and malformed payloads.
+- [x] 6.4 Update TUI help text and related tests.
+- [x] 6.5 Update README command wording for `/skill:<skill_name>`.
+- [x] 6.6 Add producer-side and projection-side leakage regression tests.
 
 ## Implementation Details
 Use the TechSpec "Monitoring and Observability" and ADR-003 metadata-only decision. `record_event` mirrors payloads to history, debug logs, chat projection, and UI events, so the producer should emit only metadata before projection sees the event.

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add App-Owned Workflow Target Ledger
 type: backend
 complexity: high
@@ -31,13 +31,13 @@ Add the workflow target ledger that makes planned file-edit targets inspectable 
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Add workflow context, target, target status, and completion status types near `RunDriveContext`.
-- [ ] 3.2 Attach optional workflow context to workflow-mode `RunDriveContext` construction.
-- [ ] 3.3 Add target-key normalization consistent with existing parallel scope validation.
-- [ ] 3.4 Create planned targets when `run_parallel_group` starts and child specs are available.
-- [ ] 3.5 Ensure read-only reviewer children and empty `write_files` do not add ledger entries.
-- [ ] 3.6 Update normal Run, subtask Run, and test-only `RunDriveContext` constructors for the new workflow field.
-- [ ] 3.7 Add focused unit tests for target derivation, duplicate path handling, and normalization.
+- [x] 3.1 Add workflow context, target, target status, and completion status types near `RunDriveContext`.
+- [x] 3.2 Attach optional workflow context to workflow-mode `RunDriveContext` construction.
+- [x] 3.3 Add target-key normalization consistent with existing parallel scope validation.
+- [x] 3.4 Create planned targets when `run_parallel_group` starts and child specs are available.
+- [x] 3.5 Ensure read-only reviewer children and empty `write_files` do not add ledger entries.
+- [x] 3.6 Update normal Run, subtask Run, and test-only `RunDriveContext` constructors for the new workflow field.
+- [x] 3.7 Add focused unit tests for target derivation, duplicate path handling, and normalization.
 
 ## Implementation Details
 Keep the ledger app-owned in `src/app/mod.rs` as described in the TechSpec "Core Interfaces" and "Data Models" sections. Do not move ownership into the Orchestrator or derive workflow targets from `ParallelGroupResult.changed_files`.
@@ -67,14 +67,14 @@ Keep the ledger app-owned in `src/app/mod.rs` as described in the TechSpec "Core
 
 ## Tests
 - Unit tests:
-  - [ ] A child with `write_files = ["parallel-output/fixer-a.txt"]` creates one planned target for that path.
-  - [ ] A reviewer child with `write_files = []` and read roots only creates no target.
-  - [ ] Multiple write files in one child create separate targets with the same source step metadata.
-  - [ ] Target keys are normalized consistently for workspace-relative paths accepted by existing parallel scope validation.
-  - [ ] Repeated target paths across separate groups retain source evidence instead of silently replacing a prior ledger entry.
+  - [x] A child with `write_files = ["parallel-output/fixer-a.txt"]` creates one planned target for that path.
+  - [x] A reviewer child with `write_files = []` and read roots only creates no target.
+  - [x] Multiple write files in one child create separate targets with the same source step metadata.
+  - [x] Target keys are normalized consistently for workspace-relative paths accepted by existing parallel scope validation.
+  - [x] Repeated target paths across separate groups retain source evidence instead of silently replacing a prior ledger entry.
 - Integration tests:
-  - [ ] `/workflow parallel create a feature` records planned targets from the fake parallel group.
-  - [ ] `/workflow parallel create a feature` does not count the fake reviewer read-only scope as a planned file-edit target.
+  - [x] `/workflow parallel create a feature` records planned targets from the fake parallel group.
+  - [x] `/workflow parallel create a feature` does not count the fake reviewer read-only scope as a planned file-edit target.
 - Test coverage target: >=80%
 - All tests must pass
 

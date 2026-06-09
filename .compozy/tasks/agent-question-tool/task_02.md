@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Validate Clarification Options And Fake Runtime Fixture"
 type: backend
 complexity: medium
@@ -30,11 +30,11 @@ Add the validation rules that make structured clarifying questions reliable and 
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add option-count validation for waiting clarification decisions.
-- [ ] 2.2 Add option identity, label, and uniqueness validation.
-- [ ] 2.3 Add recommended-option validation.
-- [ ] 2.4 Update fake runtime clarification fixture with deterministic options.
-- [ ] 2.5 Expand validation and fake runtime tests.
+- [x] 2.1 Add option-count validation for waiting clarification decisions.
+- [x] 2.2 Add option identity, label, and uniqueness validation.
+- [x] 2.3 Add recommended-option validation.
+- [x] 2.4 Update fake runtime clarification fixture with deterministic options.
+- [x] 2.5 Expand validation and fake runtime tests.
 
 ## Implementation Details
 Use the TechSpec "Data Models" validation rules. This task depends on task 01's schema fields and should not add app state or TUI behavior.
@@ -62,16 +62,16 @@ Use the TechSpec "Data Models" validation rules. This task depends on task 01's 
 
 ## Tests
 - Unit tests:
-  - [ ] Waiting decision with exactly two valid options is accepted.
-  - [ ] Waiting decision with exactly four valid options is accepted.
-  - [ ] Waiting decision with zero, one, or five options is rejected.
-  - [ ] Waiting decision with blank option id is rejected.
-  - [ ] Waiting decision with blank option label is rejected.
-  - [ ] Waiting decision with duplicate option ids is rejected.
-  - [ ] Waiting decision with a recommended option id not present in options is rejected.
-  - [ ] Continue and complete decisions do not require clarification options.
+  - [x] Waiting decision with exactly two valid options is accepted.
+  - [x] Waiting decision with exactly four valid options is accepted.
+  - [x] Waiting decision with zero, one, or five options is rejected.
+  - [x] Waiting decision with blank option id is rejected.
+  - [x] Waiting decision with blank option label is rejected.
+  - [x] Waiting decision with duplicate option ids is rejected.
+  - [x] Waiting decision with a recommended option id not present in options is rejected.
+  - [x] Continue and complete decisions do not require clarification options.
 - Integration tests:
-  - [ ] Fake runtime prompt containing `needs clarification` produces `WaitingForUser` with deterministic options and a recommended id.
+  - [x] Fake runtime prompt containing `needs clarification` produces `WaitingForUser` with deterministic options and a recommended id.
 - Test coverage target: >=80%
 - All tests must pass
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Integrate Normal Prompt Skill Loading In App"
 type: backend
 complexity: high
@@ -34,13 +34,13 @@ Wire shared skill prompt compilation into app-owned run creation for normal prom
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Extend run context data to carry submitted prompt, normalized prompt, and skill context.
-- [ ] 3.2 Integrate prompt compilation into normal prompt submission before run creation.
-- [ ] 3.3 Integrate prompt compilation into `/subtask` task text before subtask run creation.
-- [ ] 3.4 Emit metadata-only `skills_loaded` after successful run creation and prompt submission.
-- [ ] 3.5 Add fail-closed app diagnostics for skill load failures.
-- [ ] 3.6 Preserve clarification, pending approval, and unknown slash-command ordering.
-- [ ] 3.7 Replace raw `/skill:` app tests with loading and failure tests.
+- [x] 3.1 Extend run context data to carry submitted prompt, normalized prompt, and skill context.
+- [x] 3.2 Integrate prompt compilation into normal prompt submission before run creation.
+- [x] 3.3 Integrate prompt compilation into `/subtask` task text before subtask run creation.
+- [x] 3.4 Emit metadata-only `skills_loaded` after successful run creation and prompt submission.
+- [x] 3.5 Add fail-closed app diagnostics for skill load failures.
+- [x] 3.6 Preserve clarification, pending approval, and unknown slash-command ordering.
+- [x] 3.7 Replace raw `/skill:` app tests with loading and failure tests.
 
 ## Implementation Details
 Use the TechSpec "Run lifecycle" and "Integration Points" sections. `src/app/mod.rs` should consume `skills::compile_prompt` rather than duplicating resolver logic. Runtime prompt rendering is finalized in task 04, but this task should leave enough context on the run for task 04 to render later without reparsing prompt text.
@@ -72,21 +72,21 @@ Use the TechSpec "Run lifecycle" and "Integration Points" sections. `src/app/mod
 
 ## Tests
 - Unit tests:
-  - [ ] `RunDriveContext` construction stores submitted prompt, normalized prompt, and skill context without rendered skill sections.
-  - [ ] `skills_loaded` payload serialization includes names, canonical IDs, source origins, source paths, and requested names only.
-  - [ ] Skill-load errors map to user-facing app diagnostics with suggestions when provided by the resolver.
+  - [x] `RunDriveContext` construction stores submitted prompt, normalized prompt, and skill context without rendered skill sections.
+  - [x] `skills_loaded` payload serialization includes names, canonical IDs, source origins, source paths, and requested names only.
+  - [x] Skill-load errors map to user-facing app diagnostics with suggestions when provided by the resolver.
 - Integration tests:
-  - [ ] `/skill:reviewer inspect README` resolves before run creation and emits `run_started`, `prompt_submitted`, then `skills_loaded`.
-  - [ ] Unknown `/skill:missing inspect README` records no `run_started`, no `prompt_submitted`, no `skills_loaded`, and no run record.
-  - [ ] Empty `/skill:` reports a skill-load diagnostic instead of generic unknown-command behavior.
-  - [ ] Mid-prompt `please use /skill:reviewer here` resolves as a skill invocation.
-  - [ ] Duplicate references like `/skill:a do x /skill:a` emit one loaded skill entry with requested alias metadata.
-  - [ ] `prompt_submitted`, history JSONL, debug log, and run record JSON do not contain a sentinel full skill body.
-  - [ ] Clarification answer `/tmp/project` remains a clarification answer.
-  - [ ] Clarification answer `/skill:reviewer` does not load a new skill in V1 and emits no `skills_loaded`.
-  - [ ] Pending approval still rejects normal prompt answers before any skill compilation.
-  - [ ] `/subtask explorer /skill:reviewer inspect README` resolves before `subtask_started`.
-  - [ ] Failed `/subtask explorer /skill:missing inspect README` creates no subtask run.
+  - [x] `/skill:reviewer inspect README` resolves before run creation and emits `run_started`, `prompt_submitted`, then `skills_loaded`.
+  - [x] Unknown `/skill:missing inspect README` records no `run_started`, no `prompt_submitted`, no `skills_loaded`, and no run record.
+  - [x] Empty `/skill:` reports a skill-load diagnostic instead of generic unknown-command behavior.
+  - [x] Mid-prompt `please use /skill:reviewer here` resolves as a skill invocation.
+  - [x] Duplicate references like `/skill:a do x /skill:a` emit one loaded skill entry with requested alias metadata.
+  - [x] `prompt_submitted`, history JSONL, debug log, and run record JSON do not contain a sentinel full skill body.
+  - [x] Clarification answer `/tmp/project` remains a clarification answer.
+  - [x] Clarification answer `/skill:reviewer` does not load a new skill in V1 and emits no `skills_loaded`.
+  - [x] Pending approval still rejects normal prompt answers before any skill compilation.
+  - [x] `/subtask explorer /skill:reviewer inspect README` resolves before `subtask_started`.
+  - [x] Failed `/subtask explorer /skill:missing inspect README` creates no subtask run.
 - Test coverage target: >=80%
 - All tests must pass
 

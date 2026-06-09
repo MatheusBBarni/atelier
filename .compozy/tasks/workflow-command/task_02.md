@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Start Workflow Runs With Prompt Envelope And Start Event
 type: backend
 complexity: medium
@@ -30,12 +30,12 @@ Start workflow-mode execution as one normal Run while keeping user-visible histo
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add `App::handle_workflow_command` or equivalent flow after task 01 preflight.
-- [ ] 2.2 Add workflow prompt-envelope creation for the runtime prompt path.
-- [ ] 2.3 Record `workflow_started` after `run_started` and before or near `prompt_submitted`.
-- [ ] 2.4 Ensure `prompt_submitted` stores the original command text, not the runtime envelope.
-- [ ] 2.5 Ensure `RunDriveContext.prompt` carries the workflow runtime prompt while workflow metadata preserves the original command.
-- [ ] 2.6 Add tests for event ordering, payload content, and unchanged normal prompt submission.
+- [x] 2.1 Add `App::handle_workflow_command` or equivalent flow after task 01 preflight.
+- [x] 2.2 Add workflow prompt-envelope creation for the runtime prompt path.
+- [x] 2.3 Record `workflow_started` after `run_started` and before or near `prompt_submitted`.
+- [x] 2.4 Ensure `prompt_submitted` stores the original command text, not the runtime envelope.
+- [x] 2.5 Ensure `RunDriveContext.prompt` carries the workflow runtime prompt while workflow metadata preserves the original command.
+- [x] 2.6 Add tests for event ordering, payload content, and unchanged normal prompt submission.
 
 ## Implementation Details
 Implement the workflow start path in `src/app/mod.rs` near existing command handlers and Run creation. Reference TechSpec "Event Payloads", "Development Sequencing", and ADR-004 for the exact history contract.
@@ -66,14 +66,14 @@ Implement the workflow start path in `src/app/mod.rs` near existing command hand
 
 ## Tests
 - Unit tests:
-  - [ ] Workflow prompt envelope includes the extracted user prompt and workflow evidence requirements.
-  - [ ] Workflow start payload includes `mode = workflow`, `parallel_step_groups = true`, and configured `max_parallel_agent_steps`.
+  - [x] Workflow prompt envelope includes the extracted user prompt and workflow evidence requirements.
+  - [x] Workflow start payload includes `mode = workflow`, `parallel_step_groups = true`, and configured `max_parallel_agent_steps`.
 - Integration tests:
-  - [ ] `/workflow parallel create a feature` records `run_started`, `workflow_started`, and `prompt_submitted` in the expected order.
-  - [ ] `prompt_submitted.payload.prompt` remains `/workflow parallel create a feature`.
-  - [ ] Runtime-facing prompt content contains workflow-mode instructions while history preserves the raw command.
-  - [ ] The workflow runtime path still reaches the fake Orchestrator and completes a normal Run.
-  - [ ] A normal `parallel create a feature` prompt records no `workflow_started` event.
+  - [x] `/workflow parallel create a feature` records `run_started`, `workflow_started`, and `prompt_submitted` in the expected order.
+  - [x] `prompt_submitted.payload.prompt` remains `/workflow parallel create a feature`.
+  - [x] Runtime-facing prompt content contains workflow-mode instructions while history preserves the raw command.
+  - [x] The workflow runtime path still reaches the fake Orchestrator and completes a normal Run.
+  - [x] A normal `parallel create a feature` prompt records no `workflow_started` event.
 - Test coverage target: >=80%
 - All tests must pass
 

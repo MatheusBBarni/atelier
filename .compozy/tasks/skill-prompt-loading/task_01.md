@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add Shared Skill Discovery And Parsing Foundation"
 type: backend
 complexity: medium
@@ -31,12 +31,12 @@ Create the shared skills module that becomes the source of truth for skill roots
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Create the shared `src/skills/mod.rs` module and export it.
-- [ ] 1.2 Add YAML frontmatter parsing for skill metadata.
-- [ ] 1.3 Add root discovery models with injectable project and home roots for test isolation.
-- [ ] 1.4 Add canonical identity and alias metadata needed by later resolver work.
-- [ ] 1.5 Add metadata-only suggestion data that can replace TUI-local discovery later.
-- [ ] 1.6 Add focused unit tests for roots, metadata, aliases, and suggestion serialization.
+- [x] 1.1 Create the shared `src/skills/mod.rs` module and export it.
+- [x] 1.2 Add YAML frontmatter parsing for skill metadata.
+- [x] 1.3 Add root discovery models with injectable project and home roots for test isolation.
+- [x] 1.4 Add canonical identity and alias metadata needed by later resolver work.
+- [x] 1.5 Add metadata-only suggestion data that can replace TUI-local discovery later.
+- [x] 1.6 Add focused unit tests for roots, metadata, aliases, and suggestion serialization.
 
 ## Implementation Details
 Follow the TechSpec "Core Interfaces", "Parsing And Resolution", and "Technical Dependencies" sections for the shape of the shared module. The current TUI-only discovery code in `src/tui/mod.rs` is the main local behavior to preserve, but this task should not make the TUI consume the new module yet unless doing so is necessary to keep the module compileable.
@@ -69,17 +69,17 @@ Follow the TechSpec "Core Interfaces", "Parsing And Resolution", and "Technical 
 
 ## Tests
 - Unit tests:
-  - [ ] Root discovery returns project `.agents/skills`, project `.claude/skills`, personal `~/.agents/skills`, and personal `~/.claude/skills` in exact precedence order.
-  - [ ] Root discovery tests use injected home/project paths and do not depend on the developer machine's real home directory.
-  - [ ] Valid YAML frontmatter parses `name` and `description`.
-  - [ ] Quoted YAML names parse correctly.
-  - [ ] Missing frontmatter falls back to the skill directory name as an alias.
-  - [ ] Invalid YAML frontmatter fails with a descriptive module-level error.
-  - [ ] Directory name and frontmatter `name` can both be represented as aliases for one canonical skill identity.
-  - [ ] Suggestion metadata contains source tag, source origin, display name, alias, and path data without full skill body content.
+  - [x] Root discovery returns project `.agents/skills`, project `.claude/skills`, personal `~/.agents/skills`, and personal `~/.claude/skills` in exact precedence order.
+  - [x] Root discovery tests use injected home/project paths and do not depend on the developer machine's real home directory.
+  - [x] Valid YAML frontmatter parses `name` and `description`.
+  - [x] Quoted YAML names parse correctly.
+  - [x] Missing frontmatter falls back to the skill directory name as an alias.
+  - [x] Invalid YAML frontmatter fails with a descriptive module-level error.
+  - [x] Directory name and frontmatter `name` can both be represented as aliases for one canonical skill identity.
+  - [x] Suggestion metadata contains source tag, source origin, display name, alias, and path data without full skill body content.
 - Integration tests:
-  - [ ] The new module is publicly importable from another crate module without requiring TUI state.
-  - [ ] The shared suggestion shape can represent existing project and personal skill roots used by `src/tui/mod.rs`.
+  - [x] The new module is publicly importable from another crate module without requiring TUI state.
+  - [x] The shared suggestion shape can represent existing project and personal skill roots used by `src/tui/mod.rs`.
 - Test coverage target: >=80%
 - All tests must pass
 

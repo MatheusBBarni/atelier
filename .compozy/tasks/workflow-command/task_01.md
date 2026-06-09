@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add Workflow Command Parsing And Preflight
 type: backend
 complexity: medium
@@ -30,12 +30,12 @@ Add the `/workflow <prompt>` command entry point and prerequisite checks before 
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Add a small parser/helper that extracts workflow prompt text from `/workflow <prompt>`.
-- [ ] 1.2 Add workflow prerequisite checks for Parallel Step Group availability.
-- [ ] 1.3 Wire the parser into `App::submit_prompt` before unknown slash-command rejection.
-- [ ] 1.4 Return workflow-specific diagnostic text for empty prompt and failed prerequisites.
-- [ ] 1.5 Update slash-command availability text so `/workflow <prompt>` is not reported as unknown.
-- [ ] 1.6 Add focused tests for command parsing, failed preflight, and non-workflow regression.
+- [x] 1.1 Add a small parser/helper that extracts workflow prompt text from `/workflow <prompt>`.
+- [x] 1.2 Add workflow prerequisite checks for Parallel Step Group availability.
+- [x] 1.3 Wire the parser into `App::submit_prompt` before unknown slash-command rejection.
+- [x] 1.4 Return workflow-specific diagnostic text for empty prompt and failed prerequisites.
+- [x] 1.5 Update slash-command availability text so `/workflow <prompt>` is not reported as unknown.
+- [x] 1.6 Add focused tests for command parsing, failed preflight, and non-workflow regression.
 
 ## Implementation Details
 Implement the command parsing and prerequisite decision points in `src/app/mod.rs`. Reference the TechSpec "Integration Points" and "Testing Approach" sections for the expected placement and behavior.

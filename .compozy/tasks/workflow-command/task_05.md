@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Project Workflow Events In Chat
 type: backend
 complexity: medium
@@ -33,12 +33,12 @@ Render workflow-specific lifecycle events in Chat so users can distinguish workf
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Add `workflow_started` handling in `ChatProjection::apply_history_event`.
-- [ ] 5.2 Add `workflow_completed` handling with severity derived from workflow status.
-- [ ] 5.3 Render target counts, unfinished targets, verification, skipped checks, and residual risks from the event payload.
-- [ ] 5.4 Keep generic `run_completed` projection unchanged for non-workflow prompts.
-- [ ] 5.5 Use a distinct workflow lifecycle key strategy so `run_completed` cannot replace the workflow evidence item.
-- [ ] 5.6 Add focused projection tests for workflow start and each terminal status class.
+- [x] 5.1 Add `workflow_started` handling in `ChatProjection::apply_history_event`.
+- [x] 5.2 Add `workflow_completed` handling with severity derived from workflow status.
+- [x] 5.3 Render target counts, unfinished targets, verification, skipped checks, and residual risks from the event payload.
+- [x] 5.4 Keep generic `run_completed` projection unchanged for non-workflow prompts.
+- [x] 5.5 Use a distinct workflow lifecycle key strategy so `run_completed` cannot replace the workflow evidence item.
+- [x] 5.6 Add focused projection tests for workflow start and each terminal status class.
 
 ## Implementation Details
 Implement projection logic in `src/app/chat/projection.rs` alongside existing run and parallel group summary handlers. Reference TechSpec "Chat projection" and ADR-004 for the warning treatment and duplicate-completion expectations.
@@ -67,16 +67,16 @@ Implement projection logic in `src/app/chat/projection.rs` alongside existing ru
 
 ## Tests
 - Unit tests:
-  - [ ] Rebuilding projection with `workflow_started` creates a workflow lifecycle item.
-  - [ ] Rebuilding projection with `workflow_completed.status = completed` creates a success item.
-  - [ ] Rebuilding projection with `workflow_completed.status = completed_with_issues` creates a warning item.
-  - [ ] Rebuilding projection with `workflow_completed.status = failed` creates an error item.
-  - [ ] `workflow_completed` body includes target counts and unfinished targets when payload includes them.
-  - [ ] `workflow_completed` remains a separate item after a later `run_completed` event for the same run.
-  - [ ] A `workflow_completed` event missing optional arrays still renders without panic.
+  - [x] Rebuilding projection with `workflow_started` creates a workflow lifecycle item.
+  - [x] Rebuilding projection with `workflow_completed.status = completed` creates a success item.
+  - [x] Rebuilding projection with `workflow_completed.status = completed_with_issues` creates a warning item.
+  - [x] Rebuilding projection with `workflow_completed.status = failed` creates an error item.
+  - [x] `workflow_completed` body includes target counts and unfinished targets when payload includes them.
+  - [x] `workflow_completed` remains a separate item after a later `run_completed` event for the same run.
+  - [x] A `workflow_completed` event missing optional arrays still renders without panic.
 - Integration tests:
-  - [ ] A fake workflow completed-with-issues run surfaces a warning Chat item.
-  - [ ] A non-workflow completed run still renders the existing generic completion behavior.
+  - [x] A fake workflow completed-with-issues run surfaces a warning Chat item.
+  - [x] A non-workflow completed run still renders the existing generic completion behavior.
 - Test coverage target: >=80%
 - All tests must pass
 

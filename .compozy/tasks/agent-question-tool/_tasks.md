@@ -4,8 +4,8 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Add Clarification Option Schema Fields | pending | medium | — |
-| 02 | Validate Clarification Options And Fake Runtime Fixture | pending | medium | task_01 |
+| 01 | Add Clarification Option Schema Fields | completed | medium | — |
+| 02 | Validate Clarification Options And Fake Runtime Fixture | completed | medium | task_01 |
 | 03 | Update Runtime Prompt Contracts | pending | medium | task_01 |
 | 04 | Expose Pending Clarification View And Request Lifecycle | pending | medium | task_02 |
 | 05 | Add Structured Clarification Answer Path | pending | medium | task_04 |
