@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add TUI Clarification Selection Key Handling"
 type: frontend
 complexity: medium
@@ -31,12 +31,12 @@ Add the keyboard interaction model for answering pending clarifying questions in
 </requirements>
 
 ## Subtasks
-- [ ] 7.1 Add TUI state for clarification option selection and custom answer input.
-- [ ] 7.2 Add TUI command variants for clarification navigation and submission.
-- [ ] 7.3 Route key events to clarification mode before normal prompt submission.
-- [ ] 7.4 Dispatch structured clarification answers to the app worker.
-- [ ] 7.5 Preserve Ctrl-C interrupt and pending approval behavior.
-- [ ] 7.6 Add key-handling and local-state tests.
+- [x] 7.1 Add TUI state for clarification option selection and custom answer input.
+- [x] 7.2 Add TUI command variants for clarification navigation and submission.
+- [x] 7.3 Route key events to clarification mode before normal prompt submission.
+- [x] 7.4 Dispatch structured clarification answers to the app worker.
+- [x] 7.5 Preserve Ctrl-C interrupt and pending approval behavior.
+- [x] 7.6 Add key-handling and local-state tests.
 
 ## Implementation Details
 Use TechSpec sections "TUI Composer Mode" and "Development Sequencing". Rendering belongs to task 08; this task may add minimal state helpers needed for rendering, but should focus on behavior.
@@ -64,18 +64,18 @@ Use TechSpec sections "TUI Composer Mode" and "Development Sequencing". Renderin
 
 ## Tests
 - Unit tests:
-  - [ ] Up key selects the previous clarification option and does not move the input cursor.
-  - [ ] Down key selects the next clarification option and does not move the input cursor.
-  - [ ] Enter on a recommended option dispatches `ClarificationAnswered` with selected option metadata.
-  - [ ] Character input updates custom answer text while clarification is pending.
-  - [ ] Backspace edits custom answer text while clarification is pending.
-  - [ ] Enter with custom text dispatches `ClarificationAnswered` with `answer_source = "custom"`.
-  - [ ] Ctrl-C still dispatches run interrupt while clarification is pending.
-  - [ ] Pending approval Enter still dispatches `ApprovalAnswered`, not clarification answer.
+  - [x] Up key selects the previous clarification option and does not move the input cursor.
+  - [x] Down key selects the next clarification option and does not move the input cursor.
+  - [x] Enter on a recommended option dispatches `ClarificationAnswered` with selected option metadata.
+  - [x] Character input updates custom answer text while clarification is pending.
+  - [x] Backspace edits custom answer text while clarification is pending.
+  - [x] Enter with custom text dispatches `ClarificationAnswered` with `answer_source = "custom"`.
+  - [x] Ctrl-C still dispatches run interrupt while clarification is pending.
+  - [x] Pending approval Enter still dispatches `ApprovalAnswered`, not clarification answer.
 - Integration tests:
-  - [ ] Clarification selection movement emits no app worker event until Enter is pressed.
-- Test coverage target: >=80%
-- All tests must pass
+  - [x] Clarification selection movement emits no app worker event until Enter is pressed.
+- Test coverage target: >=80% ✓
+- All tests must pass ✓
 
 ## Success Criteria
 - All tests passing

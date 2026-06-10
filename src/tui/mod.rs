@@ -59,6 +59,9 @@ enum TuiCommand {
     MoveInputCursor(InputCursorCommand),
     AgentDropdown(DropdownCommand),
     SkillDropdown(DropdownCommand),
+    Clarification(ClarificationCommand),
+    ClarificationInputCharacter(char),
+    ClarificationInputBackspace,
     ReloadSkills,
     InputCharacter(char),
     InputBackspace,
@@ -89,6 +92,13 @@ enum DropdownCommand {
     Accept,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClarificationCommand {
+    PreviousOption,
+    NextOption,
+    Submit,
+}
+
 #[derive(Debug)]
 enum AppWorkerCommand {
     Event(AppEvent),
@@ -111,6 +121,8 @@ struct TuiUiState {
     agent_selection_index: usize,
     skill_suggestions: Vec<SkillSuggestion>,
     skill_selection_index: usize,
+    clarification_option_index: usize,
+    clarification_custom_answer: String,
     status_message: Option<String>,
     work_spinner_frame: usize,
 }
@@ -132,6 +144,8 @@ impl Default for TuiUiState {
             agent_selection_index: 0,
             skill_suggestions: Vec::new(),
             skill_selection_index: 0,
+            clarification_option_index: 0,
+            clarification_custom_answer: String::new(),
             status_message: None,
             work_spinner_frame: 0,
         }
@@ -337,6 +351,17 @@ async fn execute_tui_command_with_interrupt(
             apply_skill_dropdown_command(state, ui_state, command);
             Ok(true)
         }
+        TuiCommand::Clarification(command) => {
+            apply_clarification_command(state, ui_state, command, command_sender).await
+        }
+        TuiCommand::ClarificationInputCharacter(ch) => {
+            ui_state.clarification_custom_answer.push(ch);
+            Ok(true)
+        }
+        TuiCommand::ClarificationInputBackspace => {
+            ui_state.clarification_custom_answer.pop();
+            Ok(true)
+        }
         TuiCommand::ReloadSkills => {
             reload_skills(state, ui_state);
             Ok(true)
@@ -486,6 +511,19 @@ fn key_event_to_tui_command_with_ui(
             } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
             _ => None,
         }
+    } else if state.pending_clarification.is_some() {
+        clarification_key_command(state, ui_state, key).or_else(|| {
+            match key {
+                KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
+                _ => None,
+            }
+        })
+    } else if state.pending_approval.is_some() {
+        key_event_to_tui_command(state, key)
     } else if agent_dropdown(state, ui_state).is_some() {
         agent_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
     } else if skill_dropdown(&state.input, ui_state).is_some() {
@@ -525,6 +563,38 @@ fn skill_dropdown_key_command(key: KeyEvent) -> Option<TuiCommand> {
             code: KeyCode::Enter,
             ..
         } => Some(TuiCommand::SkillDropdown(DropdownCommand::Accept)),
+        _ => None,
+    }
+}
+
+fn clarification_key_command(
+    state: &AppState,
+    _ui_state: &TuiUiState,
+    key: KeyEvent,
+) -> Option<TuiCommand> {
+    let Some(_clarification) = &state.pending_clarification else {
+        return None;
+    };
+    match key {
+        KeyEvent {
+            code: KeyCode::Up, ..
+        } => Some(TuiCommand::Clarification(ClarificationCommand::PreviousOption)),
+        KeyEvent {
+            code: KeyCode::Down, ..
+        } => Some(TuiCommand::Clarification(ClarificationCommand::NextOption)),
+        KeyEvent {
+            code: KeyCode::Enter, ..
+        } => Some(TuiCommand::Clarification(ClarificationCommand::Submit)),
+        KeyEvent {
+            code: KeyCode::Backspace, ..
+        } => Some(TuiCommand::ClarificationInputBackspace),
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            ..
+        } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            Some(TuiCommand::ClarificationInputCharacter(ch))
+        }
         _ => None,
     }
 }
@@ -993,6 +1063,66 @@ fn apply_skill_dropdown_command(
         DropdownCommand::Accept => {
             let suggestion = dropdown.suggestions[dropdown.selected].clone();
             apply_skill_suggestion(state, ui_state, &dropdown.token, &suggestion);
+        }
+    }
+}
+
+async fn apply_clarification_command(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    command: ClarificationCommand,
+    command_sender: &mpsc::Sender<AppWorkerCommand>,
+) -> Result<bool> {
+    let Some(clarification) = &state.pending_clarification else {
+        return Ok(true);
+    };
+
+    match command {
+        ClarificationCommand::PreviousOption => {
+            let option_count = clarification.options.len();
+            ui_state.clarification_option_index = if ui_state.clarification_option_index == 0 {
+                option_count.saturating_sub(1)
+            } else {
+                ui_state.clarification_option_index - 1
+            };
+            Ok(true)
+        }
+        ClarificationCommand::NextOption => {
+            let option_count = clarification.options.len();
+            ui_state.clarification_option_index =
+                (ui_state.clarification_option_index + 1) % option_count.max(1);
+            Ok(true)
+        }
+        ClarificationCommand::Submit => {
+            let custom_answer = ui_state.clarification_custom_answer.trim().to_string();
+
+            let (answer_text, selected_option_id, selected_option_label, answer_source) =
+                if !custom_answer.is_empty() {
+                    (custom_answer, None, None, "custom".to_string())
+                } else if ui_state.clarification_option_index < clarification.options.len() {
+                    let option = &clarification.options[ui_state.clarification_option_index];
+                    (
+                        option.label.clone(),
+                        Some(option.id.clone()),
+                        Some(option.label.clone()),
+                        "recommended".to_string(),
+                    )
+                } else {
+                    return Ok(true);
+                };
+
+            let event = AppEvent::ClarificationAnswered(crate::app::ClarificationAnswer {
+                question_id: clarification.question_id.clone(),
+                answer: answer_text,
+                selected_option_id,
+                selected_option_label,
+                answer_source,
+            });
+
+            queue_app_event(command_sender, event).await?;
+            ui_state.clarification_custom_answer.clear();
+            ui_state.clarification_option_index = 0;
+            Ok(true)
         }
     }
 }
@@ -2017,10 +2147,13 @@ fn set_input_cursor(frame: &mut Frame, input_area: Rect, input_layout: InputLayo
 mod tests {
     use super::*;
     use crate::app::chat::ChatProjection;
-    use crate::app::{AgentView, ConfigStatusView, LiveStepStatus, LiveStepView, LiveStreamView};
+    use crate::app::{
+        AgentView, ClarificationAnswer, ConfigStatusView, LiveStepStatus, LiveStepView,
+        LiveStreamView, PendingClarificationView,
+    };
     use crate::config::{load_effective_config, ConfigLoadOptions};
     use crate::history::HistoryEvent;
-    use crate::orchestrator::RunState;
+    use crate::orchestrator::{ClarificationOption, RunState};
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
     use ratatui::backend::TestBackend;
     use serde_json::json;
@@ -3888,6 +4021,177 @@ mod tests {
             sources: vec!["built-in defaults".to_string()],
             preset: None,
             warnings: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn clarification_up_key_cycles_options() {
+        let mut ui_state = TuiUiState::default();
+        ui_state.clarification_option_index = 1;
+
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(PendingClarificationView {
+            run_id: "run".to_string(),
+            question_id: "q1".to_string(),
+            question: "Test question".to_string(),
+            options: vec![
+                ClarificationOption {
+                    id: "opt1".to_string(),
+                    label: "Option 1".to_string(),
+                    description: None,
+                },
+                ClarificationOption {
+                    id: "opt2".to_string(),
+                    label: "Option 2".to_string(),
+                    description: None,
+                },
+                ClarificationOption {
+                    id: "opt3".to_string(),
+                    label: "Option 3".to_string(),
+                    description: None,
+                },
+            ],
+            recommended_option_id: None,
+        });
+
+        let command =
+            key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Up));
+        assert_eq!(command, Some(TuiCommand::Clarification(ClarificationCommand::PreviousOption)));
+
+        let (sender, _) = mpsc::channel(1);
+        execute_tui_command(&mut app_state, &mut ui_state, &sender, command.unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(ui_state.clarification_option_index, 0);
+    }
+
+    #[tokio::test]
+    async fn clarification_down_key_cycles_options() {
+        let mut ui_state = TuiUiState::default();
+        ui_state.clarification_option_index = 0;
+
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(PendingClarificationView {
+            run_id: "run".to_string(),
+            question_id: "q1".to_string(),
+            question: "Test question".to_string(),
+            options: vec![
+                ClarificationOption {
+                    id: "opt1".to_string(),
+                    label: "Option 1".to_string(),
+                    description: None,
+                },
+                ClarificationOption {
+                    id: "opt2".to_string(),
+                    label: "Option 2".to_string(),
+                    description: None,
+                },
+            ],
+            recommended_option_id: None,
+        });
+
+        let command =
+            key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Down));
+        assert_eq!(command, Some(TuiCommand::Clarification(ClarificationCommand::NextOption)));
+
+        let (sender, _) = mpsc::channel(1);
+        execute_tui_command(&mut app_state, &mut ui_state, &sender, command.unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(ui_state.clarification_option_index, 1);
+    }
+
+    #[test]
+    fn clarification_character_input_updates_custom_answer() {
+        let mut ui_state = TuiUiState::default();
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(PendingClarificationView {
+            run_id: "run".to_string(),
+            question_id: "q1".to_string(),
+            question: "Test question".to_string(),
+            options: vec![],
+            recommended_option_id: None,
+        });
+
+        let command = key_event_to_tui_command_with_ui(
+            &app_state,
+            &ui_state,
+            key(KeyCode::Char('t')),
+        );
+        assert_eq!(command, Some(TuiCommand::ClarificationInputCharacter('t')));
+
+        if let Some(TuiCommand::ClarificationInputCharacter(ch)) = command {
+            ui_state.clarification_custom_answer.push(ch);
+        }
+
+        assert_eq!(ui_state.clarification_custom_answer, "t");
+    }
+
+    #[test]
+    fn clarification_backspace_removes_character() {
+        let mut ui_state = TuiUiState::default();
+        ui_state.clarification_custom_answer = "test".to_string();
+
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(PendingClarificationView {
+            run_id: "run".to_string(),
+            question_id: "q1".to_string(),
+            question: "Test question".to_string(),
+            options: vec![],
+            recommended_option_id: None,
+        });
+
+        let command = key_event_to_tui_command_with_ui(
+            &app_state,
+            &ui_state,
+            key(KeyCode::Backspace),
+        );
+        assert_eq!(command, Some(TuiCommand::ClarificationInputBackspace));
+
+        if let Some(TuiCommand::ClarificationInputBackspace) = command {
+            ui_state.clarification_custom_answer.pop();
+        }
+
+        assert_eq!(ui_state.clarification_custom_answer, "tes");
+    }
+
+    #[test]
+    fn ctrl_c_still_works_during_clarification() {
+        let ui_state = TuiUiState::default();
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(PendingClarificationView {
+            run_id: "run".to_string(),
+            question_id: "q1".to_string(),
+            question: "Test question".to_string(),
+            options: vec![],
+            recommended_option_id: None,
+        });
+
+        let command = key_event_to_tui_command_with_ui(
+            &app_state,
+            &ui_state,
+            key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            command,
+            Some(TuiCommand::DispatchAndQuit(
+                AppEvent::RunInterruptRequested
+            ))
+        );
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        key_with_modifiers(code, KeyModifiers::NONE)
+    }
+
+    fn key_with_modifiers(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
         }
     }
 }

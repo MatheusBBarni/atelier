@@ -10,5 +10,5 @@
 | 04 | Expose Pending Clarification View And Request Lifecycle | completed | medium | task_02 |
 | 05 | Add Structured Clarification Answer Path | completed | medium | task_04 |
 | 06 | Add Clarification Chat Semantics And Projection | completed | medium | task_04, task_05 |
-| 07 | Add TUI Clarification Selection Key Handling | pending | medium | task_05 |
+| 07 | Add TUI Clarification Selection Key Handling | completed | medium | task_05 |
 | 08 | Render Clarification Composer Layout | pending | medium | task_06, task_07 |

@@ -4,9 +4,10 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
 
 ## Current State
 
-- Tasks 01-06 completed: schema, validation, runtime contracts, app pending state, structured answer path, and Chat semantics.
+- Tasks 01-07 completed: schema, validation, runtime contracts, app pending state, structured answer path, Chat semantics, and TUI key handling.
 - Task 05: `AppEvent::ClarificationAnswered` with full answer metadata; validates question_id, rejects empty answers, resumes run.
-- Task 06: Added `ChatItemKind::Clarification` and `ChatItemStatus::WaitingForUser` to distinguish from Approval. Projects `clarification_requested` as pending Clarification item and `clarification_answered` as completed state. Kept `blocker_reported` using RunSummary/WaitingApproval for backward compatibility.
+- Task 06: Added `ChatItemKind::Clarification` and `ChatItemStatus::WaitingForUser`. Projects `clarification_requested` as pending, `clarification_answered` as completed.
+- Task 07: TUI state fields `clarification_option_index` and `clarification_custom_answer`; command routing checks pending clarification before dropdowns; Up/Down cycle options, Enter submits with answer_source logic, character input/backspace edit custom answer; Ctrl-C preserved.
 
 ## Shared Decisions
 
