@@ -13,7 +13,7 @@ use crate::history::{HistoryEvent, HistoryStore};
 use crate::ids::new_id;
 use crate::orchestrator::{
     agent_results, build_orchestrator_prompt, validate_orchestrator_decision, AgentResult,
-    AgentResultStatus, DecisionNextStep, DecisionStatus, ParallelBlockedScope,
+    AgentResultStatus, ClarificationOption, DecisionNextStep, DecisionStatus, ParallelBlockedScope,
     ParallelChildResultRef, ParallelFailedScope, ParallelFileScope, ParallelGroupPlan,
     ParallelGroupResult, ParallelGroupStatus, RunState, RunStepResult, COUNCIL_WORKFLOW_AGENT_ID,
 };
@@ -77,6 +77,7 @@ pub struct AppState {
     pub live_step: Option<LiveStepView>,
     pub live_steps: Vec<LiveStepView>,
     pub pending_approval: Option<PendingApprovalView>,
+    pub pending_clarification: Option<PendingClarificationView>,
     pub agents: Vec<AgentView>,
     pub chat_items: Vec<ChatItemView>,
     pub events: Vec<String>,
@@ -134,6 +135,15 @@ pub struct PendingApprovalView {
     pub agent: String,
     pub summary: String,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingClarificationView {
+    pub run_id: String,
+    pub question_id: String,
+    pub question: String,
+    pub options: Vec<ClarificationOption>,
+    pub recommended_option_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -676,6 +686,7 @@ impl App {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            pending_clarification: None,
             agents: build_agent_views(&config, &availability),
             chat_items: Vec::new(),
             events: Vec::new(),
@@ -826,6 +837,7 @@ impl App {
                 )?;
                 pending.run.prompt =
                     format!("{}\n\nUser clarification: {}", pending.run.prompt, answer);
+                self.state.pending_clarification = None;
                 self.state.run_state = RunState::Planning;
                 return self.drive_run(pending.run, None).await;
             }
@@ -1179,6 +1191,7 @@ impl App {
             self.state.live_step = None;
             self.state.live_steps.clear();
             self.state.pending_approval = None;
+            self.state.pending_clarification = None;
             self.pending_approval = None;
             self.pending_clarification = None;
             self.active_step = None;
@@ -1307,12 +1320,29 @@ impl App {
             DecisionStatus::WaitingForUser => {
                 self.state.run_state = RunState::WaitingForUser;
                 self.pending_clarification = Some(PendingClarification { run: run.clone() });
+                let question = decision
+                    .clarifying_question
+                    .clone()
+                    .context("validated waiting_for_user decision missing clarifying_question")?;
+                let view = PendingClarificationView {
+                    run_id: run.run_id.clone(),
+                    question_id: new_id(),
+                    question,
+                    options: decision.clarifying_options.clone(),
+                    recommended_option_id: decision.recommended_option_id.clone(),
+                };
+                self.state.pending_clarification = Some(view.clone());
                 self.set_agent_status("orchestrator", "waiting_for_user");
                 self.record_event(
                     Some(run.run_id.clone()),
                     None,
-                    "blocker_reported",
-                    json!({ "question": decision.clarifying_question }),
+                    "clarification_requested",
+                    json!({
+                        "question_id": view.question_id,
+                        "question": view.question,
+                        "options": view.options,
+                        "recommended_option_id": view.recommended_option_id,
+                    }),
                     "Orchestrator asked a clarifying question.",
                 )?;
                 Ok(false)
@@ -3784,6 +3814,7 @@ impl App {
         )?;
         self.state.active_run_id = None;
         self.state.pending_approval = None;
+        self.state.pending_clarification = None;
         self.pending_approval = None;
         self.pending_clarification = None;
         if self
@@ -8768,6 +8799,9 @@ instructions_file = "agents/explorer.md"
             .any(|event| event.kind == "parallel_group_started"));
         assert!(!events.iter().any(|event| event.kind == "action_requested"));
         assert!(!events.iter().any(|event| event.kind == "blocker_reported"));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "clarification_requested"));
         assert!(!events.iter().any(|event| event.kind == "council_started"));
     }
 
@@ -9628,6 +9662,8 @@ runtime = "fake"
         assert!(app.state.active_run_id.is_some());
         let pending = app.state.pending_approval.as_ref().unwrap();
         assert_eq!(pending.agent, "fixer");
+        assert!(app.state.pending_clarification.is_none());
+        assert!(app.pending_clarification.is_none());
         assert_eq!(agent_status(&app, "fixer"), "waiting_approval");
         assert!(pending
             .diagnostic
@@ -9648,6 +9684,37 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn app_state_defaults_to_no_pending_clarification() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+
+        assert!(app.state.pending_clarification.is_none());
+        assert!(app.pending_clarification.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupt_clears_pending_clarification_state() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_clarification.is_some());
+        assert!(app.pending_clarification.is_some());
+
+        app.interrupt().unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        assert!(app.state.active_run_id.is_none());
+        assert!(app.state.pending_clarification.is_none());
+        assert!(app.pending_clarification.is_none());
+    }
+
+    #[tokio::test]
     async fn clarifying_answer_resumes_waiting_run() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
@@ -9661,9 +9728,62 @@ runtime = "fake"
         assert!(app.state.active_run_id.is_some());
         assert!(app.state.pending_approval.is_none());
         assert_eq!(agent_status(&app, "orchestrator"), "waiting_for_user");
+        let view = app.state.pending_clarification.as_ref().unwrap();
+        assert_eq!(
+            Some(view.run_id.as_str()),
+            app.state.active_run_id.as_deref()
+        );
+        assert!(!view.question_id.is_empty());
+        assert_eq!(
+            view.question,
+            "Which target or constraint should guide this run?"
+        );
+        assert_eq!(
+            view.options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["target_scope", "success_criteria", "constraints"]
+        );
+        assert_eq!(view.recommended_option_id.as_deref(), Some("target_scope"));
         let events = app.state.events.join("\n");
         assert!(events.contains("Orchestrator asked a clarifying question."));
         let history_events = app.history.read_events().unwrap();
+        let requested = history_events
+            .iter()
+            .find(|event| event.kind == "clarification_requested")
+            .unwrap();
+        assert_eq!(
+            requested.run_id.as_deref(),
+            app.state.active_run_id.as_deref()
+        );
+        assert_eq!(
+            requested.payload.get("question_id").and_then(Value::as_str),
+            Some(view.question_id.as_str())
+        );
+        assert_eq!(
+            requested.payload.get("question").and_then(Value::as_str),
+            Some(view.question.as_str())
+        );
+        let requested_options = requested
+            .payload
+            .get("options")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(
+            requested_options
+                .iter()
+                .map(|option| option.get("id").and_then(Value::as_str).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["target_scope", "success_criteria", "constraints"]
+        );
+        assert_eq!(
+            requested
+                .payload
+                .get("recommended_option_id")
+                .and_then(Value::as_str),
+            Some("target_scope")
+        );
         let decision_event = history_events
             .iter()
             .find(|event| event.kind == "orchestrator_decision")
@@ -9702,6 +9822,8 @@ runtime = "fake"
 
         assert_eq!(app.state.run_state, RunState::Completed);
         assert!(app.state.active_run_id.is_none());
+        assert!(app.state.pending_clarification.is_none());
+        assert!(app.pending_clarification.is_none());
         assert_eq!(agent_status(&app, "orchestrator"), "idle");
         let events = app.state.events.join("\n");
         assert!(events.contains("You: use the CLI path"));

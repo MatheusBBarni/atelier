@@ -74,7 +74,7 @@ impl ChatProjection {
             "run_completed" | "run_failed" | "run_limit_reached" | "run_interrupted"
             | "subtask_completed" => self.apply_run_summary(event),
             "diagnostic" => self.apply_diagnostic(event),
-            "blocker_reported" => self.apply_blocker(event),
+            "blocker_reported" | "clarification_requested" => self.apply_blocker(event),
             "config_viewed"
             | "session_goal_viewed"
             | "session_goal_set"
