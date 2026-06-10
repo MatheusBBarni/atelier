@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add Structured Clarification Answer Path"
 type: backend
 complexity: medium
@@ -32,12 +32,12 @@ Add the dedicated app event and resume path for structured clarification answers
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Add the structured clarification answer type and app event.
-- [ ] 5.2 Resolve recommended-option answers against the active pending clarification.
-- [ ] 5.3 Resolve custom-text answers without slash-command interpretation.
-- [ ] 5.4 Record enriched `clarification_answered` history payloads.
-- [ ] 5.5 Resume the paused run and clear pending clarification state.
-- [ ] 5.6 Add app tests for valid, invalid, selected, and custom answer paths.
+- [x] 5.1 Add the structured clarification answer type and app event.
+- [x] 5.2 Resolve recommended-option answers against the active pending clarification.
+- [x] 5.3 Resolve custom-text answers without slash-command interpretation.
+- [x] 5.4 Record enriched `clarification_answered` history payloads.
+- [x] 5.5 Resume the paused run and clear pending clarification state.
+- [x] 5.6 Add app tests for valid, invalid, selected, and custom answer paths.
 
 ## Implementation Details
 Use TechSpec sections "App Answer Path", "AppEvent", and "History Events". Preserve the existing behavior that clarification text is appended to the run prompt as user clarification after the answer is accepted.
@@ -66,17 +66,17 @@ Use TechSpec sections "App Answer Path", "AppEvent", and "History Events". Prese
 
 ## Tests
 - Unit tests:
-  - [ ] Recommended option answer records `answer_source = "recommended"` and selected option id/label.
-  - [ ] Custom answer records `answer_source = "custom"` with no selected option id.
-  - [ ] Answer with the wrong question id is rejected without clearing pending state.
-  - [ ] Empty custom answer is rejected with a useful diagnostic.
-  - [ ] Slash-prefixed custom answer such as `/tmp/project` is accepted as text.
+  - [x] Recommended option answer records `answer_source = "recommended"` and selected option id/label.
+  - [x] Custom answer records `answer_source = "custom"` with no selected option id.
+  - [x] Answer with the wrong question id is rejected without clearing pending state.
+  - [x] Empty custom answer is rejected with a useful diagnostic.
+  - [x] Slash-prefixed custom answer such as `/tmp/project` is accepted as text.
 - Integration tests:
-  - [ ] Fake runtime `needs clarification` flow resumes and completes after selected option answer.
-  - [ ] Fake runtime `needs clarification` flow resumes and completes after custom answer.
-  - [ ] Pending approval still rejects normal prompts and does not route through clarification answer handling.
-- Test coverage target: >=80%
-- All tests must pass
+  - [x] Fake runtime `needs clarification` flow resumes and completes after selected option answer.
+  - [x] Fake runtime `needs clarification` flow resumes and completes after custom answer.
+  - [x] Pending approval still rejects normal prompts and does not route through clarification answer handling.
+- Test coverage target: >=80% ✓
+- All tests must pass ✓
 
 ## Success Criteria
 - All tests passing

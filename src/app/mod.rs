@@ -173,10 +173,20 @@ impl ApprovalHandle {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClarificationAnswer {
+    pub question_id: String,
+    pub answer: String,
+    pub selected_option_id: Option<String>,
+    pub selected_option_label: Option<String>,
+    pub answer_source: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
     PromptSubmitted(String),
     ApprovalAnswered(bool),
+    ClarificationAnswered(ClarificationAnswer),
     InputCharacter(char),
     InputBackspace,
     RunInterruptRequested,
@@ -769,6 +779,11 @@ impl App {
                 self.resolve_pending_approval(approved).await?;
                 Ok(())
             }
+            AppEvent::ClarificationAnswered(answer) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resolve_pending_clarification(answer).await
+            }
             AppEvent::InputCharacter(ch) => {
                 self.state.input.push(ch);
                 self.publish_state();
@@ -826,20 +841,8 @@ impl App {
             if self.state.pending_approval.is_some() {
                 bail!("a run is waiting for action approval");
             }
-            if let Some(mut pending) = self.pending_clarification.take() {
-                let answer = prompt.trim().to_string();
-                self.record_event(
-                    Some(pending.run.run_id.clone()),
-                    None,
-                    "clarification_answered",
-                    json!({ "answer": answer }),
-                    user_event_display(&answer),
-                )?;
-                pending.run.prompt =
-                    format!("{}\n\nUser clarification: {}", pending.run.prompt, answer);
-                self.state.pending_clarification = None;
-                self.state.run_state = RunState::Planning;
-                return self.drive_run(pending.run, None).await;
+            if self.pending_clarification.is_some() {
+                bail!("a run is waiting for clarification; use the structured clarification answer event");
             }
         }
         let workflow_start = self.handle_workflow_command(&prompt)?;
@@ -1161,6 +1164,52 @@ impl App {
         };
         self.drive_run(pending.run, Some(resume)).await?;
         Ok(Some(result))
+    }
+
+    pub async fn resolve_pending_clarification(&mut self, answer: ClarificationAnswer) -> Result<()> {
+        let Some(clarification_view) = &self.state.pending_clarification else {
+            bail!("no clarification is pending");
+        };
+
+        if answer.question_id != clarification_view.question_id {
+            return Err(anyhow!(
+                "answer question id does not match pending clarification (expected: {}, got: {})",
+                clarification_view.question_id,
+                answer.question_id
+            ));
+        }
+
+        if answer.answer.trim().is_empty() {
+            return Err(anyhow!("clarification answer cannot be empty"));
+        }
+
+        let Some(pending) = self.pending_clarification.take() else {
+            bail!("no clarification is pending");
+        };
+
+        self.record_event(
+            Some(pending.run.run_id.clone()),
+            None,
+            "clarification_answered",
+            json!({
+                "question_id": answer.question_id.clone(),
+                "answer": answer.answer.clone(),
+                "answer_source": answer.answer_source.clone(),
+                "selected_option_id": answer.selected_option_id.clone(),
+                "selected_option_label": answer.selected_option_label.clone(),
+            }),
+            user_event_display(&answer.answer),
+        )?;
+
+        let mut run = pending.run;
+        run.prompt = format!("{}\n\nUser clarification: {}", run.prompt, answer.answer);
+
+        self.state.pending_clarification = None;
+        self.state.run_state = RunState::Planning;
+        self.publish_state();
+
+        self.drive_run(run, None).await?;
+        Ok(())
     }
 
     pub fn interrupt(&mut self) -> Result<()> {
@@ -9818,7 +9867,18 @@ runtime = "fake"
             Some("target_scope")
         );
 
-        app.submit_prompt("use the CLI path").await.unwrap();
+        let question_id = view.question_id.clone();
+        let answer = ClarificationAnswer {
+            question_id,
+            answer: "use the CLI path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer))
+            .await
+            .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         assert!(app.state.active_run_id.is_none());
@@ -9842,16 +9902,34 @@ runtime = "fake"
             .unwrap();
         assert_eq!(app.state.run_state, RunState::WaitingForUser);
 
-        app.submit_prompt("/tmp/project").await.unwrap();
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id,
+            answer: "/tmp/project".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer))
+            .await
+            .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
-        let answer = events
+        let answered = events
             .iter()
             .find(|event| event.kind == "clarification_answered")
             .unwrap();
         assert_eq!(
-            answer
+            answered
                 .payload
                 .get("answer")
                 .and_then(serde_json::Value::as_str),
@@ -9877,16 +9955,34 @@ runtime = "fake"
             .unwrap();
         assert_eq!(app.state.run_state, RunState::WaitingForUser);
 
-        app.submit_prompt("/skill:reviewer").await.unwrap();
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id,
+            answer: "/skill:reviewer".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer))
+            .await
+            .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
-        let answer = events
+        let answered = events
             .iter()
             .find(|event| event.kind == "clarification_answered")
             .unwrap();
         assert_eq!(
-            answer
+            answered
                 .payload
                 .get("answer")
                 .and_then(serde_json::Value::as_str),
@@ -9945,7 +10041,23 @@ runtime = "fake"
             .prompt
             .contains("/skill:new use the CLI path"));
 
-        app.submit_prompt("/skill:new use the CLI path")
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id,
+            answer: "/skill:new use the CLI path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer))
             .await
             .unwrap();
 
@@ -9960,12 +10072,12 @@ runtime = "fake"
             loaded_events[0].payload["skills"][0]["display_name"],
             Value::String("base".to_string())
         );
-        let answer = events
+        let answered = events
             .iter()
             .find(|event| event.kind == "clarification_answered")
             .unwrap();
         assert_eq!(
-            answer
+            answered
                 .payload
                 .get("answer")
                 .and_then(serde_json::Value::as_str),
@@ -10251,5 +10363,237 @@ runtime = "fake"
             .and_then(serde_json::Value::as_str)
             .unwrap();
         assert!(dir.path().join(".multiagent").join(artifact_path).exists());
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_with_recommended_option() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id: question_id.clone(),
+            answer: "Option A selected".to_string(),
+            selected_option_id: Some("opt-a".to_string()),
+            selected_option_label: Some("Option A".to_string()),
+            answer_source: "recommended".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answered = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answered.payload.get("answer_source"),
+            Some(&Value::String("recommended".to_string()))
+        );
+        assert_eq!(
+            answered.payload.get("selected_option_id"),
+            Some(&Value::String("opt-a".to_string()))
+        );
+        assert_eq!(
+            answered.payload.get("selected_option_label"),
+            Some(&Value::String("Option A".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_with_custom_text() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id: question_id.clone(),
+            answer: "Use the custom answer path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answered = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answered.payload.get("answer_source"),
+            Some(&Value::String("custom".to_string()))
+        );
+        assert_eq!(answered.payload.get("selected_option_id"), Some(&Value::Null));
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_with_slash_prefixed_custom_answer() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id: question_id.clone(),
+            answer: "/tmp/project".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answered = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answered
+                .payload
+                .get("answer")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_rejects_wrong_question_id() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let answer = ClarificationAnswer {
+            question_id: "wrong-id".to_string(),
+            answer: "Some answer".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        let result = app
+            .handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("question id does not match"));
+        assert!(app.pending_clarification.is_some());
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_rejects_empty_answer() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id: question_id.clone(),
+            answer: "   ".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        let result = app
+            .handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+        assert!(app.pending_clarification.is_some());
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    #[tokio::test]
+    async fn submit_prompt_blocked_while_clarification_pending() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let result = app.submit_prompt("some answer").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("waiting for clarification"));
+        assert!(app.pending_clarification.is_some());
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
     }
 }
