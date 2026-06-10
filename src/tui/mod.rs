@@ -1653,6 +1653,7 @@ fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
         ChatItemKind::CommandResult => "command",
         ChatItemKind::FileEdit => "file edit",
         ChatItemKind::Approval => "approval",
+        ChatItemKind::Clarification => "clarification",
         ChatItemKind::Diagnostic => "diagnostic",
         ChatItemKind::SkillContext => "skills",
         ChatItemKind::AgentResult => "agent",

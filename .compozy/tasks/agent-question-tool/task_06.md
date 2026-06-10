@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add Clarification Chat Semantics And Projection"
 type: frontend
 complexity: medium
@@ -32,12 +32,12 @@ Add dedicated Chat semantics for clarifying questions so they no longer appear a
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Add clarification Chat kind and waiting-for-user status labels.
-- [ ] 6.2 Project pending clarification requests into a dedicated Chat item.
-- [ ] 6.3 Project clarification answers into completed clarification state.
-- [ ] 6.4 Update TUI Chat item kind labels for clarification.
-- [ ] 6.5 Preserve existing approval projection tests.
-- [ ] 6.6 Add clarification projection tests.
+- [x] 6.1 Add clarification Chat kind and waiting-for-user status labels.
+- [x] 6.2 Project pending clarification requests into a dedicated Chat item.
+- [x] 6.3 Project clarification answers into completed clarification state.
+- [x] 6.4 Update TUI Chat item kind labels for clarification.
+- [x] 6.5 Preserve existing approval projection tests.
+- [x] 6.6 Add clarification projection tests.
 
 ## Implementation Details
 Use TechSpec sections "Chat", "History Events", and "Known Risks". This task should consume events produced by tasks 04 and 05, not create new app lifecycle behavior.
@@ -65,16 +65,16 @@ Use TechSpec sections "Chat", "History Events", and "Known Risks". This task sho
 
 ## Tests
 - Unit tests:
-  - [ ] `clarification_requested` projects as `ChatItemKind::Clarification`.
-  - [ ] Pending clarification item status is `ChatItemStatus::WaitingForUser`.
-  - [ ] `clarification_answered` projects as completed clarification with answer source visible.
-  - [ ] Existing `approval_requested` still projects as `ChatItemKind::Approval`.
-  - [ ] Existing pending approval status remains `WaitingApproval`.
-  - [ ] Chat kind label for clarification renders a distinct label from approval.
+  - [x] `clarification_requested` projects as `ChatItemKind::Clarification`.
+  - [x] Pending clarification item status is `ChatItemStatus::WaitingForUser`.
+  - [x] `clarification_answered` projects as completed clarification with answer source visible.
+  - [x] Existing `approval_requested` still projects as `ChatItemKind::Approval`.
+  - [x] Existing pending approval status remains `WaitingApproval`.
+  - [x] Chat kind label for clarification renders a distinct label from approval.
 - Integration tests:
-  - [ ] Fake runtime clarification request and answer produce Chat items that never use `ChatItemKind::Approval`.
-- Test coverage target: >=80%
-- All tests must pass
+  - [x] Fake runtime clarification request and answer produce Chat items that never use `ChatItemKind::Approval`.
+- Test coverage target: >=80% ✓
+- All tests must pass ✓
 
 ## Success Criteria
 - All tests passing

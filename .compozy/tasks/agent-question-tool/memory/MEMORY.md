@@ -4,10 +4,9 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
 
 ## Current State
 
-- Tasks 01-05 completed: schema fields, validation + fake fixture, runtime prompt contracts, app-owned `AppState.pending_clarification` with `clarification_requested` lifecycle events, and structured `AppEvent::ClarificationAnswered` answer path.
-- Task 05 implementation: `AppEvent::ClarificationAnswered(ClarificationAnswer)` with `question_id`, `answer`, `selected_option_id`, `selected_option_label`, `answer_source` metadata.
-- Resolution validates question_id match, rejects empty answers, records enriched `clarification_answered` events, clears pending state, resumes run.
-- Normal `submit_prompt` is blocked when clarification is pending — enforces structured answer path over free text.
+- Tasks 01-06 completed: schema, validation, runtime contracts, app pending state, structured answer path, and Chat semantics.
+- Task 05: `AppEvent::ClarificationAnswered` with full answer metadata; validates question_id, rejects empty answers, resumes run.
+- Task 06: Added `ChatItemKind::Clarification` and `ChatItemStatus::WaitingForUser` to distinguish from Approval. Projects `clarification_requested` as pending Clarification item and `clarification_answered` as completed state. Kept `blocker_reported` using RunSummary/WaitingApproval for backward compatibility.
 
 ## Shared Decisions
 

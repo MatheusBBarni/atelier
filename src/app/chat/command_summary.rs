@@ -243,7 +243,7 @@ fn severity_for_status(status: &ChatItemStatus) -> ChatSeverity {
     match status {
         ChatItemStatus::Completed => ChatSeverity::Success,
         ChatItemStatus::Failed => ChatSeverity::Error,
-        ChatItemStatus::Denied | ChatItemStatus::WaitingApproval => ChatSeverity::Warning,
+        ChatItemStatus::Denied | ChatItemStatus::WaitingApproval | ChatItemStatus::WaitingForUser => ChatSeverity::Warning,
         _ => ChatSeverity::Info,
     }
 }

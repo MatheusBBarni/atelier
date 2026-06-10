@@ -51,7 +51,9 @@ impl ChatProjection {
         match event.kind.as_str() {
             "session_started" | "session_ended" => {}
             "run_started" => self.apply_run_started(event),
-            "prompt_submitted" | "clarification_answered" => self.apply_user_prompt(event),
+            "prompt_submitted" => self.apply_user_prompt(event),
+            "clarification_requested" => self.apply_clarification_requested(event),
+            "clarification_answered" => self.apply_clarification_answered(event),
             "orchestrator_decision" => self.apply_orchestrator_decision(event),
             "agent_step_started" => self.apply_agent_step_started(event),
             "runtime_stream_delta" => self.apply_runtime_stream_delta(event),
@@ -74,7 +76,7 @@ impl ChatProjection {
             "run_completed" | "run_failed" | "run_limit_reached" | "run_interrupted"
             | "subtask_completed" => self.apply_run_summary(event),
             "diagnostic" => self.apply_diagnostic(event),
-            "blocker_reported" | "clarification_requested" => self.apply_blocker(event),
+            "blocker_reported" => self.apply_blocker(event),
             "config_viewed"
             | "session_goal_viewed"
             | "session_goal_set"
@@ -1112,6 +1114,83 @@ impl ChatProjection {
             title: "Clarification needed".to_string(),
             summary: Some(concise(&question, MAX_SUMMARY_CHARS)),
             body: vec![ChatLineView::warning(question)],
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    fn apply_clarification_requested(&mut self, event: &HistoryEvent) {
+        let question = string_field(&event.payload, "question")
+            .unwrap_or_else(|| "Orchestrator needs clarification.".to_string());
+        let mut body = vec![ChatLineView::plain(question.clone())];
+
+        if let Some(options) = event.payload.get("options").and_then(|v| v.as_array()) {
+            body.push(ChatLineView::muted("Options:"));
+            for option in options {
+                let id = option.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let label = option.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                let recommended = event.payload
+                    .get("recommended_option_id")
+                    .and_then(|v| v.as_str())
+                    .map(|rec| rec == id)
+                    .unwrap_or(false);
+                let marker = if recommended { "★ " } else { "  " };
+                body.push(ChatLineView::muted(format!("{marker}{id}: {label}")));
+            }
+        }
+
+        self.upsert(ItemInput {
+            lifecycle_key: event
+                .run_id
+                .clone()
+                .map(|run_id| ChatLifecycleKey::Run { run_id }),
+            kind: ChatItemKind::Clarification,
+            status: ChatItemStatus::WaitingForUser,
+            severity: ChatSeverity::Warning,
+            title: "Clarifying question".to_string(),
+            summary: Some(concise(&question, MAX_SUMMARY_CHARS)),
+            body,
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    fn apply_clarification_answered(&mut self, event: &HistoryEvent) {
+        let answer = string_field(&event.payload, "answer")
+            .unwrap_or_else(|| "No answer provided.".to_string());
+        let answer_source = string_field(&event.payload, "answer_source")
+            .unwrap_or_else(|| "custom".to_string());
+        let selected_option_label = string_field(&event.payload, "selected_option_label");
+
+        let mut body = vec![ChatLineView::plain(format!("Answer: {answer}"))];
+
+        match answer_source.as_str() {
+            "recommended" => {
+                if let Some(label) = selected_option_label {
+                    body.push(ChatLineView::muted(format!("Option: {label}")));
+                }
+            }
+            "custom" => {
+                body.push(ChatLineView::muted("Custom answer"));
+            }
+            _ => {}
+        }
+
+        self.upsert(ItemInput {
+            lifecycle_key: event
+                .run_id
+                .clone()
+                .map(|run_id| ChatLifecycleKey::Run { run_id }),
+            kind: ChatItemKind::Clarification,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "Clarifying question answered".to_string(),
+            summary: Some(concise(&answer, MAX_SUMMARY_CHARS)),
+            body,
             details: history_detail(event, "history"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
@@ -3191,5 +3270,185 @@ mod tests {
             .body
             .iter()
             .any(|line| line.text == "[stdout:final] plan: verify"));
+    }
+
+    #[test]
+    fn clarification_requested_projects_as_clarification_kind() {
+        let events = vec![event(
+            "clarification_requested",
+            Some("run-1"),
+            None,
+            json!({
+                "question_id": "q1",
+                "question": "Which scope?",
+                "options": [
+                    {"id": "scope1", "label": "Feature scope"},
+                    {"id": "scope2", "label": "Bug fix scope"}
+                ],
+                "recommended_option_id": "scope1"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::Clarification);
+        assert_eq!(item.status, ChatItemStatus::WaitingForUser);
+        assert_eq!(item.title, "Clarifying question");
+        assert!(item.body.iter().any(|line| line.text == "Which scope?"));
+        assert!(item.body.iter().any(|line| line.text.contains("★")));
+    }
+
+    #[test]
+    fn clarification_answered_with_recommended_option_projects_completed() {
+        let events = vec![
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Which scope?",
+                    "options": [
+                        {"id": "scope1", "label": "Feature scope"},
+                        {"id": "scope2", "label": "Bug fix scope"}
+                    ],
+                    "recommended_option_id": "scope1"
+                }),
+            ),
+            event(
+                "clarification_answered",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "answer": "Feature scope",
+                    "answer_source": "recommended",
+                    "selected_option_id": "scope1",
+                    "selected_option_label": "Feature scope"
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.kind, ChatItemKind::Clarification);
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.title, "Clarifying question answered");
+        assert!(item.body.iter().any(|line| line.text.contains("Answer:")));
+        assert!(item.body.iter().any(|line| line.text.contains("Feature scope")));
+    }
+
+    #[test]
+    fn clarification_answered_with_custom_text_projects_completed() {
+        let events = vec![
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "What's your name?",
+                    "options": [
+                        {"id": "opt1", "label": "Option 1"},
+                    ],
+                    "recommended_option_id": null
+                }),
+            ),
+            event(
+                "clarification_answered",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "answer": "Custom answer text",
+                    "answer_source": "custom",
+                    "selected_option_id": null,
+                    "selected_option_label": null
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert!(item.body.iter().any(|line| line.text == "Custom answer"));
+    }
+
+    #[test]
+    fn approval_requested_still_uses_approval_kind() {
+        let events = vec![event(
+            "approval_requested",
+            Some("run-1"),
+            Some("step-1"),
+            json!({
+                "action_id": "action-1",
+                "summary": "Execute dangerous command"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::Approval);
+        assert_eq!(item.status, ChatItemStatus::WaitingApproval);
+    }
+
+    #[test]
+    fn blocker_reported_uses_run_summary_kind() {
+        let events = vec![event(
+            "blocker_reported",
+            Some("run-1"),
+            None,
+            json!({
+                "question": "Some blocker"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::RunSummary);
+        assert_eq!(item.status, ChatItemStatus::WaitingApproval);
+    }
+
+    #[test]
+    fn clarification_and_approval_are_distinct() {
+        let events = vec![
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Clarification question?",
+                    "options": [],
+                    "recommended_option_id": null
+                }),
+            ),
+            event(
+                "approval_requested",
+                Some("run-1"),
+                Some("step-1"),
+                json!({
+                    "action_id": "action-1",
+                    "summary": "Approval request"
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, ChatItemKind::Clarification);
+        assert_eq!(items[1].kind, ChatItemKind::Approval);
+        assert_ne!(items[0].status, items[1].status);
     }
 }
