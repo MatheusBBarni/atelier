@@ -709,7 +709,9 @@ pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
             .to_string(),
         "- Do not route to disabled or unknown agents.".to_string(),
         "- Keep required_capabilities no broader than the next step needs.".to_string(),
-        "- Ask a clarifying question when the next safe step is ambiguous.".to_string(),
+        "- Ask a clarifying question when the next safe step is ambiguous, and include 2-4 concise recommended answers as clarifying_options.".to_string(),
+        "- Set recommended_option_id to the strongest option id, or leave it null when no option stands out.".to_string(),
+        "- Do not add a custom, other, or free-text option; the app always provides its own custom text answer path.".to_string(),
         "- Mark the run complete only when the original user request is satisfied.".to_string(),
     ]);
     if config.features.parallel_step_groups && config.limits.max_parallel_agent_steps > 0 {
@@ -1532,6 +1534,25 @@ orchestrator_description = "Use for official documentation and API lookup."
         };
 
         validate_orchestrator_decision(&decision, &config).unwrap();
+    }
+
+    #[test]
+    fn generated_orchestrator_prompt_includes_structured_clarification_guidance() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        let prompt = build_orchestrator_prompt(&config);
+
+        assert!(prompt.contains("Ask a clarifying question when the next safe step is ambiguous"));
+        assert!(prompt.contains("2-4 concise recommended answers as clarifying_options"));
+        assert!(prompt.contains("Set recommended_option_id to the strongest option id"));
+        assert!(prompt.contains("the app always provides its own custom text answer path"));
+        assert!(!prompt.contains("question tool"));
+        assert!(!prompt.contains("ask_user"));
     }
 
     #[test]

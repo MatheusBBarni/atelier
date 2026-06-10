@@ -1018,8 +1018,17 @@ When output_schema is orchestrator_decision, return:
   "required_capabilities": ["read"],
   "stop_condition": "what should be true after the next step",
   "clarifying_question": null,
+  "clarifying_options": [],
+  "recommended_option_id": null,
   "final_summary": null
 }}
+
+When status is waiting_for_user:
+- Set clarifying_question to one targeted question.
+- Set clarifying_options to 2-4 concise recommended answers, each shaped as {{"id": "stable-id", "label": "short answer", "description": "optional detail or null"}}.
+- Keep option ids unique and every id and label non-empty.
+- Set recommended_option_id to the strongest option id, or null when no option stands out.
+- Do not add a custom, other, or free-text option; the app always provides its own custom text answer path.
 
 When output_schema is agent_result, return:
 {{
@@ -1673,6 +1682,24 @@ exec sleep 30
         assert!(prompt.contains("return one action_request JSON contract"));
         assert!(prompt.contains(crate::orchestrator::JSON_START));
         assert!(!prompt.contains("--print"));
+    }
+
+    #[test]
+    fn cursor_prompt_text_describes_structured_clarification_contract() {
+        let prompt = cursor_prompt_text(&runtime_request(
+            std::path::PathBuf::from("/tmp/project"),
+            "orchestrator",
+            "default",
+        ))
+        .unwrap();
+
+        assert!(prompt.contains("\"clarifying_options\": []"));
+        assert!(prompt.contains("\"recommended_option_id\": null"));
+        assert!(prompt.contains("2-4 concise recommended answers"));
+        assert!(prompt.contains("Set recommended_option_id to the strongest option id"));
+        assert!(prompt.contains("the app always provides its own custom text answer path"));
+        assert!(!prompt.contains("question tool"));
+        assert!(!prompt.contains("ask_user"));
     }
 
     fn final_result_frame(agent: &str, step_id: &str, summary: &str) -> String {
