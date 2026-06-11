@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add `[ui]` config section with `hide_banner`
 type: backend
 complexity: low
@@ -30,11 +30,11 @@ Extend the TOML configuration schema with an optional `[ui]` section carrying `h
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Define `UiConfig` (public, Default/Serialize/Deserialize) and `RawUiConfig` structs mirroring the `Features`/`RawFeatures` pair.
-- [ ] 1.2 Add the field to `RawConfig`, `EffectiveConfig`, the built-in defaults init, and the `apply_raw` merge.
-- [ ] 1.3 Extend `PrintableConfig` and `to_redacted_toml` with the `ui` section.
-- [ ] 1.4 Add a `[ui]` example to `starter_config_text()`.
-- [ ] 1.5 Add parse tests: absent section default, explicit `hide_banner = true`, unknown-key rejection.
+- [x] 1.1 Define `UiConfig` (public, Default/Serialize/Deserialize) and `RawUiConfig` structs mirroring the `Features`/`RawFeatures` pair.
+- [x] 1.2 Add the field to `RawConfig`, `EffectiveConfig`, the built-in defaults init, and the `apply_raw` merge.
+- [x] 1.3 Extend `PrintableConfig` and `to_redacted_toml` with the `ui` section.
+- [x] 1.4 Add a `[ui]` example to `starter_config_text()`.
+- [x] 1.5 Add parse tests: absent section default, explicit `hide_banner = true`, unknown-key rejection.
 
 ## Implementation Details
 
@@ -59,12 +59,12 @@ Single-file change in `src/config/mod.rs`. Mimic the `[features]` flow end to en
 
 ## Tests
 - Unit tests:
-  - [ ] Config with no `[ui]` section parses and `ui.hide_banner == false`.
-  - [ ] Config with `[ui]\nhide_banner = true` parses and `ui.hide_banner == true`.
-  - [ ] Config with `[ui]\nunknown_key = 1` fails to parse (deny_unknown_fields).
-  - [ ] `to_redacted_toml` output contains the `[ui]` section with the effective value.
+  - [x] Config with no `[ui]` section parses and `ui.hide_banner == false`.
+  - [x] Config with `[ui]\nhide_banner = true` parses and `ui.hide_banner == true`.
+  - [x] Config with `[ui]\nunknown_key = 1` fails to parse (deny_unknown_fields).
+  - [x] `to_redacted_toml` output contains the `[ui]` section with the effective value.
 - Integration tests:
-  - [ ] `load_from_temp` round-trip with a preset plus `[ui]` section yields merged `hide_banner` from the project file.
+  - [x] `load_from_temp` round-trip with a preset plus `[ui]` section yields merged `hide_banner` from the project file.
 - Test coverage target: >=80%
 - All tests must pass
 
