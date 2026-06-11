@@ -314,7 +314,7 @@ impl ChatProjection {
         let item_status = match status.as_str() {
             "complete" => ChatItemStatus::Completed,
             "failed" => ChatItemStatus::Failed,
-            "waiting_for_user" => ChatItemStatus::WaitingApproval,
+            "waiting_for_user" => ChatItemStatus::WaitingForUser,
             _ => ChatItemStatus::Completed,
         };
         let lifecycle_key =
@@ -1108,8 +1108,8 @@ impl ChatProjection {
                 .run_id
                 .clone()
                 .map(|run_id| ChatLifecycleKey::Run { run_id }),
-            kind: ChatItemKind::RunSummary,
-            status: ChatItemStatus::WaitingApproval,
+            kind: ChatItemKind::Clarification,
+            status: ChatItemStatus::WaitingForUser,
             severity: ChatSeverity::Warning,
             title: "Clarification needed".to_string(),
             summary: Some(concise(&question, MAX_SUMMARY_CHARS)),
@@ -1131,7 +1131,8 @@ impl ChatProjection {
             for option in options {
                 let id = option.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                 let label = option.get("label").and_then(|v| v.as_str()).unwrap_or("?");
-                let recommended = event.payload
+                let recommended = event
+                    .payload
                     .get("recommended_option_id")
                     .and_then(|v| v.as_str())
                     .map(|rec| rec == id)
@@ -1142,10 +1143,7 @@ impl ChatProjection {
         }
 
         self.upsert(ItemInput {
-            lifecycle_key: event
-                .run_id
-                .clone()
-                .map(|run_id| ChatLifecycleKey::Run { run_id }),
+            lifecycle_key: clarification_key(event),
             kind: ChatItemKind::Clarification,
             status: ChatItemStatus::WaitingForUser,
             severity: ChatSeverity::Warning,
@@ -1162,11 +1160,23 @@ impl ChatProjection {
     fn apply_clarification_answered(&mut self, event: &HistoryEvent) {
         let answer = string_field(&event.payload, "answer")
             .unwrap_or_else(|| "No answer provided.".to_string());
-        let answer_source = string_field(&event.payload, "answer_source")
-            .unwrap_or_else(|| "custom".to_string());
+        let answer_source =
+            string_field(&event.payload, "answer_source").unwrap_or_else(|| "custom".to_string());
         let selected_option_label = string_field(&event.payload, "selected_option_label");
 
-        let mut body = vec![ChatLineView::plain(format!("Answer: {answer}"))];
+        let lifecycle_key = clarification_key(event);
+        let question = lifecycle_key
+            .as_ref()
+            .and_then(|key| self.index.get(key).copied())
+            .and_then(|index| self.items.get(index))
+            .and_then(|item| item.body.first())
+            .map(|line| line.text.clone());
+
+        let mut body = Vec::new();
+        if let Some(question) = question {
+            body.push(ChatLineView::muted(format!("Question: {question}")));
+        }
+        body.push(ChatLineView::plain(format!("Answer: {answer}")));
 
         match answer_source.as_str() {
             "recommended" => {
@@ -1181,10 +1191,7 @@ impl ChatProjection {
         }
 
         self.upsert(ItemInput {
-            lifecycle_key: event
-                .run_id
-                .clone()
-                .map(|run_id| ChatLifecycleKey::Run { run_id }),
+            lifecycle_key,
             kind: ChatItemKind::Clarification,
             status: ChatItemStatus::Completed,
             severity: ChatSeverity::Info,
@@ -1638,6 +1645,13 @@ fn step_key(event: &HistoryEvent, item_kind: ChatItemKind) -> Option<ChatLifecyc
         run_id: event.run_id.clone()?,
         step_id: event.step_id.clone()?,
         item_kind,
+    })
+}
+
+fn clarification_key(event: &HistoryEvent) -> Option<ChatLifecycleKey> {
+    Some(ChatLifecycleKey::Clarification {
+        run_id: event.run_id.clone()?,
+        question_id: string_field(&event.payload, "question_id")?,
     })
 }
 
@@ -3338,8 +3352,18 @@ mod tests {
         assert_eq!(item.kind, ChatItemKind::Clarification);
         assert_eq!(item.status, ChatItemStatus::Completed);
         assert_eq!(item.title, "Clarifying question answered");
-        assert!(item.body.iter().any(|line| line.text.contains("Answer:")));
-        assert!(item.body.iter().any(|line| line.text.contains("Feature scope")));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "Question: Which scope?"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "Answer: Feature scope"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "Option: Feature scope"));
     }
 
     #[test]
@@ -3401,7 +3425,7 @@ mod tests {
     }
 
     #[test]
-    fn blocker_reported_uses_run_summary_kind() {
+    fn blocker_reported_projects_as_clarification() {
         let events = vec![event(
             "blocker_reported",
             Some("run-1"),
@@ -3414,8 +3438,8 @@ mod tests {
         let projection = ChatProjection::rebuild(&events);
         let item = &projection.items()[0];
 
-        assert_eq!(item.kind, ChatItemKind::RunSummary);
-        assert_eq!(item.status, ChatItemStatus::WaitingApproval);
+        assert_eq!(item.kind, ChatItemKind::Clarification);
+        assert_eq!(item.status, ChatItemStatus::WaitingForUser);
     }
 
     #[test]
@@ -3450,5 +3474,142 @@ mod tests {
         assert_eq!(items[0].kind, ChatItemKind::Clarification);
         assert_eq!(items[1].kind, ChatItemKind::Approval);
         assert_ne!(items[0].status, items[1].status);
+    }
+
+    #[test]
+    fn orchestrator_decision_waiting_for_user_does_not_use_approval_status() {
+        let events = vec![event(
+            "orchestrator_decision",
+            Some("run-1"),
+            Some("step-1"),
+            json!({
+                "status": "waiting_for_user",
+                "reason": "Need more detail before routing."
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::RoutingDecision);
+        assert_eq!(item.status, ChatItemStatus::WaitingForUser);
+    }
+
+    #[test]
+    fn answered_clarification_survives_run_lifecycle() {
+        let events = vec![
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Which scope?",
+                    "options": [
+                        {"id": "scope1", "label": "Feature scope"},
+                        {"id": "scope2", "label": "Bug fix scope"}
+                    ],
+                    "recommended_option_id": "scope1"
+                }),
+            ),
+            event(
+                "clarification_answered",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "answer": "Feature scope",
+                    "answer_source": "recommended",
+                    "selected_option_id": "scope1",
+                    "selected_option_label": "Feature scope"
+                }),
+            ),
+            event(
+                "run_completed",
+                Some("run-1"),
+                None,
+                json!({ "summary": "done" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        let clarification = items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::Clarification)
+            .expect("answered clarification must survive run completion");
+        assert_eq!(clarification.status, ChatItemStatus::Completed);
+        assert!(clarification
+            .body
+            .iter()
+            .any(|line| line.text == "Question: Which scope?"));
+        assert!(clarification
+            .body
+            .iter()
+            .any(|line| line.text == "Answer: Feature scope"));
+        let run_summary = items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::RunSummary)
+            .expect("run summary item must exist");
+        assert_eq!(run_summary.title, "Run completed");
+    }
+
+    #[test]
+    fn multiple_clarifications_in_one_run_project_distinct_items() {
+        let events = vec![
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "First question?",
+                    "options": [],
+                    "recommended_option_id": null
+                }),
+            ),
+            event(
+                "clarification_answered",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "answer": "First answer",
+                    "answer_source": "custom",
+                    "selected_option_id": null,
+                    "selected_option_label": null
+                }),
+            ),
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q2",
+                    "question": "Second question?",
+                    "options": [],
+                    "recommended_option_id": null
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, ChatItemKind::Clarification);
+        assert_eq!(items[0].status, ChatItemStatus::Completed);
+        assert!(items[0]
+            .body
+            .iter()
+            .any(|line| line.text == "Answer: First answer"));
+        assert_eq!(items[1].kind, ChatItemKind::Clarification);
+        assert_eq!(items[1].status, ChatItemStatus::WaitingForUser);
+        assert!(items[1]
+            .body
+            .iter()
+            .any(|line| line.text == "Second question?"));
     }
 }

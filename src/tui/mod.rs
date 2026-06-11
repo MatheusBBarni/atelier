@@ -512,15 +512,13 @@ fn key_event_to_tui_command_with_ui(
             _ => None,
         }
     } else if state.pending_clarification.is_some() {
-        clarification_key_command(state, ui_state, key).or_else(|| {
-            match key {
-                KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
-                _ => None,
-            }
+        clarification_key_command(state, ui_state, key).or(match key {
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
+            _ => None,
         })
     } else if state.pending_approval.is_some() {
         key_event_to_tui_command(state, key)
@@ -578,15 +576,20 @@ fn clarification_key_command(
     match key {
         KeyEvent {
             code: KeyCode::Up, ..
-        } => Some(TuiCommand::Clarification(ClarificationCommand::PreviousOption)),
+        } => Some(TuiCommand::Clarification(
+            ClarificationCommand::PreviousOption,
+        )),
         KeyEvent {
-            code: KeyCode::Down, ..
+            code: KeyCode::Down,
+            ..
         } => Some(TuiCommand::Clarification(ClarificationCommand::NextOption)),
         KeyEvent {
-            code: KeyCode::Enter, ..
+            code: KeyCode::Enter,
+            ..
         } => Some(TuiCommand::Clarification(ClarificationCommand::Submit)),
         KeyEvent {
-            code: KeyCode::Backspace, ..
+            code: KeyCode::Backspace,
+            ..
         } => Some(TuiCommand::ClarificationInputBackspace),
         KeyEvent {
             code: KeyCode::Char(ch),
@@ -2148,8 +2151,8 @@ mod tests {
     use super::*;
     use crate::app::chat::ChatProjection;
     use crate::app::{
-        AgentView, ClarificationAnswer, ConfigStatusView, LiveStepStatus, LiveStepView,
-        LiveStreamView, PendingClarificationView,
+        AgentView, ConfigStatusView, LiveStepStatus, LiveStepView, LiveStreamView,
+        PendingClarificationView,
     };
     use crate::config::{load_effective_config, ConfigLoadOptions};
     use crate::history::HistoryEvent;
@@ -4026,8 +4029,10 @@ mod tests {
 
     #[tokio::test]
     async fn clarification_up_key_cycles_options() {
-        let mut ui_state = TuiUiState::default();
-        ui_state.clarification_option_index = 1;
+        let mut ui_state = TuiUiState {
+            clarification_option_index: 1,
+            ..Default::default()
+        };
 
         let mut app_state = state_with_input("", false);
         app_state.pending_clarification = Some(PendingClarificationView {
@@ -4054,9 +4059,13 @@ mod tests {
             recommended_option_id: None,
         });
 
-        let command =
-            key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Up));
-        assert_eq!(command, Some(TuiCommand::Clarification(ClarificationCommand::PreviousOption)));
+        let command = key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Up));
+        assert_eq!(
+            command,
+            Some(TuiCommand::Clarification(
+                ClarificationCommand::PreviousOption
+            ))
+        );
 
         let (sender, _) = mpsc::channel(1);
         execute_tui_command(&mut app_state, &mut ui_state, &sender, command.unwrap())
@@ -4068,8 +4077,10 @@ mod tests {
 
     #[tokio::test]
     async fn clarification_down_key_cycles_options() {
-        let mut ui_state = TuiUiState::default();
-        ui_state.clarification_option_index = 0;
+        let mut ui_state = TuiUiState {
+            clarification_option_index: 0,
+            ..Default::default()
+        };
 
         let mut app_state = state_with_input("", false);
         app_state.pending_clarification = Some(PendingClarificationView {
@@ -4091,9 +4102,11 @@ mod tests {
             recommended_option_id: None,
         });
 
-        let command =
-            key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Down));
-        assert_eq!(command, Some(TuiCommand::Clarification(ClarificationCommand::NextOption)));
+        let command = key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Down));
+        assert_eq!(
+            command,
+            Some(TuiCommand::Clarification(ClarificationCommand::NextOption))
+        );
 
         let (sender, _) = mpsc::channel(1);
         execute_tui_command(&mut app_state, &mut ui_state, &sender, command.unwrap())
@@ -4115,11 +4128,8 @@ mod tests {
             recommended_option_id: None,
         });
 
-        let command = key_event_to_tui_command_with_ui(
-            &app_state,
-            &ui_state,
-            key(KeyCode::Char('t')),
-        );
+        let command =
+            key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Char('t')));
         assert_eq!(command, Some(TuiCommand::ClarificationInputCharacter('t')));
 
         if let Some(TuiCommand::ClarificationInputCharacter(ch)) = command {
@@ -4131,8 +4141,10 @@ mod tests {
 
     #[test]
     fn clarification_backspace_removes_character() {
-        let mut ui_state = TuiUiState::default();
-        ui_state.clarification_custom_answer = "test".to_string();
+        let mut ui_state = TuiUiState {
+            clarification_custom_answer: "test".to_string(),
+            ..Default::default()
+        };
 
         let mut app_state = state_with_input("", false);
         app_state.pending_clarification = Some(PendingClarificationView {
@@ -4143,11 +4155,8 @@ mod tests {
             recommended_option_id: None,
         });
 
-        let command = key_event_to_tui_command_with_ui(
-            &app_state,
-            &ui_state,
-            key(KeyCode::Backspace),
-        );
+        let command =
+            key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Backspace));
         assert_eq!(command, Some(TuiCommand::ClarificationInputBackspace));
 
         if let Some(TuiCommand::ClarificationInputBackspace) = command {
@@ -4155,6 +4164,19 @@ mod tests {
         }
 
         assert_eq!(ui_state.clarification_custom_answer, "tes");
+    }
+
+    #[test]
+    fn clarification_chat_kind_label_is_distinct_from_approval() {
+        assert_eq!(
+            chat_kind_label(&ChatItemKind::Clarification),
+            "clarification"
+        );
+        assert_eq!(chat_kind_label(&ChatItemKind::Approval), "approval");
+        assert_ne!(
+            chat_kind_label(&ChatItemKind::Clarification),
+            chat_kind_label(&ChatItemKind::Approval)
+        );
     }
 
     #[test]
@@ -4176,9 +4198,7 @@ mod tests {
         );
         assert_eq!(
             command,
-            Some(TuiCommand::DispatchAndQuit(
-                AppEvent::RunInterruptRequested
-            ))
+            Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested))
         );
     }
 

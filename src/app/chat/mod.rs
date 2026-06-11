@@ -117,6 +117,10 @@ pub enum ChatLifecycleKey {
     Run {
         run_id: String,
     },
+    Clarification {
+        run_id: String,
+        question_id: String,
+    },
     Workflow {
         run_id: String,
     },
@@ -196,6 +200,10 @@ impl ChatLifecycleKey {
         match self {
             ChatLifecycleKey::Prompt { run_id } => format!("chat:prompt:{run_id}"),
             ChatLifecycleKey::Run { run_id } => format!("chat:run:{run_id}"),
+            ChatLifecycleKey::Clarification {
+                run_id,
+                question_id,
+            } => format!("chat:clarification:{run_id}:{question_id}"),
             ChatLifecycleKey::Workflow { run_id } => format!("chat:workflow:{run_id}"),
             ChatLifecycleKey::Step {
                 run_id,

@@ -1166,7 +1166,10 @@ impl App {
         Ok(Some(result))
     }
 
-    pub async fn resolve_pending_clarification(&mut self, answer: ClarificationAnswer) -> Result<()> {
+    pub async fn resolve_pending_clarification(
+        &mut self,
+        answer: ClarificationAnswer,
+    ) -> Result<()> {
         let Some(clarification_view) = &self.state.pending_clarification else {
             bail!("no clarification is pending");
         };
@@ -9892,6 +9895,75 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn clarification_flow_chat_items_never_use_approval_kind() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+
+        let pending_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::Clarification)
+            .unwrap();
+        assert_eq!(pending_item.status, ChatItemStatus::WaitingForUser);
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.kind == ChatItemKind::Approval));
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.status == ChatItemStatus::WaitingApproval));
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+        app.handle_event(AppEvent::ClarificationAnswered(ClarificationAnswer {
+            question_id,
+            answer: "use the CLI path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let answered_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::Clarification)
+            .unwrap();
+        assert_eq!(answered_item.status, ChatItemStatus::Completed);
+        assert!(answered_item
+            .body
+            .iter()
+            .any(|line| line.text == "Answer: use the CLI path"));
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.kind == ChatItemKind::Approval));
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.status == ChatItemStatus::WaitingApproval));
+    }
+
+    #[tokio::test]
     async fn clarifying_answer_can_start_with_slash() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
@@ -10457,7 +10529,10 @@ runtime = "fake"
             answered.payload.get("answer_source"),
             Some(&Value::String("custom".to_string()))
         );
-        assert_eq!(answered.payload.get("selected_option_id"), Some(&Value::Null));
+        assert_eq!(
+            answered.payload.get("selected_option_id"),
+            Some(&Value::Null)
+        );
     }
 
     #[tokio::test]
