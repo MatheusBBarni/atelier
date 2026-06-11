@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add Queue Replay, Pause, Cancel, And Resume Lifecycle"
 type: backend
 complexity: high
@@ -30,13 +30,13 @@ Add the queue lifecycle behavior that turns pending queue items into normal Runs
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add queue lifecycle status transitions for pending, paused, replaying, and cancelled items.
-- [ ] 2.2 Add cancellation handling for queued items before replay.
-- [ ] 2.3 Add resume handling for paused queued items.
-- [ ] 2.4 Add safe replay gating around Run completion paths.
-- [ ] 2.5 Add pause handling for non-clean Run endings.
-- [ ] 2.6 Add queue lifecycle history events.
-- [ ] 2.7 Add focused app lifecycle tests.
+- [x] 2.1 Add queue lifecycle status transitions for pending, paused, replaying, and cancelled items.
+- [x] 2.2 Add cancellation handling for queued items before replay.
+- [x] 2.3 Add resume handling for paused queued items.
+- [x] 2.4 Add safe replay gating around Run completion paths.
+- [x] 2.5 Add pause handling for non-clean Run endings.
+- [x] 2.6 Add queue lifecycle history events.
+- [x] 2.7 Add focused app lifecycle tests.
 
 ## Implementation Details
 Extend the queue state from task 01. Reference the TechSpec "Replay Rules" and "History And Chat Events" sections. Keep replay logic app-owned and avoid adding runtime adapter behavior.
@@ -67,17 +67,17 @@ Extend the queue state from task 01. Reference the TechSpec "Replay Rules" and "
 
 ## Tests
 - Unit tests:
-  - [ ] Two queued prompts replay oldest-first across two clean completed Runs.
-  - [ ] A clean completed Run replays only one queued item.
-  - [ ] Cancelling a pending queued item prevents replay.
-  - [ ] Resuming a paused queued item makes it eligible for replay.
-  - [ ] Replay records `follow_up_replay_started` and normal `prompt_submitted` for the replayed Run.
+  - [x] Two queued prompts replay oldest-first across two clean completed Runs.
+  - [x] A clean completed Run replays only one queued item.
+  - [x] Cancelling a pending queued item prevents replay.
+  - [x] Resuming a paused queued item makes it eligible for replay.
+  - [x] Replay records `follow_up_replay_started` and normal `prompt_submitted` for the replayed Run.
 - Integration tests:
-  - [ ] A queued prompt after a successful fake-runtime prompt starts as the next Run.
-  - [ ] `needs clarification create a feature` pauses the queue until clarification is resolved or the item is resumed later.
-  - [ ] `approval action create a feature` pauses the queue while approval is pending.
-  - [ ] `always parse error create a feature` does not replay queued items.
-  - [ ] A limit-reached Run does not replay queued items.
+  - [x] A queued prompt after a successful fake-runtime prompt starts as the next Run.
+  - [x] `needs clarification create a feature` pauses the queue until clarification is resolved or the item is resumed later.
+  - [x] `approval action create a feature` pauses the queue while approval is pending.
+  - [x] `always parse error create a feature` does not replay queued items.
+  - [x] A limit-reached Run does not replay queued items.
 - Test coverage target: >=80%
 - All tests must pass
 

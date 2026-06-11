@@ -80,6 +80,7 @@ pub struct AppState {
     pub pending_clarification: Option<PendingClarificationView>,
     pub agents: Vec<AgentView>,
     pub chat_items: Vec<ChatItemView>,
+    pub queued_follow_ups: Vec<QueuedFollowUpView>,
     pub events: Vec<String>,
     pub input: String,
 }
@@ -108,6 +109,24 @@ pub enum LiveStepStatus {
     Interrupted,
     Completed,
     Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueuedFollowUpView {
+    pub id: String,
+    pub prompt: String,
+    pub created_at: String,
+    pub status: QueuedFollowUpStatus,
+    pub pause_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedFollowUpStatus {
+    Pending,
+    Paused,
+    Replaying,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,6 +206,8 @@ pub enum AppEvent {
     PromptSubmitted(String),
     ApprovalAnswered(bool),
     ClarificationAnswered(ClarificationAnswer),
+    FollowUpCancelled(String),
+    FollowUpResumeRequested(String),
     InputCharacter(char),
     InputBackspace,
     RunInterruptRequested,
@@ -203,6 +224,7 @@ pub struct App {
     pending_clarification: Option<PendingClarification>,
     active_step: Option<ActiveStep>,
     active_steps: Vec<ActiveStep>,
+    follow_up_queue: VecDeque<QueuedFollowUp>,
     debug_enabled: bool,
     session_ended: bool,
     state_sender: Option<watch::Sender<AppState>>,
@@ -250,6 +272,37 @@ struct ActiveStep {
     step_label: Option<String>,
     file_scope: Option<ParallelFileScope>,
     agent: String,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedFollowUp {
+    id: String,
+    prompt: String,
+    created_at: String,
+    status: QueuedFollowUpStatus,
+    pause_reason: Option<String>,
+}
+
+impl QueuedFollowUp {
+    fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            id: new_id(),
+            prompt: prompt.into(),
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            status: QueuedFollowUpStatus::Pending,
+            pause_reason: None,
+        }
+    }
+
+    fn to_view(&self) -> QueuedFollowUpView {
+        QueuedFollowUpView {
+            id: self.id.clone(),
+            prompt: self.prompt.clone(),
+            created_at: self.created_at.clone(),
+            status: self.status.clone(),
+            pause_reason: self.pause_reason.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -699,6 +752,7 @@ impl App {
             pending_clarification: None,
             agents: build_agent_views(&config, &availability),
             chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
             events: Vec::new(),
             input: String::new(),
         };
@@ -712,6 +766,7 @@ impl App {
             pending_clarification: None,
             active_step: None,
             active_steps: Vec::new(),
+            follow_up_queue: VecDeque::new(),
             debug_enabled: debug_enabled || debug_enabled_from_env(),
             session_ended: false,
             state_sender: None,
@@ -784,6 +839,22 @@ impl App {
                 self.publish_state();
                 self.resolve_pending_clarification(answer).await
             }
+            AppEvent::FollowUpCancelled(id) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.cancel_follow_up(&id)
+            }
+            AppEvent::FollowUpResumeRequested(id) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resume_follow_up(&id)?;
+                // Resume only replays when the app is already in a clean idle state;
+                // it never pauses, so it cannot undo the resume it just performed.
+                if self.can_replay_now() {
+                    self.react_to_run_end_for_queue().await?;
+                }
+                Ok(())
+            }
             AppEvent::InputCharacter(ch) => {
                 self.state.input.push(ch);
                 self.publish_state();
@@ -835,6 +906,9 @@ impl App {
             return Ok(());
         }
         if self.handle_subtask_command(&prompt).await? {
+            return Ok(());
+        }
+        if self.handle_queue_command(&prompt)? {
             return Ok(());
         }
         if matches!(self.state.run_state, RunState::WaitingForUser) {
@@ -917,7 +991,7 @@ impl App {
                 .as_ref()
                 .map(|start| WorkflowRunContext::new(&start.command)),
         );
-        self.drive_run(run, None).await
+        self.drive_and_replay(run, None).await
     }
 
     fn handle_workflow_command(&self, prompt: &str) -> Result<Option<WorkflowStart>> {
@@ -1003,6 +1077,257 @@ impl App {
         Ok(true)
     }
 
+    fn handle_queue_command(&mut self, prompt: &str) -> Result<bool> {
+        let Some(message) = parse_queue_command(prompt)? else {
+            return Ok(false);
+        };
+        let item = QueuedFollowUp::new(message);
+        let view = item.to_view();
+        self.follow_up_queue.push_back(item);
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_queued",
+            json!({
+                "id": view.id,
+                "prompt": view.prompt,
+                "created_at": view.created_at,
+                "status": view.status,
+            }),
+            format!("Queued follow-up: {}", single_line_event_text(&view.prompt)),
+        )?;
+        Ok(true)
+    }
+
+    /// Drive a run to its terminal/waiting state, then replay or pause queued
+    /// follow-ups based on how the run ended.
+    async fn drive_and_replay(
+        &mut self,
+        run: RunDriveContext,
+        resume: Option<StepResume>,
+    ) -> Result<()> {
+        self.drive_run(run, resume).await?;
+        self.react_to_run_end_for_queue().await
+    }
+
+    /// Replay is only safe immediately after a clean completed Run with no
+    /// outstanding user input and no active Run.
+    fn can_replay_now(&self) -> bool {
+        matches!(self.state.run_state, RunState::Completed)
+            && self.state.active_run_id.is_none()
+            && self.pending_approval.is_none()
+            && self.pending_clarification.is_none()
+    }
+
+    /// React to the Run that just ended: drain queued follow-ups FIFO after a
+    /// clean completion (chaining across each replayed Run's completion), or
+    /// pause the oldest pending item after a non-clean ending. Replays at most
+    /// one item per completed Run and preserves the one-active-Run invariant.
+    async fn react_to_run_end_for_queue(&mut self) -> Result<()> {
+        loop {
+            if self.can_replay_now() {
+                let Some(prompt) = self.pop_oldest_pending_for_replay()? else {
+                    break;
+                };
+                let run = self.build_follow_up_run(prompt)?;
+                self.drive_run(run, None).await?;
+            } else if matches!(
+                self.state.run_state,
+                RunState::Failed
+                    | RunState::Interrupted
+                    | RunState::LimitReached
+                    | RunState::WaitingForUser
+            ) {
+                self.pause_oldest_pending_for_queue()?;
+                break;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn first_pending_index(&self) -> Option<usize> {
+        self.follow_up_queue
+            .iter()
+            .position(|item| item.status == QueuedFollowUpStatus::Pending)
+    }
+
+    /// Remove the oldest pending follow-up and record that it began replaying.
+    /// The item leaves the queue because it becomes a normal Run.
+    fn pop_oldest_pending_for_replay(&mut self) -> Result<Option<String>> {
+        let Some(index) = self.first_pending_index() else {
+            return Ok(None);
+        };
+        let item = self
+            .follow_up_queue
+            .remove(index)
+            .expect("first_pending_index returns a valid index");
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_replay_started",
+            json!({
+                "id": item.id,
+                "prompt": item.prompt,
+            }),
+            format!(
+                "Replaying queued follow-up: {}",
+                single_line_event_text(&item.prompt)
+            ),
+        )?;
+        Ok(Some(item.prompt))
+    }
+
+    /// Pause the oldest pending follow-up with a reason describing the unsafe
+    /// Run ending. No-op when nothing is pending.
+    fn pause_oldest_pending_for_queue(&mut self) -> Result<()> {
+        let reason = self.queue_pause_reason();
+        let Some(index) = self.first_pending_index() else {
+            return Ok(());
+        };
+        let item = &mut self.follow_up_queue[index];
+        item.status = QueuedFollowUpStatus::Paused;
+        item.pause_reason = Some(reason.to_string());
+        let view = item.to_view();
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_replay_paused",
+            json!({
+                "id": view.id,
+                "prompt": view.prompt,
+                "status": view.status,
+                "pause_reason": reason,
+            }),
+            format!(
+                "Paused queued follow-up ({reason}): {}",
+                single_line_event_text(&view.prompt)
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn queue_pause_reason(&self) -> &'static str {
+        match self.state.run_state {
+            RunState::Failed => "previous run failed",
+            RunState::Interrupted => "previous run interrupted",
+            RunState::LimitReached => "previous run reached a limit",
+            RunState::WaitingForUser => {
+                if self.pending_approval.is_some() {
+                    "run is waiting for action approval"
+                } else if self.pending_clarification.is_some() {
+                    "run is waiting for clarification"
+                } else {
+                    "run is waiting for user"
+                }
+            }
+            _ => "queue paused",
+        }
+    }
+
+    /// Build a normal Run for a replayed follow-up prompt, mirroring the
+    /// run-creation path used by `submit_prompt` for ordinary prompts.
+    fn build_follow_up_run(&mut self, prompt: String) -> Result<RunDriveContext> {
+        let compiled_prompt = compile_app_prompt(&self.config.working_directory, &prompt)?;
+        let visible_prompt = compiled_prompt.user_prompt.clone();
+        let run_prompt = compiled_prompt.user_prompt.clone();
+        let submitted_prompt = compiled_prompt.submitted_prompt.clone();
+
+        self.reset_enabled_agent_statuses();
+        let run_id = new_id();
+        self.state.active_run_id = Some(run_id.clone());
+        self.state.run_state = RunState::Planning;
+        self.record_event(
+            Some(run_id.clone()),
+            None,
+            "run_started",
+            json!({ "run_id": run_id }),
+            "Run started.",
+        )?;
+        self.record_event(
+            Some(run_id.clone()),
+            None,
+            "prompt_submitted",
+            json!({
+                "prompt": visible_prompt.clone(),
+                "submitted_prompt": submitted_prompt.clone(),
+            }),
+            user_event_display(&visible_prompt),
+        )?;
+        self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
+        Ok(RunDriveContext::new(
+            run_id,
+            None,
+            submitted_prompt,
+            run_prompt,
+            compiled_prompt.skill_context,
+            None,
+            None,
+        ))
+    }
+
+    /// Cancel a queued follow-up before it begins replaying.
+    fn cancel_follow_up(&mut self, id: &str) -> Result<()> {
+        let Some(item) = self.follow_up_queue.iter_mut().find(|item| item.id == id) else {
+            bail!("no queued follow-up with id {id}");
+        };
+        if item.status == QueuedFollowUpStatus::Cancelled {
+            return Ok(());
+        }
+        item.status = QueuedFollowUpStatus::Cancelled;
+        item.pause_reason = None;
+        let view = item.to_view();
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_cancelled",
+            json!({
+                "id": view.id,
+                "prompt": view.prompt,
+                "status": view.status,
+            }),
+            format!(
+                "Cancelled queued follow-up: {}",
+                single_line_event_text(&view.prompt)
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Resume a paused follow-up, making it eligible for replay again.
+    fn resume_follow_up(&mut self, id: &str) -> Result<()> {
+        let Some(item) = self.follow_up_queue.iter_mut().find(|item| item.id == id) else {
+            bail!("no queued follow-up with id {id}");
+        };
+        if item.status != QueuedFollowUpStatus::Paused {
+            bail!("queued follow-up {id} is not paused");
+        }
+        item.status = QueuedFollowUpStatus::Pending;
+        item.pause_reason = None;
+        let view = item.to_view();
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_replay_resumed",
+            json!({
+                "id": view.id,
+                "prompt": view.prompt,
+                "status": view.status,
+            }),
+            format!(
+                "Resumed queued follow-up: {}",
+                single_line_event_text(&view.prompt)
+            ),
+        )?;
+        Ok(())
+    }
+
     async fn handle_subtask_command(&mut self, prompt: &str) -> Result<bool> {
         let trimmed = prompt.trim();
         if !trimmed.starts_with("/subtask") {
@@ -1066,7 +1391,7 @@ impl App {
             }),
             None,
         );
-        self.drive_run(run, None).await
+        self.drive_and_replay(run, None).await
     }
 
     pub async fn resolve_pending_approval(
@@ -1096,12 +1421,14 @@ impl App {
             self.stop_for_wall_clock_limit(&pending.run)?;
             self.write_run_record(&pending.run)?;
             self.state.active_run_id = None;
+            self.pause_oldest_pending_for_queue()?;
             return Ok(None);
         }
         if self.step_time_limit_reached(pending.step_started_at) {
             self.stop_for_step_time_limit(&pending.run, &pending.step_id, pending.step_started_at)?;
             self.write_run_record(&pending.run)?;
             self.state.active_run_id = None;
+            self.pause_oldest_pending_for_queue()?;
             return Ok(None);
         }
 
@@ -1133,6 +1460,7 @@ impl App {
                 )?;
                 self.write_run_record(&pending.run)?;
                 self.state.active_run_id = None;
+                self.pause_oldest_pending_for_queue()?;
                 return Ok(None);
             };
             result
@@ -1162,7 +1490,7 @@ impl App {
             step_started_at: pending.step_started_at,
             request: pending.request,
         };
-        self.drive_run(pending.run, Some(resume)).await?;
+        self.drive_and_replay(pending.run, Some(resume)).await?;
         Ok(Some(result))
     }
 
@@ -1211,7 +1539,7 @@ impl App {
         self.state.run_state = RunState::Planning;
         self.publish_state();
 
-        self.drive_run(run, None).await?;
+        self.drive_and_replay(run, None).await?;
         Ok(())
     }
 
@@ -1250,6 +1578,7 @@ impl App {
             self.active_steps.clear();
             self.sync_chat_items();
             self.publish_state();
+            self.pause_oldest_pending_for_queue()?;
         }
         Ok(())
     }
@@ -3684,6 +4013,14 @@ impl App {
         self.state.chat_items = self.chat_projection.items().to_vec();
     }
 
+    fn sync_queued_follow_ups(&mut self) {
+        self.state.queued_follow_ups = self
+            .follow_up_queue
+            .iter()
+            .map(QueuedFollowUp::to_view)
+            .collect();
+    }
+
     fn publish_state(&self) {
         if let Some(sender) = &self.state_sender {
             let _ = sender.send(self.state.clone());
@@ -5443,6 +5780,24 @@ fn parse_subtask_command(input: &str) -> Result<(&str, &str)> {
         bail!("usage: /subtask <agent> <task>");
     }
     Ok((agent.trim(), task))
+}
+
+fn parse_queue_command(prompt: &str) -> Result<Option<String>> {
+    let trimmed = prompt.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(None);
+    }
+    let (command, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((command, rest)) => (command, rest.trim()),
+        None => (trimmed, ""),
+    };
+    if command != "/queue" && command != "/q" {
+        return Ok(None);
+    }
+    if rest.is_empty() {
+        bail!("usage: /queue <message> or /q <message>");
+    }
+    Ok(Some(rest.to_string()))
 }
 
 fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
@@ -8101,6 +8456,525 @@ instructions_file = "agents/explorer.md"
         assert!(!events
             .iter()
             .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+    }
+
+    #[test]
+    fn parse_queue_command_accepts_explicit_commands_and_rejects_empty() {
+        assert_eq!(
+            parse_queue_command("/queue update docs").unwrap(),
+            Some("update docs".to_string())
+        );
+        assert_eq!(
+            parse_queue_command("/q update docs").unwrap(),
+            Some("update docs".to_string())
+        );
+        // Text after the alias is preserved verbatim, including internal spacing.
+        assert_eq!(
+            parse_queue_command("/q update  the   docs").unwrap(),
+            Some("update  the   docs".to_string())
+        );
+        // Empty queue commands are usage errors, not silent no-ops.
+        assert!(parse_queue_command("/queue").is_err());
+        assert!(parse_queue_command("/q").is_err());
+        assert!(parse_queue_command("/queue    ").is_err());
+        // Non-queue input is never treated as a queue command.
+        assert_eq!(parse_queue_command("q").unwrap(), None);
+        assert_eq!(parse_queue_command("queue later").unwrap(), None);
+        assert_eq!(parse_queue_command("/queueextra now").unwrap(), None);
+        assert_eq!(parse_queue_command("/goal something").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn queue_command_creates_pending_follow_up_without_starting_run() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/queue update docs").await.unwrap();
+
+        assert_eq!(app.state.queued_follow_ups.len(), 1);
+        let item = &app.state.queued_follow_ups[0];
+        assert_eq!(item.prompt, "update docs");
+        assert_eq!(item.status, QueuedFollowUpStatus::Pending);
+        assert!(item.pause_reason.is_none());
+        assert!(!item.id.is_empty());
+        assert!(!item.created_at.is_empty());
+
+        // A queue command must not start a Run.
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+        assert!(events.iter().any(|event| event.kind == "follow_up_queued"
+            && event.payload["prompt"] == "update docs"
+            && event.payload["status"] == "pending"));
+    }
+
+    #[tokio::test]
+    async fn q_alias_queues_follow_up_and_preserves_prompt_text() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/q update the README docs")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.queued_follow_ups.len(), 1);
+        assert_eq!(
+            app.state.queued_follow_ups[0].prompt,
+            "update the README docs"
+        );
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Pending
+        );
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_queue_command_returns_usage_and_leaves_queue_empty() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app.submit_prompt("/queue").await.unwrap_err();
+
+        assert!(error.to_string().contains("usage"));
+        assert!(error.to_string().contains("/queue"));
+        assert!(app.state.queued_follow_ups.is_empty());
+        assert_eq!(app.state.run_state, RunState::Idle);
+        let events = app.history.read_events().unwrap();
+        assert!(!events.iter().any(|event| event.kind == "follow_up_queued"));
+    }
+
+    #[tokio::test]
+    async fn empty_q_alias_returns_usage_and_leaves_queue_empty() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app.submit_prompt("/q").await.unwrap_err();
+
+        assert!(error.to_string().contains("usage"));
+        assert!(app.state.queued_follow_ups.is_empty());
+        assert_eq!(app.state.run_state, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn plain_q_is_not_queued_and_follows_normal_prompt_path() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("q").await.unwrap();
+
+        // Plain "q" is ordinary input, not the /q alias.
+        assert!(app.state.queued_follow_ups.is_empty());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "run_started"));
+        assert!(!events.iter().any(|event| event.kind == "follow_up_queued"));
+    }
+
+    async fn queue_via_event(app: &mut App, message: &str) {
+        app.handle_event(AppEvent::PromptSubmitted(format!("/queue {message}")))
+            .await
+            .unwrap();
+    }
+
+    fn replay_started_prompts(app: &App) -> Vec<String> {
+        app.history
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "follow_up_replay_started")
+            .map(|event| event.payload["prompt"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn approval_mode_config(dir: &Path) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+approval_mode = "normal"
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn single_agent_step_limit_config(dir: &Path) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[limits]
+max_agent_steps = 1
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_queued_prompts_replay_oldest_first_across_two_completed_runs() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "first follow up").await;
+        app.handle_event(AppEvent::PromptSubmitted("/q second follow up".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(app.state.queued_follow_ups.len(), 2);
+
+        // A clean completed Run drains both queued items oldest-first.
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert!(app.state.queued_follow_ups.is_empty());
+        assert_eq!(
+            replay_started_prompts(&app),
+            vec![
+                "first follow up".to_string(),
+                "second follow up".to_string()
+            ]
+        );
+        let events = app.history.read_events().unwrap();
+        let submitted: Vec<&str> = events
+            .iter()
+            .filter(|event| event.kind == "prompt_submitted")
+            .filter_map(|event| event.payload["prompt"].as_str())
+            .collect();
+        assert!(submitted.contains(&"first follow up"));
+        assert!(submitted.contains(&"second follow up"));
+    }
+
+    #[tokio::test]
+    async fn clean_completed_run_replays_only_one_queued_item() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        // The first queued item will pause its own replay on a clarification;
+        // the second must not start while the first is still waiting.
+        queue_via_event(&mut app, "needs clarification create a feature").await;
+        queue_via_event(&mut app, "second follow up").await;
+
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_clarification.is_some());
+        // Exactly one item was replayed from the single completed Run.
+        assert_eq!(
+            replay_started_prompts(&app),
+            vec!["needs clarification create a feature".to_string()]
+        );
+        // The second item remains queued and is paused, not replayed.
+        assert_eq!(app.state.queued_follow_ups.len(), 1);
+        assert_eq!(app.state.queued_follow_ups[0].prompt, "second follow up");
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_queued_item_prevents_replay() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "cancel me").await;
+        let id = app.state.queued_follow_ups[0].id.clone();
+        app.handle_event(AppEvent::FollowUpCancelled(id))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Cancelled
+        );
+
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "follow_up_cancelled"));
+        assert!(replay_started_prompts(&app).is_empty());
+        assert!(app
+            .state
+            .queued_follow_ups
+            .iter()
+            .all(|item| item.status == QueuedFollowUpStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn resuming_paused_queued_item_makes_it_eligible_for_replay() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "resume target").await;
+
+        // A clarification-waiting Run pauses the queue.
+        app.handle_event(AppEvent::PromptSubmitted(
+            "needs clarification create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
+        let id = app.state.queued_follow_ups[0].id.clone();
+
+        // Resolving the clarification must NOT auto-replay the paused item.
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+        app.handle_event(AppEvent::ClarificationAnswered(ClarificationAnswer {
+            question_id,
+            answer: "use the CLI path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
+        assert!(replay_started_prompts(&app).is_empty());
+
+        // Resuming makes the item eligible and it replays against the completed state.
+        app.handle_event(AppEvent::FollowUpResumeRequested(id))
+            .await
+            .unwrap();
+
+        assert!(app.state.queued_follow_ups.is_empty());
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "follow_up_replay_resumed"));
+        assert_eq!(
+            replay_started_prompts(&app),
+            vec!["resume target".to_string()]
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "prompt_submitted"
+                && event.payload["prompt"] == "resume target"));
+    }
+
+    #[tokio::test]
+    async fn replay_records_replay_started_and_normal_prompt_submitted() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "replay me").await;
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let replay_started = events
+            .iter()
+            .find(|event| event.kind == "follow_up_replay_started")
+            .unwrap();
+        assert_eq!(replay_started.payload["prompt"], "replay me");
+        let replay_submitted = events
+            .iter()
+            .find(|event| {
+                event.kind == "prompt_submitted" && event.payload["prompt"] == "replay me"
+            })
+            .unwrap();
+        assert!(replay_submitted.run_id.is_some());
+        let original_submitted = events
+            .iter()
+            .find(|event| {
+                event.kind == "prompt_submitted" && event.payload["prompt"] == "create a feature"
+            })
+            .unwrap();
+        // The replayed item runs as its own distinct Run.
+        assert_ne!(replay_submitted.run_id, original_submitted.run_id);
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert!(app.state.queued_follow_ups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_after_successful_run_starts_as_next_run() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "deferred work").await;
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        // Exactly two Runs started: the original prompt and the one replayed follow-up.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "run_started")
+                .count(),
+            2
+        );
+        let replay_submitted = events
+            .iter()
+            .find(|event| {
+                event.kind == "prompt_submitted" && event.payload["prompt"] == "deferred work"
+            })
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "run_completed" && event.run_id == replay_submitted.run_id));
+        assert!(app.state.queued_follow_ups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clarification_waiting_pauses_queue_with_reason() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "queued doc update").await;
+        app.handle_event(AppEvent::PromptSubmitted(
+            "needs clarification create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_clarification.is_some());
+        let item = &app.state.queued_follow_ups[0];
+        assert_eq!(item.status, QueuedFollowUpStatus::Paused);
+        assert!(item
+            .pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("clarification")));
+        assert!(replay_started_prompts(&app).is_empty());
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "follow_up_replay_paused"));
+    }
+
+    #[tokio::test]
+    async fn approval_waiting_pauses_queue_while_pending() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "post-approval work").await;
+        app.handle_event(AppEvent::PromptSubmitted(
+            "approval action create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_approval.is_some());
+        let item = &app.state.queued_follow_ups[0];
+        assert_eq!(item.status, QueuedFollowUpStatus::Paused);
+        assert!(item
+            .pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("approval")));
+        assert!(replay_started_prompts(&app).is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_error_run_does_not_replay_queued_items() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "post-failure work").await;
+        app.handle_event(AppEvent::PromptSubmitted(
+            "always parse error create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Failed);
+        assert!(replay_started_prompts(&app).is_empty());
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_reached_run_does_not_replay_queued_items() {
+        let dir = tempdir().unwrap();
+        let config = single_agent_step_limit_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "post-limit work").await;
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::LimitReached);
+        assert!(replay_started_prompts(&app).is_empty());
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
     }
 
     #[tokio::test]

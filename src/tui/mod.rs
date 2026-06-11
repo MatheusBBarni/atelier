@@ -2320,6 +2320,7 @@ mod tests {
             pending_clarification: None,
             agents: Vec::new(),
             chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
             events: Vec::new(),
             input: String::new(),
         };
@@ -2378,6 +2379,7 @@ mod tests {
                 status: "running".to_string(),
             }],
             chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
             events: vec![
                 "Run started.".to_string(),
                 "Fixer step started.".to_string(),
@@ -2582,6 +2584,7 @@ mod tests {
             pending_clarification: None,
             agents: Vec::new(),
             chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
             events: vec!["You: build a feature".to_string()],
             input: String::new(),
         };
@@ -2681,6 +2684,7 @@ mod tests {
             pending_clarification: None,
             agents: Vec::new(),
             chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
             events: vec!["Action approval required.".to_string()],
             input: String::new(),
         };
@@ -3891,6 +3895,7 @@ mod tests {
                 status: "idle".to_string(),
             }],
             chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
             events: vec!["Run started.".to_string()],
             input: String::new(),
         };
@@ -3997,6 +4002,7 @@ mod tests {
             pending_clarification: None,
             agents: Vec::new(),
             chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
             events: Vec::new(),
             input: input.to_string(),
         }
