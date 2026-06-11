@@ -33,13 +33,18 @@ Produce and publish the distribution deliverables the whole feature exists to en
 6. CONTEXT.md TUI-surface descriptions (:187-202) SHOULD be reviewed for accuracy after the redesign (welcome item, footer) and updated if they describe superseded behavior.
 </requirements>
 
+> **Status: BLOCKED on manual capture/verification.** The docs work is done;
+> the binary asset capture and 3-terminal GUI verification require an
+> interactive desktop and a human eye (no capture tooling in this environment).
+> Handoff: `.compozy/tasks/atelier-tui-redesign/release-verification.md`.
+
 ## Subtasks
-- [ ] 9.1 Capture the welcome screenshot (≥80 cols, truecolor terminal, fresh session in a git repo so the facts box is full).
-- [ ] 9.2 Record the parallel-agents GIF (multi-agent run, accents visible, footer in frame).
-- [ ] 9.3 Add the hero section to README.md with both assets.
-- [ ] 9.4 Execute the 3-terminal + NO_COLOR checklist; record results.
-- [ ] 9.5 Decide and record the website-screenshot refresh (do now vs. filed follow-up).
-- [ ] 9.6 Review CONTEXT.md surface descriptions; update welcome/footer mentions.
+- [ ] 9.1 Capture the welcome screenshot — **BLOCKED (manual; spec in release-verification.md)**.
+- [ ] 9.2 Record the parallel-agents GIF — **BLOCKED (manual; spec in release-verification.md)**.
+- [x] 9.3 README hero section added (structure + correct `web/public/images/` paths + alt text + release-gate comment); the two **binary assets are pending capture** (9.1/9.2).
+- [ ] 9.4 Execute the 3-terminal + NO_COLOR checklist — **BLOCKED (manual; checklist ready in release-verification.md)**.
+- [x] 9.5 Website-screenshot decision recorded (recommend refresh-in-same-session, else filed follow-up) in release-verification.md.
+- [x] 9.6 CONTEXT.md reviewed; added Welcome + Status Footer surfaces.
 
 ## Implementation Details
 
@@ -68,14 +73,16 @@ Asset capture happens against the finished product (all four dependency tasks me
 
 ## Tests
 - Unit tests:
-  - [ ] Not applicable (docs/assets task) — gate is the manual checklist below; no code paths added.
-- Integration tests:
-  - [ ] README image paths resolve in the GitHub rendered view (both assets visible).
-  - [ ] Terminal.app (256-color): welcome, footer, dropdowns, parallel run render legibly — recorded pass.
-  - [ ] iTerm2 (truecolor): same surfaces — recorded pass.
-  - [ ] Alacritty: same surfaces — recorded pass.
-  - [ ] `NO_COLOR=1` run: no wordmark, all content present, no color output — recorded pass.
-  - [ ] GIF shows ≥2 simultaneously running agents with distinct accents.
+  - [x] Not applicable (docs/assets task) — no code paths added; full suite still green (539 passed).
+- Doc check (done):
+  - [x] Markdown link/path check on changed docs — no unexpected broken links; only the two hero images are expected-pending (gated on capture).
+- Integration tests (BLOCKED — manual, this task's gate):
+  - [ ] README image paths resolve in the GitHub rendered view — pending the two captured assets.
+  - [ ] Terminal.app (256-color): welcome, footer, dropdowns, parallel run render legibly — **manual**.
+  - [ ] iTerm2 (truecolor): same surfaces — **manual**.
+  - [ ] Alacritty: same surfaces — **manual**.
+  - [ ] `NO_COLOR=1` run: no wordmark, all content present, no color output — **manual** (text-equality behavior covered by automated `tui::tests`; visual confirmation pending).
+  - [ ] GIF shows ≥2 simultaneously running agents with distinct accents — **manual**.
 - Test coverage target: >=80% (not applicable to assets; code coverage unchanged)
 - All tests must pass
 

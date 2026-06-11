@@ -3,6 +3,23 @@
 `atelier` is a terminal-native Rust harness that routes each user prompt through
 an orchestrator and a sequence of specialized agent profiles.
 
+<!-- RELEASE GATE (ADR-002): the two assets below must be captured against the
+shipped TUI and placed in web/public/images/ before this hero is merged. Capture
+specs and the manual 3-terminal checklist live in
+.compozy/tasks/atelier-tui-redesign/release-verification.md. -->
+
+<p align="center">
+  <img src="web/public/images/atelier-tui-welcome.png" alt="Atelier branded welcome screen: the Atelier wordmark above a facts box with version, working directory, repo and branch, agent summary, active preset, and a /help hint" width="900">
+</p>
+
+<p align="center">
+  <em>Parallel agents, each with a distinct accent color, under a live status footer:</em>
+</p>
+
+<p align="center">
+  <img src="web/public/images/atelier-tui-parallel-agents.gif" alt="Two Atelier agents running in parallel with distinct accent colors and a persistent repo, branch, and run-state footer" width="900">
+</p>
+
 ## Features
 
 - One-click launch from any directory (or selected `--cwd`).

@@ -188,6 +188,14 @@ _Avoid_: timeout, budget
 The primary TUI surface that presents a readable conversation-style view of prompts, routing decisions, agent activity, harness actions, command results, file edits, diagnostics, and results.
 _Avoid_: Event Stream, log, transcript, console output
 
+**Welcome**:
+The branded surface rendered as the first Chat Item at startup — the Atelier wordmark above a facts box (version, working directory, repo and branch when in a git repo, agent summary, active preset, and a `/help` hint). It persists in scrollback and replaced the former skill-loading screen; it is suppressed by `[ui] hide_banner` or a `NO_COLOR` terminal.
+_Avoid_: splash screen, banner, loading screen
+
+**Status Footer**:
+The persistent footer line in the Input Composer area showing repo and branch (when in a git repo), run state, and the active agent count, beneath the work indicator and `/help` hint. The ambient "where am I, what is happening" surface that guards against wrong-branch runs.
+_Avoid_: status bar, statusline
+
 **Chat Item**:
 A curated unit rendered in the Chat, such as a user prompt, routing decision, agent summary, harness action, command result, file edit, diagnostic, diff, or final result.
 _Avoid_: message, raw log line
