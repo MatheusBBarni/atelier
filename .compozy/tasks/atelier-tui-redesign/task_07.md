@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Per-agent accent colors and run-summary restyle
 type: frontend
 complexity: medium
@@ -31,12 +31,12 @@ Give each configured agent a stable accent color (roster-order round-robin via `
 </requirements>
 
 ## Subtasks
-- [ ] 7.1 Add an accent-resolution helper mapping an agent name → roster index → accent (one place, used by all surfaces).
-- [ ] 7.2 Apply accents in the roster name spans.
-- [ ] 7.3 Apply accents in `chat_item_header_line` for `AgentProgress`/`AgentResult` titles.
-- [ ] 7.4 Apply accents in `agent_dropdown_item` id/name spans.
-- [ ] 7.5 Restyle `RunSummary` header/body with theme tokens.
-- [ ] 7.6 Tests: deterministic assignment, two-agent distinctness, unattributed-item fallback.
+- [x] 7.1 Accent-resolution helpers (`agent_index_for_title`/`item_agent_accent`); all surfaces resolve through `theme.accent_for(roster_index)`.
+- [x] 7.2 Roster name spans use `theme.accent_for(index)`.
+- [x] 7.3 `chat_item_header_line` accents `AgentProgress`/`AgentResult` titles; unmatched/other kinds fall back to severity styling.
+- [x] 7.4 `agent_dropdown_item` colors id and name in the agent's accent (resolved by id → roster index).
+- [x] 7.5 `RunSummary` kept severity-driven (excluded from accenting), theme tokens, accent kind-label emphasis.
+- [x] 7.6 Tests: deterministic assignment + pool wrap, two-agent distinctness (buffer-cell inspection), unattributed fallback, progress/result format equivalence, three-surface consistency, RunSummary.
 
 ## Implementation Details
 
@@ -63,13 +63,13 @@ The attribution mechanism (title-prefix matching) is the pragmatic V1 choice giv
 
 ## Tests
 - Unit tests:
-  - [ ] Accent resolution for a 3-agent roster returns pool colors 0, 1, 2 in roster order; a 7-agent roster wraps (index 5 == pool[5 % len]).
-  - [ ] Resolving an agent name absent from the roster returns no accent (caller falls back to severity styling).
-  - [ ] Title "fixer running" resolves to agent "fixer"'s index; title "fixer: done" (AgentResult format) resolves identically.
+  - [x] Accent resolution for a 3-agent roster returns pool colors 0, 1, 2 in roster order; a 7-agent roster wraps (index 5 == pool[5 % len]).
+  - [x] Resolving an agent name absent from the roster returns no accent (caller falls back to severity styling).
+  - [x] Title "fixer running" resolves to agent "fixer"'s index; title "fixer: done" (AgentResult format) resolves identically.
 - Integration tests:
-  - [ ] Two-agent state with `AgentProgress` items from each: rendered headers carry the two distinct accent styles (verify via styled-buffer cell inspection at the title cells).
-  - [ ] Roster render for the same state shows the same two accents on the matching names.
-  - [ ] A `RunSummary` item renders with theme tokens and no agent accent.
+  - [x] Two-agent state with `AgentProgress` items from each: rendered headers carry the two distinct accent styles (verified via styled-buffer cell inspection at the title cells).
+  - [x] Roster render for the same state shows the same two accents on the matching names; dropdown render also matches (three-surface consistency).
+  - [x] A `RunSummary` item renders with theme tokens and no agent accent.
 - Test coverage target: >=80%
 - All tests must pass
 

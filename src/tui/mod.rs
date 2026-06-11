@@ -1,8 +1,9 @@
 use crate::app::chat::{
     ChatDetailRef, ChatItemKind, ChatItemView, ChatLineStyle, ChatLineView, ChatSeverity,
 };
+use crate::app::git::GitContext;
 use crate::app::{
-    App, AppEvent, AppState, ApprovalHandle, InterruptHandle, PendingClarificationView,
+    AgentView, App, AppEvent, AppState, ApprovalHandle, InterruptHandle, PendingClarificationView,
     QueuedFollowUpStatus, QueuedFollowUpView,
 };
 use crate::config::EffectiveConfig;
@@ -22,7 +23,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -43,7 +44,8 @@ pub mod welcome;
 use theme::{TerminalCaps, Theme};
 use welcome::WelcomeFacts;
 
-const INPUT_COMPOSER_HEIGHT: u16 = 5;
+// Input box (4) + status line (1) + ambient footer line (1).
+const INPUT_COMPOSER_HEIGHT: u16 = 6;
 const INPUT_BOX_HEIGHT: u16 = 4;
 const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
@@ -53,6 +55,11 @@ const RELOAD_SKILLS_COMMAND: &str = "/reload:skills";
 const DROPDOWN_MAX_ITEMS: usize = 6;
 const WORK_HINT: &str = "/help";
 const WORK_INDICATOR_HEIGHT: u16 = 1;
+/// Ambient status footer line (repo·branch · run state · agents), below the
+/// work-indicator/hint line.
+const FOOTER_HEIGHT: u16 = 1;
+/// Agent statuses counted as actively running in the footer summary.
+const RUNNING_AGENT_STATUSES: [&str; 3] = ["running", "streaming", "running_parallel"];
 const WORK_LABEL: &str = "Working";
 const MOUSE_SCROLL_LINES: usize = 3;
 const WORK_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
@@ -1446,14 +1453,15 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         let roster_items = state
             .agents
             .iter()
-            .map(|agent| {
+            .enumerate()
+            .map(|(index, agent)| {
                 let availability = availability_label(&agent.availability);
                 ListItem::new(vec![
                     Line::from(vec![
                         Span::styled(
                             format!("{} ", agent.name),
                             Style::default()
-                                .fg(theme.accent)
+                                .fg(theme.accent_for(index))
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
@@ -1541,8 +1549,9 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
     frame.render_widget(input, input_areas.input);
     render_input_status(frame, input_areas.status, ui_state, work_active);
+    render_footer(frame, input_areas.footer, state, &theme);
     if let Some(dropdown) = agent_dropdown(state, ui_state) {
-        render_agent_dropdown(frame, input_areas.input, &dropdown, &theme);
+        render_agent_dropdown(frame, input_areas.input, &dropdown, &theme, &state.agents);
     } else if let Some(dropdown) = skill_dropdown(&state.input, ui_state) {
         render_skill_dropdown(frame, input_areas.input, &dropdown, &theme);
     }
@@ -1676,6 +1685,7 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
         chat_item_lines(
             &theme,
             &state.chat_items,
+            &state.agents,
             paragraph_width,
             hide_banner,
             &welcome_facts,
@@ -1737,11 +1747,34 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
     }
 }
 
+// ── Surface → token mapping (one color = one meaning, PRD F2) ──────────────
+// Border tokens carry exactly one role each:
+//   • `border`          — structural panels: roster, queue, chat.
+//   • `border_focused`  — the focused input composer (and only that).
+//   • `accent`          — transient/attention overlays: agent & skill
+//                         dropdowns, help modal, clarification composer.
+// Titles on every panel/overlay use `accent`. The help modal additionally
+// paints an `ink` backdrop (the only surface with a fill). Selected items in
+// both dropdowns and clarification options share one treatment via
+// `selection_style` (ink on accent). Per-agent identity colors (task_07) ride
+// the roster/chat/dropdown id+name text, never the chrome.
+
+/// Shared selection highlight: ink foreground on the brand accent. Used for the
+/// selected dropdown marker and the selected clarification option so the
+/// "this is selected" cue is identical across surfaces.
+fn selection_style(theme: &Theme) -> Style {
+    Style::default()
+        .fg(theme.ink)
+        .bg(theme.accent)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn render_agent_dropdown(
     frame: &mut Frame,
     input_area: Rect,
     dropdown: &AgentDropdown,
     theme: &Theme,
+    agents: &[AgentView],
 ) {
     if input_area.y == 0 || input_area.width < 8 || dropdown.suggestions.is_empty() {
         return;
@@ -1770,7 +1803,16 @@ fn render_agent_dropdown(
         .enumerate()
         .skip(first_visible)
         .take(visible_count)
-        .map(|(index, suggestion)| agent_dropdown_item(theme, suggestion, index == selected))
+        .map(|(index, suggestion)| {
+            // Resolve the agent's accent by its roster position so the dropdown
+            // matches the roster/chat coloring for the same agent.
+            let accent = agents
+                .iter()
+                .position(|agent| agent.id == suggestion.id)
+                .map(|roster_index| theme.accent_for(roster_index))
+                .unwrap_or(theme.accent);
+            agent_dropdown_item(theme, suggestion, index == selected, accent)
+        })
         .collect::<Vec<_>>();
     let area = Rect {
         x: input_area.x,
@@ -1783,7 +1825,7 @@ fn render_agent_dropdown(
             .title(" Agents ")
             .title(Line::from(" Up/Down Enter ").right_aligned())
             .title_style(Style::default().fg(theme.accent))
-            .border_style(Style::default().fg(theme.border))
+            .border_style(Style::default().fg(theme.accent))
             .borders(Borders::ALL),
     );
     frame.render_widget(Clear, area);
@@ -1794,27 +1836,27 @@ fn agent_dropdown_item(
     theme: &Theme,
     suggestion: &AgentSuggestion,
     selected: bool,
+    accent: Color,
 ) -> ListItem<'static> {
+    // Selection cue is the shared brand-accent highlight; the agent's own
+    // accent stays on the id/name text below.
     let marker_style = if selected {
-        Style::default()
-            .fg(theme.ink)
-            .bg(theme.accent)
-            .add_modifier(Modifier::BOLD)
+        selection_style(theme)
     } else {
         Style::default().fg(theme.text_dim)
     };
+    // Id and name both wear the agent's accent so the dropdown teaches the
+    // color mapping used in the roster and chat headers.
     let id_style = if selected {
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme.accent)
+        Style::default().fg(accent)
     };
     let line = Line::from(vec![
         Span::styled(if selected { "> " } else { "  " }, marker_style),
         Span::styled(suggestion.id.clone(), id_style),
         Span::raw("  "),
-        Span::styled(suggestion.name.clone(), Style::default().fg(theme.text)),
+        Span::styled(suggestion.name.clone(), Style::default().fg(accent)),
         Span::raw("  "),
         Span::styled(
             suggestion.detail.clone(),
@@ -1878,7 +1920,7 @@ fn render_skill_dropdown(
             .title(" Skills ")
             .title(Line::from(" Up/Down Enter ").right_aligned())
             .title_style(Style::default().fg(theme.accent))
-            .border_style(Style::default().fg(theme.border))
+            .border_style(Style::default().fg(theme.accent))
             .borders(Borders::ALL),
     );
     frame.render_widget(Clear, area);
@@ -1892,10 +1934,7 @@ fn skill_dropdown_item(
     row_width: u16,
 ) -> ListItem<'static> {
     let marker_style = if selected {
-        Style::default()
-            .fg(theme.ink)
-            .bg(theme.accent)
-            .add_modifier(Modifier::BOLD)
+        selection_style(theme)
     } else {
         Style::default().fg(theme.text_dim)
     };
@@ -1961,6 +2000,7 @@ fn truncate_to_char_width(value: &str, max_width: usize) -> String {
 fn chat_item_lines(
     theme: &Theme,
     items: &[ChatItemView],
+    agents: &[AgentView],
     width: u16,
     hide_banner: bool,
     welcome_facts: &WelcomeFacts,
@@ -1982,7 +2022,8 @@ fn chat_item_lines(
             lines.push(Line::from(""));
             continue;
         }
-        lines.push(chat_item_header_line(theme, item));
+        let agent_accent = item_agent_accent(theme, agents, item);
+        lines.push(chat_item_header_line(theme, item, agent_accent));
         if let Some(summary) = item
             .summary
             .as_deref()
@@ -2075,21 +2116,69 @@ fn user_prompt_lines(theme: &Theme, item: &ChatItemView) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn chat_item_header_line(theme: &Theme, item: &ChatItemView) -> Line<'static> {
+/// True when `agent`'s id or display name is the leading token of `title`
+/// (AgentProgress: "{agent} …"; AgentResult: "{agent}: …"). The space/colon
+/// delimiter prevents partial matches (e.g. "fix" vs "fixer").
+fn title_names_agent(title: &str, agent: &AgentView) -> bool {
+    [agent.id.as_str(), agent.name.as_str()]
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .any(|name| {
+            title
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with(':'))
+        })
+}
+
+/// Roster index of the agent that owns `title`, or `None` if no agent matches.
+fn agent_index_for_title(agents: &[AgentView], title: &str) -> Option<usize> {
+    agents
+        .iter()
+        .position(|agent| title_names_agent(title, agent))
+}
+
+/// Accent for an agent-attributed item's title: the owning agent's round-robin
+/// color (ADR-006). `None` for non-attributed kinds or unmatched agents, so the
+/// caller falls back to severity styling. Consistent with the roster/dropdown
+/// because all three resolve through `theme.accent_for(roster_index)`.
+fn item_agent_accent(theme: &Theme, agents: &[AgentView], item: &ChatItemView) -> Option<Color> {
+    if !matches!(
+        item.kind,
+        ChatItemKind::AgentProgress | ChatItemKind::AgentResult
+    ) {
+        return None;
+    }
+    agent_index_for_title(agents, &item.title).map(|index| theme.accent_for(index))
+}
+
+fn chat_item_header_line(
+    theme: &Theme,
+    item: &ChatItemView,
+    agent_accent: Option<Color>,
+) -> Line<'static> {
+    // Agent-attributed kinds take the owning agent's accent; everything else
+    // (including the agent-spanning run summary) stays severity-driven.
+    let title_style = match agent_accent {
+        Some(accent) => Style::default().fg(accent),
+        None => severity_title_style(theme, &item.severity),
+    }
+    .add_modifier(Modifier::BOLD);
+    // The run summary is the styled run conclusion — emphasize its kind label.
+    let kind_style = if item.kind == ChatItemKind::RunSummary {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text_dim)
+    };
     Line::from(vec![
         Span::styled(
             format!(" {} ", item.status.label()),
             severity_badge_style(theme, &item.severity),
         ),
         Span::raw(" "),
-        Span::styled(
-            item.title.clone(),
-            severity_title_style(theme, &item.severity).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  {}", chat_kind_label(&item.kind)),
-            Style::default().fg(theme.text_dim),
-        ),
+        Span::styled(item.title.clone(), title_style),
+        Span::styled(format!("  {}", chat_kind_label(&item.kind)), kind_style),
     ])
 }
 
@@ -2223,7 +2312,7 @@ fn render_help_modal(frame: &mut Frame, theme: &Theme) {
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 )
-                .border_style(Style::default().fg(theme.border_focused))
+                .border_style(Style::default().fg(theme.accent))
                 .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: false });
@@ -2337,6 +2426,7 @@ fn work_indicator_active(state: &AppState) -> bool {
 struct InputAreas {
     input: Rect,
     status: Rect,
+    footer: Rect,
 }
 
 fn input_areas(composer_area: Rect) -> InputAreas {
@@ -2344,6 +2434,7 @@ fn input_areas(composer_area: Rect) -> InputAreas {
         return InputAreas {
             input: composer_area,
             status: Rect::ZERO,
+            footer: Rect::ZERO,
         };
     }
 
@@ -2352,6 +2443,7 @@ fn input_areas(composer_area: Rect) -> InputAreas {
         .constraints([
             Constraint::Length(INPUT_BOX_HEIGHT),
             Constraint::Length(WORK_INDICATOR_HEIGHT),
+            Constraint::Length(FOOTER_HEIGHT),
             Constraint::Min(0),
         ])
         .split(composer_area);
@@ -2359,6 +2451,7 @@ fn input_areas(composer_area: Rect) -> InputAreas {
     InputAreas {
         input: areas[0],
         status: areas[1],
+        footer: areas[2],
     }
 }
 
@@ -2426,6 +2519,123 @@ fn render_input_status(
     }
     frame.render_widget(Clear, status_area);
     frame.render_widget(Paragraph::new(Line::from(spans)), line_area);
+}
+
+/// Render the ambient status footer (line 2 of the composer): repo·branch (when
+/// in a git repo) · run state · agent summary. Single line, never wrapped, so
+/// narrow terminals clip rather than reflow (req: no panic/wrap).
+fn render_footer(frame: &mut Frame, footer_area: Rect, state: &AppState, theme: &Theme) {
+    if footer_area.width == 0 || footer_area.height == 0 {
+        return;
+    }
+    let line_area = Rect {
+        x: footer_area.x + 1,
+        y: footer_area.y,
+        width: footer_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let line = footer_line(
+        theme,
+        state.git_context.as_ref(),
+        &state.run_state,
+        &state.agents,
+        usize::from(line_area.width),
+    );
+    frame.render_widget(Clear, footer_area);
+    frame.render_widget(Paragraph::new(line), line_area);
+}
+
+/// Build the footer line. The git segment is omitted entirely (no separator
+/// artifact) outside a repo; on narrow widths the branch is truncated first so
+/// the run state and agent summary stay legible.
+fn footer_line(
+    theme: &Theme,
+    git: Option<&GitContext>,
+    run_state: &RunState,
+    agents: &[AgentView],
+    width: usize,
+) -> Line<'static> {
+    const SEP: &str = " · ";
+    let sep_style = Style::default().fg(theme.text_dim);
+    let run = run_state_label(run_state).to_string();
+    let agents_text = agent_summary(agents);
+    let tail_width = run.chars().count() + SEP.chars().count() + agents_text.chars().count();
+
+    let mut spans = Vec::new();
+    if let Some(git) = git {
+        // Budget for the git segment ("repo · branch · "), then truncate the
+        // branch to whatever remains after the always-shown tail.
+        let repo_segment = format!("{}{SEP}", git.repo_name);
+        let reserved = tail_width + SEP.chars().count() + repo_segment.chars().count();
+        let branch_budget = width.saturating_sub(reserved);
+        let branch = truncate_branch(&git.branch, branch_budget);
+        spans.push(Span::styled(
+            git.repo_name.clone(),
+            Style::default().fg(theme.text_muted),
+        ));
+        spans.push(Span::styled(SEP, sep_style));
+        spans.push(Span::styled(branch, Style::default().fg(theme.accent)));
+        spans.push(Span::styled(SEP, sep_style));
+    }
+    spans.push(Span::styled(run, run_state_style(theme, run_state)));
+    spans.push(Span::styled(SEP, sep_style));
+    spans.push(Span::styled(
+        agents_text,
+        Style::default().fg(theme.text_muted),
+    ));
+    Line::from(spans)
+}
+
+fn run_state_label(run_state: &RunState) -> &'static str {
+    match run_state {
+        RunState::Idle => "idle",
+        RunState::Planning => "planning",
+        RunState::Running => "running",
+        RunState::WaitingForUser => "waiting for user",
+        RunState::Interrupted => "interrupted",
+        RunState::Completed => "completed",
+        RunState::Failed => "failed",
+        RunState::LimitReached => "limit reached",
+    }
+}
+
+fn run_state_style(theme: &Theme, run_state: &RunState) -> Style {
+    let color = match run_state {
+        RunState::Idle => theme.text_dim,
+        RunState::Planning | RunState::Running => theme.accent,
+        RunState::WaitingForUser => theme.status_warn,
+        RunState::Completed => theme.status_ok,
+        RunState::Interrupted | RunState::Failed | RunState::LimitReached => theme.status_error,
+    };
+    Style::default().fg(color)
+}
+
+/// "{n} agents" plus "· {r} running" when any agent is in a running status.
+fn agent_summary(agents: &[AgentView]) -> String {
+    let running = agents
+        .iter()
+        .filter(|agent| RUNNING_AGENT_STATUSES.contains(&agent.status.as_str()))
+        .count();
+    if running > 0 {
+        format!("{} agents · {running} running", agents.len())
+    } else {
+        format!("{} agents", agents.len())
+    }
+}
+
+/// Truncate a branch name to `max` display cells, appending an ellipsis when cut.
+fn truncate_branch(branch: &str, max: usize) -> String {
+    if branch.chars().count() <= max {
+        return branch.to_string();
+    }
+    match max {
+        0 => String::new(),
+        1 => "…".to_string(),
+        _ => {
+            let kept: String = branch.chars().take(max - 1).collect();
+            format!("{kept}…")
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2505,10 +2715,13 @@ fn composer_height(state: &AppState) -> u16 {
 }
 
 fn clarification_input_areas(composer_area: Rect) -> InputAreas {
+    // The clarification composer keeps the original single status line (its own
+    // hint), so it carries no ambient footer.
     if composer_area.height <= WORK_INDICATOR_HEIGHT {
         return InputAreas {
             input: composer_area,
             status: Rect::ZERO,
+            footer: Rect::ZERO,
         };
     }
     let areas = Layout::default()
@@ -2521,6 +2734,7 @@ fn clarification_input_areas(composer_area: Rect) -> InputAreas {
     InputAreas {
         input: areas[0],
         status: areas[1],
+        footer: Rect::ZERO,
     }
 }
 
@@ -2547,7 +2761,7 @@ fn render_clarification_composer(
             CLARIFICATION_UNSELECTED_MARKER
         };
         let option_style = if selected {
-            Style::default().fg(theme.ink).bg(theme.accent)
+            selection_style(&theme)
         } else {
             Style::default().fg(theme.text_muted)
         };
@@ -2950,7 +3164,7 @@ mod tests {
 
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(7, 20));
+            .assert_cursor_position(Position::new(7, 19));
     }
 
     #[test]
@@ -2975,7 +3189,7 @@ mod tests {
         assert!(text.contains("  uvwxyz1234"));
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(13, 9));
+            .assert_cursor_position(Position::new(13, 8));
     }
 
     #[test]
@@ -4068,7 +4282,7 @@ mod tests {
             .unwrap();
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(13, 8));
+            .assert_cursor_position(Position::new(13, 7));
     }
 
     #[test]
@@ -5406,5 +5620,472 @@ runtime = "fake"
             "worker shutdown hung with the poller active"
         );
         result.unwrap().unwrap();
+    }
+
+    // ── task_06 status footer ──
+
+    fn footer_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn footer_line_shows_git_segment_when_present_and_omits_it_when_absent() {
+        let theme = TuiUiState::default().theme;
+        let git = GitContext {
+            repo_name: "atelier".to_string(),
+            branch: "main".to_string(),
+        };
+        let with = footer_text(&footer_line(&theme, Some(&git), &RunState::Idle, &[], 80));
+        assert!(with.contains("atelier"));
+        assert!(with.contains("main"));
+
+        let without = footer_text(&footer_line(&theme, None, &RunState::Idle, &[], 80));
+        assert!(!without.contains("atelier"));
+        assert!(!without.contains("main"));
+        // No leading separator artifact when the git segment is omitted.
+        assert!(!without.trim_start().starts_with('·'));
+    }
+
+    #[test]
+    fn agent_summary_counts_running_statuses() {
+        let agents = vec![
+            agent_view("a", "A", "running", &[]),
+            agent_view("b", "B", "idle", &[]),
+            agent_view("c", "C", "streaming", &[]),
+        ];
+        assert_eq!(agent_summary(&agents), "3 agents · 2 running");
+
+        let idle = vec![
+            agent_view("a", "A", "idle", &[]),
+            agent_view("b", "B", "idle", &[]),
+            agent_view("c", "C", "idle", &[]),
+        ];
+        assert_eq!(agent_summary(&idle), "3 agents");
+    }
+
+    #[test]
+    fn run_state_labels_render_for_every_variant() {
+        for run_state in [
+            RunState::Idle,
+            RunState::Planning,
+            RunState::Running,
+            RunState::WaitingForUser,
+            RunState::Interrupted,
+            RunState::Completed,
+            RunState::Failed,
+            RunState::LimitReached,
+        ] {
+            assert!(!run_state_label(&run_state).is_empty());
+        }
+        assert_eq!(
+            run_state_label(&RunState::WaitingForUser),
+            "waiting for user"
+        );
+    }
+
+    #[test]
+    fn footer_truncates_branch_on_narrow_width_without_panicking() {
+        let theme = TuiUiState::default().theme;
+        let git = GitContext {
+            repo_name: "atelier".to_string(),
+            branch: "feature/a-very-long-branch-name-that-will-not-fit".to_string(),
+        };
+        // At 40 cols the branch is shortened first while the run state stays.
+        let text = footer_text(&footer_line(&theme, Some(&git), &RunState::Idle, &[], 40));
+        assert!(text.contains("idle"));
+        assert!(
+            text.contains('…'),
+            "long branch is truncated with an ellipsis"
+        );
+        assert!(
+            !text.contains("not-fit"),
+            "the far end of the branch is dropped"
+        );
+    }
+
+    #[test]
+    fn footer_renders_below_status_line_in_idle_and_running() {
+        let mut state = state_with_agent_roster("");
+        state.git_context = Some(GitContext {
+            repo_name: "atelier".to_string(),
+            branch: "main".to_string(),
+        });
+
+        for run_state in [RunState::Idle, RunState::Running] {
+            state.run_state = run_state.clone();
+            let mut ui_state = TuiUiState::default();
+            let lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 80, 24);
+
+            let help_row = lines.iter().position(|l| l.contains("/help")).unwrap();
+            let footer_row = lines.iter().position(|l| l.contains("atelier")).unwrap();
+            assert!(
+                footer_row > help_row,
+                "footer renders below the status line"
+            );
+            assert!(lines[footer_row].contains("main"));
+            assert!(lines[footer_row].contains("agents"));
+            assert!(lines[footer_row].contains(run_state_label(&run_state)));
+        }
+    }
+
+    #[test]
+    fn footer_reflects_branch_change_across_state_updates() {
+        let mut state = state_with_input("", false);
+        state.git_context = Some(GitContext {
+            repo_name: "atelier".to_string(),
+            branch: "feat/one".to_string(),
+        });
+        let before = render_to_text(&state, 80, 24);
+        assert!(before.contains("feat/one"));
+
+        state.git_context = Some(GitContext {
+            repo_name: "atelier".to_string(),
+            branch: "feat/two".to_string(),
+        });
+        let after = render_to_text(&state, 80, 24);
+        assert!(after.contains("feat/two"));
+        assert!(!after.contains("feat/one"));
+    }
+
+    // ── task_07 per-agent accents ──
+
+    fn chat_item(title: &str, kind: ChatItemKind) -> ChatItemView {
+        ChatItemView {
+            id: format!("i:{title}"),
+            lifecycle_key: None,
+            kind,
+            status: crate::app::chat::ChatItemStatus::Running,
+            severity: ChatSeverity::Info,
+            title: title.to_string(),
+            summary: None,
+            body: Vec::new(),
+            details: Vec::new(),
+            source: crate::app::chat::ChatSourceRef {
+                event_ids: Vec::new(),
+                run_id: None,
+                step_id: None,
+                action_id: None,
+            },
+            updated_at: String::new(),
+        }
+    }
+
+    /// fg of the first cell of `needle` in the rendered buffer, reconstructing
+    /// text cell-by-cell so multi-byte borders/badges don't skew the column.
+    fn title_cell_fg(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<Color> {
+        let area = *buffer.area();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let mut text = String::new();
+                let mut cx = x;
+                while cx < area.width && text.chars().count() < needle.chars().count() {
+                    text.push_str(buffer.cell((cx, y)).map(|c| c.symbol()).unwrap_or(""));
+                    cx += 1;
+                }
+                if text.starts_with(needle) {
+                    return buffer.cell((x, y)).and_then(|cell| cell.style().fg);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn agent_index_resolves_in_roster_order_and_wraps_the_pool() {
+        let agents: Vec<AgentView> = (0..7)
+            .map(|i| agent_view(&format!("agent{i}"), &format!("agent{i}"), "idle", &[]))
+            .collect();
+        for i in 0..3 {
+            assert_eq!(
+                agent_index_for_title(&agents, &format!("agent{i} step started")),
+                Some(i)
+            );
+        }
+        let index5 = agent_index_for_title(&agents, "agent5 step started").unwrap();
+        assert_eq!(index5, 5);
+        // Pool wraps at AGENT_ACCENT_COUNT: accent_for(5) == accent_for(0).
+        let theme = TuiUiState::default().theme;
+        assert_eq!(theme.accent_for(index5), theme.accent_for(0));
+    }
+
+    #[test]
+    fn absent_agent_title_resolves_to_no_accent() {
+        let agents = vec![agent_view("fixer", "Fixer", "idle", &[])];
+        let theme = TuiUiState::default().theme;
+        assert_eq!(agent_index_for_title(&agents, "ghost step started"), None);
+        let item = chat_item("ghost step started", ChatItemKind::AgentProgress);
+        assert!(item_agent_accent(&theme, &agents, &item).is_none());
+    }
+
+    #[test]
+    fn progress_and_result_title_formats_resolve_to_same_agent() {
+        let agents = vec![
+            agent_view("orchestrator", "Orchestrator", "idle", &[]),
+            agent_view("fixer", "Fixer", "idle", &[]),
+        ];
+        // AgentProgress "{agent} …" and AgentResult "{agent}: …" formats.
+        assert_eq!(agent_index_for_title(&agents, "fixer running"), Some(1));
+        assert_eq!(agent_index_for_title(&agents, "fixer: done"), Some(1));
+    }
+
+    #[test]
+    fn agent_progress_headers_carry_distinct_accents() {
+        let theme = TuiUiState::default().theme;
+        let mut state = state_with_input("", false);
+        state.agents = vec![
+            agent_view("explorer", "Explorer", "idle", &[]),
+            agent_view("fixer", "Fixer", "idle", &[]),
+        ];
+        state.chat_items = vec![
+            chat_item("explorer is working", ChatItemKind::AgentProgress),
+            chat_item("fixer is working", ChatItemKind::AgentProgress),
+        ];
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut ui_state = TuiUiState {
+            roster_visible: false,
+            ..TuiUiState::default()
+        };
+        terminal
+            .draw(|frame| render(frame, &state, &mut ui_state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let explorer_fg = title_cell_fg(buffer, "explorer is working").unwrap();
+        let fixer_fg = title_cell_fg(buffer, "fixer is working").unwrap();
+        assert_eq!(explorer_fg, theme.accent_for(0));
+        assert_eq!(fixer_fg, theme.accent_for(1));
+        assert_ne!(explorer_fg, fixer_fg);
+    }
+
+    #[test]
+    fn roster_names_carry_same_accents_as_chat() {
+        let theme = TuiUiState::default().theme;
+        let mut state = state_with_input("", false);
+        state.agents = vec![
+            agent_view("explorer", "Explorer", "idle", &[]),
+            agent_view("fixer", "Fixer", "idle", &[]),
+        ];
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut ui_state = TuiUiState::default();
+        terminal
+            .draw(|frame| render(frame, &state, &mut ui_state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(
+            title_cell_fg(buffer, "Explorer").unwrap(),
+            theme.accent_for(0)
+        );
+        assert_eq!(title_cell_fg(buffer, "Fixer").unwrap(), theme.accent_for(1));
+    }
+
+    #[test]
+    fn run_summary_uses_severity_styling_not_agent_accent() {
+        let theme = TuiUiState::default().theme;
+        let agents = vec![agent_view("fixer", "Fixer", "idle", &[])];
+        // Titled like an agent result, but a run summary spans agents and must
+        // not pick up an agent accent.
+        let item = chat_item("fixer: run complete", ChatItemKind::RunSummary);
+        assert!(item_agent_accent(&theme, &agents, &item).is_none());
+
+        let line = chat_item_header_line(&theme, &item, None);
+        let title_span = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("fixer: run complete"))
+            .unwrap();
+        assert_eq!(title_span.style.fg, Some(theme.text)); // Info severity token
+        assert_ne!(title_span.style.fg, Some(theme.accent_for(0)));
+    }
+
+    #[test]
+    fn agent_dropdown_ids_carry_same_accents_as_roster() {
+        let theme = TuiUiState::default().theme;
+        // Roster order: explorer (0), fixer (1), archived/disabled (2, filtered).
+        let state = state_with_agent_roster("/agent:");
+        let mut ui_state = TuiUiState {
+            roster_visible: false,
+            input_cursor: input_char_count("/agent:"),
+            ..TuiUiState::default()
+        };
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &mut ui_state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(
+            title_cell_fg(buffer, "explorer").unwrap(),
+            theme.accent_for(0)
+        );
+        assert_eq!(title_cell_fg(buffer, "fixer").unwrap(), theme.accent_for(1));
+    }
+
+    // ── task_08 surface polish ──
+
+    fn render_to_buffer(
+        state: &AppState,
+        ui_state: &mut TuiUiState,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, state, ui_state))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// bg of the first cell of `needle`, reconstructing text cell-by-cell.
+    fn cell_bg_for_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<Color> {
+        let area = *buffer.area();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let mut text = String::new();
+                let mut cx = x;
+                while cx < area.width && text.chars().count() < needle.chars().count() {
+                    text.push_str(buffer.cell((cx, y)).map(|c| c.symbol()).unwrap_or(""));
+                    cx += 1;
+                }
+                if text.starts_with(needle) {
+                    return buffer.cell((x, y)).and_then(|cell| cell.style().bg);
+                }
+            }
+        }
+        None
+    }
+
+    /// True if the row containing `row_needle` has any cell with `bg`.
+    fn row_contains_bg(buffer: &ratatui::buffer::Buffer, row_needle: &str, bg: Color) -> bool {
+        let area = *buffer.area();
+        for y in 0..area.height {
+            let row: String = (0..area.width)
+                .map(|x| buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(""))
+                .collect();
+            if row.contains(row_needle) {
+                return (0..area.width)
+                    .any(|x| buffer.cell((x, y)).and_then(|c| c.style().bg) == Some(bg));
+            }
+        }
+        false
+    }
+
+    /// fg of a titled box's top-left corner (┌ sits two cells left of the title:
+    /// `┌` + leading space + title).
+    fn box_corner_fg(buffer: &ratatui::buffer::Buffer, title: &str) -> Option<Color> {
+        let area = *buffer.area();
+        for y in 0..area.height {
+            let symbols: Vec<String> = (0..area.width)
+                .map(|x| {
+                    buffer
+                        .cell((x, y))
+                        .map(|c| c.symbol().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            let row: String = symbols.concat();
+            if let Some(byte_idx) = row.find(title) {
+                let mut bytes = 0usize;
+                for (cell_x, symbol) in symbols.iter().enumerate() {
+                    if bytes == byte_idx {
+                        let corner = (cell_x as u16).saturating_sub(2);
+                        return buffer.cell((corner, y)).and_then(|c| c.style().fg);
+                    }
+                    bytes += symbol.len();
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn selection_style_is_ink_on_accent() {
+        let theme = TuiUiState::default().theme;
+        let style = selection_style(&theme);
+        assert_eq!(style.fg, Some(theme.ink));
+        assert_eq!(style.bg, Some(theme.accent));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn both_dropdowns_share_the_accent_selection_treatment() {
+        let theme = TuiUiState::default().theme;
+
+        let agent_state = state_with_agent_roster("/agent:");
+        let mut agent_ui = TuiUiState {
+            roster_visible: false,
+            input_cursor: input_char_count("/agent:"),
+            ..TuiUiState::default()
+        };
+        let agent_buf = render_to_buffer(&agent_state, &mut agent_ui, 100, 24);
+        assert!(
+            row_contains_bg(&agent_buf, "explorer", theme.accent),
+            "selected agent row carries the accent selection bg"
+        );
+
+        let skill_state = state_with_input("/skill:", false);
+        let mut skill_ui = ui_state_with_skills_at_end("/skill:");
+        skill_ui.roster_visible = false;
+        let skill_buf = render_to_buffer(&skill_state, &mut skill_ui, 100, 24);
+        assert!(
+            row_contains_bg(&skill_buf, "project-alpha", theme.accent),
+            "selected skill row carries the accent selection bg"
+        );
+    }
+
+    #[test]
+    fn skill_tags_use_distinct_tokens_for_project_and_personal() {
+        let theme = TuiUiState::default().theme;
+        let state = state_with_input("/skill:", false);
+        let mut ui = ui_state_with_skills_at_end("/skill:");
+        ui.roster_visible = false;
+        let buf = render_to_buffer(&state, &mut ui, 100, 24);
+
+        let project = cell_bg_for_text(&buf, "Project");
+        let personal = cell_bg_for_text(&buf, "Personal");
+        assert_eq!(project, Some(theme.status_ok));
+        assert_eq!(personal, Some(theme.accent));
+        assert_ne!(project, personal);
+    }
+
+    #[test]
+    fn help_and_clarification_borders_differ_from_input_composer_token() {
+        let theme = TuiUiState::default().theme;
+        // Auditable mapping: input composer = border_focused; overlays = accent.
+        assert_ne!(theme.border_focused, theme.accent);
+
+        // Help modal border is accent (≠ the input composer's border_focused).
+        let state = state_with_input("hi", false);
+        let mut help_ui = TuiUiState {
+            roster_visible: false,
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        let help_buf = render_to_buffer(&state, &mut help_ui, 80, 24);
+        let help_border = box_corner_fg(&help_buf, "Help");
+        assert_eq!(help_border, Some(theme.accent));
+        assert_ne!(help_border, Some(theme.border_focused));
+
+        // Clarification composer border is accent too (≠ border_focused).
+        let mut clar_state = state_with_input("", false);
+        clar_state.pending_clarification = Some(clarification_view(vec![clarification_option(
+            "opt1",
+            "Feature scope",
+        )]));
+        let mut clar_ui = TuiUiState {
+            roster_visible: false,
+            ..TuiUiState::default()
+        };
+        let clar_buf = render_to_buffer(&clar_state, &mut clar_ui, 80, 24);
+        let clar_border = box_corner_fg(&clar_buf, "Clarifying question");
+        assert_eq!(clar_border, Some(theme.accent));
+        assert_ne!(clar_border, Some(theme.border_focused));
     }
 }

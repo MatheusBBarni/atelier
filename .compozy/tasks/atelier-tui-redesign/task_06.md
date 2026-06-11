@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Persistent status footer
 type: frontend
 complexity: medium
@@ -32,12 +32,12 @@ Grow the existing one-line status area into the ambient-state footer (PRD F3): `
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Extend the input-area layout: new footer line constant, adjusted constraints, updated `composer_height`.
-- [ ] 6.2 Implement the footer line builder: git segment, run-state label, agent-count summary, theme-token styling.
-- [ ] 6.3 Compute running counts from `AgentView.status` using the established status-string sets (:1954-1973).
-- [ ] 6.4 Preserve spinner/status_message/hint behaviors on the original line.
-- [ ] 6.5 Truncation behavior for narrow widths.
-- [ ] 6.6 Update height-stability and work-indicator tests for the new layout; add footer content tests.
+- [x] 6.1 Extend the input-area layout: `FOOTER_HEIGHT` const, `INPUT_COMPOSER_HEIGHT` 5→6, 3-region `input_areas` constraints, `InputAreas.footer`.
+- [x] 6.2 Implement `footer_line`/`render_footer`: git segment, run-state label, agent-count summary, theme-token styling.
+- [x] 6.3 Compute running counts from `AgentView.status` via `RUNNING_AGENT_STATUSES` (running/streaming/running_parallel).
+- [x] 6.4 Preserve spinner/status_message/hint on the original line (`render_input_status` untouched).
+- [x] 6.5 Branch-first truncation (`truncate_branch`) with saturating budgets; `Paragraph` unwrapped so narrow widths clip without panic.
+- [x] 6.6 Work-indicator/height-stability tests pass unchanged; 3 cursor-position tests updated for the +1 row shift; added footer unit + integration tests.
 
 ## Implementation Details
 
@@ -62,14 +62,14 @@ Exploration confirmed the constraint: `INPUT_COMPOSER_HEIGHT = 5` (4 input + 1 s
 
 ## Tests
 - Unit tests:
-  - [ ] Footer line with `Some(GitContext{repo:"atelier", branch:"main"})` contains "atelier" and "main"; with `None` contains neither and no separator artifact.
-  - [ ] Agent summary for 3 agents with statuses [running, idle, streaming] reads "3 agents · 2 running"; all idle reads "3 agents".
-  - [ ] Run-state labels render for each `RunState` variant used in the footer.
-  - [ ] Narrow width (40 cols) truncates the branch segment without panicking.
+  - [x] Footer line with `Some(GitContext{repo:"atelier", branch:"main"})` contains "atelier" and "main"; with `None` contains neither and no separator artifact.
+  - [x] Agent summary for 3 agents with statuses [running, idle, streaming] reads "3 agents · 2 running"; all idle reads "3 agents".
+  - [x] Run-state labels render for each `RunState` variant used in the footer.
+  - [x] Narrow width (40 cols) truncates the branch segment (ellipsis) without panicking.
 - Integration tests:
-  - [ ] `render_to_lines_with_ui_mut` at 80x24: footer line visible below the status line in idle and running states; composer height stable between the two.
-  - [ ] State update with a changed branch re-renders the footer with the new value (watch-channel path).
-  - [ ] Existing work-indicator tests pass with updated height constant.
+  - [x] `render_to_lines_with_ui_mut` at 80x24: footer line visible below the status line in idle and running states; composer height stable between the two (existing stability test).
+  - [x] State update with a changed branch re-renders the footer with the new value (watch-channel path).
+  - [x] Existing work-indicator tests pass (assert relative positions, robust to the new height).
 - Test coverage target: >=80%
 - All tests must pass
 

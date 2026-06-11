@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Surface polish: dropdowns, dialogs, help modal, input composer"
 type: frontend
 complexity: low
@@ -30,12 +30,12 @@ Apply the semantic theme deliberately to every remaining chrome surface so each 
 </requirements>
 
 ## Subtasks
-- [ ] 8.1 Define the surface→token mapping table (one comment block in the render module or the theme module docs).
-- [ ] 8.2 Apply to both dropdowns (chrome + selected/unselected + skill tags).
-- [ ] 8.3 Apply to help modal and `centered_rect` backdrop.
-- [ ] 8.4 Apply to input composer and clarification composer/status.
-- [ ] 8.5 Apply to roster/chat block chrome and legacy chat lines.
-- [ ] 8.6 Verify the 13 existing surface tests; add styled-cell assertions for the selected-item convention.
+- [x] 8.1 Surface→token mapping documented as a comment block above the dropdown renderers.
+- [x] 8.2 Both dropdowns: chrome border → `accent` (overlay role); selected marker → shared `selection_style`; skill tags `status_ok`/`accent` retained.
+- [x] 8.3 Help modal border `border_focused` → `accent` (now distinct from the input composer); `ink` backdrop kept.
+- [x] 8.4 Input composer keeps `border_focused` (focused-input role); clarification composer keeps `accent` border, selected option → shared `selection_style`; status hint `text_muted`.
+- [x] 8.5 Roster/chat/queue block chrome kept on `border`+`accent`; legacy chat lines unchanged (already tokenized correctly in task_03).
+- [x] 8.6 The 13 existing surface tests pass unchanged; added styled-cell assertions for the selection convention, skill tags, and border distinctness.
 
 ## Implementation Details
 
@@ -59,12 +59,12 @@ All sites are in `src/tui/mod.rs` and were tokenized in task_03 — this task ed
 
 ## Tests
 - Unit tests:
-  - [ ] Surface mapping helper (if introduced) returns the documented token per surface role.
+  - [x] `selection_style` returns the documented token (ink on accent, bold).
 - Integration tests:
-  - [ ] All 13 existing dropdown/help/clarification tests pass with unchanged content assertions.
-  - [ ] Selected dropdown item renders the shared selection treatment (styled-cell assertion on bg token) in both agent and skill dropdowns.
-  - [ ] Skill tags render two distinct token styles for project vs personal sources.
-  - [ ] Help modal and clarification composer borders use different tokens than the input composer (one-color-one-meaning spot check).
+  - [x] All 13 existing dropdown/help/clarification tests pass with unchanged content assertions.
+  - [x] Selected dropdown item renders the shared selection treatment (styled-cell bg = accent) in both agent and skill dropdowns.
+  - [x] Skill tags render two distinct token styles for project (status_ok) vs personal (accent).
+  - [x] Help modal and clarification composer borders render `accent`, different from the input composer's `border_focused` (one-color-one-meaning spot check via box-corner cells).
 - Test coverage target: >=80%
 - All tests must pass
 
