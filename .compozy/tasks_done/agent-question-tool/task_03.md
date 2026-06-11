@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Update Runtime Prompt Contracts"
 type: backend
 complexity: medium
@@ -30,11 +30,11 @@ Update runtime-facing prompt contracts so every orchestrator-capable runtime kno
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Update Codex runtime protocol text for structured clarification fields.
-- [ ] 3.2 Update Claude runtime protocol text for structured clarification fields.
-- [ ] 3.3 Update Cursor runtime protocol text for structured clarification fields.
-- [ ] 3.4 Update shared orchestrator guidance for option count, recommendation, and custom-answer boundary.
-- [ ] 3.5 Add prompt-contract tests that guard the new fields and guidance.
+- [x] 3.1 Update Codex runtime protocol text for structured clarification fields.
+- [x] 3.2 Update Claude runtime protocol text for structured clarification fields.
+- [x] 3.3 Update Cursor runtime protocol text for structured clarification fields.
+- [x] 3.4 Update shared orchestrator guidance for option count, recommendation, and custom-answer boundary.
+- [x] 3.5 Add prompt-contract tests that guard the new fields and guidance.
 
 ## Implementation Details
 Follow TechSpec sections "Runtime Prompt Contracts" and "Known Risks". Keep this task scoped to prompt contract text and tests; validation belongs to task 02 and app/TUI behavior belongs to later tasks.
@@ -64,13 +64,13 @@ Follow TechSpec sections "Runtime Prompt Contracts" and "Known Risks". Keep this
 
 ## Tests
 - Unit tests:
-  - [ ] Codex prompt text includes `clarifying_options`, `recommended_option_id`, and the 2-4 option rule.
-  - [ ] Claude prompt text includes `clarifying_options`, `recommended_option_id`, and the 2-4 option rule.
-  - [ ] Cursor prompt text includes `clarifying_options`, `recommended_option_id`, and the 2-4 option rule.
-  - [ ] Shared orchestrator prompt includes guidance to ask a Clarifying Question with recommended answers when the next safe step is ambiguous.
-  - [ ] Prompt text does not describe a general any-agent question tool.
+  - [x] Codex prompt text includes `clarifying_options`, `recommended_option_id`, and the 2-4 option rule.
+  - [x] Claude prompt text includes `clarifying_options`, `recommended_option_id`, and the 2-4 option rule.
+  - [x] Cursor prompt text includes `clarifying_options`, `recommended_option_id`, and the 2-4 option rule.
+  - [x] Shared orchestrator prompt includes guidance to ask a Clarifying Question with recommended answers when the next safe step is ambiguous.
+  - [x] Prompt text does not describe a general any-agent question tool.
 - Integration tests:
-  - [ ] Existing runtime prompt contract tests still pass after the expanded schema text is added.
+  - [x] Existing runtime prompt contract tests still pass after the expanded schema text is added.
 - Test coverage target: >=80%
 - All tests must pass
 

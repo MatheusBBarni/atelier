@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Expose Pending Clarification View And Request Lifecycle"
 type: backend
 complexity: medium
@@ -30,11 +30,11 @@ Expose structured pending clarification state through `AppState` and record the 
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Add the public pending clarification view to app state.
-- [ ] 4.2 Populate pending clarification state from the validated orchestrator decision.
-- [ ] 4.3 Record explicit `clarification_requested` history events.
-- [ ] 4.4 Clear pending clarification state on interrupt and terminal state transitions.
-- [ ] 4.5 Update app state fixtures and tests to include the new field.
+- [x] 4.1 Add the public pending clarification view to app state.
+- [x] 4.2 Populate pending clarification state from the validated orchestrator decision.
+- [x] 4.3 Record explicit `clarification_requested` history events.
+- [x] 4.4 Clear pending clarification state on interrupt and terminal state transitions.
+- [x] 4.5 Update app state fixtures and tests to include the new field.
 
 ## Implementation Details
 Use TechSpec sections "App Clarification State" and "History Events". This task should not implement answer submission; that belongs to task 05.
@@ -64,13 +64,13 @@ Use TechSpec sections "App Clarification State" and "History Events". This task 
 
 ## Tests
 - Unit tests:
-  - [ ] App state defaults to no pending clarification.
-  - [ ] Valid waiting clarification decision populates run id, question id, question, options, and recommended option id.
-  - [ ] Interrupt clears both private pending clarification and public pending clarification view.
-  - [ ] Pending approval state does not populate pending clarification view.
+  - [x] App state defaults to no pending clarification.
+  - [x] Valid waiting clarification decision populates run id, question id, question, options, and recommended option id.
+  - [x] Interrupt clears both private pending clarification and public pending clarification view.
+  - [x] Pending approval state does not populate pending clarification view.
 - Integration tests:
-  - [ ] Fake runtime `needs clarification` prompt records `clarification_requested` with expected question and options.
-  - [ ] Existing pending approval tests still see `pending_approval` and no pending clarification view.
+  - [x] Fake runtime `needs clarification` prompt records `clarification_requested` with expected question and options.
+  - [x] Existing pending approval tests still see `pending_approval` and no pending clarification view.
 - Test coverage target: >=80%
 - All tests must pass
 
