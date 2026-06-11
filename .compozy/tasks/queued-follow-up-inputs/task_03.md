@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Project Queue Lifecycle Events Into Chat"
 type: backend
 complexity: medium
@@ -31,11 +31,11 @@ Make queued follow-up lifecycle events visible in the existing Chat presentation
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Add queue event handling to Chat projection.
-- [ ] 3.2 Choose existing Chat item kind/status/severity mappings for queue states.
-- [ ] 3.3 Include prompt summaries and pause reasons in Chat item body or summary.
-- [ ] 3.4 Preserve existing prompt and run summary projection behavior.
-- [ ] 3.5 Add Chat projection tests for all queue lifecycle events.
+- [x] 3.1 Add queue event handling to Chat projection.
+- [x] 3.2 Choose existing Chat item kind/status/severity mappings for queue states.
+- [x] 3.3 Include prompt summaries and pause reasons in Chat item body or summary.
+- [x] 3.4 Preserve existing prompt and run summary projection behavior.
+- [x] 3.5 Add Chat projection tests for all queue lifecycle events.
 
 ## Implementation Details
 Modify Chat projection only after task 02 has introduced queue lifecycle events. Reference the TechSpec "History And Chat Events" section. Avoid introducing a new `ChatItemKind` unless existing diagnostics or user-prompt-adjacent items cannot represent the states clearly.
@@ -63,14 +63,14 @@ Modify Chat projection only after task 02 has introduced queue lifecycle events.
 
 ## Tests
 - Unit tests:
-  - [ ] `follow_up_queued` creates a visible Chat item with the queued prompt summary.
-  - [ ] `follow_up_cancelled` updates or creates a visible cancelled state.
-  - [ ] `follow_up_replay_started` shows the queued item is replaying.
-  - [ ] `follow_up_replay_paused` shows the pause reason.
-  - [ ] `follow_up_replay_resumed` shows the item is eligible again.
+  - [x] `follow_up_queued` creates a visible Chat item with the queued prompt summary.
+  - [x] `follow_up_cancelled` updates or creates a visible cancelled state.
+  - [x] `follow_up_replay_started` shows the queued item is replaying.
+  - [x] `follow_up_replay_paused` shows the pause reason.
+  - [x] `follow_up_replay_resumed` shows the item is eligible again.
 - Integration tests:
-  - [ ] Rebuilding `ChatProjection` from history containing queue events produces stable item ordering.
-  - [ ] Existing run summary and user prompt projection tests still pass with queue events present.
+  - [x] Rebuilding `ChatProjection` from history containing queue events produces stable item ordering.
+  - [x] Existing run summary and user prompt projection tests still pass with queue events present.
 - Test coverage target: >=80%
 - All tests must pass
 

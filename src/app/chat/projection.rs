@@ -76,6 +76,11 @@ impl ChatProjection {
             "run_completed" | "run_failed" | "run_limit_reached" | "run_interrupted"
             | "subtask_completed" => self.apply_run_summary(event),
             "diagnostic" => self.apply_diagnostic(event),
+            "follow_up_queued"
+            | "follow_up_replay_started"
+            | "follow_up_replay_paused"
+            | "follow_up_replay_resumed"
+            | "follow_up_cancelled" => self.apply_follow_up_lifecycle(event),
             "blocker_reported" => self.apply_blocker(event),
             "config_viewed"
             | "session_goal_viewed"
@@ -1093,6 +1098,67 @@ impl ChatProjection {
                     ChatLineStyle::Warning
                 },
             ),
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    /// Project the queued follow-up lifecycle (queued, replaying, paused,
+    /// resumed, cancelled) onto a single Chat item per follow-up id, so the
+    /// queue state is understandable without reading raw history.
+    fn apply_follow_up_lifecycle(&mut self, event: &HistoryEvent) {
+        let prompt = string_field(&event.payload, "prompt").unwrap_or_default();
+        let lifecycle_key = string_field(&event.payload, "id")
+            .map(|follow_up_id| ChatLifecycleKey::FollowUp { follow_up_id });
+        let (title, status, severity, body) = match event.kind.as_str() {
+            "follow_up_queued" => (
+                "Queued follow-up",
+                ChatItemStatus::Pending,
+                ChatSeverity::Info,
+                vec![ChatLineView::muted(
+                    "Queued for replay after the active run completes.",
+                )],
+            ),
+            "follow_up_replay_started" => (
+                "Replaying follow-up",
+                ChatItemStatus::Running,
+                ChatSeverity::Info,
+                vec![ChatLineView::muted("Started as a new run.")],
+            ),
+            "follow_up_replay_paused" => {
+                let reason = string_field(&event.payload, "pause_reason")
+                    .unwrap_or_else(|| "replay paused".to_string());
+                (
+                    "Paused follow-up",
+                    ChatItemStatus::Pending,
+                    ChatSeverity::Warning,
+                    vec![ChatLineView::warning(format!("Paused: {reason}"))],
+                )
+            }
+            "follow_up_replay_resumed" => (
+                "Resumed follow-up",
+                ChatItemStatus::Pending,
+                ChatSeverity::Info,
+                vec![ChatLineView::muted("Resumed; eligible for replay.")],
+            ),
+            "follow_up_cancelled" => (
+                "Cancelled follow-up",
+                ChatItemStatus::Skipped,
+                ChatSeverity::Info,
+                vec![ChatLineView::muted("Cancelled before replay.")],
+            ),
+            _ => return,
+        };
+        self.upsert(ItemInput {
+            lifecycle_key,
+            kind: ChatItemKind::Diagnostic,
+            status,
+            severity,
+            title: title.to_string(),
+            summary: Some(concise(&prompt, MAX_SUMMARY_CHARS)),
+            body,
             details: history_detail(event, "history"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
@@ -3611,5 +3677,193 @@ mod tests {
             .body
             .iter()
             .any(|line| line.text == "Second question?"));
+    }
+
+    #[test]
+    fn follow_up_queued_projects_visible_chat_item_with_prompt() {
+        let events = vec![event(
+            "follow_up_queued",
+            Some("run"),
+            None,
+            json!({ "id": "q1", "prompt": "update the docs", "created_at": "t", "status": "pending" }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:follow_up:q1");
+        assert_eq!(
+            item.lifecycle_key,
+            Some(ChatLifecycleKey::FollowUp {
+                follow_up_id: "q1".to_string()
+            })
+        );
+        assert_eq!(item.kind, ChatItemKind::Diagnostic);
+        assert_eq!(item.status, ChatItemStatus::Pending);
+        assert_eq!(item.severity, ChatSeverity::Info);
+        assert_eq!(item.title, "Queued follow-up");
+        assert!(item_text(item).contains("update the docs"));
+    }
+
+    #[test]
+    fn follow_up_cancelled_projects_cancelled_state() {
+        let events = vec![
+            event(
+                "follow_up_queued",
+                Some("run"),
+                None,
+                json!({ "id": "q1", "prompt": "cancel me", "status": "pending" }),
+            ),
+            event(
+                "follow_up_cancelled",
+                None,
+                None,
+                json!({ "id": "q1", "prompt": "cancel me", "status": "cancelled" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        // Both events for the same follow-up collapse into one evolving item.
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Skipped);
+        assert_eq!(item.title, "Cancelled follow-up");
+        assert!(item_text(item).contains("cancel me"));
+    }
+
+    #[test]
+    fn follow_up_replay_started_projects_replaying_state() {
+        let events = vec![event(
+            "follow_up_replay_started",
+            None,
+            None,
+            json!({ "id": "q1", "prompt": "replay me" }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Running);
+        assert_eq!(item.title, "Replaying follow-up");
+        assert!(item_text(item).contains("replay me"));
+    }
+
+    #[test]
+    fn follow_up_replay_paused_shows_pause_reason() {
+        let events = vec![event(
+            "follow_up_replay_paused",
+            None,
+            None,
+            json!({
+                "id": "q1",
+                "prompt": "paused work",
+                "status": "paused",
+                "pause_reason": "run is waiting for clarification"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Pending);
+        assert_eq!(item.severity, ChatSeverity::Warning);
+        assert_eq!(item.title, "Paused follow-up");
+        let text = item_text(item);
+        assert!(text.contains("paused work"));
+        assert!(text.contains("run is waiting for clarification"));
+    }
+
+    #[test]
+    fn follow_up_replay_resumed_shows_eligible_again() {
+        let events = vec![event(
+            "follow_up_replay_resumed",
+            None,
+            None,
+            json!({ "id": "q1", "prompt": "resume target", "status": "pending" }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Pending);
+        assert_eq!(item.title, "Resumed follow-up");
+        let text = item_text(item).to_lowercase();
+        assert!(text.contains("resume target"));
+        assert!(text.contains("eligible"));
+    }
+
+    #[test]
+    fn rebuilding_full_queue_lifecycle_produces_single_stable_item() {
+        let events = vec![
+            event(
+                "follow_up_queued",
+                Some("run"),
+                None,
+                json!({ "id": "q1", "prompt": "deferred", "status": "pending" }),
+            ),
+            event(
+                "follow_up_replay_paused",
+                None,
+                None,
+                json!({ "id": "q1", "prompt": "deferred", "status": "paused", "pause_reason": "previous run failed" }),
+            ),
+            event(
+                "follow_up_replay_resumed",
+                None,
+                None,
+                json!({ "id": "q1", "prompt": "deferred", "status": "pending" }),
+            ),
+            event(
+                "follow_up_replay_started",
+                None,
+                None,
+                json!({ "id": "q1", "prompt": "deferred" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        // All lifecycle events for one follow-up id collapse to a single item.
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:follow_up:q1");
+        assert_eq!(item.title, "Replaying follow-up");
+        // Rebuild is deterministic for the same history.
+        let again = ChatProjection::rebuild(&events);
+        assert_eq!(again.items(), projection.items());
+    }
+
+    #[test]
+    fn queue_events_preserve_prompt_and_run_summary_projection() {
+        let events = vec![
+            event(
+                "prompt_submitted",
+                Some("run"),
+                None,
+                json!({ "prompt": "build it" }),
+            ),
+            event(
+                "follow_up_queued",
+                Some("run"),
+                None,
+                json!({ "id": "q1", "prompt": "later work", "status": "pending" }),
+            ),
+            event("run_completed", Some("run"), None, json!({})),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        // Existing user-prompt and run-summary projection is unchanged.
+        assert!(items
+            .iter()
+            .any(|item| item.id == "chat:prompt:run" && item.kind == ChatItemKind::UserPrompt));
+        assert!(items
+            .iter()
+            .any(|item| item.id == "chat:run:run" && item.kind == ChatItemKind::RunSummary));
+        // The queued follow-up projects as its own item alongside them.
+        assert!(items.iter().any(|item| item.id == "chat:follow_up:q1"));
     }
 }

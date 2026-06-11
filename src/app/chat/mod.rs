@@ -134,6 +134,9 @@ pub enum ChatLifecycleKey {
         step_id: String,
         action_id: String,
     },
+    FollowUp {
+        follow_up_id: String,
+    },
 }
 
 impl ChatLineView {
@@ -215,6 +218,9 @@ impl ChatLifecycleKey {
                 step_id,
                 action_id,
             } => format!("chat:action:{run_id}:{step_id}:{action_id}"),
+            ChatLifecycleKey::FollowUp { follow_up_id } => {
+                format!("chat:follow_up:{follow_up_id}")
+            }
         }
     }
 }
