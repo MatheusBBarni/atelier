@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Branded welcome screen as synthetic chat item
 type: frontend
 complexity: high
@@ -34,13 +34,13 @@ Build the branded welcome screen (PRD F1): a new `ChatItemKind::Welcome` injecte
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Add the `Welcome` variant and extend both exhaustive matches.
-- [ ] 4.2 Create `src/tui/welcome.rs`: wordmark (Sextant vs Quadrant `PixelSize` prototyped, pick by eye), facts box builder, width ladder.
-- [ ] 4.3 Add `tui-big-text = "0.7"` to `Cargo.toml`.
-- [ ] 4.4 Inject the welcome item at startup; honor `config.ui.hide_banner` and no-color caps.
-- [ ] 4.5 Replace both skill-loading call sites; move reload feedback to `status_message`.
-- [ ] 4.6 Remove/retire the `renders_skill_loading_state` test (:2335) and add welcome render tests at the three breakpoints.
-- [ ] 4.7 Audit `ChatProjection` consumers for the new kind (verified safe — `items()`/`upsert()` don't filter by kind; confirm at integration).
+- [x] 4.1 Add the `Welcome` variant and extend both exhaustive matches (`slug()`, `chat_kind_label()`).
+- [x] 4.2 Create `src/tui/welcome.rs`: wordmark (chose `PixelSize::Full`/`Quadrant`; gradient deferred — per-row RGB would violate the no-`Color::` invariant in this file), facts box builder, width ladder. Wordmark drawn into an off-screen buffer and lifted to `Line`s so it scrolls as a chat item.
+- [x] 4.3 Add `tui-big-text = "0.7"` to `Cargo.toml`.
+- [x] 4.4 Inject the welcome item at startup (seed state + prepend in `sync_chat_items`); honor `config.ui.hide_banner` and no-color caps.
+- [x] 4.5 Replace both skill-loading call sites; first frame renders the main UI immediately, reload feedback via `status_message`.
+- [x] 4.6 Remove the `renders_skill_loading_state` test and the `render_skill_loading` fn; add welcome breakpoint + integration tests.
+- [x] 4.7 Audit `ChatProjection` consumers — the welcome lives outside the projection (prepended in `sync_chat_items`), so consumers never see it; `items()` confirmed not to filter.
 
 ## Implementation Details
 
@@ -72,15 +72,15 @@ The "No chat yet." empty state (`src/tui/mod.rs:1415`) becomes unreachable in pr
 
 ## Tests
 - Unit tests:
-  - [ ] Width ladder selection: 100 cols → full wordmark, 70 → compact, 50 → plain text line containing "Atelier".
-  - [ ] Facts box includes version string equal to `CARGO_PKG_VERSION`, agent count matching a 3-agent state, and preset name when set.
-  - [ ] Facts box omits the repo+branch line when `git_context` is `None`; includes "repo · branch" when `Some`.
-  - [ ] `hide_banner = true` → no wordmark lines; facts box still renders.
-  - [ ] No-color theme → no wordmark; facts content identical as plain text.
+  - [x] Width ladder selection: 100 cols → full wordmark, 70 → compact, 50 → plain text line containing "Atelier".
+  - [x] Facts box includes version string equal to `CARGO_PKG_VERSION`, agent count matching a 3-agent state, and preset name when set.
+  - [x] Facts box omits the repo+branch line when `git_context` is `None`; includes "repo · branch" when `Some`.
+  - [x] `hide_banner = true` → no wordmark lines; facts box still renders.
+  - [x] No-color theme → no wordmark; facts content identical as plain text.
 - Integration tests:
-  - [ ] `render_to_text` at 80x24 on a fresh state shows wordmark + facts above the input composer; "No chat yet." absent.
-  - [ ] After appending a user-prompt chat item, scrolling to top still shows the welcome content (scrollback persistence).
-  - [ ] `/reload:skills` flow sets a `status_message` instead of drawing the loading screen.
+  - [x] `render_to_text` at 80x24 on a fresh state shows wordmark + facts above the input composer; "No chat yet." absent.
+  - [x] After appending a user-prompt chat item, scrolling to top still shows the welcome content (scrollback persistence).
+  - [x] `/reload:skills` flow sets a `status_message` instead of drawing the loading screen (existing `reload_skills_command_refreshes_cache_and_clears_input` test asserts this; loading-screen draw removed).
 - Test coverage target: >=80%
 - All tests must pass
 

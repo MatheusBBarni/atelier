@@ -21,7 +21,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -38,8 +38,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 pub mod theme;
+pub mod welcome;
 
 use theme::{TerminalCaps, Theme};
+use welcome::WelcomeFacts;
 
 const INPUT_COMPOSER_HEIGHT: u16 = 5;
 const INPUT_BOX_HEIGHT: u16 = 4;
@@ -150,6 +152,7 @@ struct TuiUiState {
     status_message: Option<String>,
     work_spinner_frame: usize,
     theme: Theme,
+    hide_banner: bool,
 }
 
 impl Default for TuiUiState {
@@ -181,6 +184,7 @@ impl Default for TuiUiState {
                 no_color: false,
                 truecolor: true,
             }),
+            hide_banner: false,
         }
     }
 }
@@ -248,6 +252,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     }
 
     let working_directory = config.working_directory.clone();
+    let hide_banner = config.ui.hide_banner;
     let theme = Theme::resolve(TerminalCaps::detect());
     let mut app = App::new_with_debug(config, debug_enabled).await?;
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
@@ -263,24 +268,21 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let mut terminal = Terminal::new(backend)?;
     let worker = tokio::spawn(run_app_worker(app, command_receiver));
 
-    let result = match terminal.draw(|frame| render_skill_loading(frame, &theme)) {
-        Ok(_) => {
-            let skill_suggestions = load_skill_suggestions(&working_directory);
-            let mut ui_state =
-                TuiUiState::with_skill_suggestions(working_directory, skill_suggestions);
-            ui_state.theme = theme;
-            run_loop(
-                &mut terminal,
-                state_receiver,
-                command_sender.clone(),
-                interrupt_handle,
-                approval_handle,
-                ui_state,
-            )
-            .await
-        }
-        Err(error) => Err(error).context("failed to render skill loading state"),
-    };
+    // No loading interstitial: the main UI (with the branded welcome item)
+    // renders on the first frame, and skill scanning happens behind it inside
+    // `run_loop` so startup stays under the first-frame budget (ADR-005).
+    let mut ui_state = TuiUiState::with_skill_suggestions(working_directory, Vec::new());
+    ui_state.theme = theme;
+    ui_state.hide_banner = hide_banner;
+    let result = run_loop(
+        &mut terminal,
+        state_receiver,
+        command_sender.clone(),
+        interrupt_handle,
+        approval_handle,
+        ui_state,
+    )
+    .await;
 
     let cleanup_result = (|| -> Result<()> {
         disable_raw_mode()?;
@@ -308,6 +310,13 @@ async fn run_loop(
     mut ui_state: TuiUiState,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
+    // Render the first frame (welcome visible) before the blocking skill scan,
+    // then load suggestions behind it so the /skill dropdown is ready by the
+    // next interaction.
+    terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
+    if let Some(working_directory) = ui_state.working_directory.clone() {
+        ui_state.skill_suggestions = load_skill_suggestions(&working_directory);
+    }
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
@@ -320,9 +329,8 @@ async fn run_loop(
                 _ => None,
             };
             if let Some(command) = command {
-                if matches!(&command, TuiCommand::ReloadSkills) {
-                    terminal.draw(|frame| render_skill_loading(frame, &ui_state.theme))?;
-                }
+                // Skill reload reports via the status line (set in `reload_skills`)
+                // rather than a full-screen takeover.
                 if !execute_tui_command_with_interrupt(
                     &mut state,
                     &mut ui_state,
@@ -490,20 +498,36 @@ async fn queue_app_event(
         .context("app worker is not accepting TUI events")
 }
 
+/// Cadence of the background git-context poll (ADR-006).
+const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 async fn run_app_worker(
     mut app: App,
     mut command_receiver: mpsc::Receiver<AppWorkerCommand>,
 ) -> Result<()> {
-    while let Some(command) = command_receiver.recv().await {
-        match command {
-            AppWorkerCommand::Event(event) => {
-                if let Err(error) = app.handle_event(event).await {
-                    app.record_diagnostic(error.to_string())?;
+    // Immediate startup refresh, then a change-gated poll every 5s. The poll
+    // lives inside the worker's select loop, so it stops as soon as the loop
+    // exits on shutdown — no separate task to abort (ADR-006).
+    app.refresh_git_context().await;
+    let mut git_poll = tokio::time::interval(GIT_POLL_INTERVAL);
+    git_poll.tick().await; // consume the immediate first tick (startup covered it)
+
+    loop {
+        tokio::select! {
+            command = command_receiver.recv() => match command {
+                Some(AppWorkerCommand::Event(event)) => {
+                    if let Err(error) = app.handle_event(event).await {
+                        app.record_diagnostic(error.to_string())?;
+                    }
                 }
-            }
-            AppWorkerCommand::Shutdown => {
-                app.end_session()?;
-                return Ok(());
+                Some(AppWorkerCommand::Shutdown) => {
+                    app.end_session()?;
+                    return Ok(());
+                }
+                None => break,
+            },
+            _ = git_poll.tick() => {
+                app.refresh_git_context().await;
             }
         }
     }
@@ -1385,34 +1409,6 @@ fn agent_suggestion_detail(agent: &crate::app::AgentView) -> String {
     format!("{}/{}{}", agent.runtime, agent.model, capabilities)
 }
 
-fn render_skill_loading(frame: &mut Frame, theme: &Theme) {
-    let area = frame.area();
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Loading skills",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("...", Style::default().fg(theme.text)),
-        ]),
-        Line::from("Scanning project and personal skill folders"),
-    ];
-    let paragraph = Paragraph::new(lines)
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.text_muted))
-        .block(
-            Block::default()
-                .title(" Atelier ")
-                .title_style(Style::default().fg(theme.accent))
-                .border_style(Style::default().fg(theme.accent))
-                .borders(Borders::ALL),
-        );
-    frame.render_widget(Clear, area);
-    frame.render_widget(paragraph, area);
-}
-
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     let theme = ui_state.theme;
     let queue_height = queue_panel_height(state);
@@ -1654,8 +1650,36 @@ fn render_queue_panel(frame: &mut Frame, area: Rect, state: &AppState, ui_state:
 
 fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: &mut TuiUiState) {
     let theme = ui_state.theme;
+    let hide_banner = ui_state.hide_banner;
+    let working_directory = ui_state.working_directory.clone();
+    let block = Block::default()
+        .title(" Chat ")
+        .title_style(Style::default().fg(theme.accent))
+        .border_style(Style::default().fg(theme.border))
+        .borders(Borders::ALL);
+    let inner_area = block.inner(event_area);
+    let paragraph_width = inner_area.width.saturating_sub(1).max(1);
+    // Facts shown in the welcome item, read from live state. `git` is `None`
+    // until task_05 supplies `AppState.git_context`.
+    let welcome_facts = WelcomeFacts {
+        version: env!("CARGO_PKG_VERSION"),
+        working_directory: working_directory.as_deref(),
+        agents: &state.agents,
+        preset: state.config_status.preset.as_deref(),
+        warnings: state.config_status.warnings.len(),
+        git: state
+            .git_context
+            .as_ref()
+            .map(|git| (git.repo_name.as_str(), git.branch.as_str())),
+    };
     let event_lines = if !state.chat_items.is_empty() {
-        chat_item_lines(&theme, &state.chat_items)
+        chat_item_lines(
+            &theme,
+            &state.chat_items,
+            paragraph_width,
+            hide_banner,
+            &welcome_facts,
+        )
     } else if let Some(pending) = &state.pending_approval {
         vec![
             Line::from(format!(
@@ -1678,13 +1702,6 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
             .map(|event| legacy_chat_line(&theme, event))
             .collect::<Vec<_>>()
     };
-    let block = Block::default()
-        .title(" Chat ")
-        .title_style(Style::default().fg(theme.accent))
-        .border_style(Style::default().fg(theme.border))
-        .borders(Borders::ALL);
-    let inner_area = block.inner(event_area);
-    let paragraph_width = inner_area.width.saturating_sub(1).max(1);
     let viewport_lines = usize::from(inner_area.height.max(1));
     let content_lines = wrapped_event_line_count(&event_lines, paragraph_width);
     ui_state.event_content_lines = content_lines;
@@ -1941,9 +1958,25 @@ fn truncate_to_char_width(value: &str, max_width: usize) -> String {
     value.chars().take(max_width).collect()
 }
 
-fn chat_item_lines(theme: &Theme, items: &[ChatItemView]) -> Vec<Line<'static>> {
+fn chat_item_lines(
+    theme: &Theme,
+    items: &[ChatItemView],
+    width: u16,
+    hide_banner: bool,
+    welcome_facts: &WelcomeFacts,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for item in items {
+        if item.kind == ChatItemKind::Welcome {
+            lines.extend(welcome::welcome_lines(
+                theme,
+                width,
+                hide_banner,
+                welcome_facts,
+            ));
+            lines.push(Line::from(""));
+            continue;
+        }
         if item.kind == ChatItemKind::UserPrompt {
             lines.extend(user_prompt_lines(theme, item));
             lines.push(Line::from(""));
@@ -2099,6 +2132,7 @@ fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
         ChatItemKind::SkillContext => "skills",
         ChatItemKind::AgentResult => "agent",
         ChatItemKind::RunSummary => "run",
+        ChatItemKind::Welcome => "welcome",
     }
 }
 
@@ -2620,6 +2654,7 @@ mod tests {
             queued_follow_ups: Vec::new(),
             events: Vec::new(),
             input: String::new(),
+            git_context: None,
         };
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Agent Roster"));
@@ -2627,27 +2662,6 @@ mod tests {
         assert!(text.contains(">"));
         assert!(!text.contains("Input Composer"));
         assert!(text.contains("No chat yet."));
-    }
-
-    #[test]
-    fn renders_skill_loading_state() {
-        let backend = TestBackend::new(80, 16);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let theme = TuiUiState::default().theme;
-
-        terminal
-            .draw(|frame| render_skill_loading(frame, &theme))
-            .unwrap();
-
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("Loading skills"));
-        assert!(text.contains("Scanning project and personal skill folders"));
     }
 
     #[test]
@@ -2685,6 +2699,7 @@ mod tests {
                 "Fixer step started.".to_string(),
             ],
             input: "follow up".to_string(),
+            git_context: None,
         };
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Fixer"));
@@ -2887,6 +2902,7 @@ mod tests {
             queued_follow_ups: Vec::new(),
             events: vec!["You: build a feature".to_string()],
             input: String::new(),
+            git_context: None,
         };
 
         let text = render_to_text(&state, 100, 24);
@@ -2987,6 +3003,7 @@ mod tests {
             queued_follow_ups: Vec::new(),
             events: vec!["Action approval required.".to_string()],
             input: String::new(),
+            git_context: None,
         };
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Approval required for fixer action action."));
@@ -4199,6 +4216,7 @@ mod tests {
             queued_follow_ups: Vec::new(),
             events: vec!["Run started.".to_string()],
             input: String::new(),
+            git_context: None,
         };
         let ui_state = TuiUiState {
             roster_visible: false,
@@ -4306,6 +4324,7 @@ mod tests {
             queued_follow_ups: Vec::new(),
             events: Vec::new(),
             input: input.to_string(),
+            git_context: None,
         }
     }
 
@@ -5290,5 +5309,102 @@ runtime = "fake"
 
         assert_eq!(truecolor, no_color);
         assert!(no_color.contains("Explorer"));
+    }
+
+    // ── task_04 welcome screen ──
+
+    fn user_prompt_chat_item(text: &str) -> ChatItemView {
+        ChatItemView {
+            id: format!("u:{text}"),
+            lifecycle_key: None,
+            kind: ChatItemKind::UserPrompt,
+            status: crate::app::chat::ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "You".to_string(),
+            summary: None,
+            body: vec![ChatLineView {
+                style: ChatLineStyle::Plain,
+                text: text.to_string(),
+            }],
+            details: Vec::new(),
+            source: crate::app::chat::ChatSourceRef {
+                event_ids: Vec::new(),
+                run_id: None,
+                step_id: None,
+                action_id: None,
+            },
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn welcome_item_renders_facts_and_replaces_empty_state() {
+        let mut state = state_with_agent_roster("");
+        state.chat_items = vec![ChatItemView::welcome()];
+
+        let text = render_to_text(&state, 80, 24);
+
+        assert!(
+            text.contains(env!("CARGO_PKG_VERSION")),
+            "welcome facts version present"
+        );
+        assert!(text.contains("Atelier"), "wordmark present");
+        assert!(!text.contains("No chat yet."), "empty state replaced");
+    }
+
+    #[test]
+    fn welcome_persists_above_later_chat_items() {
+        let mut state = state_with_agent_roster("");
+        state.chat_items = vec![
+            ChatItemView::welcome(),
+            user_prompt_chat_item("hello world"),
+        ];
+        let ui_state = TuiUiState {
+            event_follow: false,
+            event_scroll: 0,
+            ..TuiUiState::default()
+        };
+
+        let text = render_to_text_with_ui(&state, &ui_state, 80, 24);
+
+        assert!(
+            text.contains(env!("CARGO_PKG_VERSION")),
+            "welcome facts still visible at the top of scrollback"
+        );
+        assert!(text.contains("hello world"), "later chat item rendered too");
+    }
+
+    // ── task_05 git poller / worker lifecycle ──
+
+    fn fake_worker_config(dir: &Path) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            "[runtimes.fake]\ntype = \"fake\"\n\n[agents.orchestrator]\nruntime = \"fake\"\n",
+        )
+        .unwrap();
+        crate::config::load_effective_config(crate::config::ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn worker_shuts_down_promptly_with_git_poller_active() {
+        let dir = tempdir().unwrap();
+        let app = App::new(fake_worker_config(dir.path())).await.unwrap();
+        let (sender, receiver) = mpsc::channel(8);
+        let worker = tokio::spawn(run_app_worker(app, receiver));
+
+        // The 5s poll lives in the worker's select loop; a shutdown must win
+        // immediately rather than waiting for a tick (no hang).
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), shutdown_app_worker(sender, worker)).await;
+        assert!(
+            result.is_ok(),
+            "worker shutdown hung with the poller active"
+        );
+        result.unwrap().unwrap();
     }
 }

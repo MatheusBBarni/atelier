@@ -162,6 +162,12 @@ impl Theme {
     pub fn accent_for(&self, agent_index: usize) -> Color {
         self.agent_accents[agent_index % self.agent_accents.len()]
     }
+
+    /// True when resolved under `NO_COLOR`: every token is the terminal default,
+    /// so brand-color-dependent flourishes (e.g. the wordmark) are skipped.
+    pub fn is_monochrome(&self) -> bool {
+        self.text == Color::Reset
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 pub mod chat;
+pub mod git;
 
 use self::chat::{ChatItemView, ChatProjection};
+use self::git::{fetch_git_context, GitContext};
 use crate::actions::{
     execute_action_request, is_vcs_mutation, vcs_action_explicitly_requested, ActionDecision,
     ActionExecutionContext, ActionKind, ActionRequest, ActionResult, ActionStatus,
@@ -83,6 +85,9 @@ pub struct AppState {
     pub queued_follow_ups: Vec<QueuedFollowUpView>,
     pub events: Vec<String>,
     pub input: String,
+    /// Repo + branch of the working directory, refreshed by the git poller
+    /// (ADR-006). `None` outside a git repo or while git is unavailable.
+    pub git_context: Option<GitContext>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -751,10 +756,13 @@ impl App {
             pending_approval: None,
             pending_clarification: None,
             agents: build_agent_views(&config, &availability),
-            chat_items: Vec::new(),
+            // Branded welcome item present from the first frame (ADR-005);
+            // `sync_chat_items` keeps it prepended across projection updates.
+            chat_items: vec![ChatItemView::welcome()],
             queued_follow_ups: Vec::new(),
             events: Vec::new(),
             input: String::new(),
+            git_context: None,
         };
         let mut app = Self {
             config,
@@ -825,6 +833,9 @@ impl App {
         match event {
             AppEvent::PromptSubmitted(prompt) => {
                 self.state.input.clear();
+                // Refresh git before the run so the footer/welcome reflect the
+                // branch the prompt actually runs against (ADR-006).
+                self.refresh_git_context().await;
                 self.publish_state();
                 self.submit_prompt(prompt).await
             }
@@ -4010,7 +4021,12 @@ impl App {
             .apply_live_steps(&self.state.live_steps);
         self.chat_projection
             .apply_pending_approval(self.state.pending_approval.as_ref());
-        self.state.chat_items = self.chat_projection.items().to_vec();
+        // The welcome item is prepended (not part of the projection) so it stays
+        // first and stable across re-syncs (ADR-005).
+        let mut items = Vec::with_capacity(self.chat_projection.items().len() + 1);
+        items.push(ChatItemView::welcome());
+        items.extend(self.chat_projection.items().iter().cloned());
+        self.state.chat_items = items;
     }
 
     fn sync_queued_follow_ups(&mut self) {
@@ -4025,6 +4041,24 @@ impl App {
         if let Some(sender) = &self.state_sender {
             let _ = sender.send(self.state.clone());
         }
+    }
+
+    /// Apply a freshly fetched git context, publishing a state update only when
+    /// the value changed (ADR-006 change gate). Returns whether it published.
+    fn set_git_context(&mut self, context: Option<GitContext>) -> bool {
+        if self.state.git_context == context {
+            return false;
+        }
+        self.state.git_context = context;
+        self.publish_state();
+        true
+    }
+
+    /// Fetch the working directory's git context and apply it through the change
+    /// gate. Driven by the startup refresh, the 5s poll, and prompt submission.
+    pub(crate) async fn refresh_git_context(&mut self) {
+        let context = fetch_git_context(&self.config.working_directory).await;
+        self.set_git_context(context);
     }
 
     fn record_action_completed(
@@ -8330,6 +8364,94 @@ prompt = "{reviewer_prompt}"
                 && action.status.as_deref() == Some("completed")));
         let serialized = serde_json::to_string(&request.recent_context).unwrap();
         assert!(!serialized.contains("created by fake runtime"));
+    }
+
+    // ── task_05 git context ──
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git available");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_git_repo(dir: &std::path::Path, branch: &str) {
+        run_git(dir, &["init"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+        run_git(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("seed.txt"), "seed").unwrap();
+        run_git(dir, &["add", "seed.txt"]);
+        run_git(dir, &["commit", "-m", "init"]);
+        run_git(dir, &["checkout", "-b", branch]);
+    }
+
+    #[tokio::test]
+    async fn set_git_context_publishes_only_on_change() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        let (sender, mut receiver) = watch::channel(app.state.clone());
+        app.attach_state_sender(sender);
+        receiver.borrow_and_update(); // consume the publish from attach
+
+        let context = GitContext {
+            repo_name: "atelier".to_string(),
+            branch: "main".to_string(),
+        };
+        assert!(app.set_git_context(Some(context.clone())));
+        assert!(receiver.has_changed().unwrap(), "change published");
+        receiver.borrow_and_update();
+
+        assert!(!app.set_git_context(Some(context)));
+        assert!(
+            !receiver.has_changed().unwrap(),
+            "identical context must not publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_git_context_populates_from_repo() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/start");
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+
+        assert!(app.state.git_context.is_none());
+        app.refresh_git_context().await;
+
+        let context = app.state.git_context.as_ref().expect("Some after refresh");
+        assert_eq!(context.branch, "feat/start");
+        assert_eq!(
+            context.repo_name,
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_git_working_directory_refreshes_to_none_without_error() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.refresh_git_context().await;
+        assert!(app.state.git_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_submission_refreshes_git_context_to_current_branch() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/one");
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.refresh_git_context().await;
+        assert_eq!(app.state.git_context.as_ref().unwrap().branch, "feat/one");
+
+        // Switch branch outside the app, then submit a prompt.
+        run_git(dir.path(), &["checkout", "-b", "feat/two"]);
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.git_context.as_ref().unwrap().branch, "feat/two");
     }
 
     #[tokio::test]

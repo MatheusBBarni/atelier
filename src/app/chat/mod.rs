@@ -36,6 +36,9 @@ pub enum ChatItemKind {
     SkillContext,
     AgentResult,
     RunSummary,
+    /// Synthetic branded welcome item, injected at startup (ADR-005). Not an
+    /// orchestration event; carries no lifecycle key and never updates.
+    Welcome,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,6 +243,33 @@ impl ChatItemKind {
             ChatItemKind::SkillContext => "skill_context",
             ChatItemKind::AgentResult => "agent_result",
             ChatItemKind::RunSummary => "run_summary",
+            ChatItemKind::Welcome => "welcome",
+        }
+    }
+}
+
+impl ChatItemView {
+    /// The synthetic welcome chat item injected at startup (ADR-005). A stable
+    /// marker with no lifecycle key; its facts/wordmark are rendered from live
+    /// state by `tui::welcome`, so the item itself carries no body.
+    pub fn welcome() -> Self {
+        Self {
+            id: "chat:welcome".to_string(),
+            lifecycle_key: None,
+            kind: ChatItemKind::Welcome,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "Atelier".to_string(),
+            summary: None,
+            body: Vec::new(),
+            details: Vec::new(),
+            source: ChatSourceRef {
+                event_ids: Vec::new(),
+                run_id: None,
+                step_id: None,
+                action_id: None,
+            },
+            updated_at: String::new(),
         }
     }
 }

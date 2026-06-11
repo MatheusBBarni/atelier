@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Git context module with change-gated polling
 type: backend
 complexity: medium
@@ -31,12 +31,12 @@ Create `src/app/git.rs` providing `fetch_git_context() -> Option<GitContext>` vi
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Create `src/app/git.rs` with `GitContext` and `fetch_git_context` (subprocess + timeout + None-on-failure).
-- [ ] 5.2 Declare `pub mod git;` in `src/app/mod.rs` (after `pub mod chat;`, :1).
-- [ ] 5.3 Add `git_context` to `AppState` and a setter that publishes only on change.
-- [ ] 5.4 Spawn the 5s poll task within the worker scope; ensure shutdown stops it.
-- [ ] 5.5 Hook immediate refresh into startup and the `PromptSubmitted` path.
-- [ ] 5.6 Tests: fetch parsing, None paths, change-gating, and the prompt-refresh hook.
+- [x] 5.1 Create `src/app/git.rs` with `GitContext` and `fetch_git_context` (subprocess + timeout + None-on-failure; detached HEAD resolves to short SHA).
+- [x] 5.2 Declare `pub mod git;` in `src/app/mod.rs`.
+- [x] 5.3 Add `git_context` to `AppState` and `set_git_context` that publishes only on change.
+- [x] 5.4 5s poll integrated into `run_app_worker`'s `select!` loop (stops when the loop exits at shutdown — no separate task to leak).
+- [x] 5.5 Hook immediate refresh into startup (before the worker loop) and the `PromptSubmitted` path (before `submit_prompt`).
+- [x] 5.6 Tests: fetch parsing, None paths, change-gating, prompt-refresh, worker-shutdown. Also wired `welcome_facts.git` to `state.git_context` (task_04's deferred integration point).
 
 ## Implementation Details
 
@@ -64,15 +64,15 @@ Worker integration: `run_app_worker` (`src/tui/mod.rs:463-482`) processes comman
 
 ## Tests
 - Unit tests:
-  - [ ] In a temp git repo (init + commit + branch `feat/x`): `fetch_git_context` returns `Some` with `branch == "feat/x"` and repo_name == temp dir name.
-  - [ ] In a plain temp dir (no repo): returns `None`.
-  - [ ] With a PATH containing no git (or overridden command name): returns `None` without error.
-  - [ ] Detached HEAD state: returns `Some` with a non-empty branch value (SHA).
-  - [ ] Change-gate: feeding the same context twice produces exactly one state publish.
+  - [x] In a temp git repo (init + commit + branch `feat/x`): `fetch_git_context` returns `Some` with `branch == "feat/x"` and repo_name == temp dir name.
+  - [x] In a plain temp dir (no repo): returns `None`.
+  - [x] With an overridden command name (`fetch_with_git`): returns `None` without error.
+  - [x] Detached HEAD state: returns `Some` with a non-empty branch value (short SHA, `!= "HEAD"`).
+  - [x] Change-gate: feeding the same context twice produces exactly one state publish.
 - Integration tests:
-  - [ ] `#[tokio::test]`: after app startup in a temp repo, `state.git_context` becomes `Some` (startup refresh).
-  - [ ] `#[tokio::test]`: switching branch in the temp repo then submitting a prompt updates `git_context` to the new branch (prompt-submission refresh).
-  - [ ] Worker shutdown completes within the existing 500ms grace path with the poller active (no hang).
+  - [x] `#[tokio::test]`: after `refresh_git_context` in a temp repo, `state.git_context` becomes `Some` (startup refresh).
+  - [x] `#[tokio::test]`: switching branch in the temp repo then submitting a prompt updates `git_context` to the new branch (prompt-submission refresh).
+  - [x] Worker shutdown completes within the 500ms grace path with the poller active (no hang).
 - Test coverage target: >=80%
 - All tests must pass
 
