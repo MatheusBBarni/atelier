@@ -1288,11 +1288,15 @@ mod tests {
     #[test]
     fn rejects_parallel_group_when_feature_disabled() {
         let dir = tempdir().unwrap();
-        let config = load_effective_config(ConfigLoadOptions {
+        let mut config = load_effective_config(ConfigLoadOptions {
             working_directory: dir.path().to_path_buf(),
             config_path: None,
         })
         .unwrap();
+        // Force the feature off so this stays hermetic regardless of the
+        // developer's home config (config_path: None reads it), mirroring
+        // parallel_enabled_config which forces it on.
+        config.features.parallel_step_groups = false;
         let decision = OrchestratorDecision {
             schema_version: 2,
             decision_id: "01".to_string(),
