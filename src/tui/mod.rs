@@ -3,6 +3,7 @@ use crate::app::chat::{
 };
 use crate::app::{
     App, AppEvent, AppState, ApprovalHandle, InterruptHandle, PendingClarificationView,
+    QueuedFollowUpStatus, QueuedFollowUpView,
 };
 use crate::config::EffectiveConfig;
 use crate::orchestrator::RunState;
@@ -56,6 +57,10 @@ const CLARIFICATION_RECOMMENDED_LABEL: &str = "★ recommended";
 const CLARIFICATION_CUSTOM_LABEL: &str = "Custom: ";
 const CLARIFICATION_HINT: &str =
     "↑/↓ select · type custom answer · Enter answer · Ctrl-C interrupt";
+const QUEUE_VISIBLE_MAX: usize = 6;
+const QUEUE_SELECTED_MARKER: &str = "> ";
+const QUEUE_UNSELECTED_MARKER: &str = "  ";
+const QUEUE_HINT: &str = "↑/↓ select · Del cancel · Ctrl-R resume (clear input to focus)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TuiCommand {
@@ -70,6 +75,7 @@ enum TuiCommand {
     Clarification(ClarificationCommand),
     ClarificationInputCharacter(char),
     ClarificationInputBackspace,
+    QueueSelection(QueueSelectionCommand),
     ReloadSkills,
     InputCharacter(char),
     InputBackspace,
@@ -107,6 +113,12 @@ enum ClarificationCommand {
     Submit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueSelectionCommand {
+    Previous,
+    Next,
+}
+
 #[derive(Debug)]
 enum AppWorkerCommand {
     Event(AppEvent),
@@ -131,6 +143,7 @@ struct TuiUiState {
     skill_selection_index: usize,
     clarification_option_index: usize,
     clarification_custom_answer: String,
+    queue_selection_index: usize,
     status_message: Option<String>,
     work_spinner_frame: usize,
 }
@@ -154,6 +167,7 @@ impl Default for TuiUiState {
             skill_selection_index: 0,
             clarification_option_index: 0,
             clarification_custom_answer: String::new(),
+            queue_selection_index: 0,
             status_message: None,
             work_spinner_frame: 0,
         }
@@ -370,6 +384,10 @@ async fn execute_tui_command_with_interrupt(
             ui_state.clarification_custom_answer.pop();
             Ok(true)
         }
+        TuiCommand::QueueSelection(command) => {
+            apply_queue_selection_command(state, ui_state, command);
+            Ok(true)
+        }
         TuiCommand::ReloadSkills => {
             reload_skills(state, ui_state);
             Ok(true)
@@ -534,9 +552,110 @@ fn key_event_to_tui_command_with_ui(
         agent_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
     } else if skill_dropdown(&state.input, ui_state).is_some() {
         skill_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+    } else if queue_control_active(state, ui_state) {
+        queue_control_key_command(state, ui_state, key)
+            .or_else(|| key_event_to_tui_command(state, key))
     } else {
         key_event_to_tui_command(state, key)
     }
+}
+
+/// Queue focus is active when the input composer is empty and there are queued
+/// follow-ups, with no higher-priority mode (help / clarification / approval)
+/// open. The `/agent:` and `/skill:` dropdowns require non-empty input, so they
+/// are never active at the same time as queue focus.
+fn queue_control_active(state: &AppState, ui_state: &TuiUiState) -> bool {
+    state.input.is_empty()
+        && !state.queued_follow_ups.is_empty()
+        && !ui_state.help_visible
+        && state.pending_clarification.is_none()
+        && state.pending_approval.is_none()
+}
+
+fn selected_queue_item<'a>(
+    state: &'a AppState,
+    ui_state: &TuiUiState,
+) -> Option<&'a QueuedFollowUpView> {
+    let items = &state.queued_follow_ups;
+    if items.is_empty() {
+        return None;
+    }
+    let index = ui_state
+        .queue_selection_index
+        .min(items.len().saturating_sub(1));
+    items.get(index)
+}
+
+fn queue_control_key_command(
+    state: &AppState,
+    ui_state: &TuiUiState,
+    key: KeyEvent,
+) -> Option<TuiCommand> {
+    match key {
+        KeyEvent {
+            code: KeyCode::Up, ..
+        } => Some(TuiCommand::QueueSelection(QueueSelectionCommand::Previous)),
+        KeyEvent {
+            code: KeyCode::Down,
+            ..
+        } => Some(TuiCommand::QueueSelection(QueueSelectionCommand::Next)),
+        KeyEvent {
+            code: KeyCode::Delete,
+            ..
+        } => {
+            let item = selected_queue_item(state, ui_state)?;
+            // Cancellation is only meaningful before an item is replaying or
+            // already cancelled.
+            if matches!(
+                item.status,
+                QueuedFollowUpStatus::Pending | QueuedFollowUpStatus::Paused
+            ) {
+                Some(TuiCommand::Dispatch(AppEvent::FollowUpCancelled(
+                    item.id.clone(),
+                )))
+            } else {
+                None
+            }
+        }
+        KeyEvent {
+            code: KeyCode::Char('r'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            let item = selected_queue_item(state, ui_state)?;
+            if item.status == QueuedFollowUpStatus::Paused {
+                Some(TuiCommand::Dispatch(AppEvent::FollowUpResumeRequested(
+                    item.id.clone(),
+                )))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn apply_queue_selection_command(
+    state: &AppState,
+    ui_state: &mut TuiUiState,
+    command: QueueSelectionCommand,
+) {
+    let count = state.queued_follow_ups.len();
+    if count == 0 {
+        ui_state.queue_selection_index = 0;
+        return;
+    }
+    let current = ui_state.queue_selection_index.min(count - 1);
+    ui_state.queue_selection_index = match command {
+        QueueSelectionCommand::Previous => {
+            if current == 0 {
+                count - 1
+            } else {
+                current - 1
+            }
+        }
+        QueueSelectionCommand::Next => (current + 1) % count,
+    };
 }
 
 fn agent_dropdown_key_command(key: KeyEvent) -> Option<TuiCommand> {
@@ -1283,18 +1402,37 @@ fn render_skill_loading(frame: &mut Frame) {
 }
 
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(6),
-            Constraint::Length(composer_height(state)),
-        ])
-        .split(frame.area());
+    let queue_height = queue_panel_height(state);
+    let outer = if queue_height > 0 {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),
+                Constraint::Length(queue_height),
+                Constraint::Length(composer_height(state)),
+            ])
+            .split(frame.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),
+                Constraint::Length(composer_height(state)),
+            ])
+            .split(frame.area())
+    };
+    let main_area = outer[0];
+    let queue_area = if queue_height > 0 {
+        Some(outer[1])
+    } else {
+        None
+    };
+    let composer_area = outer[outer.len() - 1];
     let event_area = if ui_state.roster_visible {
         let main = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
-            .split(outer[0]);
+            .split(main_area);
 
         let roster_items = state
             .agents
@@ -1352,13 +1490,17 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         frame.render_widget(roster, main[0]);
         main[1]
     } else {
-        outer[0]
+        main_area
     };
 
     render_chat(frame, event_area, state, ui_state);
 
+    if let Some(queue_area) = queue_area {
+        render_queue_panel(frame, queue_area, state, ui_state);
+    }
+
     if let Some(clarification) = &state.pending_clarification {
-        let areas = clarification_input_areas(outer[1]);
+        let areas = clarification_input_areas(composer_area);
         render_clarification_composer(frame, areas.input, clarification, ui_state);
         render_clarification_status(frame, areas.status);
         if ui_state.help_visible {
@@ -1370,7 +1512,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     }
 
     let work_active = work_indicator_active(state);
-    let input_areas = input_areas(outer[1]);
+    let input_areas = input_areas(composer_area);
     let input_layout = input_layout(input_areas.input, &state.input, ui_state.input_cursor);
     ui_state.input_width = input_layout.width;
     let input = Paragraph::new(wrapped_input_lines(&state.input, input_layout.width))
@@ -1393,6 +1535,102 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     } else {
         set_input_cursor(frame, input_areas.input, input_layout);
     }
+}
+
+/// Height of the compact queue panel: borders (2) + up to `QUEUE_VISIBLE_MAX`
+/// item rows + an optional "more" row + a hint row. Zero when the queue is
+/// empty so the existing two-row layout is unchanged.
+fn queue_panel_height(state: &AppState) -> u16 {
+    let count = state.queued_follow_ups.len();
+    if count == 0 {
+        return 0;
+    }
+    let visible = count.min(QUEUE_VISIBLE_MAX);
+    let more_row = usize::from(count > QUEUE_VISIBLE_MAX);
+    let rows = 2 + visible + more_row + 1; // borders + items + (more) + hint
+    rows.min(usize::from(u16::MAX)) as u16
+}
+
+fn queue_status_label(status: &QueuedFollowUpStatus) -> &'static str {
+    match status {
+        QueuedFollowUpStatus::Pending => "pending",
+        QueuedFollowUpStatus::Paused => "paused",
+        QueuedFollowUpStatus::Replaying => "replaying",
+        QueuedFollowUpStatus::Cancelled => "cancelled",
+    }
+}
+
+fn queue_status_style(status: &QueuedFollowUpStatus) -> Style {
+    match status {
+        QueuedFollowUpStatus::Pending => Style::default().fg(Color::Cyan),
+        QueuedFollowUpStatus::Paused => Style::default().fg(Color::Yellow),
+        QueuedFollowUpStatus::Replaying => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        QueuedFollowUpStatus::Cancelled => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn render_queue_panel(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &TuiUiState) {
+    let items = &state.queued_follow_ups;
+    let selected = ui_state
+        .queue_selection_index
+        .min(items.len().saturating_sub(1));
+    let visible = items.len().min(QUEUE_VISIBLE_MAX);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (index, item) in items.iter().take(visible).enumerate() {
+        let is_selected = index == selected && queue_control_active(state, ui_state);
+        let marker = if is_selected {
+            QUEUE_SELECTED_MARKER
+        } else {
+            QUEUE_UNSELECTED_MARKER
+        };
+        let marker_style = if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let mut spans = vec![
+            Span::styled(marker, marker_style),
+            Span::styled(
+                format!("[{}] ", queue_status_label(&item.status)),
+                queue_status_style(&item.status),
+            ),
+            Span::styled(
+                queue_prompt_summary(&item.prompt),
+                Style::default().fg(Color::White),
+            ),
+        ];
+        if let Some(reason) = item.pause_reason.as_deref() {
+            spans.push(Span::styled(
+                format!(" — {reason}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if items.len() > visible {
+        lines.push(Line::from(Span::styled(
+            format!("  …and {} more", items.len() - visible),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        QUEUE_HINT,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let panel = Paragraph::new(lines).block(
+        Block::default()
+            .title(format!(" Queue ({}) ", items.len()))
+            .title_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(Color::DarkGray))
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(panel, area);
 }
 
 fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: &mut TuiUiState) {
@@ -1653,6 +1891,10 @@ fn skill_dropdown_item(
     } else {
         item
     }
+}
+
+fn queue_prompt_summary(prompt: &str) -> String {
+    prompt.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn truncate_to_char_width(value: &str, max_width: usize) -> String {
@@ -4675,5 +4917,244 @@ runtime = "fake"
             kind: crossterm::event::KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         }
+    }
+
+    fn queue_view(
+        id: &str,
+        prompt: &str,
+        status: QueuedFollowUpStatus,
+        pause_reason: Option<&str>,
+    ) -> QueuedFollowUpView {
+        QueuedFollowUpView {
+            id: id.to_string(),
+            prompt: prompt.to_string(),
+            created_at: "2026-06-11T00:00:00.000Z".to_string(),
+            status,
+            pause_reason: pause_reason.map(str::to_string),
+        }
+    }
+
+    fn state_with_queue(items: Vec<QueuedFollowUpView>) -> AppState {
+        let mut state = state_with_input("", false);
+        state.queued_follow_ups = items;
+        state
+    }
+
+    #[test]
+    fn queue_panel_renders_single_pending_item_with_count() {
+        let state = state_with_queue(vec![queue_view(
+            "q1",
+            "update the docs",
+            QueuedFollowUpStatus::Pending,
+            None,
+        )]);
+
+        let text = render_to_text(&state, 100, 30);
+
+        assert!(text.contains("Queue (1)"));
+        assert!(text.contains("update the docs"));
+        assert!(text.contains("pending"));
+    }
+
+    #[test]
+    fn queue_panel_preserves_fifo_display_order() {
+        let state = state_with_queue(vec![
+            queue_view("q1", "first item", QueuedFollowUpStatus::Pending, None),
+            queue_view("q2", "second item", QueuedFollowUpStatus::Pending, None),
+        ]);
+
+        let text = render_to_text(&state, 100, 30);
+
+        assert!(text.contains("Queue (2)"));
+        let first = text.find("first item").expect("first item rendered");
+        let second = text.find("second item").expect("second item rendered");
+        assert!(first < second, "queue items should render in FIFO order");
+    }
+
+    #[test]
+    fn queue_panel_renders_paused_reason() {
+        let state = state_with_queue(vec![queue_view(
+            "q1",
+            "blocked item",
+            QueuedFollowUpStatus::Paused,
+            Some("run is waiting for clarification"),
+        )]);
+
+        let text = render_to_text(&state, 120, 30);
+
+        assert!(text.contains("paused"));
+        assert!(text.contains("blocked item"));
+        assert!(text.contains("run is waiting for clarification"));
+    }
+
+    #[test]
+    fn queue_panel_distinguishes_replaying_item() {
+        let state = state_with_queue(vec![
+            queue_view("q1", "running item", QueuedFollowUpStatus::Replaying, None),
+            queue_view("q2", "waiting item", QueuedFollowUpStatus::Pending, None),
+        ]);
+
+        let text = render_to_text(&state, 100, 30);
+
+        assert!(text.contains("replaying"));
+        assert!(text.contains("pending"));
+        assert!(text.contains("running item"));
+        assert!(text.contains("waiting item"));
+    }
+
+    #[test]
+    fn delete_key_cancels_selected_queue_item() {
+        let state = state_with_queue(vec![queue_view(
+            "q1",
+            "cancel me",
+            QueuedFollowUpStatus::Pending,
+            None,
+        )]);
+        let ui_state = TuiUiState::default();
+
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui_state, key(KeyCode::Delete)),
+            Some(TuiCommand::Dispatch(AppEvent::FollowUpCancelled(
+                "q1".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn ctrl_r_resumes_selected_paused_item() {
+        let state = state_with_queue(vec![queue_view(
+            "q1",
+            "paused item",
+            QueuedFollowUpStatus::Paused,
+            Some("previous run failed"),
+        )]);
+        let ui_state = TuiUiState::default();
+
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                key_with_modifiers(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::FollowUpResumeRequested(
+                "q1".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn ctrl_r_does_not_resume_pending_item() {
+        let state = state_with_queue(vec![queue_view(
+            "q1",
+            "pending item",
+            QueuedFollowUpStatus::Pending,
+            None,
+        )]);
+        let ui_state = TuiUiState::default();
+
+        // Ctrl-R only resumes paused items; on a pending item it falls through.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                key_with_modifiers(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_navigation_selects_and_cancel_targets_selected_item() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_queue(vec![
+            queue_view("q1", "first", QueuedFollowUpStatus::Pending, None),
+            queue_view("q2", "second", QueuedFollowUpStatus::Pending, None),
+        ]);
+        let mut ui_state = TuiUiState::default();
+
+        // Down navigates the queue selection without dispatching an event.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui_state, key(KeyCode::Down)),
+            Some(TuiCommand::QueueSelection(QueueSelectionCommand::Next))
+        );
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::QueueSelection(QueueSelectionCommand::Next),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ui_state.queue_selection_index, 1);
+        assert!(receiver.try_recv().is_err());
+
+        // Delete now cancels the selected (second) item.
+        let command = key_event_to_tui_command_with_ui(&state, &ui_state, key(KeyCode::Delete))
+            .expect("delete dispatches a cancel");
+        assert_eq!(
+            command,
+            TuiCommand::Dispatch(AppEvent::FollowUpCancelled("q2".to_string()))
+        );
+        execute_tui_command(&mut state, &mut ui_state, &sender, command)
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::FollowUpCancelled(id)) if id == "q2"
+        ));
+    }
+
+    #[test]
+    fn agent_and_skill_dropdown_routing_unchanged_when_queue_control_inactive() {
+        // Queued items present, but a non-empty `/agent:` input keeps the agent
+        // dropdown active and queue control inactive.
+        let mut agent_state = state_with_agent_roster("/agent:");
+        agent_state.queued_follow_ups = vec![queue_view(
+            "q1",
+            "queued",
+            QueuedFollowUpStatus::Pending,
+            None,
+        )];
+        let agent_ui = ui_state_with_cursor_at_end(&agent_state.input);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&agent_state, &agent_ui, key(KeyCode::Up)),
+            Some(TuiCommand::AgentDropdown(DropdownCommand::Previous))
+        );
+
+        let mut skill_state = state_with_input("/skill:", false);
+        skill_state.queued_follow_ups = vec![queue_view(
+            "q1",
+            "queued",
+            QueuedFollowUpStatus::Pending,
+            None,
+        )];
+        let skill_ui = ui_state_with_skills_at_end(&skill_state.input);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&skill_state, &skill_ui, key(KeyCode::Down)),
+            Some(TuiCommand::SkillDropdown(DropdownCommand::Next))
+        );
+    }
+
+    #[test]
+    fn queue_control_inactive_while_composing_input() {
+        let mut state = state_with_input("typing a message", false);
+        state.queued_follow_ups = vec![queue_view(
+            "q1",
+            "queued",
+            QueuedFollowUpStatus::Pending,
+            None,
+        )];
+        let ui_state = ui_state_with_cursor_at_end(&state.input);
+
+        // While composing (non-empty input) queue focus is inactive, so Delete is
+        // not a cancel and Up/Down move the input cursor.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui_state, key(KeyCode::Delete)),
+            None
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui_state, key(KeyCode::Up)),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up))
+        );
     }
 }

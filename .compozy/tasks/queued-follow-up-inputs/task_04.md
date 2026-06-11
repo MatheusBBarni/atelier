@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Render Queue State And Controls In TUI"
 type: frontend
 complexity: high
@@ -32,12 +32,12 @@ Expose queued follow-up state in the interactive TUI and add keyboard-dispatchab
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Add compact queue rendering to the TUI.
-- [ ] 4.2 Add paused queue reason rendering.
-- [ ] 4.3 Add TUI command dispatch for queue cancellation.
-- [ ] 4.4 Add TUI command dispatch for queue resume.
-- [ ] 4.5 Preserve existing input cursor, scroll, dropdown, approval, and interrupt behavior.
-- [ ] 4.6 Add render and key-dispatch tests.
+- [x] 4.1 Add compact queue rendering to the TUI.
+- [x] 4.2 Add paused queue reason rendering.
+- [x] 4.3 Add TUI command dispatch for queue cancellation.
+- [x] 4.4 Add TUI command dispatch for queue resume.
+- [x] 4.5 Preserve existing input cursor, scroll, dropdown, approval, and interrupt behavior.
+- [x] 4.6 Add render and key-dispatch tests.
 
 ## Implementation Details
 Modify `src/tui/mod.rs` after queue state, lifecycle events, and Chat projection exist. Reference the TechSpec "Component Overview" and "Testing Approach" sections. Keep the first UI compact; do not introduce a large modal or full queue manager in MVP.
@@ -67,15 +67,15 @@ Modify `src/tui/mod.rs` after queue state, lifecycle events, and Chat projection
 
 ## Tests
 - Unit tests:
-  - [ ] Rendering with one pending queue item shows the item summary and count.
-  - [ ] Rendering with multiple pending items preserves FIFO display order.
-  - [ ] Rendering a paused item shows the pause reason.
-  - [ ] Rendering a replaying item distinguishes it from pending items.
-  - [ ] Existing help, approval, and Chat render tests still pass.
+  - [x] Rendering with one pending queue item shows the item summary and count.
+  - [x] Rendering with multiple pending items preserves FIFO display order.
+  - [x] Rendering a paused item shows the pause reason.
+  - [x] Rendering a replaying item distinguishes it from pending items.
+  - [x] Existing help, approval, and Chat render tests still pass.
 - Integration tests:
-  - [ ] Queue cancel control dispatches `AppEvent::FollowUpCancelled` for the selected item id.
-  - [ ] Queue resume control dispatches `AppEvent::FollowUpResumeRequested` for the paused item id.
-  - [ ] Agent and skill dropdown key routing remains unchanged when no queue control is active.
+  - [x] Queue cancel control dispatches `AppEvent::FollowUpCancelled` for the selected item id.
+  - [x] Queue resume control dispatches `AppEvent::FollowUpResumeRequested` for the paused item id.
+  - [x] Agent and skill dropdown key routing remains unchanged when no queue control is active.
 - Test coverage target: >=80%
 - All tests must pass
 
