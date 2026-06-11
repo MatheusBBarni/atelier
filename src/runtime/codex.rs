@@ -317,20 +317,21 @@ When status is waiting_for_user:
 - Set recommended_option_id to the strongest option id, or null when no option stands out.
 - Do not add a custom, other, or free-text option; the app always provides its own custom text answer path.
 
-When output_schema is agent_result, return:
+When output_schema is agent_result, return (findings, changed_files, commands, and verification are each a list of plain strings — never objects or action descriptors):
 {{
   "schema_version": 1,
   "agent": "{agent_id}",
   "step_id": "{step_id}",
   "status": "completed|blocked|failed|cancelled|parse_error|limit_reached|approval_denied|no_changes",
   "summary": "brief result",
-  "findings": [],
-  "changed_files": [],
-  "commands": [],
-  "verification": [],
+  "findings": ["short factual finding"],
+  "changed_files": ["relative/path/to/file"],
+  "commands": ["short description of a command you ran, e.g. cargo test"],
+  "verification": ["how you confirmed the result, e.g. cargo test passed"],
   "blocker": null,
   "artifacts": []
 }}
+Never embed action objects (read_file, list_files, run_command, ...) inside any agent_result field; to perform an action, return one action_request contract at a time.
 
 When an action is needed instead, return:
 {{
@@ -763,6 +764,19 @@ exit 65
         assert!(prompt.contains(crate::orchestrator::JSON_START));
         assert!(prompt.contains("\"agent\""));
         assert!(prompt.contains("\"id\": \"orchestrator\""));
+    }
+
+    #[test]
+    fn codex_prompt_text_types_agent_result_arrays_as_strings() {
+        let request = runtime_request(std::path::PathBuf::from("/tmp/project"), "explorer");
+        let prompt = codex_prompt_text(&request).unwrap();
+
+        // The schema must teach that commands (and the sibling arrays) are
+        // strings, not action objects — the cause of the explorer parse errors.
+        assert!(prompt.contains("each a list of plain strings"));
+        assert!(prompt.contains("Never embed action objects"));
+        assert!(prompt.contains("\"commands\": [\"short description of a command you ran"));
+        assert!(!prompt.contains("\"commands\": []"));
     }
 
     #[test]
