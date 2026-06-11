@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Render Clarification Composer Layout"
 type: frontend
 complexity: medium
@@ -32,12 +32,12 @@ Render the pending clarification state as a select-style Input Composer with que
 </requirements>
 
 ## Subtasks
-- [ ] 8.1 Add clarification composer layout rendering.
-- [ ] 8.2 Render selected and recommended option states.
-- [ ] 8.3 Render always-visible custom answer field and cursor placement.
-- [ ] 8.4 Preserve pending approval and normal input rendering.
-- [ ] 8.5 Add render tests for common terminal sizes.
-- [ ] 8.6 Add final regression coverage for full TUI-visible clarification flow.
+- [x] 8.1 Add clarification composer layout rendering.
+- [x] 8.2 Render selected and recommended option states.
+- [x] 8.3 Render always-visible custom answer field and cursor placement.
+- [x] 8.4 Preserve pending approval and normal input rendering.
+- [x] 8.5 Add render tests for common terminal sizes.
+- [x] 8.6 Add final regression coverage for full TUI-visible clarification flow.
 
 ## Implementation Details
 Use TechSpec sections "TUI Composer Mode", "Chat Projection", and "Known Risks". This task depends on task 07 for interaction state and task 06 for Chat labels/statuses.
@@ -66,18 +66,18 @@ Use TechSpec sections "TUI Composer Mode", "Chat Projection", and "Known Risks".
 
 ## Tests
 - Unit tests:
-  - [ ] Pending clarification renders the question text in the composer area.
-  - [ ] Two recommended options render without overlap at 80x24.
-  - [ ] Four recommended options render without overlap at 120x40.
-  - [ ] The selected option has a visible marker distinct from unselected options.
-  - [ ] The recommended option has a visible marker distinct from selection.
-  - [ ] Custom answer field is always visible below the options.
-  - [ ] Cursor lands in the custom answer field when custom text is active.
-  - [ ] Pending approval rendering remains unchanged and does not show clarification labels.
+  - [x] Pending clarification renders the question text in the composer area.
+  - [x] Two recommended options render without overlap at 80x24.
+  - [x] Four recommended options render without overlap at 120x40.
+  - [x] The selected option has a visible marker distinct from unselected options.
+  - [x] The recommended option has a visible marker distinct from selection.
+  - [x] Custom answer field is always visible below the options.
+  - [x] Cursor lands in the custom answer field when custom text is active.
+  - [x] Pending approval rendering remains unchanged and does not show clarification labels.
 - Integration tests:
-  - [ ] Full fake-runtime pending clarification state renders Chat clarification context and composer answer controls together.
-- Test coverage target: >=80%
-- All tests must pass
+  - [x] Full fake-runtime pending clarification state renders Chat clarification context and composer answer controls together.
+- Test coverage target: >=80% ✓
+- All tests must pass ✓
 
 ## Success Criteria
 - All tests passing

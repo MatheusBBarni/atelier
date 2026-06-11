@@ -4,7 +4,8 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
 
 ## Current State
 
-- Tasks 01-07 completed: schema, validation, runtime contracts, app pending state, structured answer path, Chat semantics, and TUI key handling.
+- Tasks 01-08 completed: schema, validation, runtime contracts, app pending state, structured answer path, Chat semantics, TUI key handling, and clarification composer rendering. Feature complete.
+- Task 08: composer transforms in place when `pending_clarification` is Some (Cyan-bordered panel: question, option rows with `>` selection + `★ recommended` suffix, always-visible `Custom:` line, Ctrl-C hint, dynamic height, cursor in custom field). Normal/approval rendering byte-identical when not pending.
 - Task 05: `AppEvent::ClarificationAnswered` with full answer metadata; validates question_id, rejects empty answers, resumes run.
 - Task 06: Added `ChatItemKind::Clarification` and `ChatItemStatus::WaitingForUser`. Projects `clarification_requested` as pending, `clarification_answered` as completed. Remediated 2026-06-11: clarification items now use dedicated `ChatLifecycleKey::Clarification { run_id, question_id }` (they previously shared the `Run` key and were erased by `run_completed`); orchestrator decision `waiting_for_user` and legacy `blocker_reported` no longer project `WaitingApproval`.
 - Task 07: TUI state fields `clarification_option_index` and `clarification_custom_answer`; command routing checks pending clarification before dropdowns; Up/Down cycle options, Enter submits with answer_source logic, character input/backspace edit custom answer; Ctrl-C preserved. Remediated 2026-06-11 (test-only): Submit dispatch, approval-routing precedence, and movement-no-event coverage were missing/tautological and are now genuine executor-level tests.
@@ -26,4 +27,4 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
 ## Open Risks
 
 ## Handoffs
-- Task 08: clarification chat items persist across the full run lifecycle, keyed `chat:clarification:{run_id}:{question_id}`; pending status is `WaitingForUser`; `WaitingApproval` never appears in clarification flows.
+- None pending — all eight tasks complete.

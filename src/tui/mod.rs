@@ -1,7 +1,9 @@
 use crate::app::chat::{
     ChatDetailRef, ChatItemKind, ChatItemView, ChatLineStyle, ChatLineView, ChatSeverity,
 };
-use crate::app::{App, AppEvent, AppState, ApprovalHandle, InterruptHandle};
+use crate::app::{
+    App, AppEvent, AppState, ApprovalHandle, InterruptHandle, PendingClarificationView,
+};
 use crate::config::EffectiveConfig;
 use crate::orchestrator::RunState;
 use crate::skills::{
@@ -48,6 +50,12 @@ const WORK_INDICATOR_HEIGHT: u16 = 1;
 const WORK_LABEL: &str = "Working";
 const MOUSE_SCROLL_LINES: usize = 3;
 const WORK_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+const CLARIFICATION_SELECTED_MARKER: &str = "> ";
+const CLARIFICATION_UNSELECTED_MARKER: &str = "  ";
+const CLARIFICATION_RECOMMENDED_LABEL: &str = "★ recommended";
+const CLARIFICATION_CUSTOM_LABEL: &str = "Custom: ";
+const CLARIFICATION_HINT: &str =
+    "↑/↓ select · type custom answer · Enter answer · Ctrl-C interrupt";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TuiCommand {
@@ -1279,7 +1287,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
-            Constraint::Length(INPUT_COMPOSER_HEIGHT),
+            Constraint::Length(composer_height(state)),
         ])
         .split(frame.area());
     let event_area = if ui_state.roster_visible {
@@ -1348,6 +1356,18 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     };
 
     render_chat(frame, event_area, state, ui_state);
+
+    if let Some(clarification) = &state.pending_clarification {
+        let areas = clarification_input_areas(outer[1]);
+        render_clarification_composer(frame, areas.input, clarification, ui_state);
+        render_clarification_status(frame, areas.status);
+        if ui_state.help_visible {
+            render_help_modal(frame);
+        } else {
+            set_clarification_cursor(frame, areas.input, clarification, ui_state);
+        }
+        return;
+    }
 
     let work_active = work_indicator_active(state);
     let input_areas = input_areas(outer[1]);
@@ -2143,6 +2163,130 @@ fn set_input_cursor(frame: &mut Frame, input_area: Rect, input_layout: InputLayo
     frame.set_cursor_position(Position::new(
         input_area.x + 1 + input_layout.cursor_col,
         input_area.y + 1 + input_layout.cursor_row,
+    ));
+}
+
+fn composer_height(state: &AppState) -> u16 {
+    let Some(clarification) = &state.pending_clarification else {
+        return INPUT_COMPOSER_HEIGHT;
+    };
+    // borders (2) + question (1) + option rows + custom answer line (1)
+    let box_rows = 2 + 1 + clarification.options.len() + 1;
+    (box_rows.min(usize::from(u16::MAX)) as u16).saturating_add(WORK_INDICATOR_HEIGHT)
+}
+
+fn clarification_input_areas(composer_area: Rect) -> InputAreas {
+    if composer_area.height <= WORK_INDICATOR_HEIGHT {
+        return InputAreas {
+            input: composer_area,
+            status: Rect::ZERO,
+        };
+    }
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(composer_area.height - WORK_INDICATOR_HEIGHT),
+            Constraint::Length(WORK_INDICATOR_HEIGHT),
+        ])
+        .split(composer_area);
+    InputAreas {
+        input: areas[0],
+        status: areas[1],
+    }
+}
+
+fn render_clarification_composer(
+    frame: &mut Frame,
+    area: Rect,
+    clarification: &PendingClarificationView,
+    ui_state: &TuiUiState,
+) {
+    let mut lines = vec![Line::from(Span::styled(
+        clarification.question.clone(),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for (index, option) in clarification.options.iter().enumerate() {
+        let selected = index == ui_state.clarification_option_index;
+        let recommended = clarification
+            .recommended_option_id
+            .as_deref()
+            .is_some_and(|id| id == option.id);
+        let marker = if selected {
+            CLARIFICATION_SELECTED_MARKER
+        } else {
+            CLARIFICATION_UNSELECTED_MARKER
+        };
+        let option_style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let mut spans = vec![Span::styled(
+            format!("{marker}{}", option.label),
+            option_style,
+        )];
+        if recommended {
+            spans.push(Span::styled(
+                format!(" {CLARIFICATION_RECOMMENDED_LABEL}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(CLARIFICATION_CUSTOM_LABEL, Style::default().fg(Color::Cyan)),
+        Span::raw(ui_state.clarification_custom_answer.clone()),
+    ]));
+    let composer = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Clarifying question ")
+            .title_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(Color::Cyan))
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(composer, area);
+}
+
+fn render_clarification_status(frame: &mut Frame, status_area: Rect) {
+    if status_area.width == 0 || status_area.height == 0 {
+        return;
+    }
+    let line_area = Rect {
+        x: status_area.x + 1,
+        y: status_area.y,
+        width: status_area.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(Clear, status_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            CLARIFICATION_HINT,
+            Style::default().fg(Color::Gray),
+        ))),
+        line_area,
+    );
+}
+
+fn set_clarification_cursor(
+    frame: &mut Frame,
+    area: Rect,
+    clarification: &PendingClarificationView,
+    ui_state: &TuiUiState,
+) {
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let custom_row = 1 + 1 + clarification.options.len();
+    let custom_col = 1
+        + CLARIFICATION_CUSTOM_LABEL.chars().count()
+        + input_char_count(&ui_state.clarification_custom_answer);
+    let max_col = usize::from(area.width.saturating_sub(2));
+    let max_row = usize::from(area.height.saturating_sub(2));
+    frame.set_cursor_position(Position::new(
+        area.x + custom_col.min(max_col) as u16,
+        area.y + custom_row.min(max_row) as u16,
     ));
 }
 
@@ -4279,6 +4423,203 @@ mod tests {
             AppWorkerCommand::Event(AppEvent::ClarificationAnswered(_))
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn renders_clarification_question_options_and_custom_field_at_80x24() {
+        let mut state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("opt1", "Feature scope"),
+            clarification_option("opt2", "Bug fix scope"),
+        ]);
+        view.recommended_option_id = Some("opt1".to_string());
+        state.pending_clarification = Some(view);
+        let mut ui_state = TuiUiState::default();
+
+        let lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 80, 24);
+
+        let question_row = lines
+            .iter()
+            .position(|line| line.contains("Test question"))
+            .unwrap();
+        let selected_row = lines
+            .iter()
+            .position(|line| line.contains("> Feature scope"))
+            .unwrap();
+        let other_row = lines
+            .iter()
+            .position(|line| line.contains("Bug fix scope"))
+            .unwrap();
+        let custom_row = lines
+            .iter()
+            .position(|line| line.contains("Custom:"))
+            .unwrap();
+        assert!(question_row < selected_row);
+        assert!(selected_row < other_row);
+        assert!(other_row < custom_row);
+        assert!(lines[selected_row].contains("★ recommended"));
+        assert!(!lines[other_row].contains("> "));
+        assert!(lines.join("\n").contains("Ctrl-C interrupt"));
+    }
+
+    #[test]
+    fn renders_recommended_marker_distinct_from_selection_marker() {
+        let mut state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("opt1", "Feature scope"),
+            clarification_option("opt2", "Bug fix scope"),
+        ]);
+        view.recommended_option_id = Some("opt1".to_string());
+        state.pending_clarification = Some(view);
+        let mut ui_state = TuiUiState {
+            clarification_option_index: 1,
+            ..Default::default()
+        };
+
+        let lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 80, 24);
+
+        let recommended_row = lines
+            .iter()
+            .position(|line| line.contains("★ recommended"))
+            .unwrap();
+        let selected_row = lines
+            .iter()
+            .position(|line| line.contains("> Bug fix scope"))
+            .unwrap();
+        assert!(lines[recommended_row].contains("Feature scope"));
+        assert!(!lines[recommended_row].contains("> "));
+        assert_ne!(recommended_row, selected_row);
+        assert!(!lines[selected_row].contains("★"));
+    }
+
+    #[test]
+    fn renders_four_options_without_overlap_at_120x40() {
+        let mut state = state_with_input("", false);
+        state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("opt1", "Option one"),
+            clarification_option("opt2", "Option two"),
+            clarification_option("opt3", "Option three"),
+            clarification_option("opt4", "Option four"),
+        ]));
+        let mut ui_state = TuiUiState::default();
+
+        let lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 120, 40);
+
+        let rows = [
+            "Option one",
+            "Option two",
+            "Option three",
+            "Option four",
+            "Custom:",
+        ]
+        .iter()
+        .map(|needle| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("missing row: {needle}"))
+        })
+        .collect::<Vec<_>>();
+        for pair in rows.windows(2) {
+            assert!(pair[0] < pair[1], "rows must not overlap: {rows:?}");
+        }
+        let question_row = lines
+            .iter()
+            .position(|line| line.contains("Test question"))
+            .unwrap();
+        assert!(question_row < rows[0]);
+    }
+
+    #[test]
+    fn cursor_lands_in_custom_answer_field_while_clarification_pending() {
+        let mut state = state_with_input("", false);
+        state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("opt1", "Feature scope"),
+            clarification_option("opt2", "Bug fix scope"),
+        ]));
+        let mut ui_state = TuiUiState {
+            clarification_custom_answer: "abc".to_string(),
+            ..Default::default()
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &mut ui_state))
+            .unwrap();
+
+        // composer box: y = 24 - 7 = 17; custom row = 17 + border + question + 2 options = 21
+        // cursor col = border (1) + "Custom: " (8) + "abc" (3) = 12
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(12, 21));
+    }
+
+    #[test]
+    fn pending_approval_rendering_shows_no_clarification_labels() {
+        let state = state_with_input("", true);
+
+        let text = render_to_text(&state, 100, 24);
+
+        assert!(text.contains("Approval required for fixer action action."));
+        assert!(!text.contains("Clarifying question"));
+        assert!(!text.contains("Custom:"));
+        assert!(!text.contains("★ recommended"));
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_clarification_renders_chat_context_and_composer_controls() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "fake"
+
+[agents.consul]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        let view = app.state().pending_clarification.clone().unwrap();
+        assert_eq!(view.options.len(), 3);
+
+        let mut ui_state = TuiUiState::default();
+        let text = render_to_text_with_ui_mut(app.state(), &mut ui_state, 120, 40);
+
+        // Chat context from the projection (status badge is chat-only).
+        assert!(text.contains("waiting for clarification"));
+        // Composer answer controls.
+        assert!(text.contains("Which target or constraint should guide this run?"));
+        assert!(text.contains("> Clarify the target scope"));
+        assert!(text.contains("★ recommended"));
+        assert!(text.contains("Custom:"));
+        assert!(text.contains("Ctrl-C interrupt"));
     }
 
     #[test]
