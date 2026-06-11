@@ -4027,37 +4027,38 @@ mod tests {
         }
     }
 
+    fn clarification_option(id: &str, label: &str) -> ClarificationOption {
+        ClarificationOption {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: None,
+        }
+    }
+
+    fn clarification_view(options: Vec<ClarificationOption>) -> PendingClarificationView {
+        PendingClarificationView {
+            run_id: "run".to_string(),
+            question_id: "q1".to_string(),
+            question: "Test question".to_string(),
+            options,
+            recommended_option_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn clarification_up_key_cycles_options() {
         let mut ui_state = TuiUiState {
             clarification_option_index: 1,
+            input_cursor: 3,
             ..Default::default()
         };
 
-        let mut app_state = state_with_input("", false);
-        app_state.pending_clarification = Some(PendingClarificationView {
-            run_id: "run".to_string(),
-            question_id: "q1".to_string(),
-            question: "Test question".to_string(),
-            options: vec![
-                ClarificationOption {
-                    id: "opt1".to_string(),
-                    label: "Option 1".to_string(),
-                    description: None,
-                },
-                ClarificationOption {
-                    id: "opt2".to_string(),
-                    label: "Option 2".to_string(),
-                    description: None,
-                },
-                ClarificationOption {
-                    id: "opt3".to_string(),
-                    label: "Option 3".to_string(),
-                    description: None,
-                },
-            ],
-            recommended_option_id: None,
-        });
+        let mut app_state = state_with_input("draft", false);
+        app_state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("opt1", "Option 1"),
+            clarification_option("opt2", "Option 2"),
+            clarification_option("opt3", "Option 3"),
+        ]));
 
         let command = key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Up));
         assert_eq!(
@@ -4067,40 +4068,29 @@ mod tests {
             ))
         );
 
-        let (sender, _) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel(1);
         execute_tui_command(&mut app_state, &mut ui_state, &sender, command.unwrap())
             .await
             .unwrap();
 
         assert_eq!(ui_state.clarification_option_index, 0);
+        assert_eq!(ui_state.input_cursor, 3);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn clarification_down_key_cycles_options() {
         let mut ui_state = TuiUiState {
             clarification_option_index: 0,
+            input_cursor: 2,
             ..Default::default()
         };
 
-        let mut app_state = state_with_input("", false);
-        app_state.pending_clarification = Some(PendingClarificationView {
-            run_id: "run".to_string(),
-            question_id: "q1".to_string(),
-            question: "Test question".to_string(),
-            options: vec![
-                ClarificationOption {
-                    id: "opt1".to_string(),
-                    label: "Option 1".to_string(),
-                    description: None,
-                },
-                ClarificationOption {
-                    id: "opt2".to_string(),
-                    label: "Option 2".to_string(),
-                    description: None,
-                },
-            ],
-            recommended_option_id: None,
-        });
+        let mut app_state = state_with_input("draft", false);
+        app_state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("opt1", "Option 1"),
+            clarification_option("opt2", "Option 2"),
+        ]));
 
         let command = key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Down));
         assert_eq!(
@@ -4108,62 +4098,187 @@ mod tests {
             Some(TuiCommand::Clarification(ClarificationCommand::NextOption))
         );
 
-        let (sender, _) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel(1);
         execute_tui_command(&mut app_state, &mut ui_state, &sender, command.unwrap())
             .await
             .unwrap();
 
         assert_eq!(ui_state.clarification_option_index, 1);
+        assert_eq!(ui_state.input_cursor, 2);
+        assert!(receiver.try_recv().is_err());
     }
 
-    #[test]
-    fn clarification_character_input_updates_custom_answer() {
+    #[tokio::test]
+    async fn clarification_character_input_updates_custom_answer() {
         let mut ui_state = TuiUiState::default();
         let mut app_state = state_with_input("", false);
-        app_state.pending_clarification = Some(PendingClarificationView {
-            run_id: "run".to_string(),
-            question_id: "q1".to_string(),
-            question: "Test question".to_string(),
-            options: vec![],
-            recommended_option_id: None,
-        });
+        app_state.pending_clarification = Some(clarification_view(vec![]));
 
         let command =
             key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Char('t')));
         assert_eq!(command, Some(TuiCommand::ClarificationInputCharacter('t')));
 
-        if let Some(TuiCommand::ClarificationInputCharacter(ch)) = command {
-            ui_state.clarification_custom_answer.push(ch);
-        }
+        let (sender, mut receiver) = mpsc::channel(1);
+        execute_tui_command(&mut app_state, &mut ui_state, &sender, command.unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(ui_state.clarification_custom_answer, "t");
+        assert!(app_state.input.is_empty());
+        assert!(receiver.try_recv().is_err());
     }
 
-    #[test]
-    fn clarification_backspace_removes_character() {
+    #[tokio::test]
+    async fn clarification_backspace_removes_character() {
         let mut ui_state = TuiUiState {
             clarification_custom_answer: "test".to_string(),
             ..Default::default()
         };
 
         let mut app_state = state_with_input("", false);
-        app_state.pending_clarification = Some(PendingClarificationView {
-            run_id: "run".to_string(),
-            question_id: "q1".to_string(),
-            question: "Test question".to_string(),
-            options: vec![],
-            recommended_option_id: None,
-        });
+        app_state.pending_clarification = Some(clarification_view(vec![]));
 
         let command =
             key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Backspace));
         assert_eq!(command, Some(TuiCommand::ClarificationInputBackspace));
 
-        if let Some(TuiCommand::ClarificationInputBackspace) = command {
-            ui_state.clarification_custom_answer.pop();
-        }
+        let (sender, mut receiver) = mpsc::channel(1);
+        execute_tui_command(&mut app_state, &mut ui_state, &sender, command.unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(ui_state.clarification_custom_answer, "tes");
+        assert!(app_state.input.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn clarification_enter_on_option_dispatches_answer_with_metadata() {
+        let mut ui_state = TuiUiState {
+            clarification_option_index: 1,
+            ..Default::default()
+        };
+
+        let mut app_state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("opt1", "Option 1"),
+            clarification_option("opt2", "Option 2"),
+        ]);
+        view.recommended_option_id = Some("opt2".to_string());
+        app_state.pending_clarification = Some(view);
+
+        let command = key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Enter));
+        assert_eq!(
+            command,
+            Some(TuiCommand::Clarification(ClarificationCommand::Submit))
+        );
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        execute_tui_command(&mut app_state, &mut ui_state, &sender, command.unwrap())
+            .await
+            .unwrap();
+
+        let queued = receiver.try_recv().unwrap();
+        let AppWorkerCommand::Event(AppEvent::ClarificationAnswered(answer)) = queued else {
+            panic!("expected clarification answer event, got {queued:?}");
+        };
+        assert_eq!(answer.question_id, "q1");
+        assert_eq!(answer.answer, "Option 2");
+        assert_eq!(answer.selected_option_id.as_deref(), Some("opt2"));
+        assert_eq!(answer.selected_option_label.as_deref(), Some("Option 2"));
+        assert_eq!(answer.answer_source, "recommended");
+        assert_eq!(ui_state.clarification_option_index, 0);
+        assert!(ui_state.clarification_custom_answer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clarification_enter_with_custom_text_dispatches_custom_answer() {
+        let mut ui_state = TuiUiState {
+            clarification_custom_answer: "  my own answer  ".to_string(),
+            ..Default::default()
+        };
+
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("opt1", "Option 1"),
+            clarification_option("opt2", "Option 2"),
+        ]));
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        execute_tui_command(
+            &mut app_state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::Clarification(ClarificationCommand::Submit),
+        )
+        .await
+        .unwrap();
+
+        let queued = receiver.try_recv().unwrap();
+        let AppWorkerCommand::Event(AppEvent::ClarificationAnswered(answer)) = queued else {
+            panic!("expected clarification answer event, got {queued:?}");
+        };
+        assert_eq!(answer.answer, "my own answer");
+        assert_eq!(answer.answer_source, "custom");
+        assert!(answer.selected_option_id.is_none());
+        assert!(answer.selected_option_label.is_none());
+        assert!(ui_state.clarification_custom_answer.is_empty());
+        assert_eq!(ui_state.clarification_option_index, 0);
+    }
+
+    #[test]
+    fn enter_with_pending_approval_routes_to_approval_not_clarification() {
+        let yes_state = state_with_input("yes", true);
+        let no_state = state_with_input("no", true);
+        let ui_state = TuiUiState::default();
+
+        assert!(yes_state.pending_clarification.is_none());
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&yes_state, &ui_state, key(KeyCode::Enter)),
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(true)))
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&no_state, &ui_state, key(KeyCode::Enter)),
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(false)))
+        );
+    }
+
+    #[tokio::test]
+    async fn clarification_movement_emits_no_app_event_until_enter() {
+        let mut ui_state = TuiUiState::default();
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("opt1", "Option 1"),
+            clarification_option("opt2", "Option 2"),
+        ]));
+
+        let (sender, mut receiver) = mpsc::channel(4);
+        for command in [
+            TuiCommand::Clarification(ClarificationCommand::NextOption),
+            TuiCommand::Clarification(ClarificationCommand::PreviousOption),
+            TuiCommand::ClarificationInputCharacter('h'),
+            TuiCommand::ClarificationInputBackspace,
+        ] {
+            execute_tui_command(&mut app_state, &mut ui_state, &sender, command)
+                .await
+                .unwrap();
+            assert!(receiver.try_recv().is_err());
+        }
+
+        execute_tui_command(
+            &mut app_state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::Clarification(ClarificationCommand::Submit),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::ClarificationAnswered(_))
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
