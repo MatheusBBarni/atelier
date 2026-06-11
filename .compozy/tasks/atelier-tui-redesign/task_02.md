@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Create theme module: caps detection, tokens, resolution, agent accents"
 type: backend
 complexity: medium
@@ -31,12 +31,12 @@ Create `src/tui/theme.rs`: the single source of color truth. It defines semantic
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Create `src/tui/theme.rs` with the `Theme` struct, serde-ready, and the web-palette token table (RGB + chosen 256-index + mono treatment per token).
-- [ ] 2.2 Implement `TerminalCaps` with a pure resolver over provided env values plus a `detect()` wrapper reading the process env.
-- [ ] 2.3 Implement `Theme::resolve(caps)` covering the three capability tiers.
-- [ ] 2.4 Implement `accent_for(index)` round-robin over the agent accent pool.
-- [ ] 2.5 Declare `pub mod theme;` in `src/tui/mod.rs` (after the use block, ~line 38).
-- [ ] 2.6 Unit-test resolution per tier and accent cycling.
+- [x] 2.1 Create `src/tui/theme.rs` with the `Theme` struct, serde-ready, and the web-palette token table (RGB + chosen 256-index + mono treatment per token).
+- [x] 2.2 Implement `TerminalCaps` with a pure resolver over provided env values plus a `detect()` wrapper reading the process env.
+- [x] 2.3 Implement `Theme::resolve(caps)` covering the three capability tiers.
+- [x] 2.4 Implement `accent_for(index)` round-robin over the agent accent pool.
+- [x] 2.5 Declare `pub mod theme;` in `src/tui/mod.rs` (after the use block, ~line 38).
+- [x] 2.6 Unit-test resolution per tier and accent cycling.
 
 ## Implementation Details
 
@@ -65,15 +65,15 @@ New file plus a one-line module declaration. Follow the module-declaration patte
 
 ## Tests
 - Unit tests:
-  - [ ] Caps from `NO_COLOR=""`/unset + `COLORTERM=truecolor` → truecolor=true, no_color=false.
-  - [ ] Caps from `NO_COLOR=1` → no_color=true regardless of COLORTERM.
-  - [ ] `resolve` under truecolor returns `Color::Rgb` for `text`, `accent`, `status_warn` with the web hex values.
-  - [ ] `resolve` under 256-color returns `Color::Indexed` for every token (no `Rgb` leaks).
-  - [ ] `resolve` under no_color returns no RGB/Indexed brand colors (terminal-default/mono styles only).
-  - [ ] `accent_for(0..2*pool)` cycles: adjacent indices distinct, index `i` == index `i + pool_len`.
-  - [ ] Red (`status_error` value) does not appear in `agent_accents`.
+  - [x] Caps from `NO_COLOR=""`/unset + `COLORTERM=truecolor` → truecolor=true, no_color=false.
+  - [x] Caps from `NO_COLOR=1` → no_color=true regardless of COLORTERM.
+  - [x] `resolve` under truecolor returns `Color::Rgb` for `text`, `accent`, `status_warn` with the web hex values.
+  - [x] `resolve` under 256-color returns `Color::Indexed` for every token (no `Rgb` leaks).
+  - [x] `resolve` under no_color returns no RGB/Indexed brand colors (terminal-default/mono styles only).
+  - [x] `accent_for(0..2*pool)` cycles: adjacent indices distinct, index `i` == index `i + pool_len`.
+  - [x] Red (`status_error` value) does not appear in `agent_accents`.
 - Integration tests:
-  - [ ] A `Theme::resolve(TerminalCaps{..})` value can style a minimal TestBackend render without panicking.
+  - [x] A `Theme::resolve(TerminalCaps{..})` value can style a minimal TestBackend render without panicking.
 - Test coverage target: >=80%
 - All tests must pass
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Thread theme through TUI and migrate all inline colors
 type: refactor
 complexity: high
@@ -32,13 +32,13 @@ Add the resolved `Theme` to `TuiUiState` and replace all 96 inline `Color::` lit
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Add `theme` to `TuiUiState`, its `Default` impl (test theme), and the startup construction in `run_tui`.
-- [ ] 3.2 Update the ~36 test construction sites and the two `ui_state_with_*` helpers.
-- [ ] 3.3 Migrate the helper functions (`status_style`, `severity_badge_style`, `severity_title_style`, `availability_style`) to tokens.
-- [ ] 3.4 Migrate the remaining literals function by function (top consumers: `skill_dropdown_item` 10, `render` 9, `chat_body_line` 8, `agent_dropdown_item` 8, `render_help_modal` 7, `render_clarification_composer` 7).
-- [ ] 3.5 Remove `USER_EVENT_BG` const (:39) in favor of `theme.user_prompt_bg`.
-- [ ] 3.6 Add the source-invariant test scanning `src/tui/` for `Color::` outside `theme.rs`.
-- [ ] 3.7 Run the full test suite; update any string assertions that intentionally changed (none expected — verified tests are content-only).
+- [x] 3.1 Add `theme` to `TuiUiState`, its `Default` impl (test theme), and the startup construction in `run_tui`.
+- [x] 3.2 Update the ~36 test construction sites and the two `ui_state_with_*` helpers. (Most inherit `theme` via `..Default::default()`; only the two direct-call sites — `legacy_chat_line`, `render_skill_loading` — needed edits.)
+- [x] 3.3 Migrate the helper functions (`status_style`, `severity_badge_style`, `severity_title_style`, `availability_style`) to tokens. (Each gains a `theme: &Theme` param — they take no `ui_state`, and ADR-004 forbids a global theme.)
+- [x] 3.4 Migrate the remaining literals function by function.
+- [x] 3.5 Remove `USER_EVENT_BG` const in favor of `theme.user_prompt_bg`.
+- [x] 3.6 Add the source-invariant test scanning `src/tui/` for `Color::` outside `theme.rs`.
+- [x] 3.7 Run the full test suite; string assertions unchanged (content-only, as verified).
 
 ## Implementation Details
 
@@ -65,12 +65,12 @@ Single-file mechanical migration in `src/tui/mod.rs` (4,673 lines; render code t
 
 ## Tests
 - Unit tests:
-  - [ ] Source-invariant: scanning `src/tui/` finds `Color::` only in `theme.rs`.
-  - [ ] `status_style("running")` returns the theme's `status_ok` with bold; `status_style("disabled")` returns `text_dim`.
-  - [ ] `severity_badge_style(Error)` uses `status_error` background.
+  - [x] Source-invariant: scanning `src/tui/` finds `Color::` only in `theme.rs`.
+  - [x] `status_style("running")` returns the theme's `status_ok` with bold; `status_style("disabled")` returns `text_dim`.
+  - [x] `severity_badge_style(Error)` uses `status_error` background.
 - Integration tests:
-  - [ ] All pre-existing render tests pass (content assertions unchanged).
-  - [ ] `render_to_text` smoke at 80x24 with a NO_COLOR-resolved theme contains identical text content to the truecolor render.
+  - [x] All pre-existing render tests pass (content assertions unchanged).
+  - [x] `render_to_text` smoke at 80x24 with a NO_COLOR-resolved theme contains identical text content to the truecolor render.
 - Test coverage target: >=80%
 - All tests must pass
 

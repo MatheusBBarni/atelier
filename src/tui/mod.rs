@@ -22,7 +22,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -37,7 +37,10 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-const USER_EVENT_BG: Color = Color::Rgb(18, 52, 71);
+pub mod theme;
+
+use theme::{TerminalCaps, Theme};
+
 const INPUT_COMPOSER_HEIGHT: u16 = 5;
 const INPUT_BOX_HEIGHT: u16 = 4;
 const INPUT_PROMPT: &str = "> ";
@@ -146,6 +149,7 @@ struct TuiUiState {
     queue_selection_index: usize,
     status_message: Option<String>,
     work_spinner_frame: usize,
+    theme: Theme,
 }
 
 impl Default for TuiUiState {
@@ -170,6 +174,13 @@ impl Default for TuiUiState {
             queue_selection_index: 0,
             status_message: None,
             work_spinner_frame: 0,
+            // Tests default to a fixed truecolor theme so style assertions are
+            // deterministic; production overrides this in `run_tui` with the
+            // capability-detected theme.
+            theme: Theme::resolve(TerminalCaps {
+                no_color: false,
+                truecolor: true,
+            }),
         }
     }
 }
@@ -237,6 +248,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     }
 
     let working_directory = config.working_directory.clone();
+    let theme = Theme::resolve(TerminalCaps::detect());
     let mut app = App::new_with_debug(config, debug_enabled).await?;
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
     app.attach_state_sender(state_sender);
@@ -251,17 +263,19 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let mut terminal = Terminal::new(backend)?;
     let worker = tokio::spawn(run_app_worker(app, command_receiver));
 
-    let result = match terminal.draw(render_skill_loading) {
+    let result = match terminal.draw(|frame| render_skill_loading(frame, &theme)) {
         Ok(_) => {
             let skill_suggestions = load_skill_suggestions(&working_directory);
+            let mut ui_state =
+                TuiUiState::with_skill_suggestions(working_directory, skill_suggestions);
+            ui_state.theme = theme;
             run_loop(
                 &mut terminal,
                 state_receiver,
                 command_sender.clone(),
                 interrupt_handle,
                 approval_handle,
-                working_directory,
-                skill_suggestions,
+                ui_state,
             )
             .await
         }
@@ -291,11 +305,9 @@ async fn run_loop(
     command_sender: mpsc::Sender<AppWorkerCommand>,
     interrupt_handle: InterruptHandle,
     approval_handle: ApprovalHandle,
-    working_directory: PathBuf,
-    skill_suggestions: Vec<SkillSuggestion>,
+    mut ui_state: TuiUiState,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
-    let mut ui_state = TuiUiState::with_skill_suggestions(working_directory, skill_suggestions);
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
@@ -309,7 +321,7 @@ async fn run_loop(
             };
             if let Some(command) = command {
                 if matches!(&command, TuiCommand::ReloadSkills) {
-                    terminal.draw(render_skill_loading)?;
+                    terminal.draw(|frame| render_skill_loading(frame, &ui_state.theme))?;
                 }
                 if !execute_tui_command_with_interrupt(
                     &mut state,
@@ -1373,28 +1385,28 @@ fn agent_suggestion_detail(agent: &crate::app::AgentView) -> String {
     format!("{}/{}{}", agent.runtime, agent.model, capabilities)
 }
 
-fn render_skill_loading(frame: &mut Frame) {
+fn render_skill_loading(frame: &mut Frame, theme: &Theme) {
     let area = frame.area();
     let lines = vec![
         Line::from(vec![
             Span::styled(
                 "Loading skills",
                 Style::default()
-                    .fg(Color::LightCyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("...", Style::default().fg(Color::White)),
+            Span::styled("...", Style::default().fg(theme.text)),
         ]),
         Line::from("Scanning project and personal skill folders"),
     ];
     let paragraph = Paragraph::new(lines)
         .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::Gray))
+        .style(Style::default().fg(theme.text_muted))
         .block(
             Block::default()
                 .title(" Atelier ")
-                .title_style(Style::default().fg(Color::Yellow))
-                .border_style(Style::default().fg(Color::Yellow))
+                .title_style(Style::default().fg(theme.accent))
+                .border_style(Style::default().fg(theme.accent))
                 .borders(Borders::ALL),
         );
     frame.render_widget(Clear, area);
@@ -1402,6 +1414,7 @@ fn render_skill_loading(frame: &mut Frame) {
 }
 
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
+    let theme = ui_state.theme;
     let queue_height = queue_panel_height(state);
     let outer = if queue_height > 0 {
         Layout::default()
@@ -1444,25 +1457,28 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
                         Span::styled(
                             format!("{} ", agent.name),
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(theme.accent)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             agent_status_label(&agent.status),
-                            status_style(&agent.status),
+                            status_style(&theme, &agent.status),
                         ),
                     ]),
                     Line::from(vec![
                         Span::styled(
                             format!("{}/{} ", agent.runtime, agent.model),
-                            Style::default().fg(Color::Gray),
+                            Style::default().fg(theme.text_muted),
                         ),
-                        Span::styled(availability, availability_style(&agent.availability)),
+                        Span::styled(
+                            availability,
+                            availability_style(&theme, &agent.availability),
+                        ),
                     ]),
                     Line::from(vec![
                         Span::styled(
                             format!("effort:{} ", agent.effort),
-                            Style::default().fg(Color::LightBlue),
+                            Style::default().fg(theme.text_muted),
                         ),
                         Span::styled(
                             if agent.thinking {
@@ -1471,9 +1487,9 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
                                 "thinking:off"
                             },
                             if agent.thinking {
-                                Style::default().fg(Color::LightMagenta)
+                                Style::default().fg(theme.accent)
                             } else {
-                                Style::default().fg(Color::DarkGray)
+                                Style::default().fg(theme.text_dim)
                             },
                         ),
                     ]),
@@ -1483,8 +1499,8 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         let roster = List::new(roster_items).block(
             Block::default()
                 .title(" Agent Roster ")
-                .title_style(Style::default().fg(Color::Cyan))
-                .border_style(Style::default().fg(Color::DarkGray))
+                .title_style(Style::default().fg(theme.accent))
+                .border_style(Style::default().fg(theme.border))
                 .borders(Borders::ALL),
         );
         frame.render_widget(roster, main[0]);
@@ -1502,9 +1518,9 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     if let Some(clarification) = &state.pending_clarification {
         let areas = clarification_input_areas(composer_area);
         render_clarification_composer(frame, areas.input, clarification, ui_state);
-        render_clarification_status(frame, areas.status);
+        render_clarification_status(frame, areas.status, &theme);
         if ui_state.help_visible {
-            render_help_modal(frame);
+            render_help_modal(frame, &theme);
         } else {
             set_clarification_cursor(frame, areas.input, clarification, ui_state);
         }
@@ -1515,23 +1531,27 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     let input_areas = input_areas(composer_area);
     let input_layout = input_layout(input_areas.input, &state.input, ui_state.input_cursor);
     ui_state.input_width = input_layout.width;
-    let input = Paragraph::new(wrapped_input_lines(&state.input, input_layout.width))
-        .style(Style::default().fg(Color::White))
-        .block(
-            Block::default()
-                .border_style(Style::default().fg(Color::Yellow))
-                .borders(Borders::ALL),
-        )
-        .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
+    let input = Paragraph::new(wrapped_input_lines(
+        &theme,
+        &state.input,
+        input_layout.width,
+    ))
+    .style(Style::default().fg(theme.text))
+    .block(
+        Block::default()
+            .border_style(Style::default().fg(theme.border_focused))
+            .borders(Borders::ALL),
+    )
+    .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
     frame.render_widget(input, input_areas.input);
     render_input_status(frame, input_areas.status, ui_state, work_active);
     if let Some(dropdown) = agent_dropdown(state, ui_state) {
-        render_agent_dropdown(frame, input_areas.input, &dropdown);
+        render_agent_dropdown(frame, input_areas.input, &dropdown, &theme);
     } else if let Some(dropdown) = skill_dropdown(&state.input, ui_state) {
-        render_skill_dropdown(frame, input_areas.input, &dropdown);
+        render_skill_dropdown(frame, input_areas.input, &dropdown, &theme);
     }
     if ui_state.help_visible {
-        render_help_modal(frame);
+        render_help_modal(frame, &theme);
     } else {
         set_input_cursor(frame, input_areas.input, input_layout);
     }
@@ -1560,18 +1580,19 @@ fn queue_status_label(status: &QueuedFollowUpStatus) -> &'static str {
     }
 }
 
-fn queue_status_style(status: &QueuedFollowUpStatus) -> Style {
+fn queue_status_style(theme: &Theme, status: &QueuedFollowUpStatus) -> Style {
     match status {
-        QueuedFollowUpStatus::Pending => Style::default().fg(Color::Cyan),
-        QueuedFollowUpStatus::Paused => Style::default().fg(Color::Yellow),
+        QueuedFollowUpStatus::Pending => Style::default().fg(theme.accent),
+        QueuedFollowUpStatus::Paused => Style::default().fg(theme.status_warn),
         QueuedFollowUpStatus::Replaying => Style::default()
-            .fg(Color::Green)
+            .fg(theme.status_ok)
             .add_modifier(Modifier::BOLD),
-        QueuedFollowUpStatus::Cancelled => Style::default().fg(Color::DarkGray),
+        QueuedFollowUpStatus::Cancelled => Style::default().fg(theme.text_dim),
     }
 }
 
 fn render_queue_panel(frame: &mut Frame, area: Rect, state: &AppState, ui_state: &TuiUiState) {
+    let theme = ui_state.theme;
     let items = &state.queued_follow_ups;
     let selected = ui_state
         .queue_selection_index
@@ -1587,27 +1608,25 @@ fn render_queue_panel(frame: &mut Frame, area: Rect, state: &AppState, ui_state:
             QUEUE_UNSELECTED_MARKER
         };
         let marker_style = if is_selected {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
         let mut spans = vec![
             Span::styled(marker, marker_style),
             Span::styled(
                 format!("[{}] ", queue_status_label(&item.status)),
-                queue_status_style(&item.status),
+                queue_status_style(&theme, &item.status),
             ),
             Span::styled(
                 queue_prompt_summary(&item.prompt),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.text),
             ),
         ];
         if let Some(reason) = item.pause_reason.as_deref() {
             spans.push(Span::styled(
                 format!(" — {reason}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.status_warn),
             ));
         }
         lines.push(Line::from(spans));
@@ -1615,27 +1634,28 @@ fn render_queue_panel(frame: &mut Frame, area: Rect, state: &AppState, ui_state:
     if items.len() > visible {
         lines.push(Line::from(Span::styled(
             format!("  …and {} more", items.len() - visible),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_dim),
         )));
     }
     lines.push(Line::from(Span::styled(
         QUEUE_HINT,
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.text_dim),
     )));
 
     let panel = Paragraph::new(lines).block(
         Block::default()
             .title(format!(" Queue ({}) ", items.len()))
-            .title_style(Style::default().fg(Color::Cyan))
-            .border_style(Style::default().fg(Color::DarkGray))
+            .title_style(Style::default().fg(theme.accent))
+            .border_style(Style::default().fg(theme.border))
             .borders(Borders::ALL),
     );
     frame.render_widget(panel, area);
 }
 
 fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: &mut TuiUiState) {
+    let theme = ui_state.theme;
     let event_lines = if !state.chat_items.is_empty() {
-        chat_item_lines(&state.chat_items)
+        chat_item_lines(&theme, &state.chat_items)
     } else if let Some(pending) = &state.pending_approval {
         vec![
             Line::from(format!(
@@ -1655,13 +1675,13 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
         state
             .events
             .iter()
-            .map(|event| legacy_chat_line(event))
+            .map(|event| legacy_chat_line(&theme, event))
             .collect::<Vec<_>>()
     };
     let block = Block::default()
         .title(" Chat ")
-        .title_style(Style::default().fg(Color::Green))
-        .border_style(Style::default().fg(Color::DarkGray))
+        .title_style(Style::default().fg(theme.accent))
+        .border_style(Style::default().fg(theme.border))
         .borders(Borders::ALL);
     let inner_area = block.inner(event_area);
     let paragraph_width = inner_area.width.saturating_sub(1).max(1);
@@ -1678,7 +1698,7 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
     }
 
     let events = Paragraph::new(event_lines)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(theme.text))
         .block(block)
         .wrap(Wrap { trim: false })
         .scroll((ui_state.event_scroll.min(usize::from(u16::MAX)) as u16, 0));
@@ -1700,7 +1720,12 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
     }
 }
 
-fn render_agent_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &AgentDropdown) {
+fn render_agent_dropdown(
+    frame: &mut Frame,
+    input_area: Rect,
+    dropdown: &AgentDropdown,
+    theme: &Theme,
+) {
     if input_area.y == 0 || input_area.width < 8 || dropdown.suggestions.is_empty() {
         return;
     }
@@ -1728,7 +1753,7 @@ fn render_agent_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &AgentDr
         .enumerate()
         .skip(first_visible)
         .take(visible_count)
-        .map(|(index, suggestion)| agent_dropdown_item(suggestion, index == selected))
+        .map(|(index, suggestion)| agent_dropdown_item(theme, suggestion, index == selected))
         .collect::<Vec<_>>();
     let area = Rect {
         x: input_area.x,
@@ -1740,47 +1765,59 @@ fn render_agent_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &AgentDr
         Block::default()
             .title(" Agents ")
             .title(Line::from(" Up/Down Enter ").right_aligned())
-            .title_style(Style::default().fg(Color::Yellow))
-            .border_style(Style::default().fg(Color::Yellow))
+            .title_style(Style::default().fg(theme.accent))
+            .border_style(Style::default().fg(theme.border))
             .borders(Borders::ALL),
     );
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
 }
 
-fn agent_dropdown_item(suggestion: &AgentSuggestion, selected: bool) -> ListItem<'static> {
+fn agent_dropdown_item(
+    theme: &Theme,
+    suggestion: &AgentSuggestion,
+    selected: bool,
+) -> ListItem<'static> {
     let marker_style = if selected {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
+            .fg(theme.ink)
+            .bg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.text_dim)
     };
     let id_style = if selected {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.accent)
     };
     let line = Line::from(vec![
         Span::styled(if selected { "> " } else { "  " }, marker_style),
         Span::styled(suggestion.id.clone(), id_style),
         Span::raw("  "),
-        Span::styled(suggestion.name.clone(), Style::default().fg(Color::White)),
+        Span::styled(suggestion.name.clone(), Style::default().fg(theme.text)),
         Span::raw("  "),
-        Span::styled(suggestion.detail.clone(), Style::default().fg(Color::Gray)),
+        Span::styled(
+            suggestion.detail.clone(),
+            Style::default().fg(theme.text_muted),
+        ),
     ]);
     let item = ListItem::new(line);
     if selected {
-        item.style(Style::default().bg(Color::DarkGray))
+        item.style(Style::default().bg(theme.border))
     } else {
         item
     }
 }
 
-fn render_skill_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &SkillDropdown) {
+fn render_skill_dropdown(
+    frame: &mut Frame,
+    input_area: Rect,
+    dropdown: &SkillDropdown,
+    theme: &Theme,
+) {
     if input_area.y == 0 || input_area.width < 8 || dropdown.suggestions.is_empty() {
         return;
     }
@@ -1809,7 +1846,9 @@ fn render_skill_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &SkillDr
         .enumerate()
         .skip(first_visible)
         .take(visible_count)
-        .map(|(index, suggestion)| skill_dropdown_item(suggestion, index == selected, row_width))
+        .map(|(index, suggestion)| {
+            skill_dropdown_item(theme, suggestion, index == selected, row_width)
+        })
         .collect::<Vec<_>>();
     let area = Rect {
         x: input_area.x,
@@ -1821,8 +1860,8 @@ fn render_skill_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &SkillDr
         Block::default()
             .title(" Skills ")
             .title(Line::from(" Up/Down Enter ").right_aligned())
-            .title_style(Style::default().fg(Color::Yellow))
-            .border_style(Style::default().fg(Color::Yellow))
+            .title_style(Style::default().fg(theme.accent))
+            .border_style(Style::default().fg(theme.border))
             .borders(Borders::ALL),
     );
     frame.render_widget(Clear, area);
@@ -1830,30 +1869,31 @@ fn render_skill_dropdown(frame: &mut Frame, input_area: Rect, dropdown: &SkillDr
 }
 
 fn skill_dropdown_item(
+    theme: &Theme,
     suggestion: &SkillSuggestion,
     selected: bool,
     row_width: u16,
 ) -> ListItem<'static> {
     let marker_style = if selected {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
+            .fg(theme.ink)
+            .bg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.text_dim)
     };
     let id_style = if selected {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.accent)
     };
     let tag_style = Style::default()
-        .fg(Color::Black)
+        .fg(theme.ink)
         .bg(match suggestion.source_tag {
-            SkillSourceTag::Project => Color::LightGreen,
-            SkillSourceTag::Personal => Color::LightBlue,
+            SkillSourceTag::Project => theme.status_ok,
+            SkillSourceTag::Personal => theme.accent,
         })
         .add_modifier(Modifier::BOLD);
     let tag = format!(" {} ", suggestion.source_tag.label());
@@ -1881,13 +1921,13 @@ fn skill_dropdown_item(
         Span::styled(marker.to_string(), marker_style),
         Span::styled(id, id_style),
         Span::raw(separator.to_string()),
-        Span::styled(origin, Style::default().fg(Color::Gray)),
+        Span::styled(origin, Style::default().fg(theme.text_muted)),
         Span::raw(" ".repeat(spacer_width)),
         Span::styled(tag, tag_style),
     ]);
     let item = ListItem::new(line);
     if selected {
-        item.style(Style::default().bg(Color::DarkGray))
+        item.style(Style::default().bg(theme.border))
     } else {
         item
     }
@@ -1901,15 +1941,15 @@ fn truncate_to_char_width(value: &str, max_width: usize) -> String {
     value.chars().take(max_width).collect()
 }
 
-fn chat_item_lines(items: &[ChatItemView]) -> Vec<Line<'static>> {
+fn chat_item_lines(theme: &Theme, items: &[ChatItemView]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for item in items {
         if item.kind == ChatItemKind::UserPrompt {
-            lines.extend(user_prompt_lines(item));
+            lines.extend(user_prompt_lines(theme, item));
             lines.push(Line::from(""));
             continue;
         }
-        lines.push(chat_item_header_line(item));
+        lines.push(chat_item_header_line(theme, item));
         if let Some(summary) = item
             .summary
             .as_deref()
@@ -1917,22 +1957,22 @@ fn chat_item_lines(items: &[ChatItemView]) -> Vec<Line<'static>> {
         {
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled(summary.to_string(), Style::default().fg(Color::Gray)),
+                Span::styled(summary.to_string(), Style::default().fg(theme.text_muted)),
             ]));
         }
         for body in &item.body {
-            lines.push(chat_body_line(body));
+            lines.push(chat_body_line(theme, body));
         }
         if !item.details.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled("  details: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  details: ", Style::default().fg(theme.text_dim)),
                 Span::styled(
                     item.details
                         .iter()
                         .map(detail_label)
                         .collect::<Vec<_>>()
                         .join(", "),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.text_dim),
                 ),
             ]));
         }
@@ -1944,7 +1984,7 @@ fn chat_item_lines(items: &[ChatItemView]) -> Vec<Line<'static>> {
     lines
 }
 
-fn user_prompt_lines(item: &ChatItemView) -> Vec<Line<'static>> {
+fn user_prompt_lines(theme: &Theme, item: &ChatItemView) -> Vec<Line<'static>> {
     let mut texts = item
         .body
         .iter()
@@ -1974,56 +2014,62 @@ fn user_prompt_lines(item: &ChatItemView) -> Vec<Line<'static>> {
                     Span::styled(
                         label,
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::LightCyan)
+                            .fg(theme.ink)
+                            .bg(theme.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(" ", Style::default().bg(USER_EVENT_BG)),
-                    Span::styled(text, Style::default().fg(Color::White).bg(USER_EVENT_BG)),
-                    Span::styled(" ", Style::default().bg(USER_EVENT_BG)),
+                    Span::styled(" ", Style::default().bg(theme.user_prompt_bg)),
+                    Span::styled(
+                        text,
+                        Style::default().fg(theme.text).bg(theme.user_prompt_bg),
+                    ),
+                    Span::styled(" ", Style::default().bg(theme.user_prompt_bg)),
                 ])
             } else {
                 Line::from(vec![
                     Span::styled(
                         continuation_prefix.clone(),
-                        Style::default().bg(USER_EVENT_BG),
+                        Style::default().bg(theme.user_prompt_bg),
                     ),
-                    Span::styled(text, Style::default().fg(Color::White).bg(USER_EVENT_BG)),
-                    Span::styled(" ", Style::default().bg(USER_EVENT_BG)),
+                    Span::styled(
+                        text,
+                        Style::default().fg(theme.text).bg(theme.user_prompt_bg),
+                    ),
+                    Span::styled(" ", Style::default().bg(theme.user_prompt_bg)),
                 ])
             }
         })
         .collect()
 }
 
-fn chat_item_header_line(item: &ChatItemView) -> Line<'static> {
+fn chat_item_header_line(theme: &Theme, item: &ChatItemView) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!(" {} ", item.status.label()),
-            severity_badge_style(&item.severity),
+            severity_badge_style(theme, &item.severity),
         ),
         Span::raw(" "),
         Span::styled(
             item.title.clone(),
-            severity_title_style(&item.severity).add_modifier(Modifier::BOLD),
+            severity_title_style(theme, &item.severity).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  {}", chat_kind_label(&item.kind)),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_dim),
         ),
     ])
 }
 
-fn chat_body_line(line: &ChatLineView) -> Line<'static> {
+fn chat_body_line(theme: &Theme, line: &ChatLineView) -> Line<'static> {
     let (prefix, style) = match line.style {
-        ChatLineStyle::Plain => ("  ", Style::default().fg(Color::White)),
-        ChatLineStyle::Muted => ("  ", Style::default().fg(Color::Gray)),
-        ChatLineStyle::Code => ("  ", Style::default().fg(Color::LightBlue)),
-        ChatLineStyle::DiffAdd => ("  ", Style::default().fg(Color::Green)),
-        ChatLineStyle::DiffRemove => ("  ", Style::default().fg(Color::Red)),
-        ChatLineStyle::DiffContext => ("  ", Style::default().fg(Color::DarkGray)),
-        ChatLineStyle::Warning => ("  ", Style::default().fg(Color::Yellow)),
-        ChatLineStyle::Error => ("  ", Style::default().fg(Color::Red)),
+        ChatLineStyle::Plain => ("  ", Style::default().fg(theme.text)),
+        ChatLineStyle::Muted => ("  ", Style::default().fg(theme.text_muted)),
+        ChatLineStyle::Code => ("  ", Style::default().fg(theme.accent)),
+        ChatLineStyle::DiffAdd => ("  ", Style::default().fg(theme.status_ok)),
+        ChatLineStyle::DiffRemove => ("  ", Style::default().fg(theme.status_error)),
+        ChatLineStyle::DiffContext => ("  ", Style::default().fg(theme.text_dim)),
+        ChatLineStyle::Warning => ("  ", Style::default().fg(theme.status_warn)),
+        ChatLineStyle::Error => ("  ", Style::default().fg(theme.status_error)),
     };
     Line::from(vec![
         Span::styled(prefix, Style::default()),
@@ -2056,21 +2102,21 @@ fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
     }
 }
 
-fn severity_badge_style(severity: &ChatSeverity) -> Style {
+fn severity_badge_style(theme: &Theme, severity: &ChatSeverity) -> Style {
     match severity {
-        ChatSeverity::Info => Style::default().fg(Color::Black).bg(Color::Blue),
-        ChatSeverity::Success => Style::default().fg(Color::Black).bg(Color::Green),
-        ChatSeverity::Warning => Style::default().fg(Color::Black).bg(Color::Yellow),
-        ChatSeverity::Error => Style::default().fg(Color::White).bg(Color::Red),
+        ChatSeverity::Info => Style::default().fg(theme.ink).bg(theme.accent),
+        ChatSeverity::Success => Style::default().fg(theme.ink).bg(theme.status_ok),
+        ChatSeverity::Warning => Style::default().fg(theme.ink).bg(theme.status_warn),
+        ChatSeverity::Error => Style::default().fg(theme.text).bg(theme.status_error),
     }
 }
 
-fn severity_title_style(severity: &ChatSeverity) -> Style {
+fn severity_title_style(theme: &Theme, severity: &ChatSeverity) -> Style {
     match severity {
-        ChatSeverity::Info => Style::default().fg(Color::White),
-        ChatSeverity::Success => Style::default().fg(Color::LightGreen),
-        ChatSeverity::Warning => Style::default().fg(Color::Yellow),
-        ChatSeverity::Error => Style::default().fg(Color::Red),
+        ChatSeverity::Info => Style::default().fg(theme.text),
+        ChatSeverity::Success => Style::default().fg(theme.status_ok),
+        ChatSeverity::Warning => Style::default().fg(theme.status_warn),
+        ChatSeverity::Error => Style::default().fg(theme.status_error),
     }
 }
 
@@ -2082,17 +2128,17 @@ fn wrapped_event_line_count(lines: &[Line<'_>], width: u16) -> usize {
         .sum()
 }
 
-fn render_help_modal(frame: &mut Frame) {
+fn render_help_modal(frame: &mut Frame, theme: &Theme) {
     let area = centered_rect(78, 100, frame.area());
     let lines = vec![
         Line::from(vec![
             Span::styled(
                 "TUI",
                 Style::default()
-                    .fg(Color::LightCyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" commands", Style::default().fg(Color::White)),
+            Span::styled(" commands", Style::default().fg(theme.text)),
         ]),
         Line::from("/help + Enter        toggle this help"),
         Line::from("/agent:<agent_name>  select enabled agent with Up/Down + Enter"),
@@ -2116,10 +2162,10 @@ fn render_help_modal(frame: &mut Frame) {
             Span::styled(
                 "CLI",
                 Style::default()
-                    .fg(Color::LightGreen)
+                    .fg(theme.status_ok)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" commands", Style::default().fg(Color::White)),
+            Span::styled(" commands", Style::default().fg(theme.text)),
         ]),
         Line::from("atelier                            open the TUI"),
         Line::from("atelier --cwd <path>               run from a workspace"),
@@ -2133,17 +2179,17 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("atelier --help                     print CLI help"),
     ];
     let help = Paragraph::new(lines)
-        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .style(Style::default().fg(theme.text).bg(theme.ink))
         .block(
             Block::default()
                 .title(" Help ")
                 .title(Line::from(" Esc ").right_aligned())
                 .title_style(
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 )
-                .border_style(Style::default().fg(Color::Yellow))
+                .border_style(Style::default().fg(theme.border_focused))
                 .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: false });
@@ -2170,40 +2216,43 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn legacy_chat_line(event: &str) -> Line<'_> {
+fn legacy_chat_line<'a>(theme: &Theme, event: &'a str) -> Line<'a> {
     if let Some(message) = event.strip_prefix("You: ") {
         return Line::from(vec![
             Span::styled(
                 " You ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::LightCyan)
+                    .fg(theme.ink)
+                    .bg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" ", Style::default().bg(USER_EVENT_BG)),
-            Span::styled(message, Style::default().fg(Color::White).bg(USER_EVENT_BG)),
-            Span::styled(" ", Style::default().bg(USER_EVENT_BG)),
+            Span::styled(" ", Style::default().bg(theme.user_prompt_bg)),
+            Span::styled(
+                message,
+                Style::default().fg(theme.text).bg(theme.user_prompt_bg),
+            ),
+            Span::styled(" ", Style::default().bg(theme.user_prompt_bg)),
         ]);
     }
 
     if event.contains("failed") || event.contains("Failed") {
-        return Line::from(Span::styled(event, Style::default().fg(Color::Red)));
+        return Line::from(Span::styled(event, Style::default().fg(theme.status_error)));
     }
 
     Line::from(event)
 }
 
-fn status_style(status: &str) -> Style {
+fn status_style(theme: &Theme, status: &str) -> Style {
     match status {
         "running" | "streaming" | "running_parallel" => Style::default()
-            .fg(Color::Green)
+            .fg(theme.status_ok)
             .add_modifier(Modifier::BOLD),
         "waiting_action" | "waiting_approval" | "waiting_for_user" | "cancelling" => {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.status_warn)
         }
-        "interrupted" => Style::default().fg(Color::Red),
-        "disabled" => Style::default().fg(Color::DarkGray),
-        _ => Style::default().fg(Color::Gray),
+        "interrupted" => Style::default().fg(theme.status_error),
+        "disabled" => Style::default().fg(theme.text_dim),
+        _ => Style::default().fg(theme.text_muted),
     }
 }
 
@@ -2215,19 +2264,22 @@ fn agent_status_label(status: &str) -> &str {
     }
 }
 
-fn availability_style(availability: &Option<crate::runtime::RuntimeAvailability>) -> Style {
+fn availability_style(
+    theme: &Theme,
+    availability: &Option<crate::runtime::RuntimeAvailability>,
+) -> Style {
     match availability
         .as_ref()
         .map(|availability| &availability.status)
     {
         Some(crate::runtime::RuntimeAvailabilityStatus::Available) => {
-            Style::default().fg(Color::Green)
+            Style::default().fg(theme.status_ok)
         }
         Some(crate::runtime::RuntimeAvailabilityStatus::Unavailable) => {
-            Style::default().fg(Color::Red)
+            Style::default().fg(theme.status_error)
         }
         Some(crate::runtime::RuntimeAvailabilityStatus::Unknown) | None => {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.status_warn)
         }
     }
 }
@@ -2285,6 +2337,7 @@ fn render_input_status(
     if status_area.width == 0 || status_area.height == 0 {
         return;
     }
+    let theme = ui_state.theme;
     let line_area = Rect {
         x: status_area.x + 1,
         y: status_area.y,
@@ -2308,12 +2361,12 @@ fn render_input_status(
         let spinner = WORK_SPINNER_FRAMES[ui_state.work_spinner_frame % WORK_SPINNER_FRAMES.len()];
         ui_state.work_spinner_frame = ui_state.work_spinner_frame.wrapping_add(1);
         spans.extend([
-            Span::styled(spinner, Style::default().fg(Color::Yellow)),
+            Span::styled(spinner, Style::default().fg(theme.accent)),
             Span::raw(" "),
             Span::styled(
                 WORK_LABEL,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
         ]);
@@ -2322,7 +2375,7 @@ fn render_input_status(
         if let Some(message) = status_message {
             spans.push(Span::styled(
                 message.to_string(),
-                Style::default().fg(Color::LightGreen),
+                Style::default().fg(theme.status_ok),
             ));
         }
     }
@@ -2333,7 +2386,7 @@ fn render_input_status(
         spans.push(Span::styled(
             WORK_HINT,
             Style::default()
-                .fg(Color::Gray)
+                .fg(theme.text_muted)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -2369,10 +2422,10 @@ fn input_layout(input_area: Rect, input: &str, cursor: usize) -> InputLayout {
     }
 }
 
-fn wrapped_input_lines(input: &str, width: usize) -> Vec<Line<'static>> {
+fn wrapped_input_lines(theme: &Theme, input: &str, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     if input.is_empty() {
-        return vec![prompted_input_line("", true)];
+        return vec![prompted_input_line(theme, "", true)];
     }
 
     let mut lines = Vec::new();
@@ -2382,21 +2435,21 @@ fn wrapped_input_lines(input: &str, width: usize) -> Vec<Line<'static>> {
         line.push(ch);
         line_len += 1;
         if line_len == width {
-            lines.push(prompted_input_line(&line, lines.is_empty()));
+            lines.push(prompted_input_line(theme, &line, lines.is_empty()));
             line.clear();
             line_len = 0;
         }
     }
     if !line.is_empty() || input.chars().count().is_multiple_of(width) {
-        lines.push(prompted_input_line(&line, lines.is_empty()));
+        lines.push(prompted_input_line(theme, &line, lines.is_empty()));
     }
     lines
 }
 
-fn prompted_input_line(input: &str, first_line: bool) -> Line<'static> {
+fn prompted_input_line(theme: &Theme, input: &str, first_line: bool) -> Line<'static> {
     let prefix = if first_line { INPUT_PROMPT } else { "  " };
     Line::from(vec![
-        Span::styled(prefix, Style::default().fg(Color::Cyan)),
+        Span::styled(prefix, Style::default().fg(theme.accent)),
         Span::raw(input.to_string()),
     ])
 }
@@ -2443,11 +2496,10 @@ fn render_clarification_composer(
     clarification: &PendingClarificationView,
     ui_state: &TuiUiState,
 ) {
+    let theme = ui_state.theme;
     let mut lines = vec![Line::from(Span::styled(
         clarification.question.clone(),
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ))];
     for (index, option) in clarification.options.iter().enumerate() {
         let selected = index == ui_state.clarification_option_index;
@@ -2461,9 +2513,9 @@ fn render_clarification_composer(
             CLARIFICATION_UNSELECTED_MARKER
         };
         let option_style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
+            Style::default().fg(theme.ink).bg(theme.accent)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.text_muted)
         };
         let mut spans = vec![Span::styled(
             format!("{marker}{}", option.label),
@@ -2472,26 +2524,29 @@ fn render_clarification_composer(
         if recommended {
             spans.push(Span::styled(
                 format!(" {CLARIFICATION_RECOMMENDED_LABEL}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.accent),
             ));
         }
         lines.push(Line::from(spans));
     }
     lines.push(Line::from(vec![
-        Span::styled(CLARIFICATION_CUSTOM_LABEL, Style::default().fg(Color::Cyan)),
+        Span::styled(
+            CLARIFICATION_CUSTOM_LABEL,
+            Style::default().fg(theme.accent),
+        ),
         Span::raw(ui_state.clarification_custom_answer.clone()),
     ]));
     let composer = Paragraph::new(lines).block(
         Block::default()
             .title(" Clarifying question ")
-            .title_style(Style::default().fg(Color::Cyan))
-            .border_style(Style::default().fg(Color::Cyan))
+            .title_style(Style::default().fg(theme.accent))
+            .border_style(Style::default().fg(theme.accent))
             .borders(Borders::ALL),
     );
     frame.render_widget(composer, area);
 }
 
-fn render_clarification_status(frame: &mut Frame, status_area: Rect) {
+fn render_clarification_status(frame: &mut Frame, status_area: Rect, theme: &Theme) {
     if status_area.width == 0 || status_area.height == 0 {
         return;
     }
@@ -2505,7 +2560,7 @@ fn render_clarification_status(frame: &mut Frame, status_area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             CLARIFICATION_HINT,
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme.text_muted),
         ))),
         line_area,
     );
@@ -2578,8 +2633,11 @@ mod tests {
     fn renders_skill_loading_state() {
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
+        let theme = TuiUiState::default().theme;
 
-        terminal.draw(render_skill_loading).unwrap();
+        terminal
+            .draw(|frame| render_skill_loading(frame, &theme))
+            .unwrap();
 
         let text = terminal
             .backend()
@@ -3766,7 +3824,8 @@ mod tests {
 
     #[test]
     fn user_prompt_event_line_has_background() {
-        let line = legacy_chat_line("You: build a feature");
+        let theme = TuiUiState::default().theme;
+        let line = legacy_chat_line(&theme, "You: build a feature");
 
         assert!(line.spans.iter().all(|span| span.style.bg.is_some()));
     }
@@ -5156,5 +5215,80 @@ runtime = "fake"
             key_event_to_tui_command_with_ui(&state, &ui_state, key(KeyCode::Up)),
             Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up))
         );
+    }
+
+    // ── task_03 migration guards ──
+
+    /// The single-source-of-color invariant: no inline color literal may appear
+    /// in any `src/tui/*.rs` file except `theme.rs`. The needle is assembled at
+    /// runtime so this very file does not contain the literal it forbids.
+    #[test]
+    fn colors_live_only_in_theme_module() {
+        let needle = concat!("Color", "::");
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui");
+        let mut theme_had_needle = false;
+        let mut scanned = 0;
+        for entry in fs::read_dir(dir).expect("src/tui is readable") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            scanned += 1;
+            let content = fs::read_to_string(&path).unwrap();
+            let is_theme = path.file_name().and_then(|name| name.to_str()) == Some("theme.rs");
+            if is_theme {
+                theme_had_needle = content.contains(needle);
+            } else {
+                assert!(
+                    !content.contains(needle),
+                    "inline color literal found outside theme.rs in {}",
+                    path.display()
+                );
+            }
+        }
+        assert!(scanned >= 2, "expected to scan mod.rs and theme.rs");
+        assert!(
+            theme_had_needle,
+            "theme.rs should define the color literals (guards against a wrong scan path)"
+        );
+    }
+
+    #[test]
+    fn status_style_maps_to_semantic_tokens() {
+        let theme = TuiUiState::default().theme;
+
+        let running = status_style(&theme, "running");
+        assert_eq!(running.fg, Some(theme.status_ok));
+        assert!(running.add_modifier.contains(Modifier::BOLD));
+
+        let disabled = status_style(&theme, "disabled");
+        assert_eq!(disabled.fg, Some(theme.text_dim));
+    }
+
+    #[test]
+    fn severity_badge_error_uses_status_error_background() {
+        let theme = TuiUiState::default().theme;
+        let badge = severity_badge_style(&theme, &ChatSeverity::Error);
+        assert_eq!(badge.bg, Some(theme.status_error));
+    }
+
+    /// The migration is color-only: text content is identical whether the theme
+    /// resolves to truecolor or to the `NO_COLOR` (terminal-default) tier.
+    #[test]
+    fn no_color_render_matches_truecolor_text_content() {
+        let state = state_with_agent_roster("draft prompt");
+        let truecolor = render_to_text(&state, 80, 24);
+
+        let no_color_ui = TuiUiState {
+            theme: Theme::resolve(TerminalCaps {
+                no_color: true,
+                truecolor: false,
+            }),
+            ..TuiUiState::default()
+        };
+        let no_color = render_to_text_with_ui(&state, &no_color_ui, 80, 24);
+
+        assert_eq!(truecolor, no_color);
+        assert!(no_color.contains("Explorer"));
     }
 }
