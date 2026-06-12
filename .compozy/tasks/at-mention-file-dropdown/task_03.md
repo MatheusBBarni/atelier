@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: FileIndex fuzzy query and ranking
 type: backend
 complexity: medium
@@ -30,12 +30,12 @@ Add fuzzy querying to `FileIndex`: score the walked entries with `nucleo-matcher
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Define `FileSuggestion` with match offsets.
-- [ ] 3.2 Implement the empty-query (recents) ordering.
-- [ ] 3.3 Implement fuzzy scoring with `nucleo-matcher`.
-- [ ] 3.4 Implement the non-empty ranking blend and the result cap.
-- [ ] 3.5 Collect and return matched character offsets.
-- [ ] 3.6 Add unit tests for ordering, cap, and highlight offsets.
+- [x] 3.1 Define `FileSuggestion` with match offsets.
+- [x] 3.2 Implement the empty-query (recents) ordering.
+- [x] 3.3 Implement fuzzy scoring with `nucleo-matcher`.
+- [x] 3.4 Implement the non-empty ranking blend and the result cap.
+- [x] 3.5 Collect and return matched character offsets.
+- [x] 3.6 Add unit tests for ordering, cap, and highlight offsets.
 
 ## Implementation Details
 Extend `src/file_index.rs` with `FileSuggestion` and the query function. See TechSpec "Core Interfaces" (`FileSuggestion`, `FileIndex::query`) and ADR-004 for the exact ranking blend. Keep the matcher reusable across calls; the candidate list is already in memory from task_02.

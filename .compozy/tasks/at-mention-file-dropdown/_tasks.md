@@ -6,7 +6,7 @@
 |---|-------|--------|------------|--------------|
 | 01 | Add ignore and nucleo-matcher dependencies | completed | low | — |
 | 02 | FileIndex walk and candidate model | completed | medium | task_01 |
-| 03 | FileIndex fuzzy query and ranking | pending | medium | task_02 |
+| 03 | FileIndex fuzzy query and ranking | completed | medium | task_02 |
 | 04 | Background file-index acquisition | pending | medium | task_02 |
 | 05 | TUI file-index state and consumer | pending | medium | task_04 |
 | 06 | File-mention dropdown model and activation | pending | medium | task_03, task_05 |

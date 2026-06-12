@@ -9,10 +9,13 @@
 //! driven off the draw thread by the TUI worker (ADR-003); callers receive an
 //! owned `Vec<FileEntry>`.
 
+use std::cmp::Ordering;
 use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Directory names pruned from the walk regardless of `.gitignore` — VCS
 /// metadata plus build/dependency noise. Mirrors `codemap`'s `EXCLUDED_DIRS`
@@ -57,11 +60,24 @@ pub struct FileEntry {
     pub depth: usize,
 }
 
-/// Namespace for the file-index operations. The walk and (in a later task) the
-/// fuzzy query hang off this type so the filesystem-touching logic stays out of
-/// the TUI module (ADR-005). It carries no state because the cached entries
-/// live on `TuiUiState` — `nucleo_matcher::Matcher` is neither `Clone` nor
-/// `Eq`, so a stateful index could not be held there.
+/// A ranked, highlight-annotated suggestion handed to the dropdown. Carries the
+/// matched character offsets so the renderer can emphasize them (ADR-004).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSuggestion {
+    /// Forward-slashed path relative to the working directory.
+    pub rel_path: String,
+    /// Whether this entry is a directory (folders render a trailing `/`).
+    pub is_dir: bool,
+    /// Char offsets into `rel_path` that the fuzzy match covered. Empty for the
+    /// recents (empty-query) listing, where nothing is highlighted.
+    pub match_indices: Vec<u32>,
+}
+
+/// Namespace for the file-index operations. The walk and the fuzzy query hang
+/// off this type so the filesystem-touching logic stays out of the TUI module
+/// (ADR-005). It carries no state because the cached entries live on
+/// `TuiUiState` — `nucleo_matcher::Matcher` is neither `Clone` nor `Eq`, so a
+/// stateful index could not be held there.
 pub struct FileIndex;
 
 impl FileIndex {
@@ -162,6 +178,97 @@ impl FileIndex {
 
         entries
     }
+
+    /// Rank `entries` for `query` and return up to `limit` suggestions.
+    ///
+    /// In-memory and synchronous — run per keystroke over the cached entries.
+    /// An empty query lists recents (most-recently-modified, then shallower,
+    /// then alphabetical). A non-empty query is scored with `nucleo-matcher`
+    /// (path-aware, case-insensitive) and ordered by fuzzy score descending,
+    /// then shallower path, then most-recently-modified, then alphabetical
+    /// (ADR-004). Non-matching entries are dropped; matched char offsets are
+    /// returned for highlighting. A single `Matcher` is reused across the whole
+    /// candidate list.
+    pub fn query(entries: &[FileEntry], query: &str, limit: usize) -> Vec<FileSuggestion> {
+        if query.is_empty() {
+            let mut recents: Vec<&FileEntry> = entries.iter().collect();
+            recents.sort_by(|a, b| recents_order(a, b));
+            return recents
+                .into_iter()
+                .take(limit)
+                .map(|entry| FileSuggestion {
+                    rel_path: entry.rel_path.clone(),
+                    is_dir: entry.is_dir,
+                    match_indices: Vec::new(),
+                })
+                .collect();
+        }
+
+        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        let atom = Atom::new(
+            query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+            false,
+        );
+
+        let mut scored: Vec<ScoredEntry<'_>> = Vec::new();
+        let mut haystack_buf: Vec<char> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        for entry in entries {
+            haystack_buf.clear();
+            indices.clear();
+            let haystack = Utf32Str::new(&entry.rel_path, &mut haystack_buf);
+            if let Some(score) = atom.indices(haystack, &mut matcher, &mut indices) {
+                indices.sort_unstable();
+                indices.dedup();
+                scored.push(ScoredEntry {
+                    score,
+                    entry,
+                    match_indices: indices.clone(),
+                });
+            }
+        }
+
+        scored.sort_by(|a, b| query_order(a, b));
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|scored| FileSuggestion {
+                rel_path: scored.entry.rel_path.clone(),
+                is_dir: scored.entry.is_dir,
+                match_indices: scored.match_indices,
+            })
+            .collect()
+    }
+}
+
+/// A candidate that matched the query, with its fuzzy score and highlight
+/// offsets, awaiting the final ranking sort.
+struct ScoredEntry<'a> {
+    score: u16,
+    entry: &'a FileEntry,
+    match_indices: Vec<u32>,
+}
+
+/// Recents ordering (empty query): most-recently-modified, then shallower path,
+/// then alphabetical.
+fn recents_order(a: &FileEntry, b: &FileEntry) -> Ordering {
+    b.mtime
+        .cmp(&a.mtime)
+        .then_with(|| a.depth.cmp(&b.depth))
+        .then_with(|| a.rel_path.cmp(&b.rel_path))
+}
+
+/// Non-empty query ordering: fuzzy score descending, then shallower path, then
+/// most-recently-modified, then alphabetical.
+fn query_order(a: &ScoredEntry<'_>, b: &ScoredEntry<'_>) -> Ordering {
+    b.score
+        .cmp(&a.score)
+        .then_with(|| a.entry.depth.cmp(&b.entry.depth))
+        .then_with(|| b.entry.mtime.cmp(&a.entry.mtime))
+        .then_with(|| a.entry.rel_path.cmp(&b.entry.rel_path))
 }
 
 fn is_force_excluded_dir(name: &str) -> bool {
@@ -343,5 +450,129 @@ mod tests {
         }
         assert!(paths.contains("src/runtime/claude.rs"));
         assert!(paths.contains("README.md"));
+    }
+
+    fn entry(rel_path: &str, is_dir: bool, mtime_secs: u64) -> FileEntry {
+        FileEntry {
+            rel_path: rel_path.to_string(),
+            is_dir,
+            mtime: UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs),
+            depth: rel_path.split('/').count(),
+        }
+    }
+
+    fn paths_of(suggestions: &[FileSuggestion]) -> Vec<String> {
+        suggestions.iter().map(|s| s.rel_path.clone()).collect()
+    }
+
+    #[test]
+    fn empty_query_lists_recents_most_recent_first() {
+        let entries = vec![
+            entry("old.rs", false, 10),
+            entry("newest.rs", false, 30),
+            entry("middle.rs", false, 20),
+        ];
+        let suggestions = FileIndex::query(&entries, "", 6);
+        assert_eq!(
+            paths_of(&suggestions),
+            ["newest.rs", "middle.rs", "old.rs"]
+        );
+        // Recents carry no highlight offsets.
+        assert!(suggestions.iter().all(|s| s.match_indices.is_empty()));
+    }
+
+    #[test]
+    fn empty_query_respects_limit() {
+        let entries = vec![
+            entry("a.rs", false, 1),
+            entry("b.rs", false, 2),
+            entry("c.rs", false, 3),
+        ];
+        assert_eq!(FileIndex::query(&entries, "", 2).len(), 2);
+    }
+
+    #[test]
+    fn fuzzy_query_ranks_shallow_relevant_above_deep_coincidental() {
+        // `rcm` hits `runtime`/`claude` at path boundaries in the shallow path,
+        // but only scattered mid-word characters in the deeper path — even
+        // though the deeper path is more recent, the stronger match wins.
+        let entries = vec![
+            entry("src/runtime/claude.rs", false, 10),
+            entry("lib/core/structures/dynamic.rs", false, 99),
+        ];
+        let suggestions = FileIndex::query(&entries, "rcm", 6);
+        assert_eq!(
+            suggestions.first().map(|s| s.rel_path.as_str()),
+            Some("src/runtime/claude.rs")
+        );
+    }
+
+    #[test]
+    fn equal_score_ranks_shallower_path_first() {
+        // Identical matched basename at a delimiter boundary in both → equal
+        // fuzzy score; the depth tiebreak must surface the shallower path.
+        let entries = vec![
+            entry("b/c/foo.txt", false, 50),
+            entry("a/foo.txt", false, 50),
+        ];
+        let suggestions = FileIndex::query(&entries, "foo.txt", 6);
+        assert_eq!(paths_of(&suggestions), ["a/foo.txt", "b/c/foo.txt"]);
+    }
+
+    #[test]
+    fn result_count_never_exceeds_limit() {
+        let entries: Vec<FileEntry> = (0..20)
+            .map(|i| entry(&format!("src/mod_{i}.rs"), false, i))
+            .collect();
+        assert_eq!(FileIndex::query(&entries, "mod", 6).len(), 6);
+    }
+
+    #[test]
+    fn match_indices_identify_the_matched_characters() {
+        let entries = vec![entry("src/tui/mod.rs", false, 10)];
+        let suggestions = FileIndex::query(&entries, "tuimod", 6);
+        let suggestion = suggestions.first().expect("a match");
+        let chars: Vec<char> = suggestion.rel_path.chars().collect();
+        let matched: String = suggestion
+            .match_indices
+            .iter()
+            .map(|&i| chars[i as usize])
+            .collect();
+        assert_eq!(matched.to_lowercase(), "tuimod");
+        // The single occurrence of each character makes the offsets exact.
+        assert_eq!(suggestion.match_indices, vec![4, 5, 6, 8, 9, 10]);
+    }
+
+    #[test]
+    fn query_with_no_match_returns_empty() {
+        let entries = vec![entry("src/tui/mod.rs", false, 10)];
+        assert!(FileIndex::query(&entries, "zzzzzz", 6).is_empty());
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        let entries = vec![entry("src/runtime/claude.rs", false, 10)];
+        let suggestions = FileIndex::query(&entries, "CLAUDE", 6);
+        assert_eq!(
+            suggestions.first().map(|s| s.rel_path.as_str()),
+            Some("src/runtime/claude.rs")
+        );
+    }
+
+    #[test]
+    fn query_integration_orders_caps_and_highlights() {
+        let entries = vec![
+            entry("src/tui/mod.rs", false, 30),
+            entry("src/runtime/mod.rs", false, 20),
+            entry("src/config/mod.rs", false, 10),
+            entry("README.md", false, 5),
+            entry("docs/guide/intro.md", false, 1),
+        ];
+        let suggestions = FileIndex::query(&entries, "mod", 2);
+        // Capped to the limit, every result matched, and highlights present.
+        assert_eq!(suggestions.len(), 2);
+        assert!(suggestions
+            .iter()
+            .all(|s| s.rel_path.contains("mod.rs") && !s.match_indices.is_empty()));
     }
 }
