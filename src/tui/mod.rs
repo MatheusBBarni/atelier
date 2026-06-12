@@ -248,9 +248,6 @@ struct SkillDropdown {
 /// and skill dropdowns it is not token-based: it activates only while the whole
 /// input is a single `/`-prefixed word, and it carries a compact no-match state
 /// (`empty`) that still renders even though nothing is selectable.
-// task_04 builds the model; rendering (task_05) and key handling (task_06)
-// consume these fields. The allow is removed once those tasks land.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CommandDropdown {
     suggestions: Vec<&'static crate::slash_commands::SlashCommandSpec>,
@@ -1380,9 +1377,6 @@ fn skill_dropdown(input: &str, ui_state: &TuiUiState) -> Option<SkillDropdown> {
 /// dismissed it for the current input (Escape). The `/agent:` and `/skill:`
 /// specialized dropdowns take precedence via the routing/render order, so this
 /// is only consulted once those are inactive.
-// Rendering (task_05) and key handling (task_06) call this; the allow keeps the
-// model-only task_04 build clean and is removed when those tasks consume it.
-#[allow(dead_code)]
 fn command_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<CommandDropdown> {
     if state.pending_approval.is_some() || matches!(state.run_state, RunState::WaitingForUser) {
         return None;
@@ -1622,10 +1616,17 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     frame.render_widget(input, input_areas.input);
     render_input_status(frame, input_areas.status, ui_state, work_active);
     render_footer(frame, input_areas.footer, state, &theme);
-    if let Some(dropdown) = agent_dropdown(state, ui_state) {
-        render_agent_dropdown(frame, input_areas.input, &dropdown, &theme, &state.agents);
-    } else if let Some(dropdown) = skill_dropdown(&state.input, ui_state) {
-        render_skill_dropdown(frame, input_areas.input, &dropdown, &theme);
+    // Dropdown precedence mirrors key routing: agent, then skill, then the
+    // top-level command dropdown. Help takes over the screen, so suppress all
+    // dropdown rendering while it is open.
+    if !ui_state.help_visible {
+        if let Some(dropdown) = agent_dropdown(state, ui_state) {
+            render_agent_dropdown(frame, input_areas.input, &dropdown, &theme, &state.agents);
+        } else if let Some(dropdown) = skill_dropdown(&state.input, ui_state) {
+            render_skill_dropdown(frame, input_areas.input, &dropdown, &theme);
+        } else if let Some(dropdown) = command_dropdown(state, ui_state) {
+            render_command_dropdown(frame, input_areas.input, &dropdown, &theme);
+        }
     }
     if ui_state.help_visible {
         render_help_modal(frame, &theme);
@@ -2052,6 +2053,126 @@ fn skill_dropdown_item(
         Span::styled(origin, Style::default().fg(theme.text_muted)),
         Span::raw(" ".repeat(spacer_width)),
         Span::styled(tag, tag_style),
+    ]);
+    let item = ListItem::new(line);
+    if selected {
+        item.style(Style::default().bg(theme.border))
+    } else {
+        item
+    }
+}
+
+fn render_command_dropdown(
+    frame: &mut Frame,
+    input_area: Rect,
+    dropdown: &CommandDropdown,
+    theme: &Theme,
+) {
+    if input_area.y == 0 || input_area.width < 8 {
+        return;
+    }
+    let available_height = input_area.y.saturating_sub(frame.area().y);
+    if available_height < 3 {
+        return;
+    }
+
+    // No-match: a single compact "No commands found" row, still framed as the
+    // command dropdown so the user knows they are in discovery, not submitting.
+    if dropdown.empty {
+        let height = 3u16;
+        let area = Rect {
+            x: input_area.x,
+            y: input_area.y.saturating_sub(height),
+            width: input_area.width,
+            height,
+        };
+        let row = ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("No commands found", Style::default().fg(theme.text_muted)),
+        ]));
+        frame.render_widget(Clear, area);
+        frame.render_widget(List::new(vec![row]).block(command_dropdown_block(theme)), area);
+        return;
+    }
+
+    let visible_count = dropdown
+        .suggestions
+        .len()
+        .min(DROPDOWN_MAX_ITEMS)
+        .min(usize::from(available_height.saturating_sub(2)));
+    if visible_count == 0 {
+        return;
+    }
+    let height = (visible_count as u16).saturating_add(2);
+    let selected = dropdown
+        .selected
+        .unwrap_or(0)
+        .min(dropdown.suggestions.len().saturating_sub(1));
+    let row_width = input_area.width.saturating_sub(2);
+    // Align descriptions into a column behind the widest visible label.
+    let label_col = dropdown
+        .suggestions
+        .iter()
+        .map(|spec| input_char_count(spec.label))
+        .max()
+        .unwrap_or(0);
+    let first_visible = selected.saturating_sub(visible_count.saturating_sub(1));
+    let items = dropdown
+        .suggestions
+        .iter()
+        .enumerate()
+        .skip(first_visible)
+        .take(visible_count)
+        .map(|(index, spec)| command_dropdown_item(theme, spec, index == selected, row_width, label_col))
+        .collect::<Vec<_>>();
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width: input_area.width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(List::new(items).block(command_dropdown_block(theme)), area);
+}
+
+fn command_dropdown_block(theme: &Theme) -> Block<'static> {
+    Block::default()
+        .title(" Commands ")
+        .title(Line::from(" Up/Down Tab/Enter ").right_aligned())
+        .title_style(Style::default().fg(theme.accent))
+        .border_style(Style::default().fg(theme.accent))
+        .borders(Borders::ALL)
+}
+
+fn command_dropdown_item(
+    theme: &Theme,
+    spec: &crate::slash_commands::SlashCommandSpec,
+    selected: bool,
+    row_width: u16,
+    label_col: usize,
+) -> ListItem<'static> {
+    let marker_style = if selected {
+        selection_style(theme)
+    } else {
+        Style::default().fg(theme.text_dim)
+    };
+    let label_style = if selected {
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.accent)
+    };
+    let marker = if selected { "> " } else { "  " };
+    let marker_width = input_char_count(marker);
+    let row_width = usize::from(row_width);
+    let gap = 2;
+    let desc_width = row_width.saturating_sub(marker_width + label_col + gap);
+    let description = truncate_to_char_width(spec.description, desc_width);
+    let label = format!("{:label_col$}", spec.label);
+    let line = Line::from(vec![
+        Span::styled(marker.to_string(), marker_style),
+        Span::styled(label, label_style),
+        Span::raw("  "),
+        Span::styled(description, Style::default().fg(theme.text_muted)),
     ]);
     let item = ListItem::new(line);
     if selected {
@@ -4008,6 +4129,78 @@ mod tests {
         assert!(agent_dropdown(&cmd_state, &cmd_ui).is_none());
         assert!(skill_dropdown(&cmd_state.input, &cmd_ui).is_none());
         assert!(command_dropdown(&cmd_state, &cmd_ui).is_some());
+    }
+
+    // ── command dropdown rendering + empty state (task_05) ──
+
+    #[test]
+    fn renders_command_dropdown_for_slash() {
+        let state = state_with_input("/", false);
+        let ui_state = ui_state_with_cursor_at_end("/");
+        let text = render_to_text_with_ui(&state, &ui_state, 80, 24);
+        assert!(text.contains("Commands"));
+        assert!(text.contains("/help"));
+        assert!(text.contains("/config"));
+        assert!(text.contains("toggle the help overlay"));
+    }
+
+    #[test]
+    fn renders_command_dropdown_filtered_for_slash_g() {
+        let state = state_with_input("/g", false);
+        let ui_state = ui_state_with_cursor_at_end("/g");
+        let text = render_to_text_with_ui(&state, &ui_state, 80, 24);
+        assert!(text.contains("Commands"));
+        assert!(text.contains("/goal"));
+        assert!(text.contains("clear the session goal"));
+        // Non-matching commands are filtered out of the rendered rows.
+        assert!(!text.contains("show config files, preset, warnings"));
+    }
+
+    #[test]
+    fn renders_no_commands_found_for_unmatched_slash() {
+        let state = state_with_input("/zz", false);
+        let ui_state = ui_state_with_cursor_at_end("/zz");
+        let text = render_to_text_with_ui(&state, &ui_state, 80, 24);
+        assert!(text.contains("Commands"));
+        assert!(text.contains("No commands found"));
+    }
+
+    #[test]
+    fn command_dropdown_rows_truncate_to_input_width() {
+        // At a narrow width the longest description is truncated, so command
+        // rows never overflow the input area.
+        let state = state_with_input("/", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/");
+        let lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 30, 24);
+        assert!(lines.iter().any(|line| line.contains("Commands")));
+        assert!(lines.iter().all(|line| line.chars().count() <= 30));
+        let text: String = lines.join("");
+        assert!(!text.contains("execute a broad prompt with workflow evidence"));
+    }
+
+    #[test]
+    fn help_modal_suppresses_command_dropdown_rendering() {
+        let state = state_with_input("/", false);
+        let ui_state = TuiUiState {
+            input_cursor: input_char_count("/"),
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &ui_state, 80, 32);
+        assert!(text.contains("Help"));
+        assert!(!text.contains("Commands"));
+    }
+
+    #[test]
+    fn command_dropdown_yields_to_active_agent_dropdown_render() {
+        // With a roster, /agent: resolves to the agent dropdown, not the command
+        // dropdown — command rendering only follows once specialized dropdowns
+        // are inactive.
+        let state = state_with_agent_roster("/agent:");
+        let ui_state = ui_state_with_cursor_at_end("/agent:");
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
+        assert!(text.contains("Agents"));
+        assert!(!text.contains("Commands"));
     }
 
     #[test]
