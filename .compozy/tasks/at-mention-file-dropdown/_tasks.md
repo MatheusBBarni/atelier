@@ -5,7 +5,7 @@
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
 | 01 | Add ignore and nucleo-matcher dependencies | completed | low | — |
-| 02 | FileIndex walk and candidate model | pending | medium | task_01 |
+| 02 | FileIndex walk and candidate model | completed | medium | task_01 |
 | 03 | FileIndex fuzzy query and ranking | pending | medium | task_02 |
 | 04 | Background file-index acquisition | pending | medium | task_02 |
 | 05 | TUI file-index state and consumer | pending | medium | task_04 |

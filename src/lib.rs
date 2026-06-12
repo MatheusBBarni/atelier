@@ -5,6 +5,7 @@ pub mod codemap;
 pub mod config;
 pub mod diagnostics;
 pub mod doctor;
+pub mod file_index;
 pub mod history;
 pub mod ids;
 pub mod orchestrator;
