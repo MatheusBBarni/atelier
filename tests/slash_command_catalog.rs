@@ -5,7 +5,7 @@ use multiagent::slash_commands::{
 #[test]
 fn catalog_accessor_is_usable_from_an_external_module() {
     let specs = catalog();
-    assert_eq!(specs.len(), 8);
+    assert_eq!(specs.len(), 10);
     assert_eq!(specs[0].label, "/help");
     assert!(specs
         .iter()

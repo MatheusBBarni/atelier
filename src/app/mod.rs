@@ -54,7 +54,6 @@ const STREAM_COALESCE_BYTES: usize = 2 * 1024;
 const STREAM_COALESCE_INTERVAL: Duration = Duration::from_millis(250);
 const WORKFLOW_COMMAND: &str = "/workflow";
 const WORKFLOW_USAGE: &str = "usage: /workflow <prompt>";
-const AVAILABLE_SLASH_COMMANDS: &str = "/help, /goal, /goal clear, /config, /subtask <agent> <task>, /workflow <prompt>, /agent:<name>, /skill:<name>";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentView {
@@ -5843,7 +5842,8 @@ fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
         return Ok(());
     }
     let command = trimmed.split_whitespace().next().unwrap_or(trimmed);
-    bail!("unknown command {command}. Available commands: {AVAILABLE_SLASH_COMMANDS}")
+    let available = crate::slash_commands::available_commands_summary();
+    bail!("unknown command {command}. Available commands: {available}")
 }
 
 fn is_named_prompt_prefix(prompt: &str, prefix: &str) -> bool {
@@ -8578,6 +8578,33 @@ instructions_file = "agents/explorer.md"
         assert!(!events
             .iter()
             .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+    }
+
+    #[test]
+    fn unknown_command_guidance_is_catalog_derived() {
+        // Guidance must come from the shared catalog so it stays aligned with
+        // the dropdown and help overlay — including `/reload:skills`, which the
+        // old hardcoded list omitted.
+        let error = reject_unknown_slash_command("/doctor").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unknown command /doctor"), "{message}");
+        for spec in crate::slash_commands::catalog() {
+            assert!(
+                message.contains(spec.label),
+                "guidance missing {}: {message}",
+                spec.label
+            );
+        }
+        assert!(message.contains("/reload:skills"), "{message}");
+        assert!(message.contains("/workflow <prompt>"), "{message}");
+    }
+
+    #[test]
+    fn prompt_prefixes_are_allowed_through_unknown_command_guard() {
+        // Named `/agent:` and `/skill:` prompts are prefixes, not commands, so
+        // the unknown-command guard must let them pass through to submission.
+        assert!(reject_unknown_slash_command("/agent:fixer inspect README").is_ok());
+        assert!(reject_unknown_slash_command("/skill:reviewer inspect README").is_ok());
     }
 
     #[test]

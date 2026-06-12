@@ -34,8 +34,14 @@ pub struct SlashCommandSpec {
     pub kind: SlashCommandKind,
 }
 
-/// The fixed V1 catalog. The command set is frozen by ADR-001; entries must
-/// not be added or removed without a PRD scope change.
+/// The fixed V1 catalog.
+///
+/// ADR-001 froze the original set on 2026-06-06. Amended 2026-06-11 (approved
+/// scope change) to add `/workflow` and `/queue`, which shipped as real app
+/// commands after the freeze and were already visible in app guidance and the
+/// help overlay; keeping them out of the catalog would have dropped real
+/// commands from the surfaces this catalog is meant to align. Entries must
+/// still not be added or removed without a deliberate PRD scope change.
 const CATALOG: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         label: "/help",
@@ -73,16 +79,30 @@ const CATALOG: &[SlashCommandSpec] = &[
         kind: SlashCommandKind::AppCommand,
     },
     SlashCommandSpec {
+        label: "/workflow",
+        insert_text: "/workflow",
+        usage: "/workflow <prompt>",
+        description: "execute a broad prompt with workflow evidence",
+        kind: SlashCommandKind::AppCommand,
+    },
+    SlashCommandSpec {
+        label: "/queue",
+        insert_text: "/queue",
+        usage: "/queue <message>",
+        description: "queue a follow-up prompt (alias /q)",
+        kind: SlashCommandKind::AppCommand,
+    },
+    SlashCommandSpec {
         label: "/agent:",
         insert_text: "/agent:",
-        usage: "/agent:<name>",
+        usage: "/agent:<agent_name>",
         description: "select an enabled agent for this prompt",
         kind: SlashCommandKind::PromptPrefix,
     },
     SlashCommandSpec {
         label: "/skill:",
         insert_text: "/skill:",
-        usage: "/skill:<name>",
+        usage: "/skill:<skill_name>",
         description: "load skill context",
         kind: SlashCommandKind::PromptPrefix,
     },
@@ -124,12 +144,14 @@ pub fn help_command_lines() -> Vec<String> {
 mod tests {
     use super::*;
 
-    const FIXED_V1_LABELS: [&str; 8] = [
+    const FIXED_V1_LABELS: [&str; 10] = [
         "/help",
         "/goal",
         "/goal clear",
         "/config",
         "/subtask",
+        "/workflow",
+        "/queue",
         "/agent:",
         "/skill:",
         "/reload:skills",
@@ -212,7 +234,7 @@ mod tests {
         );
         assert_eq!(
             labels_of(SlashCommandKind::AppCommand),
-            ["/goal", "/goal clear", "/config", "/subtask"]
+            ["/goal", "/goal clear", "/config", "/subtask", "/workflow", "/queue"]
         );
     }
 
