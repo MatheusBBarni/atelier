@@ -2341,6 +2341,12 @@ fn chat_item_lines(
             .summary
             .as_deref()
             .filter(|summary| !summary.is_empty())
+            // Run/workflow summaries set both `summary` and the first `body`
+            // line from the same plain-text string; rendering both would print
+            // the line twice. Skip the muted summary line when the first body
+            // line already carries it (structured/JSON summaries differ from
+            // their body and still render both).
+            .filter(|summary| item.body.first().map(|line| line.text.as_str()) != Some(*summary))
         {
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
@@ -7099,6 +7105,56 @@ runtime = "fake"
             style,
             text: text.to_string(),
         }
+    }
+
+    #[test]
+    fn run_summary_renders_shared_summary_and_body_text_once() {
+        let theme = TuiUiState::default().theme;
+        let facts = WelcomeFacts {
+            version: "0.0.0",
+            working_directory: None,
+            agents: &[],
+            preset: None,
+            warnings: 0,
+            git: None,
+        };
+        let line_text = |line: &Line<'static>| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+
+        // Run/workflow summaries set `summary` and the first `body` line from the
+        // same plain text; it must render exactly once, not twice.
+        let mut dup = chat_item("Run completed", ChatItemKind::RunSummary);
+        dup.summary = Some("Created CLI_README.md".to_string());
+        dup.body = vec![body(ChatLineStyle::Plain, "Created CLI_README.md")];
+        let lines = chat_item_lines(&theme, std::slice::from_ref(&dup), &[], 80, true, &facts);
+        let occurrences = lines
+            .iter()
+            .filter(|line| line_text(line).contains("Created CLI_README.md"))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "duplicated summary/body text must render once"
+        );
+
+        // Distinct summary and body both still render (no over-suppression).
+        let mut distinct = chat_item("Run completed", ChatItemKind::RunSummary);
+        distinct.summary = Some("short gist".to_string());
+        distinct.body = vec![body(ChatLineStyle::Plain, "full detail line")];
+        let lines = chat_item_lines(
+            &theme,
+            std::slice::from_ref(&distinct),
+            &[],
+            80,
+            true,
+            &facts,
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line_text(line).contains("short gist")));
+        assert!(lines
+            .iter()
+            .any(|line| line_text(line).contains("full detail line")));
     }
 
     #[test]

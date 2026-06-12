@@ -5757,19 +5757,17 @@ fn derive_workflow_completion_status(
     unfinished_targets: &[WorkflowUnfinishedTarget],
     interrupted: bool,
 ) -> WorkflowCompletionStatus {
-    if interrupted || counts.planned > 0 || counts.total() == 0 {
+    // A workflow that finished without interruption and left no planned target
+    // unaccounted for is a success. Having zero declared file-edit targets is
+    // normal for orchestrator-driven runs that write via single-agent actions
+    // (or that legitimately make no edits) — it must NOT be reported as failed.
+    if interrupted || counts.planned > 0 {
         return WorkflowCompletionStatus::Failed;
     }
     if unfinished_targets.is_empty() {
         WorkflowCompletionStatus::Completed
     } else {
         WorkflowCompletionStatus::CompletedWithIssues
-    }
-}
-
-impl WorkflowTargetCounts {
-    fn total(&self) -> usize {
-        self.planned + self.completed + self.skipped + self.blocked + self.failed
     }
 }
 
@@ -6948,6 +6946,24 @@ runtime = "fake"
             payload.unfinished_targets[0].reason,
             "planned target did not receive terminal workflow evidence"
         );
+    }
+
+    #[test]
+    fn workflow_completion_status_completes_when_no_targets_were_declared() {
+        // Orchestrator-driven runs that write via single-agent actions (or make
+        // no edits) declare no parallel file-scope targets. A clean, finished
+        // run with zero targets is a success, not a failure.
+        let counts = WorkflowTargetCounts {
+            planned: 0,
+            completed: 0,
+            skipped: 0,
+            blocked: 0,
+            failed: 0,
+        };
+
+        let status = derive_workflow_completion_status(&counts, &[], false);
+
+        assert_eq!(status, WorkflowCompletionStatus::Completed);
     }
 
     #[test]
