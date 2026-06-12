@@ -962,6 +962,19 @@ impl App {
         let run_id = new_id();
         self.state.active_run_id = Some(run_id.clone());
         self.state.run_state = RunState::Planning;
+        // Record the user's prompt before `run_started` so the prompt renders
+        // above the run's "started" summary in chat. The user submitted, then
+        // the run begins; the run summary later moves to the end on completion.
+        self.record_event(
+            Some(run_id.clone()),
+            None,
+            "prompt_submitted",
+            json!({
+                "prompt": visible_prompt.clone(),
+                "submitted_prompt": submitted_prompt.clone(),
+            }),
+            user_event_display(&visible_prompt),
+        )?;
         self.record_event(
             Some(run_id.clone()),
             None,
@@ -978,16 +991,6 @@ impl App {
                 "Workflow started.",
             )?;
         }
-        self.record_event(
-            Some(run_id.clone()),
-            None,
-            "prompt_submitted",
-            json!({
-                "prompt": visible_prompt.clone(),
-                "submitted_prompt": submitted_prompt.clone(),
-            }),
-            user_event_display(&visible_prompt),
-        )?;
         self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
 
         let run = RunDriveContext::new(
@@ -1251,13 +1254,8 @@ impl App {
         let run_id = new_id();
         self.state.active_run_id = Some(run_id.clone());
         self.state.run_state = RunState::Planning;
-        self.record_event(
-            Some(run_id.clone()),
-            None,
-            "run_started",
-            json!({ "run_id": run_id }),
-            "Run started.",
-        )?;
+        // Prompt before `run_started` so the prompt renders above the run's
+        // "started" summary in chat (matches `submit_prompt`).
         self.record_event(
             Some(run_id.clone()),
             None,
@@ -1267,6 +1265,13 @@ impl App {
                 "submitted_prompt": submitted_prompt.clone(),
             }),
             user_event_display(&visible_prompt),
+        )?;
+        self.record_event(
+            Some(run_id.clone()),
+            None,
+            "run_started",
+            json!({ "run_id": run_id }),
+            "Run started.",
         )?;
         self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
         Ok(RunDriveContext::new(
@@ -7382,6 +7387,30 @@ prompt = "{reviewer_prompt}"
     }
 
     #[tokio::test]
+    async fn prompt_submitted_is_recorded_before_run_started_for_chat_order() {
+        // The user's prompt must render above the run's "started" summary, so
+        // prompt_submitted is recorded before run_started in history.
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("create a feature").await.unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let prompt_idx = events
+            .iter()
+            .position(|event| event.kind == "prompt_submitted")
+            .expect("prompt_submitted recorded");
+        let run_started_idx = events
+            .iter()
+            .position(|event| event.kind == "run_started")
+            .expect("run_started recorded");
+        assert!(
+            prompt_idx < run_started_idx,
+            "prompt_submitted ({prompt_idx}) must precede run_started ({run_started_idx})"
+        );
+    }
+
+    #[tokio::test]
     async fn fake_runtime_executes_parallel_group_and_synthesizes_result() {
         let dir = tempdir().unwrap();
         let config = fake_parallel_config(dir.path());
@@ -9247,8 +9276,10 @@ runtime = "fake"
             .iter()
             .position(|event| event.kind == "prompt_submitted")
             .unwrap();
+        // The prompt is recorded first so it renders above the run summaries in
+        // chat; then run_started, then workflow_started.
+        assert!(prompt_submitted_index < run_started_index);
         assert!(run_started_index < workflow_started_index);
-        assert!(workflow_started_index < prompt_submitted_index);
 
         let run_id = events[run_started_index].run_id.as_ref().unwrap();
         let workflow_started = &events[workflow_started_index];
@@ -9704,8 +9735,10 @@ runtime = "fake"
             .iter()
             .position(|event| event.kind == "agent_step_started")
             .unwrap();
-        assert!(run_started_index < prompt_submitted_index);
-        assert!(prompt_submitted_index < skills_loaded_index);
+        // The prompt is recorded first (so it renders above the run summary in
+        // chat), then run_started, then skills load before any runtime work.
+        assert!(prompt_submitted_index < run_started_index);
+        assert!(run_started_index < skills_loaded_index);
         assert!(skills_loaded_index < runtime_index);
 
         let prompt = events

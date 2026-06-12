@@ -3709,6 +3709,36 @@ mod tests {
     }
 
     #[test]
+    fn user_prompt_renders_above_run_started_summary() {
+        // The run-creation paths record prompt_submitted before run_started, so
+        // the user's message renders above the run's "started" summary in chat.
+        let events = vec![
+            event(
+                "prompt_submitted",
+                Some("run-1"),
+                None,
+                json!({ "prompt": "create a feature" }),
+            ),
+            event("run_started", Some("run-1"), None, json!({})),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+        let prompt_idx = items
+            .iter()
+            .position(|item| item.kind == ChatItemKind::UserPrompt)
+            .expect("user prompt item must exist");
+        let run_idx = items
+            .iter()
+            .position(|item| item.kind == ChatItemKind::RunSummary)
+            .expect("run summary item must exist");
+        assert!(
+            prompt_idx < run_idx,
+            "user prompt must render above the run-started summary"
+        );
+    }
+
+    #[test]
     fn workflow_failure_summary_orders_last() {
         let events = vec![
             event(
