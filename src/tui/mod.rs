@@ -7,6 +7,7 @@ use crate::app::{
     QueuedFollowUpStatus, QueuedFollowUpView,
 };
 use crate::config::EffectiveConfig;
+use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
 use crate::orchestrator::RunState;
 use crate::skills::{
     self, SkillSourceTag, SkillSuggestion, SKILL_DISCOVERY_MAX_DEPTH, SKILL_FILE_NAME,
@@ -34,6 +35,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -51,6 +54,7 @@ const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
 const AGENT_PREFIX: &str = "/agent:";
 const SKILL_PREFIX: &str = "/skill:";
+const FILE_MENTION_PREFIX: &str = "@";
 const RELOAD_SKILLS_COMMAND: &str = "/reload:skills";
 const DROPDOWN_MAX_ITEMS: usize = 6;
 const WORK_HINT: &str = "/help";
@@ -85,6 +89,7 @@ enum TuiCommand {
     AgentDropdown(DropdownCommand),
     SkillDropdown(DropdownCommand),
     CommandDropdown(CommandDropdownCommand),
+    FileMentionDropdown(FileMentionDropdownCommand),
     Clarification(ClarificationCommand),
     ClarificationInputCharacter(char),
     ClarificationInputBackspace,
@@ -135,6 +140,20 @@ enum CommandDropdownCommand {
     TrapNoMatch,
 }
 
+/// File-mention dropdown actions (ADR-005). Like `CommandDropdownCommand` it
+/// supports Escape dismissal, but — unlike the command dropdown — it does NOT
+/// trap `Enter` in the no-match state: a typed `@query` with no matches still
+/// submits normally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileMentionDropdownCommand {
+    Previous,
+    Next,
+    /// Insert the selected suggestion's bare path; never dispatches an app event.
+    Accept,
+    /// Escape: suppress the dropdown for the current input without mutating it.
+    Dismiss,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClarificationCommand {
     PreviousOption,
@@ -175,6 +194,13 @@ struct TuiUiState {
     /// dropdown stays suppressed only while the raw input matches, so editing
     /// the text re-activates discovery without mutating the input.
     command_dropdown_dismissed: Option<String>,
+    /// Latest file-index snapshot from the background worker walk (ADR-003);
+    /// the `@` dropdown queries this in-memory list per keystroke.
+    file_mention_entries: Vec<FileEntry>,
+    file_mention_selection_index: usize,
+    /// Input value the file-mention dropdown was last dismissed for (Escape),
+    /// mirroring `command_dropdown_dismissed`.
+    file_mention_dropdown_dismissed: Option<String>,
     clarification_option_index: usize,
     clarification_custom_answer: String,
     queue_selection_index: usize,
@@ -203,6 +229,9 @@ impl Default for TuiUiState {
             skill_selection_index: 0,
             command_selection_index: 0,
             command_dropdown_dismissed: None,
+            file_mention_entries: Vec::new(),
+            file_mention_selection_index: 0,
+            file_mention_dropdown_dismissed: None,
             clarification_option_index: 0,
             clarification_custom_answer: String::new(),
             queue_selection_index: 0,
@@ -272,6 +301,18 @@ struct CommandDropdown {
     empty: bool,
 }
 
+/// The `@`-mention file/folder dropdown (ADR-005). Token-based like the skill
+/// dropdown (it carries a `PromptToken` and activates mid-prompt), plus a
+/// command-style `empty` no-match flag. Its suggestions are the ranked
+/// `FileSuggestion`s from `FileIndex::query` over the cached index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileMentionDropdown {
+    token: PromptToken,
+    suggestions: Vec<crate::file_index::FileSuggestion>,
+    selected: usize,
+    empty: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SkillFileFingerprint {
     path: String,
@@ -302,13 +343,22 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let interrupt_handle = app.interrupt_handle();
     let approval_handle = app.approval_handle();
     let (command_sender, command_receiver) = mpsc::channel(1024);
+    // Worker→TUI file-index snapshot channel (ADR-003). The worker walks the
+    // working directory off-thread and publishes the latest `Vec<FileEntry>`
+    // here; the render loop consumes it.
+    let (file_index_sender, file_index_receiver) = watch::channel(Vec::<FileEntry>::new());
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let worker = tokio::spawn(run_app_worker(app, command_receiver));
+    let worker = tokio::spawn(run_app_worker(
+        app,
+        command_receiver,
+        file_index_sender,
+        Some(working_directory.clone()),
+    ));
 
     // No loading interstitial: the main UI (with the branded welcome item)
     // renders on the first frame, and skill scanning happens behind it inside
@@ -322,6 +372,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
         command_sender.clone(),
         interrupt_handle,
         approval_handle,
+        file_index_receiver,
         ui_state,
     )
     .await;
@@ -349,6 +400,7 @@ async fn run_loop(
     command_sender: mpsc::Sender<AppWorkerCommand>,
     interrupt_handle: InterruptHandle,
     approval_handle: ApprovalHandle,
+    mut file_index_receiver: watch::Receiver<Vec<FileEntry>>,
     mut ui_state: TuiUiState,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
@@ -361,6 +413,7 @@ async fn run_loop(
     }
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
+        sync_file_index(&mut ui_state, &mut file_index_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
         terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
 
@@ -437,6 +490,10 @@ async fn execute_tui_command_with_interrupt(
         }
         TuiCommand::CommandDropdown(command) => {
             apply_command_dropdown_command(state, ui_state, command);
+            Ok(true)
+        }
+        TuiCommand::FileMentionDropdown(command) => {
+            apply_file_mention_dropdown_command(state, ui_state, command);
             Ok(true)
         }
         TuiCommand::Clarification(command) => {
@@ -534,6 +591,18 @@ fn sync_worker_state(state: &mut AppState, state_receiver: &mut watch::Receiver<
     }
 }
 
+/// Non-blockingly adopt the latest file-index snapshot from the worker, the
+/// same shape as `sync_worker_state`. Only clones when a new snapshot has
+/// arrived, so an idle draw loop does no work.
+fn sync_file_index(
+    ui_state: &mut TuiUiState,
+    file_index_receiver: &mut watch::Receiver<Vec<FileEntry>>,
+) {
+    if file_index_receiver.has_changed().unwrap_or(false) {
+        ui_state.file_mention_entries = file_index_receiver.borrow_and_update().clone();
+    }
+}
+
 async fn queue_app_event(
     command_sender: &mpsc::Sender<AppWorkerCommand>,
     event: AppEvent,
@@ -547,9 +616,62 @@ async fn queue_app_event(
 /// Cadence of the background git-context poll (ADR-006).
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Cadence of the background file-index refresh walk (ADR-003). Coarse on
+/// purpose: the walk is off-thread but still real work, so it runs rarely and
+/// only exists to surface files created mid-session.
+const FILE_INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Walk the working directory off the worker's async thread and publish the
+/// snapshot to the TUI. Extracted from the worker `select!` so it is
+/// unit-testable in isolation (ADR-003). The `ignore`-crate walk is
+/// synchronous, so it runs inside `spawn_blocking`; a join error (panic) or a
+/// closed receiver simply leaves the previous snapshot in place. No-op when
+/// there is no working directory.
+async fn refresh_file_index(
+    working_directory: Option<&Path>,
+    file_index_sender: &watch::Sender<Vec<FileEntry>>,
+    cancel: Arc<AtomicBool>,
+) {
+    let Some(root) = working_directory.map(Path::to_path_buf) else {
+        return;
+    };
+    // A join error (walk panic) leaves the previous snapshot in place; a send
+    // error means every receiver is gone (TUI shutting down).
+    if let Ok(entries) =
+        tokio::task::spawn_blocking(move || FileIndex::walk_cancellable(&root, &cancel)).await
+    {
+        let _ = file_index_sender.send(entries);
+    }
+}
+
+/// Kick off a file-index refresh on a detached task instead of awaiting it.
+///
+/// The walk is unbounded (no timeout, one `canonicalize` syscall per entry) and
+/// can outlive the 15s poll cadence on a large repo. Awaiting it inside the
+/// worker `select!` would park the worker at that `await`, so queued
+/// `AppWorkerCommand`s (including `Shutdown`) could not be serviced until the
+/// walk returned. Detaching keeps the command arm pollable; the snapshot lands
+/// via the `watch` channel whenever the walk finishes (last-writer-wins, so an
+/// occasional overlap between two in-flight walks is harmless).
+///
+/// `cancel` is the worker's shutdown flag: it is shared across every spawned
+/// walk so that, on quit, any in-flight walk stops promptly rather than holding
+/// a `spawn_blocking` thread alive and delaying runtime (process) shutdown.
+fn spawn_file_index_refresh(
+    working_directory: Option<PathBuf>,
+    file_index_sender: watch::Sender<Vec<FileEntry>>,
+    cancel: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        refresh_file_index(working_directory.as_deref(), &file_index_sender, cancel).await;
+    });
+}
+
 async fn run_app_worker(
     mut app: App,
     mut command_receiver: mpsc::Receiver<AppWorkerCommand>,
+    file_index_sender: watch::Sender<Vec<FileEntry>>,
+    working_directory: Option<PathBuf>,
 ) -> Result<()> {
     // Immediate startup refresh, then a change-gated poll every 5s. The poll
     // lives inside the worker's select loop, so it stops as soon as the loop
@@ -557,6 +679,27 @@ async fn run_app_worker(
     app.refresh_git_context().await;
     let mut git_poll = tokio::time::interval(GIT_POLL_INTERVAL);
     git_poll.tick().await; // consume the immediate first tick (startup covered it)
+
+    // Shared shutdown flag for every detached file-index walk. Set on worker
+    // exit so an in-flight `spawn_blocking` walk bails instead of keeping its
+    // blocking thread (and thus process exit) alive on a large workspace.
+    let walk_cancel = Arc::new(AtomicBool::new(false));
+
+    // Initial off-thread file-index walk at startup, then a coarse periodic
+    // refresh — mirrors the git poller (ADR-003). Both are detached
+    // (`spawn_file_index_refresh`) rather than awaited so the cold startup walk
+    // never blocks the command loop from servicing the first prompt, and so a
+    // slow walk cannot starve `Shutdown`.
+    spawn_file_index_refresh(
+        working_directory.clone(),
+        file_index_sender.clone(),
+        walk_cancel.clone(),
+    );
+    let mut file_index_poll = tokio::time::interval(FILE_INDEX_REFRESH_INTERVAL);
+    // A walk that overruns the interval must not trigger a burst of catch-up
+    // walks; skip missed ticks and resume the coarse cadence.
+    file_index_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    file_index_poll.tick().await; // consume the immediate first tick (startup covered it)
 
     loop {
         tokio::select! {
@@ -567,6 +710,7 @@ async fn run_app_worker(
                     }
                 }
                 Some(AppWorkerCommand::Shutdown) => {
+                    walk_cancel.store(true, Ordering::Relaxed);
                     app.end_session()?;
                     return Ok(());
                 }
@@ -575,9 +719,18 @@ async fn run_app_worker(
             _ = git_poll.tick() => {
                 app.refresh_git_context().await;
             }
+            _ = file_index_poll.tick() => {
+                spawn_file_index_refresh(
+                    working_directory.clone(),
+                    file_index_sender.clone(),
+                    walk_cancel.clone(),
+                );
+            }
         }
     }
 
+    // Channel closed (sender dropped) — signal any in-flight walk to stop too.
+    walk_cancel.store(true, Ordering::Relaxed);
     app.end_session()
 }
 
@@ -634,6 +787,9 @@ fn key_event_to_tui_command_with_ui(
         agent_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
     } else if skill_dropdown(&state.input, ui_state).is_some() {
         skill_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+    } else if let Some(dropdown) = file_mention_dropdown(state, ui_state) {
+        file_mention_dropdown_key_command(&dropdown, key)
+            .or_else(|| key_event_to_tui_command(state, key))
     } else if let Some(dropdown) = command_dropdown(state, ui_state) {
         command_dropdown_key_command(&dropdown, key)
             .or_else(|| key_event_to_tui_command(state, key))
@@ -795,6 +951,27 @@ fn command_dropdown_key_command(dropdown: &CommandDropdown, key: KeyEvent) -> Op
     }
 }
 
+fn file_mention_dropdown_key_command(
+    dropdown: &FileMentionDropdown,
+    key: KeyEvent,
+) -> Option<TuiCommand> {
+    use FileMentionDropdownCommand::{Accept, Dismiss, Next, Previous};
+    match key.code {
+        // Escape dismisses in either state; the input is left untouched.
+        KeyCode::Esc => Some(TuiCommand::FileMentionDropdown(Dismiss)),
+        // Selection and acceptance only apply when there are selectable rows.
+        KeyCode::Up if !dropdown.empty => Some(TuiCommand::FileMentionDropdown(Previous)),
+        KeyCode::Down if !dropdown.empty => Some(TuiCommand::FileMentionDropdown(Next)),
+        KeyCode::Tab | KeyCode::Enter if !dropdown.empty => {
+            Some(TuiCommand::FileMentionDropdown(Accept))
+        }
+        // No-match: unlike the command dropdown, do NOT trap Enter — a typed
+        // `@query` with no matches submits normally. All other keys fall through
+        // so editing re-filters the list.
+        _ => None,
+    }
+}
+
 fn clarification_key_command(
     state: &AppState,
     _ui_state: &TuiUiState,
@@ -944,6 +1121,7 @@ fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
     ui_state.input_cursor = 0;
     ui_state.input_preferred_col = None;
     clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
 }
 
@@ -971,6 +1149,7 @@ fn insert_input_character(state: &mut AppState, ui_state: &mut TuiUiState, ch: c
     ui_state.input_preferred_col = None;
     ui_state.status_message = None;
     clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
 }
 
@@ -988,6 +1167,7 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     ui_state.input_preferred_col = None;
     ui_state.status_message = None;
     clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
 }
 
@@ -1191,6 +1371,14 @@ fn reset_dropdown_selections(ui_state: &mut TuiUiState) {
     reset_agent_dropdown_selection(ui_state);
     reset_skill_dropdown_selection(ui_state);
     reset_command_dropdown_selection(ui_state);
+    reset_file_mention_dropdown_selection(ui_state);
+}
+
+fn reset_file_mention_dropdown_selection(ui_state: &mut TuiUiState) {
+    // Only the selection index. Like the command dropdown, the Escape dismissal
+    // is keyed to the raw input and cleared on a content edit — never on a
+    // cursor move — so Escape survives Left/Right/Up after dismissal.
+    ui_state.file_mention_selection_index = 0;
 }
 
 fn reset_agent_dropdown_selection(ui_state: &mut TuiUiState) {
@@ -1211,6 +1399,13 @@ fn reset_command_dropdown_selection(ui_state: &mut TuiUiState) {
 /// Clear the Escape dismissal so a content edit re-activates command discovery.
 fn clear_command_dropdown_dismissal(ui_state: &mut TuiUiState) {
     ui_state.command_dropdown_dismissed = None;
+}
+
+/// Clear the file-mention Escape dismissal so a content edit re-activates the
+/// `@` picker. Mirrors `clear_command_dropdown_dismissal`: called on edits
+/// (insert/backspace/clear), never on cursor moves.
+fn clear_file_mention_dropdown_dismissal(ui_state: &mut TuiUiState) {
+    ui_state.file_mention_dropdown_dismissed = None;
 }
 
 fn apply_agent_dropdown_command(
@@ -1439,6 +1634,84 @@ fn apply_command_dropdown_command(
     }
 }
 
+fn apply_file_mention_dropdown_command(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    command: FileMentionDropdownCommand,
+) {
+    let Some(dropdown) = file_mention_dropdown(state, ui_state) else {
+        return;
+    };
+    match command {
+        FileMentionDropdownCommand::Previous => {
+            let count = dropdown.suggestions.len();
+            if count == 0 {
+                return;
+            }
+            ui_state.file_mention_selection_index = if dropdown.selected == 0 {
+                count - 1
+            } else {
+                dropdown.selected - 1
+            };
+        }
+        FileMentionDropdownCommand::Next => {
+            let count = dropdown.suggestions.len();
+            if count == 0 {
+                return;
+            }
+            ui_state.file_mention_selection_index = (dropdown.selected + 1) % count;
+        }
+        FileMentionDropdownCommand::Accept => {
+            if dropdown.empty {
+                return;
+            }
+            let suggestion = dropdown.suggestions[dropdown.selected].clone();
+            apply_file_mention_suggestion(state, ui_state, &dropdown.token, &suggestion);
+        }
+        FileMentionDropdownCommand::Dismiss => {
+            ui_state.file_mention_dropdown_dismissed = Some(state.input.clone());
+        }
+    }
+}
+
+/// Accept a file suggestion by replacing the `@token` — INCLUDING the leading
+/// `@` — with the bare path, so the inserted text is a plain path (ADR-005).
+/// Folders get a trailing `/`; a trailing space is added when none follows so
+/// the cursor lands ready to keep typing (and a second `@` re-opens the
+/// picker). Text-only: no app event is dispatched.
+fn apply_file_mention_suggestion(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    token: &PromptToken,
+    suggestion: &FileSuggestion,
+) {
+    let mut inserted = suggestion.rel_path.clone();
+    if suggestion.is_dir {
+        inserted.push('/');
+    }
+
+    // Extend the replaced range back over the `@` prefix so it is consumed.
+    let prefix_len = input_char_count(FILE_MENTION_PREFIX);
+    let replace_start = token.value_start.saturating_sub(prefix_len);
+    let start = byte_index_for_char(&state.input, replace_start);
+    let end = byte_index_for_char(&state.input, token.value_end);
+    state.input.replace_range(start..end, &inserted);
+
+    let inserted_len = input_char_count(&inserted);
+    let path_end = replace_start + inserted_len;
+    let after_path = byte_index_for_char(&state.input, path_end);
+    if !state.input[after_path..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        state.input.insert(after_path, ' ');
+    }
+    ui_state.input_cursor = path_end.saturating_add(1);
+    ui_state.input_preferred_col = None;
+    reset_dropdown_selections(ui_state);
+}
+
 /// Accept a command suggestion by replacing the whole `/`-token input with its
 /// insert text. Text-only: no app event is dispatched. The dropdown is then
 /// dismissed for the inserted text so `Enter` does not re-accept the same row
@@ -1514,6 +1787,53 @@ fn command_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<CommandDr
         (Some(index), false)
     };
     Some(CommandDropdown {
+        suggestions,
+        selected,
+        empty,
+    })
+}
+
+/// Activation + ranking model for the `@`-mention file dropdown (ADR-005).
+///
+/// Token-based: it activates on an `@` token at the cursor via the shared
+/// `active_prompt_token` detector, exactly like `/agent:` and `/skill:`, so it
+/// works mid-prompt and for a second `@` later in the line. A bare `@` lists
+/// recents (most-recently-modified); a non-empty query with zero matches sets
+/// `empty` so the renderer can show the "No matching files" row. Suppressed
+/// while the run waits on the user (pending approval, pending clarification, or
+/// `WaitingForUser`) so a literal `@` in an answer stays normal text, and while
+/// the user has dismissed it for the current input (Escape). Returns `None`
+/// when there is nothing to show (e.g. a bare `@` before the index has loaded),
+/// so the dropdown never appears with a misleading empty body.
+fn file_mention_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<FileMentionDropdown> {
+    if state.pending_approval.is_some()
+        || state.pending_clarification.is_some()
+        || matches!(state.run_state, RunState::WaitingForUser)
+    {
+        return None;
+    }
+    let input = state.input.as_str();
+    let token = active_prompt_token(input, ui_state.input_cursor, FILE_MENTION_PREFIX)?;
+    if ui_state.file_mention_dropdown_dismissed.as_deref() == Some(input) {
+        return None;
+    }
+
+    let suggestions = FileIndex::query(
+        &ui_state.file_mention_entries,
+        &token.query,
+        DROPDOWN_MAX_ITEMS,
+    );
+    // No-match only when the user has actually typed a query; a bare `@` with no
+    // candidates (empty/loading index) is not a "no match" and shows nothing.
+    let empty = !token.query.is_empty() && suggestions.is_empty();
+    if suggestions.is_empty() && !empty {
+        return None;
+    }
+    let selected = ui_state
+        .file_mention_selection_index
+        .min(suggestions.len().saturating_sub(1));
+    Some(FileMentionDropdown {
+        token,
         suggestions,
         selected,
         empty,
@@ -1730,13 +2050,16 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     render_input_status(frame, input_areas.status, ui_state, work_active);
     render_footer(frame, input_areas.footer, state, &theme);
     // Dropdown precedence mirrors key routing: agent, then skill, then the
-    // top-level command dropdown. Help takes over the screen, so suppress all
-    // dropdown rendering while it is open.
+    // `@` file mention, then the top-level command dropdown. Help takes over the
+    // screen, so suppress all dropdown rendering while it is open. This chain
+    // MUST stay in sync with `key_event_to_tui_command_with_ui`.
     if !ui_state.help_visible {
         if let Some(dropdown) = agent_dropdown(state, ui_state) {
             render_agent_dropdown(frame, input_areas.input, &dropdown, &theme, &state.agents);
         } else if let Some(dropdown) = skill_dropdown(&state.input, ui_state) {
             render_skill_dropdown(frame, input_areas.input, &dropdown, &theme);
+        } else if let Some(dropdown) = file_mention_dropdown(state, ui_state) {
+            render_file_mention_dropdown(frame, input_areas.input, &dropdown, &theme);
         } else if let Some(dropdown) = command_dropdown(state, ui_state) {
             render_command_dropdown(frame, input_areas.input, &dropdown, &theme);
         }
@@ -2300,6 +2623,163 @@ fn command_dropdown_item(
     } else {
         item
     }
+}
+
+fn render_file_mention_dropdown(
+    frame: &mut Frame,
+    input_area: Rect,
+    dropdown: &FileMentionDropdown,
+    theme: &Theme,
+) {
+    if input_area.y == 0 || input_area.width < 8 {
+        return;
+    }
+    let available_height = input_area.y.saturating_sub(frame.area().y);
+    if available_height < 3 {
+        return;
+    }
+
+    // No-match: a single compact "No matching files" row, still framed as the
+    // file dropdown so the user knows they are in discovery (it does not trap
+    // Enter — see task_07).
+    if dropdown.empty {
+        let height = 3u16;
+        let area = Rect {
+            x: input_area.x,
+            y: input_area.y.saturating_sub(height),
+            width: input_area.width,
+            height,
+        };
+        let row = ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("No matching files", Style::default().fg(theme.text_muted)),
+        ]));
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            List::new(vec![row]).block(file_mention_dropdown_block(theme, " Esc ")),
+            area,
+        );
+        return;
+    }
+
+    if dropdown.suggestions.is_empty() {
+        return;
+    }
+    let visible_count = dropdown
+        .suggestions
+        .len()
+        .min(DROPDOWN_MAX_ITEMS)
+        .min(usize::from(available_height.saturating_sub(2)));
+    if visible_count == 0 {
+        return;
+    }
+    let height = (visible_count as u16).saturating_add(2);
+    let selected = dropdown
+        .selected
+        .min(dropdown.suggestions.len().saturating_sub(1));
+    let row_width = input_area.width.saturating_sub(2);
+    let first_visible = selected.saturating_sub(visible_count.saturating_sub(1));
+    let items = dropdown
+        .suggestions
+        .iter()
+        .enumerate()
+        .skip(first_visible)
+        .take(visible_count)
+        .map(|(index, suggestion)| {
+            file_mention_dropdown_item(theme, suggestion, index == selected, row_width)
+        })
+        .collect::<Vec<_>>();
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width: input_area.width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items).block(file_mention_dropdown_block(theme, " Up/Down Tab/Enter ")),
+        area,
+    );
+}
+
+/// `hint` is the right-aligned key affordance. The populated list advertises
+/// navigation/acceptance; the no-match row only honors `Esc`, so it passes a
+/// narrower hint rather than implying `Up/Down`/`Tab`/`Enter` do something.
+fn file_mention_dropdown_block(theme: &Theme, hint: &str) -> Block<'static> {
+    Block::default()
+        .title(" Files ")
+        .title(Line::from(hint.to_string()).right_aligned())
+        .title_style(Style::default().fg(theme.accent))
+        .border_style(Style::default().fg(theme.accent))
+        .borders(Borders::ALL)
+}
+
+fn file_mention_dropdown_item(
+    theme: &Theme,
+    suggestion: &FileSuggestion,
+    selected: bool,
+    row_width: u16,
+) -> ListItem<'static> {
+    let marker_style = if selected {
+        selection_style(theme)
+    } else {
+        Style::default().fg(theme.text_dim)
+    };
+    let marker = if selected { "> " } else { "  " };
+    let marker_width = input_char_count(marker);
+    let content_width = usize::from(row_width).saturating_sub(marker_width);
+
+    // Folder affordance: a trailing `/` distinguishes folders from files.
+    let mut display = suggestion.rel_path.clone();
+    if suggestion.is_dir {
+        display.push('/');
+    }
+    let display = truncate_to_char_width(&display, content_width);
+    let matched: std::collections::HashSet<usize> = suggestion
+        .match_indices
+        .iter()
+        .map(|&index| index as usize)
+        .collect();
+
+    let mut spans = vec![Span::styled(marker.to_string(), marker_style)];
+    spans.extend(highlighted_path_spans(theme, &display, &matched, selected));
+    let item = ListItem::new(Line::from(spans));
+    if selected {
+        item.style(Style::default().bg(theme.border))
+    } else {
+        item
+    }
+}
+
+/// Build one styled span per character of `display`, emphasizing the matched
+/// offsets (bold accent) so the fuzzy match is confirmable at a glance
+/// (ADR-002 — highlighting is a V1 trust mechanism, not optional polish).
+fn highlighted_path_spans(
+    theme: &Theme,
+    display: &str,
+    matched: &std::collections::HashSet<usize>,
+    selected: bool,
+) -> Vec<Span<'static>> {
+    let matched_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let base_style = if selected {
+        Style::default().fg(theme.accent)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    display
+        .chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            let style = if matched.contains(&index) {
+                matched_style
+            } else {
+                base_style
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
 }
 
 fn queue_prompt_summary(prompt: &str) -> String {
@@ -6618,7 +7098,13 @@ runtime = "fake"
         let dir = tempdir().unwrap();
         let app = App::new(fake_worker_config(dir.path())).await.unwrap();
         let (sender, receiver) = mpsc::channel(8);
-        let worker = tokio::spawn(run_app_worker(app, receiver));
+        let (file_index_sender, _file_index_receiver) = watch::channel(Vec::<FileEntry>::new());
+        let worker = tokio::spawn(run_app_worker(
+            app,
+            receiver,
+            file_index_sender,
+            Some(dir.path().to_path_buf()),
+        ));
 
         // The 5s poll lives in the worker's select loop; a shutdown must win
         // immediately rather than waiting for a tick (no hang).
@@ -6629,6 +7115,736 @@ runtime = "fake"
             "worker shutdown hung with the poller active"
         );
         result.unwrap().unwrap();
+    }
+
+    // ── task_04 background file-index acquisition ──
+
+    /// A never-set cancellation flag for refresh tests that don't exercise the
+    /// shutdown path.
+    fn no_cancel() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    #[test]
+    fn file_index_refresh_interval_has_expected_default() {
+        assert_eq!(FILE_INDEX_REFRESH_INTERVAL, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn refresh_file_index_publishes_walk_snapshot() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("README.md"), "readme").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        let (sender, receiver) = watch::channel(Vec::<FileEntry>::new());
+        refresh_file_index(Some(dir.path()), &sender, no_cancel()).await;
+
+        let published = receiver.borrow().clone();
+        assert_eq!(published, FileIndex::walk(dir.path()));
+        // The snapshot is non-empty and contains a known file.
+        assert!(published.iter().any(|entry| entry.rel_path == "README.md"));
+    }
+
+    #[tokio::test]
+    async fn refresh_file_index_is_noop_without_working_directory() {
+        let (sender, receiver) = watch::channel(vec![FileEntry {
+            rel_path: "kept.rs".to_string(),
+            is_dir: false,
+            mtime: UNIX_EPOCH,
+            depth: 1,
+        }]);
+        refresh_file_index(None, &sender, no_cancel()).await;
+        // No working directory → the previous snapshot is left untouched.
+        assert_eq!(receiver.borrow().len(), 1);
+        assert_eq!(receiver.borrow()[0].rel_path, "kept.rs");
+    }
+
+    #[tokio::test]
+    async fn refresh_file_index_honors_cancellation() {
+        // A pre-set cancel flag makes the spawned walk bail immediately, so the
+        // refresh publishes an empty snapshot rather than scanning the tree —
+        // the mechanism that keeps quit from blocking on a large workspace.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
+
+        let (sender, receiver) = watch::channel(Vec::<FileEntry>::new());
+        refresh_file_index(Some(dir.path()), &sender, Arc::new(AtomicBool::new(true))).await;
+        assert!(receiver.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_file_index_surfaces_files_created_between_walks() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("first.rs"), "fn main() {}").unwrap();
+
+        let (sender, receiver) = watch::channel(Vec::<FileEntry>::new());
+        refresh_file_index(Some(dir.path()), &sender, no_cancel()).await;
+        assert!(receiver
+            .borrow()
+            .iter()
+            .all(|entry| entry.rel_path != "second.rs"));
+
+        // A file created mid-session appears on the next refresh.
+        fs::write(dir.path().join("second.rs"), "fn second() {}").unwrap();
+        refresh_file_index(Some(dir.path()), &sender, no_cancel()).await;
+        assert!(receiver
+            .borrow()
+            .iter()
+            .any(|entry| entry.rel_path == "second.rs"));
+    }
+
+    // ── task_05 TUI file-index state and consumer ──
+
+    fn file_entry(rel_path: &str, is_dir: bool) -> FileEntry {
+        FileEntry {
+            rel_path: rel_path.to_string(),
+            is_dir,
+            mtime: UNIX_EPOCH,
+            depth: rel_path.split('/').count(),
+        }
+    }
+
+    #[test]
+    fn default_ui_state_initializes_file_mention_fields() {
+        let ui_state = TuiUiState::default();
+        assert!(ui_state.file_mention_entries.is_empty());
+        assert_eq!(ui_state.file_mention_selection_index, 0);
+        assert_eq!(ui_state.file_mention_dropdown_dismissed, None);
+    }
+
+    #[test]
+    fn reset_dropdown_selections_resets_file_mention_selection() {
+        let mut ui_state = TuiUiState {
+            file_mention_selection_index: 3,
+            ..Default::default()
+        };
+        reset_dropdown_selections(&mut ui_state);
+        assert_eq!(ui_state.file_mention_selection_index, 0);
+    }
+
+    #[test]
+    fn sync_file_index_adopts_published_snapshot() {
+        let (sender, mut receiver) = watch::channel(Vec::<FileEntry>::new());
+        let mut ui_state = TuiUiState::default();
+        let snapshot = vec![file_entry("src/main.rs", false), file_entry("src", true)];
+        sender.send(snapshot.clone()).unwrap();
+
+        sync_file_index(&mut ui_state, &mut receiver);
+        assert_eq!(ui_state.file_mention_entries, snapshot);
+    }
+
+    #[test]
+    fn content_edit_clears_file_mention_dismissal_but_cursor_move_does_not() {
+        let mut state = state_with_input("@mod", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: 4,
+            file_mention_dropdown_dismissed: Some("@mod".to_string()),
+            ..Default::default()
+        };
+
+        // A cursor move preserves the Escape dismissal.
+        move_input_cursor(&mut ui_state, &state.input, InputCursorCommand::Left);
+        assert_eq!(
+            ui_state.file_mention_dropdown_dismissed,
+            Some("@mod".to_string())
+        );
+
+        // A content edit (insert) clears it so discovery re-activates.
+        insert_input_character(&mut state, &mut ui_state, 'x');
+        assert_eq!(ui_state.file_mention_dropdown_dismissed, None);
+    }
+
+    #[test]
+    fn backspace_clears_file_mention_dismissal() {
+        let mut state = state_with_input("@mod", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: 4,
+            file_mention_dropdown_dismissed: Some("@mod".to_string()),
+            ..Default::default()
+        };
+        remove_input_character_before_cursor(&mut state, &mut ui_state);
+        assert_eq!(ui_state.file_mention_dropdown_dismissed, None);
+    }
+
+    // ── task_06 file-mention dropdown model and activation ──
+
+    fn file_entry_at(rel_path: &str, is_dir: bool, mtime_secs: u64) -> FileEntry {
+        FileEntry {
+            rel_path: rel_path.to_string(),
+            is_dir,
+            mtime: UNIX_EPOCH + Duration::from_secs(mtime_secs),
+            depth: rel_path.split('/').count(),
+        }
+    }
+
+    /// A representative seeded index with distinct mtimes for recency tests.
+    fn seeded_file_entries() -> Vec<FileEntry> {
+        vec![
+            file_entry_at("src/tui/mod.rs", false, 50),
+            file_entry_at("src/runtime/claude.rs", false, 40),
+            file_entry_at("src/runtime/mod.rs", false, 30),
+            file_entry_at("README.md", false, 20),
+            file_entry_at("src", true, 10),
+        ]
+    }
+
+    fn ui_state_with_file_entries(input: &str, entries: Vec<FileEntry>) -> TuiUiState {
+        TuiUiState {
+            input_cursor: input_char_count(input),
+            file_mention_entries: entries,
+            ..TuiUiState::default()
+        }
+    }
+
+    #[test]
+    fn file_mention_activates_for_token_at_cursor() {
+        let state = state_with_input("see @run", false);
+        let ui_state = ui_state_with_file_entries("see @run", seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active for @run");
+        assert!(!dropdown.empty);
+        assert!(!dropdown.suggestions.is_empty());
+        assert!(dropdown
+            .suggestions
+            .iter()
+            .all(|s| s.rel_path.contains("runtime")));
+    }
+
+    #[test]
+    fn bare_at_lists_recents_most_recent_first() {
+        let state = state_with_input("@", false);
+        let ui_state = ui_state_with_file_entries("@", seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active for @");
+        assert!(!dropdown.empty);
+        assert_eq!(dropdown.selected, 0);
+        assert_eq!(
+            dropdown.suggestions.first().unwrap().rel_path,
+            "src/tui/mod.rs"
+        );
+    }
+
+    #[test]
+    fn no_match_query_sets_empty_with_no_rows() {
+        let state = state_with_input("@zzzz", false);
+        let ui_state = ui_state_with_file_entries("@zzzz", seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active no-match");
+        assert!(dropdown.empty);
+        assert!(dropdown.suggestions.is_empty());
+    }
+
+    #[test]
+    fn cursor_outside_token_does_not_activate() {
+        let state = state_with_input("@run done", false);
+        // Cursor at the end sits in the "done" token, not the `@run` token.
+        let ui_state = ui_state_with_file_entries("@run done", seeded_file_entries());
+        assert!(file_mention_dropdown(&state, &ui_state).is_none());
+    }
+
+    #[test]
+    fn pending_states_suppress_activation() {
+        let entries = seeded_file_entries();
+        let ui_state = ui_state_with_file_entries("@run", entries);
+
+        // Pending approval (state_with_input sets approval + WaitingForUser).
+        let approval = state_with_input("@run", true);
+        assert!(file_mention_dropdown(&approval, &ui_state).is_none());
+
+        // Pending clarification.
+        let mut clarification = state_with_input("@run", false);
+        clarification.pending_clarification = Some(clarification_view(vec![clarification_option(
+            "a", "Option A",
+        )]));
+        assert!(file_mention_dropdown(&clarification, &ui_state).is_none());
+
+        // WaitingForUser run state on its own.
+        let mut waiting = state_with_input("@run", false);
+        waiting.run_state = RunState::WaitingForUser;
+        assert!(file_mention_dropdown(&waiting, &ui_state).is_none());
+    }
+
+    #[test]
+    fn dismissed_input_suppresses_until_edited() {
+        let state = state_with_input("@run", false);
+        let mut ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+        ui_state.file_mention_dropdown_dismissed = Some("@run".to_string());
+        assert!(file_mention_dropdown(&state, &ui_state).is_none());
+
+        // Clearing the dismissal (as a content edit does) re-activates it.
+        ui_state.file_mention_dropdown_dismissed = None;
+        assert!(file_mention_dropdown(&state, &ui_state).is_some());
+    }
+
+    #[test]
+    fn second_at_token_activates_for_token_at_cursor() {
+        let input = "a @one b @mod";
+        let state = state_with_input(input, false);
+        let ui_state = ui_state_with_file_entries(input, seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active for 2nd @");
+        assert_eq!(dropdown.token.query, "mod");
+        assert!(dropdown
+            .suggestions
+            .iter()
+            .any(|s| s.rel_path == "src/tui/mod.rs"));
+    }
+
+    #[test]
+    fn file_mention_model_produces_ranked_suggestions() {
+        let state = state_with_input("@mod", false);
+        let ui_state = ui_state_with_file_entries("@mod", seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active for @mod");
+        let paths: Vec<&str> = dropdown
+            .suggestions
+            .iter()
+            .map(|s| s.rel_path.as_str())
+            .collect();
+        // Both mod.rs files match; equal depth/score, so the more recent wins.
+        assert_eq!(paths.first(), Some(&"src/tui/mod.rs"));
+        assert!(paths.contains(&"src/runtime/mod.rs"));
+        // Highlights are present for fuzzy matches.
+        assert!(dropdown
+            .suggestions
+            .iter()
+            .all(|s| !s.match_indices.is_empty()));
+    }
+
+    // ── task_07 file-mention interaction and insertion ──
+
+    fn file_dropdown_with(empty: bool) -> FileMentionDropdown {
+        FileMentionDropdown {
+            token: PromptToken {
+                value_start: 1,
+                value_end: 4,
+                query: "mod".to_string(),
+            },
+            suggestions: if empty {
+                Vec::new()
+            } else {
+                vec![FileSuggestion {
+                    rel_path: "src/tui/mod.rs".to_string(),
+                    is_dir: false,
+                    match_indices: vec![4, 5, 6],
+                }]
+            },
+            selected: 0,
+            empty,
+        }
+    }
+
+    #[test]
+    fn file_mention_key_mapping_matches_spec() {
+        let dropdown = file_dropdown_with(false);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        use FileMentionDropdownCommand::{Accept, Dismiss, Next, Previous};
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Up)),
+            Some(TuiCommand::FileMentionDropdown(Previous))
+        );
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Down)),
+            Some(TuiCommand::FileMentionDropdown(Next))
+        );
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Tab)),
+            Some(TuiCommand::FileMentionDropdown(Accept))
+        );
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Enter)),
+            Some(TuiCommand::FileMentionDropdown(Accept))
+        );
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Esc)),
+            Some(TuiCommand::FileMentionDropdown(Dismiss))
+        );
+    }
+
+    #[test]
+    fn file_mention_no_match_does_not_trap_enter_but_esc_dismisses() {
+        let dropdown = file_dropdown_with(true);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // Enter falls through (None) so the prompt submits normally.
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Enter)),
+            None
+        );
+        // Up/Down also fall through with no selectable rows.
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Up)),
+            None
+        );
+        // Esc still dismisses.
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Esc)),
+            Some(TuiCommand::FileMentionDropdown(
+                FileMentionDropdownCommand::Dismiss
+            ))
+        );
+    }
+
+    #[test]
+    fn file_mention_selection_wraps_at_both_ends() {
+        let mut state = state_with_input("@mod", false);
+        let mut ui_state = ui_state_with_file_entries("@mod", seeded_file_entries());
+        // Exactly two matches (src/tui/mod.rs, src/runtime/mod.rs).
+        assert_eq!(
+            file_mention_dropdown(&state, &ui_state)
+                .unwrap()
+                .suggestions
+                .len(),
+            2
+        );
+
+        // Previous from 0 wraps to the last row.
+        apply_file_mention_dropdown_command(
+            &mut state,
+            &mut ui_state,
+            FileMentionDropdownCommand::Previous,
+        );
+        assert_eq!(ui_state.file_mention_selection_index, 1);
+        // Next from the last row wraps back to the first.
+        apply_file_mention_dropdown_command(
+            &mut state,
+            &mut ui_state,
+            FileMentionDropdownCommand::Next,
+        );
+        assert_eq!(ui_state.file_mention_selection_index, 0);
+    }
+
+    #[tokio::test]
+    async fn file_mention_accept_consumes_at_and_inserts_bare_path() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("see @run", false);
+        let mut ui_state = ui_state_with_file_entries("see @run", seeded_file_entries());
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::FileMentionDropdown(FileMentionDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+
+        // The `@` is gone, a bare path is inserted, a trailing space added, and
+        // the cursor follows — with surrounding text intact. No app event.
+        assert_eq!(state.input, "see src/runtime/claude.rs ");
+        assert_eq!(
+            ui_state.input_cursor,
+            input_char_count("see src/runtime/claude.rs ")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn file_mention_accept_folder_gets_trailing_slash() {
+        let mut state = state_with_input("@src", false);
+        let mut ui_state = ui_state_with_file_entries("@src", Vec::new());
+        let token = active_prompt_token("@src", 4, FILE_MENTION_PREFIX).unwrap();
+        let folder = FileSuggestion {
+            rel_path: "src/tui".to_string(),
+            is_dir: true,
+            match_indices: Vec::new(),
+        };
+        apply_file_mention_suggestion(&mut state, &mut ui_state, &token, &folder);
+        assert_eq!(state.input, "src/tui/ ");
+        assert_eq!(ui_state.input_cursor, input_char_count("src/tui/ "));
+    }
+
+    #[tokio::test]
+    async fn file_mention_esc_records_input_in_dismissal() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("@run", false);
+        let mut ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::FileMentionDropdown(FileMentionDropdownCommand::Dismiss),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ui_state.file_mention_dropdown_dismissed,
+            Some("@run".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn file_mention_accept_and_continue_supports_second_reference() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let input = "look at @mod";
+        let mut state = state_with_input(input, false);
+        let mut ui_state = ui_state_with_file_entries(input, seeded_file_entries());
+
+        // Navigate to the second match, then accept.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::FileMentionDropdown(FileMentionDropdownCommand::Next),
+        )
+        .await
+        .unwrap();
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::FileMentionDropdown(FileMentionDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "look at src/runtime/mod.rs ");
+        assert!(receiver.try_recv().is_err());
+
+        // Typing a second `@` afterward re-opens the picker at the new cursor.
+        insert_input_character(&mut state, &mut ui_state, '@');
+        assert_eq!(state.input, "look at src/runtime/mod.rs @");
+        assert!(file_mention_dropdown(&state, &ui_state).is_some());
+    }
+
+    // ── task_08 render the file-mention dropdown ──
+
+    fn file_suggestion(rel_path: &str, is_dir: bool, match_indices: Vec<u32>) -> FileSuggestion {
+        FileSuggestion {
+            rel_path: rel_path.to_string(),
+            is_dir,
+            match_indices,
+        }
+    }
+
+    fn dropdown_with(
+        suggestions: Vec<FileSuggestion>,
+        selected: usize,
+        empty: bool,
+    ) -> FileMentionDropdown {
+        FileMentionDropdown {
+            token: PromptToken {
+                value_start: 1,
+                value_end: 1,
+                query: String::new(),
+            },
+            suggestions,
+            selected,
+            empty,
+        }
+    }
+
+    /// Draw only the file-mention dropdown onto a test backend and return its
+    /// rows. The dropdown opens upward above an input area near the bottom.
+    fn render_file_dropdown_rows(
+        dropdown: &FileMentionDropdown,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = TuiUiState::default().theme;
+        let input_area = Rect {
+            x: 0,
+            y: height.saturating_sub(INPUT_COMPOSER_HEIGHT),
+            width,
+            height: INPUT_BOX_HEIGHT,
+        };
+        terminal
+            .draw(|frame| render_file_mention_dropdown(frame, input_area, dropdown, &theme))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn render_shows_both_paths_and_the_selection_marker() {
+        let dropdown = dropdown_with(
+            vec![
+                file_suggestion("src/tui/mod.rs", false, Vec::new()),
+                file_suggestion("README.md", false, Vec::new()),
+            ],
+            0,
+            false,
+        );
+        let joined = render_file_dropdown_rows(&dropdown, 60, 24).join("\n");
+        assert!(joined.contains("Files"));
+        assert!(joined.contains("src/tui/mod.rs"));
+        assert!(joined.contains("README.md"));
+        // The selected (first) row carries the `> ` marker.
+        assert!(joined.contains("> src/tui/mod.rs"));
+    }
+
+    #[test]
+    fn render_emphasizes_matched_characters() {
+        let theme = TuiUiState::default().theme;
+        let matched: std::collections::HashSet<usize> = [4usize, 5, 6].into_iter().collect();
+        let spans = highlighted_path_spans(&theme, "src/tui/mod.rs", &matched, false);
+        let bold: Vec<bool> = spans
+            .iter()
+            .map(|span| span.style.add_modifier.contains(Modifier::BOLD))
+            .collect();
+        for (index, is_bold) in bold.iter().enumerate() {
+            assert_eq!(*is_bold, [4, 5, 6].contains(&index), "char index {index}");
+        }
+    }
+
+    #[test]
+    fn render_shows_folder_trailing_slash() {
+        let dropdown = dropdown_with(vec![file_suggestion("src/tui", true, Vec::new())], 0, false);
+        let joined = render_file_dropdown_rows(&dropdown, 60, 24).join("\n");
+        assert!(joined.contains("src/tui/"));
+    }
+
+    #[test]
+    fn render_no_match_shows_single_row() {
+        let dropdown = dropdown_with(Vec::new(), 0, true);
+        let joined = render_file_dropdown_rows(&dropdown, 60, 24).join("\n");
+        assert!(joined.contains("No matching files"));
+        // The no-match row only honors Esc, so the hint must not advertise the
+        // Up/Down/Tab/Enter affordances that do nothing in this state.
+        assert!(joined.contains("Esc"));
+        assert!(!joined.contains("Tab/Enter"));
+    }
+
+    #[test]
+    fn render_caps_visible_rows_at_six() {
+        let suggestions: Vec<FileSuggestion> = (0..8)
+            .map(|i| file_suggestion(&format!("f{i}.rs"), false, Vec::new()))
+            .collect();
+        let dropdown = dropdown_with(suggestions, 0, false);
+        let joined = render_file_dropdown_rows(&dropdown, 60, 24).join("\n");
+        let shown = (0..8)
+            .filter(|i| joined.contains(&format!("f{i}.rs")))
+            .count();
+        assert_eq!(shown, DROPDOWN_MAX_ITEMS);
+    }
+
+    #[test]
+    fn render_truncates_paths_wider_than_the_row() {
+        let long = "src/very/deeply/nested/directory/structure/with/a/long/file_name.rs";
+        let dropdown = dropdown_with(vec![file_suggestion(long, false, Vec::new())], 0, false);
+        let joined = render_file_dropdown_rows(&dropdown, 40, 24).join("\n");
+        assert!(!joined.contains(long));
+        assert!(joined.contains("src/very/deeply"));
+    }
+
+    #[test]
+    fn render_integration_overlay_layout_on_standard_backend() {
+        let dropdown = dropdown_with(
+            vec![
+                file_suggestion("src/tui/mod.rs", false, vec![4, 5, 6]),
+                file_suggestion("src/runtime/mod.rs", false, vec![12, 13, 14]),
+            ],
+            1,
+            false,
+        );
+        let rows = render_file_dropdown_rows(&dropdown, 80, 24);
+        let joined = rows.join("\n");
+        assert!(joined.contains("Files"));
+        assert!(joined.contains("src/tui/mod.rs"));
+        // The selected second row carries the marker.
+        assert!(joined.contains("> src/runtime/mod.rs"));
+    }
+
+    // ── task_09 routing/render wiring and parity ──
+
+    #[test]
+    fn routing_returns_file_mention_command_for_active_token() {
+        let state = state_with_input("@run", false);
+        let ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            command,
+            Some(TuiCommand::FileMentionDropdown(
+                FileMentionDropdownCommand::Next
+            ))
+        );
+    }
+
+    #[test]
+    fn routing_skips_file_mention_during_pending_approval() {
+        // pending_approval routes through normal input before the dropdowns.
+        let state = state_with_input("@run", true);
+        let ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            command,
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Down))
+        );
+    }
+
+    #[test]
+    fn render_chain_draws_file_dropdown_and_help_suppresses_it() {
+        let state = state_with_input("@run", false);
+        let mut ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+
+        let text = render_to_text_with_ui(&state, &ui_state, 80, 24);
+        assert!(text.contains("Files"));
+
+        // Help takes over the screen and suppresses all dropdown rendering.
+        ui_state.help_visible = true;
+        let text_help = render_to_text_with_ui(&state, &ui_state, 80, 24);
+        assert!(!text_help.contains("Files"));
+    }
+
+    #[tokio::test]
+    async fn end_to_end_down_then_enter_inserts_path_without_dispatching_a_run() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let mut state = state_with_input("look at @run", false);
+        let mut ui_state = ui_state_with_file_entries("look at @run", seeded_file_entries());
+
+        // Drive the real routing: Down selects the next match.
+        let down = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .expect("Down routes to the dropdown");
+        execute_tui_command(&mut state, &mut ui_state, &sender, down)
+            .await
+            .unwrap();
+
+        // Enter accepts (the dropdown is still active with matches).
+        let enter = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .expect("Enter routes to the dropdown");
+        execute_tui_command(&mut state, &mut ui_state, &sender, enter)
+            .await
+            .unwrap();
+
+        assert_eq!(state.input, "look at src/runtime/mod.rs ");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn routing_and_render_chains_agree_on_activation() {
+        // Whenever activation is `Some`, the render pass draws the overlay; when
+        // it is `None`, it does not (the two chains stay in sync).
+        for input in ["@run", "see @mod", "@zzzz", "hello world"] {
+            let state = state_with_input(input, false);
+            let ui_state = ui_state_with_file_entries(input, seeded_file_entries());
+            let active = file_mention_dropdown(&state, &ui_state).is_some();
+            let rendered = render_to_text_with_ui(&state, &ui_state, 80, 24).contains("Files");
+            assert_eq!(
+                active, rendered,
+                "routing/render parity mismatch for {input:?}"
+            );
+        }
     }
 
     // ── task_06 status footer ──

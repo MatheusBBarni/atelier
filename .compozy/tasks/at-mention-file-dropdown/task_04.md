@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Background file-index acquisition
 type: backend
 complexity: medium
@@ -30,12 +30,12 @@ Feed the TUI a live file index without ever blocking the draw loop: run `FileInd
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Add the index-snapshot channel between the worker and the TUI.
-- [ ] 4.2 Add the refresh-interval constant.
-- [ ] 4.3 Add a `spawn_blocking` walk-and-publish helper.
-- [ ] 4.4 Invoke it at startup and on each refresh tick in the worker `select!`.
-- [ ] 4.5 Thread the working directory into the worker.
-- [ ] 4.6 Add unit/integration tests for the publish helper and refresh.
+- [x] 4.1 Add the index-snapshot channel between the worker and the TUI.
+- [x] 4.2 Add the refresh-interval constant.
+- [x] 4.3 Add a `spawn_blocking` walk-and-publish helper.
+- [x] 4.4 Invoke it at startup and on each refresh tick in the worker `select!`.
+- [x] 4.5 Thread the working directory into the worker.
+- [x] 4.6 Add unit/integration tests for the publish helper and refresh.
 
 ## Implementation Details
 Modify `src/tui/mod.rs`: add the channel alongside the existing `watch`/`mpsc` setup in `run_tui`, and add a refresh arm to the `run_app_worker` `tokio::select!` loop, mirroring `GIT_POLL_INTERVAL`. See TechSpec "Component Overview" (index acquisition task) and ADR-003. The receiver may be parked until task_05 consumes it (stage with `#[allow(dead_code)]` if the compiler flags it).

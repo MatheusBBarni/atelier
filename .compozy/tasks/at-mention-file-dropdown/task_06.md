@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: File-mention dropdown model and activation
 type: frontend
 complexity: medium
@@ -31,12 +31,12 @@ Add the `FileMentionDropdown` model and its activation logic: detect an `@` toke
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Add the `@` prefix constant and the `FileMentionDropdown` struct.
-- [ ] 6.2 Implement activation via the shared token detector.
-- [ ] 6.3 Build ranked suggestions from the cached entries via the query.
-- [ ] 6.4 Show recents for an empty query; model the no-match state otherwise.
-- [ ] 6.5 Apply state-aware suppression and the dismissal gate.
-- [ ] 6.6 Add model-level tests for activation, recents, no-match, and gating.
+- [x] 6.1 Add the `@` prefix constant and the `FileMentionDropdown` struct.
+- [x] 6.2 Implement activation via the shared token detector.
+- [x] 6.3 Build ranked suggestions from the cached entries via the query.
+- [x] 6.4 Show recents for an empty query; model the no-match state otherwise.
+- [x] 6.5 Apply state-aware suppression and the dismissal gate.
+- [x] 6.6 Add model-level tests for activation, recents, no-match, and gating.
 
 ## Implementation Details
 Modify `src/tui/mod.rs`, mirroring `skill_dropdown` / `agent_dropdown` detection and the command dropdown's gating + `empty` modeling. Build suggestions by calling the task_03 query over `ui_state.file_mention_entries`. See TechSpec "Core Interfaces" (`FileMentionDropdown`, `file_mention_dropdown`) and ADR-005. Do not wire rendering or keys here; stage with `#[allow(dead_code)]` as the slash-command tasks did.

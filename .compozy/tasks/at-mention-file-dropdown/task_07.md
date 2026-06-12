@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: File-mention dropdown interaction and insertion
 type: frontend
 complexity: medium
@@ -29,12 +29,18 @@ Add the keyboard interaction and acceptance for the file-mention dropdown: a com
 </requirements>
 
 ## Subtasks
-- [ ] 7.1 Add the command enum and the `TuiCommand` variant.
-- [ ] 7.2 Add the key-command mapping (Up/Down/Tab/Enter/Esc, no-match fallthrough).
-- [ ] 7.3 Add Previous/Next selection wraparound dispatch.
-- [ ] 7.4 Implement `apply_file_mention_suggestion` (consume `@`, folder `/`, trailing space, cursor).
-- [ ] 7.5 Implement Esc dismissal.
-- [ ] 7.6 Add unit tests for key mapping, wraparound, and insertion.
+- [x] 7.1 Add the command enum and the `TuiCommand` variant.
+- [x] 7.2 Add the key-command mapping (Up/Down/Tab/Enter/Esc, no-match fallthrough).
+- [x] 7.3 Add Previous/Next selection wraparound dispatch.
+- [x] 7.4 Implement `apply_file_mention_suggestion` (consume `@`, folder `/`, trailing space, cursor).
+- [x] 7.5 Implement Esc dismissal.
+- [x] 7.6 Add unit tests for key mapping, wraparound, and insertion.
+
+> Note: the `TuiCommand::FileMentionDropdown` executor arm is added here (not in
+> task_09) because match exhaustiveness requires it the moment the variant
+> exists; task_09's "dispatch in the executor" is therefore satisfied early.
+> The key-routing branch (deciding when to call the key-command mapper) remains
+> task_09's responsibility.
 
 ## Implementation Details
 Modify `src/tui/mod.rs`, mirroring `agent_dropdown_key_command` (Up/Down/Enter), the command dropdown's Esc handling, and `apply_skill_suggestion` for the token-replacement — but extend the replaced range back over the `@` so the result is a bare path. See TechSpec "Core Interfaces" (`FileMentionDropdownCommand`, `apply_file_mention_suggestion`) and ADR-005.

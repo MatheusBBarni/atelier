@@ -7,21 +7,8 @@
 `atelier` is a terminal-native Rust harness that routes each user prompt through
 an orchestrator and a sequence of specialized agent profiles.
 
-<!-- RELEASE GATE (ADR-002): the two assets below must be captured against the
-shipped TUI and placed in web/public/images/ before this hero is merged. Capture
-specs and the manual 3-terminal checklist live in
-.compozy/tasks/atelier-tui-redesign/release-verification.md. -->
-
 <p align="center">
-  <img src="web/public/images/atelier-tui-welcome.png" alt="Atelier branded welcome screen: the Atelier wordmark above a facts box with version, working directory, repo and branch, agent summary, active preset, and a /help hint" width="900">
-</p>
-
-<p align="center">
-  <em>Parallel agents, each with a distinct accent color, under a live status footer:</em>
-</p>
-
-<p align="center">
-  <img src="web/public/images/atelier-tui-parallel-agents.gif" alt="Two Atelier agents running in parallel with distinct accent colors and a persistent repo, branch, and run-state footer" width="900">
+  <img src="web/public/images/atelier-wordmark.png" alt="Atelier wordmark: the word 'Atelier' in pixel-art lettering beside a half-teal, half-cream sailboat, on deep navy" width="640">
 </p>
 
 ## Features
@@ -151,6 +138,20 @@ slash-prefixed answers like `/tmp/project` remain normal input.
 - `/skill:<skill_name>`: load skill context from a selected project or personal skill; in the TUI, type `/skill:` and use Up/Down plus Enter to insert a cached project or personal skill.
 - `/reload:skills`: refresh cached skill names from project and personal skill folders.
 
+Type `@` anywhere in the composer to open the file picker: it fuzzy-searches the
+project's files and folders, highlights the matched characters, and ranks the
+most likely path first (recently-edited and shallower paths surface above deep,
+old ones). A bare `@` lists your most recent files. Use `Up`/`Down` to select
+and `Tab` or `Enter` to accept — the `@fragment` is replaced in place by the
+bare path (folders end with `/`), a trailing space is added, and the cursor
+lands ready to keep typing, so a second `@` adds another reference. `Esc`
+dismisses it, and a query with no matches shows a compact "No matching files"
+row (without trapping `Enter`). Results respect `.gitignore` and exclude
+build/dependency noise and known secret files (e.g. `.env`, private keys); only
+paths inside the project appear, and selecting one inserts text only — it never
+reads file contents. Like the `/` dropdowns, it stays disabled during
+clarification and approval prompts.
+
 ## Configuration
 
 Configuration is merged in this order:
@@ -171,7 +172,7 @@ Important values:
 - `[presets.<name>.agents.<agent>]`: preset-scoped agent overrides applied before local agent overrides
 - `[agents.*]`: profile, model, `model_fallbacks`, effort, capabilities, `tools`, prompt files
 - `[council]`: `default_preset`, `timeout_seconds`, `execution_mode = "serial"`
-- `[council.presets.<name>.<councillor>]`: runtime, model, effort, and `prompt` or `prompt_file`
+- `[council.presets.<name>.<councillor>]`: runtime, model, `model_fallbacks`, effort, thinking, and `prompt` or `prompt_file`
 - `[limits.*]`:
   - `max_agent_steps`
   - `max_step_actions`
@@ -179,6 +180,7 @@ Important values:
   - `max_step_minutes`
   - `max_command_minutes`
   - `max_review_fix_cycles`
+  - `max_parallel_agent_steps`
 
 ## Runtimes
 
@@ -198,7 +200,7 @@ Important values:
   - Keeps Cursor-native tool calls behind Harness Actions.
   - Built-in agents do not use Cursor unless you opt in through config.
 - `zai`
-  - Uses API key from env var (example: `ZAI_API_KEY`) and posts to `api.z.ai`.
+  - Uses an API key from an env var (example: `ZAI_API_KEY`) and posts to `https://api.z.ai/api/paas/v4`.
 - `fake`
   - Local test/runtime simulation mode.
 
@@ -220,10 +222,10 @@ Use `--clean-sessions` to delete project-local history. Use `--yes` to skip conf
 
 - `orchestrator` (plan)
 - `explorer` (read)
-- `oracle` (answer)
-- `consul` (challenge)
-- `fixer` (edit, command, verify)
-- `reviewer` (command, verify, review)
+- `oracle` (read, answer)
+- `consul` (read, challenge)
+- `fixer` (read, edit, command, verify)
+- `reviewer` (read, command, verify, review)
 - `librarian` (read, answer; disabled by default)
 - `designer` (read, edit, verify; disabled by default)
 
@@ -235,7 +237,8 @@ inside those capabilities.
 
 The council is a harness workflow, not a normal agent. The orchestrator may route
 to `next_agent = "council"` only for high-risk architecture, security, data
-integrity, difficult review, or explicit user council requests.
+integrity, difficult review, privacy, compliance, migration, rollback, or explicit
+user council requests.
 
 Council execution is serial. Each councillor returns an `agent_result`; the
 harness records per-councillor diagnostics and synthesizes a council result with
@@ -263,11 +266,15 @@ needs it.
 - `src/cli.rs` – argument parsing and command dispatch
 - `src/config` – config loading, validation, merging, init helpers
 - `src/app` – orchestration state machine
+- `src/orchestrator` – routing decisions that advance the run loop
 - `src/tui` – terminal UI and user input
 - `src/runtime` – runtime adapters and contracts
 - `src/actions` – file and command action execution
+- `src/skills` – skill discovery and prompt injection
+- `src/file_index` – gitignore-aware file walk and fuzzy ranking for the `@` picker
 - `src/history` – event/artifact/run persistence
 - `src/codemap` – folder-level repository map generation
+- `src/diagnostics` – shared diagnostic severity and message types
 - `src/doctor` – diagnostics and availability checks
 
 ## Development

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: FileIndex walk and candidate model
 type: backend
 complexity: medium
@@ -30,12 +30,12 @@ Create the `src/file_index.rs` module with the `FileEntry` candidate model and a
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Define the `FileEntry` model and register the module in `src/lib.rs`.
-- [ ] 2.2 Implement the gitignore-aware walk over the working-directory root.
-- [ ] 2.3 Apply the secret-name denylist and project force-exclude set.
-- [ ] 2.4 Reject symlinks and any path resolving outside the root.
-- [ ] 2.5 Populate is-dir, mtime, depth, and forward-slashed relative path.
-- [ ] 2.6 Add unit tests over a `tempfile` directory tree.
+- [x] 2.1 Define the `FileEntry` model and register the module in `src/lib.rs`.
+- [x] 2.2 Implement the gitignore-aware walk over the working-directory root.
+- [x] 2.3 Apply the secret-name denylist and project force-exclude set.
+- [x] 2.4 Reject symlinks and any path resolving outside the root.
+- [x] 2.5 Populate is-dir, mtime, depth, and forward-slashed relative path.
+- [x] 2.6 Add unit tests over a `tempfile` directory tree.
 
 ## Implementation Details
 Create `src/file_index.rs`; add the module declaration to `src/lib.rs` after `pub mod codemap;`. Use the `ignore` crate's builder; layer the secret denylist and force-excludes on top of gitignore handling. Follow the repo's `anyhow::Result` + `.context(...)` convention for any fallible setup. See TechSpec "Core Interfaces" (`FileEntry`, `FileIndex::walk`) and the `src/codemap` walk for the exclusion + tempfile-test precedent (note: codemap does NOT honor `.gitignore`; this module does).

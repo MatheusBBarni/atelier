@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: TUI file-index state and consumer
 type: frontend
 complexity: medium
@@ -28,11 +28,11 @@ Hold the file index and the dropdown's UI state on `TuiUiState`, and consume the
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Add the three `TuiUiState` fields and their `Default` initializers.
-- [ ] 5.2 Receive the index snapshot in `run_loop` and store it.
-- [ ] 5.3 Extend `reset_dropdown_selections` for the file-mention selection.
-- [ ] 5.4 Clear the dismissal on content edits only.
-- [ ] 5.5 Add unit tests for defaults, snapshot update, reset, and dismissal-clear.
+- [x] 5.1 Add the three `TuiUiState` fields and their `Default` initializers.
+- [x] 5.2 Receive the index snapshot in `run_loop` and store it.
+- [x] 5.3 Extend `reset_dropdown_selections` for the file-mention selection.
+- [x] 5.4 Clear the dismissal on content edits only.
+- [x] 5.5 Add unit tests for defaults, snapshot update, reset, and dismissal-clear.
 
 ## Implementation Details
 Modify `src/tui/mod.rs` around `TuiUiState` (+ its `Default`), `run_loop`, `reset_dropdown_selections`, and the character insert/remove helpers. See TechSpec "Data Models" (TuiUiState additions). Reads of the new state may be staged with `#[allow(dead_code)]` until task_06 consumes them.
