@@ -130,10 +130,19 @@ make the workspace stale by itself.
 
 ## TUI commands
 
+Type `/` at the start of the composer to open the command dropdown: it lists the
+built-in commands with short descriptions, filters as you type, and inserts the
+selected command with `Tab` or `Enter` (text only — it never submits). `Esc`
+dismisses it, and an unmatched command shows a compact "No commands found"
+state. The dropdown stays disabled during clarification and approval prompts so
+slash-prefixed answers like `/tmp/project` remain normal input.
+
+- `/help`: toggle the help overlay.
 - `/goal <text>`, `/goal`, `/goal clear`: manage the active session goal.
 - `/config`: show active config files, selected preset, and warnings without raw prompt bodies.
 - `/subtask <agent> <task>`: run one bounded child task through a specialized enabled agent.
 - `/workflow <prompt>`: execute a broad implementation or refactor prompt inside one normal run with plan, child-outcome, verification, and risk evidence. V1 does not support saved workflow scripts, worktree-isolated workflow children, or background workflow execution.
+- `/queue <message>` (alias `/q`): queue a follow-up prompt to run after the active run finishes.
 - `/agent:<name>`: prefix a prompt with a selected agent; in the TUI, type `/agent:` and use Up/Down plus Enter to insert an enabled agent id.
 - `/skill:<skill_name>`: load skill context from a selected project or personal skill; in the TUI, type `/skill:` and use Up/Down plus Enter to insert a cached project or personal skill.
 - `/reload:skills`: refresh cached skill names from project and personal skill folders.

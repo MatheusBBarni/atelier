@@ -1475,7 +1475,13 @@ fn skill_dropdown(input: &str, ui_state: &TuiUiState) -> Option<SkillDropdown> {
 /// specialized dropdowns take precedence via the routing/render order, so this
 /// is only consulted once those are inactive.
 fn command_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<CommandDropdown> {
-    if state.pending_approval.is_some() || matches!(state.run_state, RunState::WaitingForUser) {
+    // Disabled while the run is waiting on the user: pending approval, a pending
+    // clarification, or the WaitingForUser run state. Clarification answers and
+    // approvals can legitimately start with `/` (e.g. `/tmp/project`).
+    if state.pending_approval.is_some()
+        || state.pending_clarification.is_some()
+        || matches!(state.run_state, RunState::WaitingForUser)
+    {
         return None;
     }
     let input = state.input.as_str();
@@ -4330,7 +4336,9 @@ mod tests {
                 &ui_state,
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
             ),
-            Some(TuiCommand::CommandDropdown(CommandDropdownCommand::Previous))
+            Some(TuiCommand::CommandDropdown(
+                CommandDropdownCommand::Previous
+            ))
         );
         assert_eq!(
             key_event_to_tui_command_with_ui(
@@ -4516,6 +4524,144 @@ mod tests {
                 "/goal ship v2".to_string()
             )))
         );
+    }
+
+    // ── prefix handoff + final regression coverage (task_07) ──
+
+    #[tokio::test]
+    async fn accepting_agent_prefix_hands_off_to_agent_dropdown() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_agent_roster("/agent");
+        let mut ui_state = ui_state_with_cursor_at_end("/agent");
+        // The command dropdown offers /agent: for the partial input.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::CommandDropdown(CommandDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+
+        // Inserted text only, no trailing text, no app event.
+        assert_eq!(state.input, "/agent:");
+        assert!(!state.input.ends_with(' '));
+        assert!(receiver.try_recv().is_err());
+        // The agent dropdown takes over immediately and the command dropdown
+        // yields to it in both the model and the render.
+        assert!(agent_dropdown(&state, &ui_state).is_some());
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
+        assert!(text.contains("Agents"));
+        assert!(!text.contains("Commands"));
+        // Filtering still works after handoff (no trailing text blocked it).
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::InputCharacter('f'),
+        )
+        .await
+        .unwrap();
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::InputCharacter('i'),
+        )
+        .await
+        .unwrap();
+        let filtered = render_to_text_with_ui(&state, &ui_state, 100, 24);
+        assert!(filtered.contains("fixer"));
+        assert!(!filtered.contains("explorer"));
+    }
+
+    #[tokio::test]
+    async fn accepting_skill_prefix_hands_off_to_skill_dropdown() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/skill", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: input_char_count("/skill"),
+            skill_suggestions: test_skill_suggestions(),
+            ..TuiUiState::default()
+        };
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::CommandDropdown(CommandDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.input, "/skill:");
+        assert!(!state.input.ends_with(' '));
+        assert!(receiver.try_recv().is_err());
+        assert!(skill_dropdown(&state.input, &ui_state).is_some());
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
+        assert!(text.contains("Skills"));
+        assert!(!text.contains("Commands"));
+    }
+
+    #[tokio::test]
+    async fn goal_follow_on_text_submits_normally_after_acceptance() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/goal", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/goal");
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::CommandDropdown(CommandDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "/goal");
+
+        // Typing a space releases the dropdown; the rest is normal input.
+        for ch in " ship v2".chars() {
+            execute_tui_command(
+                &mut state,
+                &mut ui_state,
+                &sender,
+                TuiCommand::InputCharacter(ch),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(state.input, "/goal ship v2");
+        assert!(command_dropdown(&state, &ui_state).is_none());
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+                "/goal ship v2".to_string()
+            )))
+        );
+        // Nothing was dispatched during acceptance or typing.
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn command_dropdown_stays_disabled_during_approval_clarification_and_waiting() {
+        // Pending approval (also WaitingForUser via the helper).
+        let mut state = state_with_input("/", true);
+        let ui_state = ui_state_with_cursor_at_end("/");
+        assert!(command_dropdown(&state, &ui_state).is_none());
+        assert!(!render_to_text_with_ui(&state, &ui_state, 80, 24).contains("Commands"));
+
+        // WaitingForUser without approval.
+        state.pending_approval = None;
+        state.run_state = RunState::WaitingForUser;
+        assert!(command_dropdown(&state, &ui_state).is_none());
+
+        // Pending clarification: a `/`-prefixed answer must stay normal input.
+        let mut clar_state = state_with_input("/tmp/project", false);
+        clar_state.pending_clarification = Some(clarification_view(vec![]));
+        let clar_ui = ui_state_with_cursor_at_end("/tmp/project");
+        assert!(command_dropdown(&clar_state, &clar_ui).is_none());
     }
 
     #[test]

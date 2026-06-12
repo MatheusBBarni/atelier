@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Preserve Prefix Handoff And Final Regression Coverage"
 type: frontend
 complexity: medium
@@ -31,11 +31,11 @@ Finish the feature by proving `/agent:` and `/skill:` suggestions accepted from 
 </requirements>
 
 ## Subtasks
-- [ ] 7.1 Add handoff tests for `/agent:` and `/skill:` accepted from the command dropdown.
-- [ ] 7.2 Verify specialized dropdowns still render and accept suggestions after prefix handoff.
-- [ ] 7.3 Add regression tests for `/goal` follow-on text, approval gating, and clarification gating.
-- [ ] 7.4 Review README command documentation and update only if implementation changed documented behavior.
-- [ ] 7.5 Run the focused test set and fix regressions within the feature scope.
+- [x] 7.1 Add handoff tests for `/agent:` and `/skill:` accepted from the command dropdown.
+- [x] 7.2 Verify specialized dropdowns still render and accept suggestions after prefix handoff.
+- [x] 7.3 Add regression tests for `/goal` follow-on text, approval gating, and clarification gating.
+- [x] 7.4 Review README command documentation and update only if implementation changed documented behavior.
+- [x] 7.5 Run the focused test set and fix regressions within the feature scope.
 
 ## Implementation Details
 Modify `src/tui/mod.rs` tests and any final TUI behavior needed for prefix handoff. Review `README.md` after the implementation; update it only if needed to keep user-visible command behavior accurate. Do not add new V1 commands or broaden command palette behavior.
@@ -64,19 +64,32 @@ Modify `src/tui/mod.rs` tests and any final TUI behavior needed for prefix hando
 
 ## Tests
 - Unit tests:
-  - [ ] Accepting `/agent:` from the command dropdown immediately makes the agent dropdown visible.
-  - [ ] Accepting `/skill:` from the command dropdown immediately makes the skill dropdown visible.
-  - [ ] Prefix handoff does not dispatch an app event.
-  - [ ] Prefix handoff does not add trailing text that prevents specialized filtering.
-  - [ ] Accepting `/goal` allows the user to type goal text afterward.
-  - [ ] Command dropdown remains disabled during pending approval.
-  - [ ] Command dropdown remains disabled during `WaitingForUser`.
+  - [x] Accepting `/agent:` from the command dropdown immediately makes the agent dropdown visible.
+  - [x] Accepting `/skill:` from the command dropdown immediately makes the skill dropdown visible.
+  - [x] Prefix handoff does not dispatch an app event.
+  - [x] Prefix handoff does not add trailing text that prevents specialized filtering.
+  - [x] Accepting `/goal` allows the user to type goal text afterward.
+  - [x] Command dropdown remains disabled during pending approval.
+  - [x] Command dropdown remains disabled during `WaitingForUser`.
 - Integration tests:
-  - [ ] Existing app clarification answer `/tmp/project` still completes as clarification input.
-  - [ ] Existing `/agent:` and `/skill:` prompt-prefix submission tests still pass.
-  - [ ] Focused TUI and app slash-command test commands pass together.
+  - [x] Existing app clarification answer `/tmp/project` still completes as clarification input.
+  - [x] Existing `/agent:` and `/skill:` prompt-prefix submission tests still pass.
+  - [x] Focused TUI and app slash-command test commands pass together.
 - Test coverage target: >=80%
 - All tests must pass
+
+## Follow-up Notes (recorded during execution, 2026-06-12)
+- **Handoff**: accepting `/agent:`/`/skill:` inserts the bare prefix (no trailing
+  text), so the specialized dropdowns' token detection takes over immediately;
+  tests confirm `fixer` filters after typing `fi` post-handoff.
+- **Clarification gating**: added an explicit `pending_clarification` guard to
+  `command_dropdown` (defense-in-depth; the app already sets `WaitingForUser`
+  alongside clarifications) so `/`-prefixed answers like `/tmp/project` stay
+  normal input.
+- **README**: updated the "TUI commands" section to document the new command
+  dropdown and the now-visible `/queue`/`/help`, preserving the wording pinned
+  by `readme_skill_command_wording_matches_help_language` and
+  `readme_workflow_command_wording_matches_v1_limits`.
 
 ## Success Criteria
 - All tests passing
