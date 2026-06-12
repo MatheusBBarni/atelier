@@ -234,7 +234,14 @@ mod tests {
         );
         assert_eq!(
             labels_of(SlashCommandKind::AppCommand),
-            ["/goal", "/goal clear", "/config", "/subtask", "/workflow", "/queue"]
+            [
+                "/goal",
+                "/goal clear",
+                "/config",
+                "/subtask",
+                "/workflow",
+                "/queue"
+            ]
         );
     }
 

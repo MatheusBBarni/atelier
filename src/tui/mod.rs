@@ -84,6 +84,7 @@ enum TuiCommand {
     MoveInputCursor(InputCursorCommand),
     AgentDropdown(DropdownCommand),
     SkillDropdown(DropdownCommand),
+    CommandDropdown(CommandDropdownCommand),
     Clarification(ClarificationCommand),
     ClarificationInputCharacter(char),
     ClarificationInputBackspace,
@@ -116,6 +117,22 @@ enum DropdownCommand {
     Previous,
     Next,
     Accept,
+}
+
+/// Command-dropdown actions. Distinct from `DropdownCommand` because the command
+/// dropdown also supports Escape dismissal and trapping `Enter` in the no-match
+/// state (ADR-004).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandDropdownCommand {
+    Previous,
+    Next,
+    /// Insert the selected command's text only; never dispatches an app event.
+    Accept,
+    /// Escape: suppress the dropdown for the current input without mutating it.
+    Dismiss,
+    /// Consume `Enter` while the no-match state is visible so invalid slash
+    /// input is not submitted.
+    TrapNoMatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,6 +435,10 @@ async fn execute_tui_command_with_interrupt(
             apply_skill_dropdown_command(state, ui_state, command);
             Ok(true)
         }
+        TuiCommand::CommandDropdown(command) => {
+            apply_command_dropdown_command(state, ui_state, command);
+            Ok(true)
+        }
         TuiCommand::Clarification(command) => {
             apply_clarification_command(state, ui_state, command, command_sender).await
         }
@@ -613,6 +634,9 @@ fn key_event_to_tui_command_with_ui(
         agent_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
     } else if skill_dropdown(&state.input, ui_state).is_some() {
         skill_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+    } else if let Some(dropdown) = command_dropdown(state, ui_state) {
+        command_dropdown_key_command(&dropdown, key)
+            .or_else(|| key_event_to_tui_command(state, key))
     } else if queue_control_active(state, ui_state) {
         queue_control_key_command(state, ui_state, key)
             .or_else(|| key_event_to_tui_command(state, key))
@@ -749,6 +773,24 @@ fn skill_dropdown_key_command(key: KeyEvent) -> Option<TuiCommand> {
             code: KeyCode::Enter,
             ..
         } => Some(TuiCommand::SkillDropdown(DropdownCommand::Accept)),
+        _ => None,
+    }
+}
+
+fn command_dropdown_key_command(dropdown: &CommandDropdown, key: KeyEvent) -> Option<TuiCommand> {
+    use CommandDropdownCommand::{Accept, Dismiss, Next, Previous, TrapNoMatch};
+    match key.code {
+        // Escape dismisses in either state; the input is left untouched.
+        KeyCode::Esc => Some(TuiCommand::CommandDropdown(Dismiss)),
+        // Selection and acceptance only apply when there are selectable rows.
+        KeyCode::Up if !dropdown.empty => Some(TuiCommand::CommandDropdown(Previous)),
+        KeyCode::Down if !dropdown.empty => Some(TuiCommand::CommandDropdown(Next)),
+        KeyCode::Tab | KeyCode::Enter if !dropdown.empty => {
+            Some(TuiCommand::CommandDropdown(Accept))
+        }
+        // No-match: trap Enter so invalid slash input is never submitted. Other
+        // keys (chars, Backspace) fall through so editing re-filters the list.
+        KeyCode::Enter => Some(TuiCommand::CommandDropdown(TrapNoMatch)),
         _ => None,
     }
 }
@@ -1347,6 +1389,61 @@ fn apply_skill_suggestion(
     ui_state.input_cursor = skill_end.saturating_add(1);
     ui_state.input_preferred_col = None;
     reset_dropdown_selections(ui_state);
+}
+
+fn apply_command_dropdown_command(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    command: CommandDropdownCommand,
+) {
+    let Some(dropdown) = command_dropdown(state, ui_state) else {
+        return;
+    };
+    match command {
+        CommandDropdownCommand::Previous => {
+            let count = dropdown.suggestions.len();
+            if count == 0 {
+                return;
+            }
+            let current = dropdown.selected.unwrap_or(0);
+            ui_state.command_selection_index = if current == 0 { count - 1 } else { current - 1 };
+        }
+        CommandDropdownCommand::Next => {
+            let count = dropdown.suggestions.len();
+            if count == 0 {
+                return;
+            }
+            let current = dropdown.selected.unwrap_or(0);
+            ui_state.command_selection_index = (current + 1) % count;
+        }
+        CommandDropdownCommand::Accept => {
+            if let Some(index) = dropdown.selected {
+                let spec = dropdown.suggestions[index];
+                apply_command_suggestion(state, ui_state, spec);
+            }
+        }
+        CommandDropdownCommand::Dismiss => {
+            ui_state.command_dropdown_dismissed = Some(state.input.clone());
+        }
+        CommandDropdownCommand::TrapNoMatch => {}
+    }
+}
+
+/// Accept a command suggestion by replacing the whole `/`-token input with its
+/// insert text. Text-only: no app event is dispatched. The dropdown is then
+/// dismissed for the inserted text so `Enter` does not re-accept the same row
+/// (it can submit or take arguments), while `/agent:`/`/skill:` still hand off
+/// to their specialized dropdowns, which do not consult this dismissal.
+fn apply_command_suggestion(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    spec: &crate::slash_commands::SlashCommandSpec,
+) {
+    state.input = spec.insert_text.to_string();
+    ui_state.input_cursor = input_char_count(spec.insert_text);
+    ui_state.input_preferred_col = None;
+    ui_state.command_selection_index = 0;
+    ui_state.command_dropdown_dismissed = Some(spec.insert_text.to_string());
 }
 
 fn skill_dropdown(input: &str, ui_state: &TuiUiState) -> Option<SkillDropdown> {
@@ -2091,7 +2188,10 @@ fn render_command_dropdown(
             Span::styled("No commands found", Style::default().fg(theme.text_muted)),
         ]));
         frame.render_widget(Clear, area);
-        frame.render_widget(List::new(vec![row]).block(command_dropdown_block(theme)), area);
+        frame.render_widget(
+            List::new(vec![row]).block(command_dropdown_block(theme)),
+            area,
+        );
         return;
     }
 
@@ -2123,7 +2223,9 @@ fn render_command_dropdown(
         .enumerate()
         .skip(first_visible)
         .take(visible_count)
-        .map(|(index, spec)| command_dropdown_item(theme, spec, index == selected, row_width, label_col))
+        .map(|(index, spec)| {
+            command_dropdown_item(theme, spec, index == selected, row_width, label_col)
+        })
         .collect::<Vec<_>>();
     let area = Rect {
         x: input_area.x,
@@ -2157,7 +2259,9 @@ fn command_dropdown_item(
         Style::default().fg(theme.text_dim)
     };
     let label_style = if selected {
-        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.accent)
     };
@@ -2491,7 +2595,11 @@ fn render_help_modal(frame: &mut Frame, theme: &Theme) {
     // Slash-command rows come from the shared catalog so help stays aligned
     // with the dropdown and unknown-command guidance (ADR-003). Non-command
     // rows (keys, scrolling, CLI flags) stay literal below.
-    lines.extend(crate::slash_commands::help_command_lines().into_iter().map(Line::from));
+    lines.extend(
+        crate::slash_commands::help_command_lines()
+            .into_iter()
+            .map(Line::from),
+    );
     lines.extend([
         Line::from("Enter                submit prompt or answer approval"),
         Line::from("Ctrl-L               show or hide Agent Roster"),
@@ -3610,7 +3718,11 @@ mod tests {
         // Every fixed V1 command's usage and description renders exactly once,
         // proving the rows come from the catalog and are not duplicated.
         for spec in crate::slash_commands::catalog() {
-            assert!(text.contains(spec.usage), "help missing usage {}", spec.usage);
+            assert!(
+                text.contains(spec.usage),
+                "help missing usage {}",
+                spec.usage
+            );
             let occurrences = text.matches(spec.description).count();
             assert_eq!(
                 occurrences, 1,
@@ -4022,7 +4134,10 @@ mod tests {
     // ── command dropdown model + activation (task_04) ──
 
     fn command_state(input: &str) -> (AppState, TuiUiState) {
-        (state_with_input(input, false), ui_state_with_cursor_at_end(input))
+        (
+            state_with_input(input, false),
+            ui_state_with_cursor_at_end(input),
+        )
     }
 
     #[test]
@@ -4201,6 +4316,206 @@ mod tests {
         let text = render_to_text_with_ui(&state, &ui_state, 100, 24);
         assert!(text.contains("Agents"));
         assert!(!text.contains("Commands"));
+    }
+
+    // ── command dropdown keyboard handling + insertion (task_06) ──
+
+    #[test]
+    fn command_dropdown_arrow_keys_route_to_selection() {
+        let state = state_with_input("/g", false);
+        let ui_state = ui_state_with_cursor_at_end("/g");
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::CommandDropdown(CommandDropdownCommand::Previous))
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::CommandDropdown(CommandDropdownCommand::Next))
+        );
+    }
+
+    #[test]
+    fn command_dropdown_selection_cycles_and_wraps() {
+        // /g -> [/goal, /goal clear].
+        let mut state = state_with_input("/g", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/g");
+        apply_command_dropdown_command(&mut state, &mut ui_state, CommandDropdownCommand::Next);
+        assert_eq!(ui_state.command_selection_index, 1);
+        apply_command_dropdown_command(&mut state, &mut ui_state, CommandDropdownCommand::Next);
+        assert_eq!(ui_state.command_selection_index, 0); // wraps forward
+        apply_command_dropdown_command(&mut state, &mut ui_state, CommandDropdownCommand::Previous);
+        assert_eq!(ui_state.command_selection_index, 1); // wraps back
+    }
+
+    #[test]
+    fn command_dropdown_tab_and_enter_map_to_accept() {
+        let state = state_with_input("/config", false);
+        let ui_state = ui_state_with_cursor_at_end("/config");
+        for code in [KeyCode::Tab, KeyCode::Enter] {
+            assert_eq!(
+                key_event_to_tui_command_with_ui(
+                    &state,
+                    &ui_state,
+                    KeyEvent::new(code, KeyModifiers::NONE)
+                ),
+                Some(TuiCommand::CommandDropdown(CommandDropdownCommand::Accept)),
+                "{code:?} should accept",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn command_dropdown_accept_inserts_text_without_app_event() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/config", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/config");
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::CommandDropdown(CommandDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "/config");
+        assert_eq!(ui_state.input_cursor, input_char_count("/config"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn command_dropdown_enter_accepts_help_without_toggling() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/help", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/help");
+        // Enter is intercepted as Accept while the dropdown is open, not as the
+        // /help toggle.
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            TuiCommand::CommandDropdown(CommandDropdownCommand::Accept)
+        );
+        execute_tui_command(&mut state, &mut ui_state, &sender, command)
+            .await
+            .unwrap();
+        assert_eq!(state.input, "/help");
+        assert!(!ui_state.help_visible);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn command_dropdown_accept_goal_leaves_cursor_ready_for_text() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/goa", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/goa");
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::CommandDropdown(CommandDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "/goal");
+        assert_eq!(ui_state.input_cursor, input_char_count("/goal"));
+        // Dismissed so a second Enter can submit / arguments can be typed,
+        // instead of re-accepting the same row.
+        assert!(command_dropdown(&state, &ui_state).is_none());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn command_dropdown_escape_dismisses_and_preserves_input() {
+        let state = state_with_input("/g", false);
+        let ui_state = ui_state_with_cursor_at_end("/g");
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::CommandDropdown(CommandDropdownCommand::Dismiss))
+        );
+
+        let mut state = state.clone();
+        let mut ui_state = ui_state.clone();
+        apply_command_dropdown_command(&mut state, &mut ui_state, CommandDropdownCommand::Dismiss);
+        assert_eq!(state.input, "/g"); // raw input untouched
+        assert_eq!(ui_state.command_dropdown_dismissed, Some("/g".to_string()));
+        assert!(command_dropdown(&state, &ui_state).is_none());
+    }
+
+    #[tokio::test]
+    async fn command_dropdown_no_match_enter_is_trapped() {
+        let state = state_with_input("/zz", false);
+        let ui_state = ui_state_with_cursor_at_end("/zz");
+        // Enter on the no-match state maps to a trap, not a submit.
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            TuiCommand::CommandDropdown(CommandDropdownCommand::TrapNoMatch)
+        );
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state.clone();
+        let mut ui_state = ui_state.clone();
+        execute_tui_command(&mut state, &mut ui_state, &sender, command)
+            .await
+            .unwrap();
+        assert_eq!(state.input, "/zz");
+        assert!(receiver.try_recv().is_err()); // no PromptSubmitted dispatched
+    }
+
+    #[test]
+    fn normal_enter_still_submits_without_command_dropdown() {
+        let state = state_with_input("hello world", false);
+        let ui_state = ui_state_with_cursor_at_end("hello world");
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+                "hello world".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn enter_submits_command_with_arguments_normally() {
+        // Once a space ends the command word the dropdown is inactive, so Enter
+        // submits as usual — preserving `/goal <text>`, `/subtask`, `/queue`.
+        let state = state_with_input("/goal ship v2", false);
+        let ui_state = ui_state_with_cursor_at_end("/goal ship v2");
+        assert!(command_dropdown(&state, &ui_state).is_none());
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+                "/goal ship v2".to_string()
+            )))
+        );
     }
 
     #[test]
