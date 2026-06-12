@@ -2285,24 +2285,21 @@ fn wrapped_event_line_count(lines: &[Line<'_>], width: u16) -> usize {
 
 fn render_help_modal(frame: &mut Frame, theme: &Theme) {
     let area = centered_rect(78, 100, frame.area());
-    let lines = vec![
+    let section_header = |label: &'static str, color| {
         Line::from(vec![
             Span::styled(
-                "TUI",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" commands", Style::default().fg(theme.text)),
-        ]),
-        Line::from("/help + Enter        toggle this help"),
-        Line::from("/agent:<agent_name>  select enabled agent with Up/Down + Enter"),
-        Line::from("/skill:<skill_name>  load skill context"),
-        Line::from("/reload:skills      refresh cached skill names"),
-        Line::from("/goal <text> | /goal | /goal clear   manage session goal"),
-        Line::from("/subtask <agent> <task>              run bounded child task"),
-        Line::from("/workflow <prompt>  execute a broad prompt with workflow evidence"),
-        Line::from("/config              show config files, preset, warnings"),
+        ])
+    };
+    let mut lines = vec![section_header("TUI", theme.accent)];
+    // Slash-command rows come from the shared catalog so help stays aligned
+    // with the dropdown and unknown-command guidance (ADR-003). Non-command
+    // rows (keys, scrolling, CLI flags) stay literal below.
+    lines.extend(crate::slash_commands::help_command_lines().into_iter().map(Line::from));
+    lines.extend([
         Line::from("Enter                submit prompt or answer approval"),
         Line::from("Ctrl-L               show or hide Agent Roster"),
         Line::from("Arrow keys           move input cursor"),
@@ -2313,15 +2310,9 @@ fn render_help_modal(frame: &mut Frame, theme: &Theme) {
         Line::from("Backspace            delete input character"),
         Line::from("Text                 edit the input composer"),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "CLI",
-                Style::default()
-                    .fg(theme.status_ok)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" commands", Style::default().fg(theme.text)),
-        ]),
+    ]);
+    lines.push(section_header("CLI", theme.status_ok));
+    lines.extend([
         Line::from("atelier                            open the TUI"),
         Line::from("atelier --cwd <path>               run from a workspace"),
         Line::from("atelier --config <path>            use a config file"),
@@ -2332,7 +2323,7 @@ fn render_help_modal(frame: &mut Frame, theme: &Theme) {
         Line::from("atelier --clean-sessions [--yes]   delete local history"),
         Line::from("atelier --debug                    write debug events"),
         Line::from("atelier --help                     print CLI help"),
-    ];
+    ]);
     let help = Paragraph::new(lines)
         .style(Style::default().fg(theme.text).bg(theme.ink))
         .block(
@@ -3390,7 +3381,8 @@ mod tests {
         assert!(text.contains("Help"));
         let header = text.lines().find(|line| line.contains("Help")).unwrap();
         assert!(header.contains("Esc"));
-        assert!(text.contains("/help + Enter"));
+        assert!(text.contains("/help"));
+        assert!(text.contains("toggle the help overlay"));
         assert!(text.contains("/agent:<agent_name>"));
         assert!(text.contains("/skill:<skill_name>"));
         assert!(text.contains("load skill context"));
@@ -3411,6 +3403,36 @@ mod tests {
         assert!(text.contains("Home/End"));
         assert!(text.contains("atelier --doctor"));
         assert!(text.contains("atelier --clean-sessions"));
+    }
+
+    #[test]
+    fn help_modal_command_rows_are_catalog_derived() {
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 40);
+
+        // Every fixed V1 command's usage and description renders exactly once,
+        // proving the rows come from the catalog and are not duplicated.
+        for spec in crate::slash_commands::catalog() {
+            assert!(text.contains(spec.usage), "help missing usage {}", spec.usage);
+            let occurrences = text.matches(spec.description).count();
+            assert_eq!(
+                occurrences, 1,
+                "description {:?} rendered {occurrences} times",
+                spec.description
+            );
+        }
+        // The amended catalog commands are visible.
+        assert!(text.contains("/reload:skills"));
+        assert!(text.contains("/workflow <prompt>"));
+        assert!(text.contains("/queue <message>"));
+        // Non-command rows survive the catalog routing.
+        assert!(text.contains("Ctrl-L"));
+        assert!(text.contains("Arrow keys"));
+        assert!(text.contains("Mouse wheel"));
     }
 
     #[test]

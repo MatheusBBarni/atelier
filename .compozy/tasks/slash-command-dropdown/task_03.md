@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Route TUI Help Command Rows Through Catalog"
 type: frontend
 complexity: low
@@ -29,11 +29,11 @@ Update the TUI help modal so slash command rows are generated from the shared co
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Identify help modal rows that represent slash commands.
-- [ ] 3.2 Replace slash command row literals with catalog-derived rows.
-- [ ] 3.3 Preserve existing non-command rows and help modal styling.
-- [ ] 3.4 Update help modal tests to assert the fixed V1 command set remains visible.
-- [ ] 3.5 Confirm no command execution tests are affected.
+- [x] 3.1 Identify help modal rows that represent slash commands.
+- [x] 3.2 Replace slash command row literals with catalog-derived rows.
+- [x] 3.3 Preserve existing non-command rows and help modal styling.
+- [x] 3.4 Update help modal tests to assert the fixed V1 command set remains visible.
+- [x] 3.5 Confirm no command execution tests are affected.
 
 ## Implementation Details
 Modify `render_help_modal` and related help test expectations in `src/tui/mod.rs`. Reference the TechSpec "Integration Points" section for the boundary: help consumes metadata, but TUI-local command handling remains unchanged.
@@ -59,12 +59,12 @@ Modify `render_help_modal` and related help test expectations in `src/tui/mod.rs
 
 ## Tests
 - Unit tests:
-  - [ ] Help modal includes every fixed V1 command label.
-  - [ ] Help modal includes `/reload:skills`.
-  - [ ] Help modal still includes non-command rows like `Ctrl-L`, `Arrow keys`, and mouse wheel help.
-  - [ ] Help modal does not duplicate command rows.
+  - [x] Help modal includes every fixed V1 command label.
+  - [x] Help modal includes `/reload:skills`.
+  - [x] Help modal still includes non-command rows like `Ctrl-L`, `Arrow keys`, and mouse wheel help.
+  - [x] Help modal does not duplicate command rows.
 - Integration tests:
-  - [ ] Existing `/help` local command test still toggles the modal without sending an app event.
+  - [x] Existing `/help` local command test still toggles the modal without sending an app event.
 - Test coverage target: >=80%
 - All tests must pass
 
