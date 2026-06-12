@@ -1,5 +1,9 @@
 # Atelier
 
+<p align="center">
+  <img src="web/public/images/atelier-logo.png" alt="Atelier logo: a teal and cream wizard hat above a terminal prompt, framed in gold on deep navy" width="168">
+</p>
+
 `atelier` is a terminal-native Rust harness that routes each user prompt through
 an orchestrator and a sequence of specialized agent profiles.
 
