@@ -7,6 +7,7 @@ use crate::app::{
     QueuedFollowUpStatus, QueuedFollowUpView,
 };
 use crate::config::EffectiveConfig;
+use crate::file_index::{FileEntry, FileIndex};
 use crate::orchestrator::RunState;
 use crate::skills::{
     self, SkillSourceTag, SkillSuggestion, SKILL_DISCOVERY_MAX_DEPTH, SKILL_FILE_NAME,
@@ -302,13 +303,25 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let interrupt_handle = app.interrupt_handle();
     let approval_handle = app.approval_handle();
     let (command_sender, command_receiver) = mpsc::channel(1024);
+    // Worker→TUI file-index snapshot channel (ADR-003). The worker walks the
+    // working directory off-thread and publishes the latest `Vec<FileEntry>`
+    // here; the render loop consumes it.
+    let (file_index_sender, file_index_receiver) = watch::channel(Vec::<FileEntry>::new());
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let worker = tokio::spawn(run_app_worker(app, command_receiver));
+    let worker = tokio::spawn(run_app_worker(
+        app,
+        command_receiver,
+        file_index_sender,
+        Some(working_directory.clone()),
+    ));
+    // Parked until task_05 threads it into `run_loop`; held here so the watch
+    // channel stays open for the worker's snapshots in the meantime.
+    let _file_index_receiver = file_index_receiver;
 
     // No loading interstitial: the main UI (with the branded welcome item)
     // renders on the first frame, and skill scanning happens behind it inside
@@ -547,9 +560,36 @@ async fn queue_app_event(
 /// Cadence of the background git-context poll (ADR-006).
 const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Cadence of the background file-index refresh walk (ADR-003). Coarse on
+/// purpose: the walk is off-thread but still real work, so it runs rarely and
+/// only exists to surface files created mid-session.
+const FILE_INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Walk the working directory off the worker's async thread and publish the
+/// snapshot to the TUI. Extracted from the worker `select!` so it is
+/// unit-testable in isolation (ADR-003). The `ignore`-crate walk is
+/// synchronous, so it runs inside `spawn_blocking`; a join error (panic) or a
+/// closed receiver simply leaves the previous snapshot in place. No-op when
+/// there is no working directory.
+async fn refresh_file_index(
+    working_directory: Option<&Path>,
+    file_index_sender: &watch::Sender<Vec<FileEntry>>,
+) {
+    let Some(root) = working_directory.map(Path::to_path_buf) else {
+        return;
+    };
+    // A join error (walk panic) leaves the previous snapshot in place; a send
+    // error means every receiver is gone (TUI shutting down).
+    if let Ok(entries) = tokio::task::spawn_blocking(move || FileIndex::walk(&root)).await {
+        let _ = file_index_sender.send(entries);
+    }
+}
+
 async fn run_app_worker(
     mut app: App,
     mut command_receiver: mpsc::Receiver<AppWorkerCommand>,
+    file_index_sender: watch::Sender<Vec<FileEntry>>,
+    working_directory: Option<PathBuf>,
 ) -> Result<()> {
     // Immediate startup refresh, then a change-gated poll every 5s. The poll
     // lives inside the worker's select loop, so it stops as soon as the loop
@@ -557,6 +597,12 @@ async fn run_app_worker(
     app.refresh_git_context().await;
     let mut git_poll = tokio::time::interval(GIT_POLL_INTERVAL);
     git_poll.tick().await; // consume the immediate first tick (startup covered it)
+
+    // Initial off-thread file-index walk at startup, then a coarse periodic
+    // refresh — mirrors the git poller (ADR-003).
+    refresh_file_index(working_directory.as_deref(), &file_index_sender).await;
+    let mut file_index_poll = tokio::time::interval(FILE_INDEX_REFRESH_INTERVAL);
+    file_index_poll.tick().await; // consume the immediate first tick (startup covered it)
 
     loop {
         tokio::select! {
@@ -574,6 +620,9 @@ async fn run_app_worker(
             },
             _ = git_poll.tick() => {
                 app.refresh_git_context().await;
+            }
+            _ = file_index_poll.tick() => {
+                refresh_file_index(working_directory.as_deref(), &file_index_sender).await;
             }
         }
     }
@@ -6618,7 +6667,13 @@ runtime = "fake"
         let dir = tempdir().unwrap();
         let app = App::new(fake_worker_config(dir.path())).await.unwrap();
         let (sender, receiver) = mpsc::channel(8);
-        let worker = tokio::spawn(run_app_worker(app, receiver));
+        let (file_index_sender, _file_index_receiver) = watch::channel(Vec::<FileEntry>::new());
+        let worker = tokio::spawn(run_app_worker(
+            app,
+            receiver,
+            file_index_sender,
+            Some(dir.path().to_path_buf()),
+        ));
 
         // The 5s poll lives in the worker's select loop; a shutdown must win
         // immediately rather than waiting for a tick (no hang).
@@ -6629,6 +6684,64 @@ runtime = "fake"
             "worker shutdown hung with the poller active"
         );
         result.unwrap().unwrap();
+    }
+
+    // ── task_04 background file-index acquisition ──
+
+    #[test]
+    fn file_index_refresh_interval_has_expected_default() {
+        assert_eq!(FILE_INDEX_REFRESH_INTERVAL, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn refresh_file_index_publishes_walk_snapshot() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("README.md"), "readme").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        let (sender, receiver) = watch::channel(Vec::<FileEntry>::new());
+        refresh_file_index(Some(dir.path()), &sender).await;
+
+        let published = receiver.borrow().clone();
+        assert_eq!(published, FileIndex::walk(dir.path()));
+        // The snapshot is non-empty and contains a known file.
+        assert!(published.iter().any(|entry| entry.rel_path == "README.md"));
+    }
+
+    #[tokio::test]
+    async fn refresh_file_index_is_noop_without_working_directory() {
+        let (sender, receiver) = watch::channel(vec![FileEntry {
+            rel_path: "kept.rs".to_string(),
+            is_dir: false,
+            mtime: UNIX_EPOCH,
+            depth: 1,
+        }]);
+        refresh_file_index(None, &sender).await;
+        // No working directory → the previous snapshot is left untouched.
+        assert_eq!(receiver.borrow().len(), 1);
+        assert_eq!(receiver.borrow()[0].rel_path, "kept.rs");
+    }
+
+    #[tokio::test]
+    async fn refresh_file_index_surfaces_files_created_between_walks() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("first.rs"), "fn main() {}").unwrap();
+
+        let (sender, receiver) = watch::channel(Vec::<FileEntry>::new());
+        refresh_file_index(Some(dir.path()), &sender).await;
+        assert!(receiver
+            .borrow()
+            .iter()
+            .all(|entry| entry.rel_path != "second.rs"));
+
+        // A file created mid-session appears on the next refresh.
+        fs::write(dir.path().join("second.rs"), "fn second() {}").unwrap();
+        refresh_file_index(Some(dir.path()), &sender).await;
+        assert!(receiver
+            .borrow()
+            .iter()
+            .any(|entry| entry.rel_path == "second.rs"));
     }
 
     // ── task_06 status footer ──
