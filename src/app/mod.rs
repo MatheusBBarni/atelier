@@ -5674,18 +5674,21 @@ fn normalize_workflow_target_key(
 
     let candidate = Path::new(trimmed);
     let relative = if candidate.is_absolute() {
-        if !extra_write_roots
-            .iter()
-            .any(|root| candidate.starts_with(root))
-        {
-            bail!("absolute paths are not allowed in workflow target paths: {path}");
+        // The path is already validated against the workspace and the configured
+        // extra write roots. Strip whichever base actually matches: an extra
+        // write root can live outside the repo, where stripping the working
+        // directory would fail and abort the whole workflow.
+        let base = std::iter::once(working_directory)
+            .chain(extra_write_roots.iter().map(PathBuf::as_path))
+            .find(|base| candidate.starts_with(base));
+        match base {
+            Some(base) => candidate
+                .strip_prefix(base)
+                .expect("candidate starts_with the matched base"),
+            None => {
+                bail!("absolute paths are not allowed in workflow target paths: {path}")
+            }
         }
-        candidate.strip_prefix(working_directory).with_context(|| {
-            format!(
-                "workflow target path must be inside the workspace: {}",
-                candidate.display()
-            )
-        })?
     } else {
         candidate
     };
@@ -6964,6 +6967,39 @@ runtime = "fake"
         let status = derive_workflow_completion_status(&counts, &[], false);
 
         assert_eq!(status, WorkflowCompletionStatus::Completed);
+    }
+
+    #[test]
+    fn workflow_target_key_normalizes_external_write_root_without_erroring() {
+        // Regression: an absolute write_file under an extra write root OUTSIDE
+        // the workspace previously aborted the whole workflow because the key
+        // was stripped against the working directory (not a prefix). It must
+        // normalize against the matching root instead.
+        let working_directory = Path::new("/workspace/repo");
+        let extra_write_roots = vec![PathBuf::from("/var/out")];
+
+        let key = normalize_workflow_target_key(
+            "/var/out/reports/summary.md",
+            working_directory,
+            &extra_write_roots,
+        )
+        .unwrap();
+
+        assert_eq!(key, "reports/summary.md");
+    }
+
+    #[test]
+    fn workflow_target_key_rejects_absolute_path_under_no_allowed_root() {
+        let working_directory = Path::new("/workspace/repo");
+
+        let error = normalize_workflow_target_key(
+            "/etc/passwd",
+            working_directory,
+            &[PathBuf::from("/var/out")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("absolute paths are not allowed"));
     }
 
     #[test]
