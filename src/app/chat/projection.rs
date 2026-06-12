@@ -1193,7 +1193,16 @@ impl ChatProjection {
         let mut body = vec![ChatLineView::plain(question.clone())];
 
         if let Some(options) = event.payload.get("options").and_then(|v| v.as_array()) {
-            body.push(ChatLineView::muted("Options:"));
+            let multi_select = event
+                .payload
+                .get("multi_select")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            body.push(ChatLineView::muted(if multi_select {
+                "Options (select any):"
+            } else {
+                "Options:"
+            }));
             for option in options {
                 let id = option.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                 let label = option.get("label").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1205,6 +1214,13 @@ impl ChatProjection {
                     .unwrap_or(false);
                 let marker = if recommended { "★ " } else { "  " };
                 body.push(ChatLineView::muted(format!("{marker}{id}: {label}")));
+                if let Some(description) = option
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .filter(|d| !d.trim().is_empty())
+                {
+                    body.push(ChatLineView::muted(format!("      {description}")));
+                }
             }
         }
 
@@ -1249,6 +1265,9 @@ impl ChatProjection {
                 if let Some(label) = selected_option_label {
                     body.push(ChatLineView::muted(format!("Option: {label}")));
                 }
+            }
+            "multi" => {
+                body.push(ChatLineView::muted("Multiple options selected"));
             }
             "custom" => {
                 body.push(ChatLineView::muted("Custom answer"));

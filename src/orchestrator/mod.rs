@@ -66,6 +66,11 @@ pub struct OrchestratorDecision {
     pub clarifying_options: Vec<ClarificationOption>,
     #[serde(default)]
     pub recommended_option_id: Option<String>,
+    /// When true, the clarifying_options may be answered by selecting several at
+    /// once (multi-select). Defaults to false (single-select). Only meaningful
+    /// for `waiting_for_user` decisions that carry clarifying_options.
+    #[serde(default)]
+    pub multi_select: bool,
     pub final_summary: Option<String>,
 }
 
@@ -710,7 +715,9 @@ pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
         "- Do not route to disabled or unknown agents.".to_string(),
         "- Keep required_capabilities no broader than the next step needs.".to_string(),
         "- Ask a clarifying question when the next safe step is ambiguous, and include 2-4 concise recommended answers as clarifying_options.".to_string(),
+        "- Give each clarifying_option a short label plus an optional one-sentence description that explains the trade-off of choosing it.".to_string(),
         "- Set recommended_option_id to the strongest option id, or leave it null when no option stands out.".to_string(),
+        "- Set multi_select to true only when the user can sensibly pick several of the clarifying_options at once; otherwise leave it false (single choice).".to_string(),
         "- Do not add a custom, other, or free-text option; the app always provides its own custom text answer path.".to_string(),
         "- Mark the run complete only when the original user request is satisfied.".to_string(),
     ]);
@@ -838,6 +845,7 @@ mod tests {
             clarifying_question: Some("Which target should this run prioritize?".to_string()),
             clarifying_options,
             recommended_option_id: recommended_option_id.map(str::to_string),
+            multi_select: false,
             final_summary: None,
         }
     }
@@ -868,6 +876,7 @@ mod tests {
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         }
     }
@@ -887,6 +896,7 @@ mod tests {
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: Some("Completed the run.".to_string()),
         }
     }
@@ -907,6 +917,7 @@ mod tests {
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
         let wrapped = wrap_json_contract(&decision).unwrap();
@@ -1032,6 +1043,7 @@ mod tests {
                 },
             ],
             recommended_option_id: Some("tests".to_string()),
+            multi_select: false,
             final_summary: None,
         };
 
@@ -1224,6 +1236,7 @@ mod tests {
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
         let error = validate_orchestrator_decision(&decision, &config).unwrap_err();
@@ -1246,6 +1259,7 @@ mod tests {
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
 
@@ -1277,6 +1291,7 @@ mod tests {
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
 
@@ -1336,6 +1351,7 @@ mod tests {
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
 
@@ -1534,6 +1550,7 @@ orchestrator_description = "Use for official documentation and API lookup."
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
 

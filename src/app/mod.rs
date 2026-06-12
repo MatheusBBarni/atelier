@@ -167,6 +167,10 @@ pub struct PendingClarificationView {
     pub question: String,
     pub options: Vec<ClarificationOption>,
     pub recommended_option_id: Option<String>,
+    /// When true the user may select several options at once; the composer
+    /// renders checkboxes instead of a single-choice list.
+    #[serde(default)]
+    pub multi_select: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1726,6 +1730,7 @@ impl App {
                     question,
                     options: decision.clarifying_options.clone(),
                     recommended_option_id: decision.recommended_option_id.clone(),
+                    multi_select: decision.multi_select,
                 };
                 self.state.pending_clarification = Some(view.clone());
                 self.set_agent_status("orchestrator", "waiting_for_user");
@@ -1738,6 +1743,7 @@ impl App {
                         "question": view.question,
                         "options": view.options,
                         "recommended_option_id": view.recommended_option_id,
+                        "multi_select": view.multi_select,
                     }),
                     "Orchestrator asked a clarifying question.",
                 )?;
@@ -6235,6 +6241,7 @@ runtime = "fake"
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
         let council_member = app
@@ -6356,6 +6363,7 @@ runtime = "fake"
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
 
@@ -8343,6 +8351,7 @@ prompt = "{reviewer_prompt}"
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
 

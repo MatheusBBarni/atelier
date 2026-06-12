@@ -860,6 +860,7 @@ exit 65
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
         let raw_output = format!(

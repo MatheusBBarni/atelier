@@ -32,6 +32,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -67,12 +68,21 @@ const RUNNING_AGENT_STATUSES: [&str; 3] = ["running", "streaming", "running_para
 const WORK_LABEL: &str = "Working";
 const MOUSE_SCROLL_LINES: usize = 3;
 const WORK_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
-const CLARIFICATION_SELECTED_MARKER: &str = "> ";
-const CLARIFICATION_UNSELECTED_MARKER: &str = "  ";
-const CLARIFICATION_RECOMMENDED_LABEL: &str = "★ recommended";
-const CLARIFICATION_CUSTOM_LABEL: &str = "Custom: ";
-const CLARIFICATION_HINT: &str =
-    "↑/↓ select · type custom answer · Enter answer · Ctrl-C interrupt";
+/// Row prefix for the focused / unfocused clarification option.
+const CLARIFICATION_FOCUS_MARKER: &str = "❯ ";
+const CLARIFICATION_BLUR_MARKER: &str = "  ";
+/// Checkbox glyphs shown for multi-select options.
+const CLARIFICATION_CHECK_ON: &str = "[x] ";
+const CLARIFICATION_CHECK_OFF: &str = "[ ] ";
+/// Prompt shown on the synthetic "custom answer" row while it is focused.
+const CLARIFICATION_CUSTOM_PROMPT: &str = "Custom: ";
+/// Placeholder shown on the custom row while it is not focused.
+const CLARIFICATION_CUSTOM_PLACEHOLDER: &str = "Custom…";
+const CLARIFICATION_RECOMMENDED_SUFFIX: &str = "  ★ recommended";
+const CLARIFICATION_HINT_SINGLE: &str =
+    "↑/↓ move · type for a custom answer · Enter confirm · Ctrl-C interrupt";
+const CLARIFICATION_HINT_MULTI: &str =
+    "↑/↓ move · Space toggle · type for a custom answer · Enter confirm · Ctrl-C interrupt";
 const QUEUE_VISIBLE_MAX: usize = 6;
 const QUEUE_SELECTED_MARKER: &str = "> ";
 const QUEUE_UNSELECTED_MARKER: &str = "  ";
@@ -158,6 +168,11 @@ enum FileMentionDropdownCommand {
 enum ClarificationCommand {
     PreviousOption,
     NextOption,
+    /// Toggle the focused option's checkbox (multi-select only).
+    ToggleOption,
+    /// Jump focus to a specific row (digit quick-select). Index is 0-based over
+    /// the option rows; the synthetic custom row is not digit-selectable.
+    FocusOption(usize),
     Submit,
 }
 
@@ -203,6 +218,11 @@ struct TuiUiState {
     file_mention_dropdown_dismissed: Option<String>,
     clarification_option_index: usize,
     clarification_custom_answer: String,
+    /// Option indices currently checked in a multi-select clarification.
+    clarification_selected: BTreeSet<usize>,
+    /// question_id of the clarification the above selection state belongs to, so
+    /// the composer resets cleanly when a new question arrives.
+    clarification_question_id: Option<String>,
     queue_selection_index: usize,
     status_message: Option<String>,
     work_spinner_frame: usize,
@@ -234,6 +254,8 @@ impl Default for TuiUiState {
             file_mention_dropdown_dismissed: None,
             clarification_option_index: 0,
             clarification_custom_answer: String::new(),
+            clarification_selected: BTreeSet::new(),
+            clarification_question_id: None,
             queue_selection_index: 0,
             status_message: None,
             work_spinner_frame: 0,
@@ -500,6 +522,11 @@ async fn execute_tui_command_with_interrupt(
             apply_clarification_command(state, ui_state, command, command_sender).await
         }
         TuiCommand::ClarificationInputCharacter(ch) => {
+            // Typing implies the custom answer: move focus onto the custom row so
+            // the input field is revealed and the cursor lands there.
+            if let Some(clarification) = &state.pending_clarification {
+                ui_state.clarification_option_index = clarification.options.len();
+            }
             ui_state.clarification_custom_answer.push(ch);
             Ok(true)
         }
@@ -974,12 +1001,17 @@ fn file_mention_dropdown_key_command(
 
 fn clarification_key_command(
     state: &AppState,
-    _ui_state: &TuiUiState,
+    ui_state: &TuiUiState,
     key: KeyEvent,
 ) -> Option<TuiCommand> {
-    let Some(_clarification) = &state.pending_clarification else {
-        return None;
-    };
+    let clarification = state.pending_clarification.as_ref()?;
+    // The custom answer lives on a synthetic row past the real options. Typing
+    // is only routed into the custom field while that row is focused.
+    let custom_row = clarification.options.len();
+    let focused = ui_state.clarification_option_index.min(custom_row);
+    let custom_focused = focused == custom_row;
+    let multi_select = clarification.multi_select;
+
     match key {
         KeyEvent {
             code: KeyCode::Up, ..
@@ -997,7 +1029,31 @@ fn clarification_key_command(
         KeyEvent {
             code: KeyCode::Backspace,
             ..
-        } => Some(TuiCommand::ClarificationInputBackspace),
+        } if custom_focused => Some(TuiCommand::ClarificationInputBackspace),
+        // Space toggles the focused option only in multi-select; in single
+        // select (and while not typing custom) it is ignored.
+        KeyEvent {
+            code: KeyCode::Char(' '),
+            ..
+        } if !custom_focused && multi_select => Some(TuiCommand::Clarification(
+            ClarificationCommand::ToggleOption,
+        )),
+        KeyEvent {
+            code: KeyCode::Char(' '),
+            ..
+        } if !custom_focused => None,
+        // Digits 1-9 jump focus to that option (Claude-CLI style quick-select)
+        // while not editing the custom answer. Out-of-range digits are ignored.
+        KeyEvent {
+            code: KeyCode::Char(ch @ '1'..='9'),
+            modifiers,
+            ..
+        } if !custom_focused && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT) => {
+            let index = (ch as usize) - ('1' as usize);
+            (index < clarification.options.len()).then_some(TuiCommand::Clarification(
+                ClarificationCommand::FocusOption(index),
+            ))
+        }
         KeyEvent {
             code: KeyCode::Char(ch),
             modifiers,
@@ -1248,6 +1304,26 @@ fn event_max_scroll(ui_state: &TuiUiState) -> usize {
     ui_state
         .event_content_lines
         .saturating_sub(ui_state.event_viewport_lines.max(1))
+}
+
+/// Maps our scroll offset onto ratatui's scrollbar position space.
+///
+/// ratatui places the thumb at the bottom of the track only when
+/// `position == content_length - 1` (its model treats `position` as the index
+/// of the line shown at the *top* of the viewport). Our `event_scroll` instead
+/// tops out at `content_lines - viewport_lines` — the last line sitting at the
+/// *bottom* of the viewport, i.e. fully scrolled. Without this remap the thumb
+/// stops `viewport_lines - 1` rows short of the end even when the chat is
+/// scrolled to the latest message. Remapping `0..=max_scroll` onto
+/// `0..=content_lines-1` (with rounding) keeps the thumb proportional while
+/// letting it reach the very bottom.
+fn scrollbar_position(event_scroll: usize, max_scroll: usize, content_lines: usize) -> usize {
+    let span = content_lines.saturating_sub(1);
+    if max_scroll == 0 {
+        return span;
+    }
+    let scrolled = event_scroll.min(max_scroll);
+    (scrolled * span + max_scroll / 2) / max_scroll
 }
 
 fn load_skill_suggestions(working_directory: &Path) -> Vec<SkillSuggestion> {
@@ -1521,54 +1597,123 @@ async fn apply_clarification_command(
         return Ok(true);
     };
 
+    // Rows span the real options plus one synthetic "custom answer" row.
+    let row_count = clarification.options.len() + 1;
     match command {
         ClarificationCommand::PreviousOption => {
-            let option_count = clarification.options.len();
             ui_state.clarification_option_index = if ui_state.clarification_option_index == 0 {
-                option_count.saturating_sub(1)
+                row_count - 1
             } else {
-                ui_state.clarification_option_index - 1
+                (ui_state.clarification_option_index - 1).min(row_count - 1)
             };
             Ok(true)
         }
         ClarificationCommand::NextOption => {
-            let option_count = clarification.options.len();
             ui_state.clarification_option_index =
-                (ui_state.clarification_option_index + 1) % option_count.max(1);
+                (ui_state.clarification_option_index + 1) % row_count;
+            Ok(true)
+        }
+        ClarificationCommand::ToggleOption => {
+            let focused = ui_state.clarification_option_index;
+            if clarification.multi_select && focused < clarification.options.len() {
+                toggle_selection(&mut ui_state.clarification_selected, focused);
+            }
+            Ok(true)
+        }
+        ClarificationCommand::FocusOption(index) => {
+            if index < clarification.options.len() {
+                ui_state.clarification_option_index = index;
+            }
             Ok(true)
         }
         ClarificationCommand::Submit => {
-            let custom_answer = ui_state.clarification_custom_answer.trim().to_string();
+            let Some(answer) = build_clarification_answer(clarification, ui_state) else {
+                // Nothing chosen yet — keep waiting rather than submitting an
+                // empty answer.
+                return Ok(true);
+            };
 
-            let (answer_text, selected_option_id, selected_option_label, answer_source) =
-                if !custom_answer.is_empty() {
-                    (custom_answer, None, None, "custom".to_string())
-                } else if ui_state.clarification_option_index < clarification.options.len() {
-                    let option = &clarification.options[ui_state.clarification_option_index];
-                    (
-                        option.label.clone(),
-                        Some(option.id.clone()),
-                        Some(option.label.clone()),
-                        "recommended".to_string(),
-                    )
-                } else {
-                    return Ok(true);
-                };
-
-            let event = AppEvent::ClarificationAnswered(crate::app::ClarificationAnswer {
-                question_id: clarification.question_id.clone(),
-                answer: answer_text,
-                selected_option_id,
-                selected_option_label,
-                answer_source,
-            });
+            let event = AppEvent::ClarificationAnswered(answer);
 
             queue_app_event(command_sender, event).await?;
             ui_state.clarification_custom_answer.clear();
             ui_state.clarification_option_index = 0;
+            ui_state.clarification_selected.clear();
+            ui_state.clarification_question_id = None;
             Ok(true)
         }
     }
+}
+
+/// Toggles an index in the multi-select set: removes it when present, otherwise
+/// inserts it.
+fn toggle_selection(selected: &mut BTreeSet<usize>, index: usize) {
+    if !selected.insert(index) {
+        selected.remove(&index);
+    }
+}
+
+/// Builds the answer payload from the current selection, or `None` when nothing
+/// has been chosen yet. Multi-select joins the chosen labels (plus any custom
+/// text); single-select returns either the focused option or the custom text.
+fn build_clarification_answer(
+    clarification: &PendingClarificationView,
+    ui_state: &TuiUiState,
+) -> Option<crate::app::ClarificationAnswer> {
+    let custom = ui_state.clarification_custom_answer.trim().to_string();
+    let options = &clarification.options;
+    let focused = ui_state.clarification_option_index;
+
+    let (answer, selected_option_id, selected_option_label, answer_source) =
+        if clarification.multi_select {
+            let mut labels = Vec::new();
+            let mut first_id = None;
+            let mut first_label = None;
+            for (index, option) in options.iter().enumerate() {
+                if ui_state.clarification_selected.contains(&index) {
+                    if first_id.is_none() {
+                        first_id = Some(option.id.clone());
+                        first_label = Some(option.label.clone());
+                    }
+                    labels.push(option.label.clone());
+                }
+            }
+            if !custom.is_empty() {
+                labels.push(custom);
+            }
+            if labels.is_empty() {
+                return None;
+            }
+            (
+                labels.join("; "),
+                first_id,
+                first_label,
+                "multi".to_string(),
+            )
+        } else if focused < options.len() {
+            // A real option is focused: submit it (focus-driven). Any stale
+            // custom text is ignored until the user focuses the custom row.
+            let option = &options[focused];
+            (
+                option.label.clone(),
+                Some(option.id.clone()),
+                Some(option.label.clone()),
+                "recommended".to_string(),
+            )
+        } else if !custom.is_empty() {
+            // The custom row is focused with text entered.
+            (custom, None, None, "custom".to_string())
+        } else {
+            return None;
+        };
+
+    Some(crate::app::ClarificationAnswer {
+        question_id: clarification.question_id.clone(),
+        answer,
+        selected_option_id,
+        selected_option_label,
+        answer_source,
+    })
 }
 
 fn apply_skill_suggestion(
@@ -1917,23 +2062,24 @@ fn agent_suggestion_detail(agent: &crate::app::AgentView) -> String {
 
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     let theme = ui_state.theme;
+    // Reset / default the clarification selection before sizing the composer so
+    // the measured height matches what we render this frame.
+    sync_clarification_state(state, ui_state);
     let queue_height = queue_panel_height(state);
+    let composer_height = composer_height(state, ui_state, frame.area(), queue_height);
     let outer = if queue_height > 0 {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(6),
                 Constraint::Length(queue_height),
-                Constraint::Length(composer_height(state)),
+                Constraint::Length(composer_height),
             ])
             .split(frame.area())
     } else {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(6),
-                Constraint::Length(composer_height(state)),
-            ])
+            .constraints([Constraint::Min(6), Constraint::Length(composer_height)])
             .split(frame.area())
     };
     let main_area = outer[0];
@@ -2021,7 +2167,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     if let Some(clarification) = &state.pending_clarification {
         let areas = clarification_input_areas(composer_area);
         render_clarification_composer(frame, areas.input, clarification, ui_state);
-        render_clarification_status(frame, areas.status, &theme);
+        render_clarification_status(frame, areas.status, &theme, clarification.multi_select);
         if ui_state.help_visible {
             render_help_modal(frame, &theme);
         } else {
@@ -2242,7 +2388,11 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
     if content_lines > viewport_lines {
         let mut scrollbar_state = ScrollbarState::new(content_lines)
             .viewport_content_length(viewport_lines)
-            .position(ui_state.event_scroll);
+            .position(scrollbar_position(
+                ui_state.event_scroll,
+                max_scroll,
+                content_lines,
+            ));
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
@@ -3531,13 +3681,33 @@ fn set_input_cursor(frame: &mut Frame, input_area: Rect, input_layout: InputLayo
     ));
 }
 
-fn composer_height(state: &AppState) -> u16 {
+/// Rows the chat (and any queue panel) must keep when the clarification composer
+/// grows to fit a long question or many options.
+const CLARIFICATION_MIN_CHAT_ROWS: u16 = 6;
+
+fn clarification_inner_width(area: Rect) -> u16 {
+    area.width.saturating_sub(2).max(1)
+}
+
+fn composer_height(state: &AppState, ui_state: &TuiUiState, area: Rect, reserved_rows: u16) -> u16 {
     let Some(clarification) = &state.pending_clarification else {
         return INPUT_COMPOSER_HEIGHT;
     };
-    // borders (2) + question (1) + option rows + custom answer line (1)
-    let box_rows = 2 + 1 + clarification.options.len() + 1;
-    (box_rows.min(usize::from(u16::MAX)) as u16).saturating_add(WORK_INDICATOR_HEIGHT)
+    let inner_width = clarification_inner_width(area);
+    let layout = clarification_layout(clarification, ui_state, &ui_state.theme);
+    let content_rows = wrapped_event_line_count(&layout.lines, inner_width);
+    // borders (2) + wrapped content + status hint line.
+    let desired = content_rows
+        .saturating_add(2)
+        .saturating_add(usize::from(WORK_INDICATOR_HEIGHT));
+    // Never crowd the chat/queue below the reserved minimum; the composer
+    // truncates gracefully on very short terminals instead.
+    let reserved =
+        usize::from(CLARIFICATION_MIN_CHAT_ROWS).saturating_add(usize::from(reserved_rows));
+    let cap = usize::from(area.height)
+        .saturating_sub(reserved)
+        .max(usize::from(INPUT_COMPOSER_HEIGHT));
+    desired.min(cap).min(usize::from(u16::MAX)) as u16
 }
 
 fn clarification_input_areas(composer_area: Rect) -> InputAreas {
@@ -3564,6 +3734,152 @@ fn clarification_input_areas(composer_area: Rect) -> InputAreas {
     }
 }
 
+/// The fully-built clarification composer body plus, when the custom row is
+/// focused, the cursor's display-column offset within the last line.
+struct ClarificationLayout {
+    lines: Vec<Line<'static>>,
+    custom_cursor_col: Option<usize>,
+}
+
+/// Builds the composer body: a wrapped bold question, one row per option (a
+/// number in single-select, a checkbox in multi-select) with an optional muted
+/// description beneath, and a synthetic custom-answer row that reveals an input
+/// when focused.
+fn clarification_layout(
+    clarification: &PendingClarificationView,
+    ui_state: &TuiUiState,
+    theme: &Theme,
+) -> ClarificationLayout {
+    let custom_row = clarification.options.len();
+    let focused = ui_state.clarification_option_index.min(custom_row);
+    let multi = clarification.multi_select;
+    let span_width = |s: &str| Span::raw(s.to_string()).width();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        clarification.question.clone(),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(String::new()));
+
+    for (index, option) in clarification.options.iter().enumerate() {
+        let is_focused = index == focused;
+        let checked = ui_state.clarification_selected.contains(&index);
+        let recommended = clarification
+            .recommended_option_id
+            .as_deref()
+            .is_some_and(|id| id == option.id);
+
+        let marker = if is_focused {
+            CLARIFICATION_FOCUS_MARKER
+        } else {
+            CLARIFICATION_BLUR_MARKER
+        };
+        let selector = if multi {
+            if checked {
+                CLARIFICATION_CHECK_ON.to_string()
+            } else {
+                CLARIFICATION_CHECK_OFF.to_string()
+            }
+        } else {
+            format!("{}. ", index + 1)
+        };
+        let label_style = if is_focused {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let mut spans = vec![
+            Span::styled(marker.to_string(), Style::default().fg(theme.accent)),
+            Span::styled(
+                selector.clone(),
+                Style::default().fg(if is_focused {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                }),
+            ),
+            Span::styled(option.label.clone(), label_style),
+        ];
+        if recommended {
+            spans.push(Span::styled(
+                CLARIFICATION_RECOMMENDED_SUFFIX.to_string(),
+                Style::default().fg(theme.text_dim),
+            ));
+        }
+        lines.push(Line::from(spans));
+
+        if let Some(description) = option.description.as_deref() {
+            if !description.trim().is_empty() {
+                let indent = " ".repeat(span_width(marker) + span_width(&selector));
+                lines.push(Line::from(Span::styled(
+                    format!("{indent}{description}"),
+                    Style::default().fg(theme.text_dim),
+                )));
+            }
+        }
+    }
+
+    // Synthetic custom row (always last so the cursor math stays simple).
+    let custom_focused = focused == custom_row;
+    let marker = if custom_focused {
+        CLARIFICATION_FOCUS_MARKER
+    } else {
+        CLARIFICATION_BLUR_MARKER
+    };
+    let selector = if multi {
+        "    ".to_string()
+    } else {
+        format!("{}. ", custom_row + 1)
+    };
+    let typed = ui_state.clarification_custom_answer.clone();
+    let mut custom_cursor_col = None;
+    let custom_spans = if custom_focused {
+        custom_cursor_col = Some(
+            span_width(marker)
+                + span_width(&selector)
+                + span_width(CLARIFICATION_CUSTOM_PROMPT)
+                + span_width(&typed),
+        );
+        vec![
+            Span::styled(marker.to_string(), Style::default().fg(theme.accent)),
+            Span::styled(selector, Style::default().fg(theme.accent)),
+            Span::styled(
+                CLARIFICATION_CUSTOM_PROMPT.to_string(),
+                Style::default().fg(theme.accent),
+            ),
+            Span::styled(typed, Style::default().fg(theme.text)),
+        ]
+    } else if typed.is_empty() {
+        vec![
+            Span::styled(marker.to_string(), Style::default().fg(theme.text_muted)),
+            Span::styled(selector, Style::default().fg(theme.text_muted)),
+            Span::styled(
+                CLARIFICATION_CUSTOM_PLACEHOLDER.to_string(),
+                Style::default().fg(theme.text_dim),
+            ),
+        ]
+    } else {
+        vec![
+            Span::styled(marker.to_string(), Style::default().fg(theme.text_muted)),
+            Span::styled(selector, Style::default().fg(theme.text_muted)),
+            Span::styled(
+                CLARIFICATION_CUSTOM_PROMPT.to_string(),
+                Style::default().fg(theme.text_muted),
+            ),
+            Span::styled(typed, Style::default().fg(theme.text_dim)),
+        ]
+    };
+    lines.push(Line::from(custom_spans));
+
+    ClarificationLayout {
+        lines,
+        custom_cursor_col,
+    }
+}
+
 fn render_clarification_composer(
     frame: &mut Frame,
     area: Rect,
@@ -3571,56 +3887,30 @@ fn render_clarification_composer(
     ui_state: &TuiUiState,
 ) {
     let theme = ui_state.theme;
-    let mut lines = vec![Line::from(Span::styled(
-        clarification.question.clone(),
-        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-    ))];
-    for (index, option) in clarification.options.iter().enumerate() {
-        let selected = index == ui_state.clarification_option_index;
-        let recommended = clarification
-            .recommended_option_id
-            .as_deref()
-            .is_some_and(|id| id == option.id);
-        let marker = if selected {
-            CLARIFICATION_SELECTED_MARKER
-        } else {
-            CLARIFICATION_UNSELECTED_MARKER
-        };
-        let option_style = if selected {
-            selection_style(&theme)
-        } else {
-            Style::default().fg(theme.text_muted)
-        };
-        let mut spans = vec![Span::styled(
-            format!("{marker}{}", option.label),
-            option_style,
-        )];
-        if recommended {
-            spans.push(Span::styled(
-                format!(" {CLARIFICATION_RECOMMENDED_LABEL}"),
-                Style::default().fg(theme.accent),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines.push(Line::from(vec![
-        Span::styled(
-            CLARIFICATION_CUSTOM_LABEL,
-            Style::default().fg(theme.accent),
-        ),
-        Span::raw(ui_state.clarification_custom_answer.clone()),
-    ]));
-    let composer = Paragraph::new(lines).block(
-        Block::default()
-            .title(" Clarifying question ")
-            .title_style(Style::default().fg(theme.accent))
-            .border_style(Style::default().fg(theme.accent))
-            .borders(Borders::ALL),
-    );
+    let layout = clarification_layout(clarification, ui_state, &theme);
+    let title = if clarification.multi_select {
+        " Clarifying question · select any "
+    } else {
+        " Clarifying question "
+    };
+    let composer = Paragraph::new(layout.lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(title)
+                .title_style(Style::default().fg(theme.accent))
+                .border_style(Style::default().fg(theme.accent))
+                .borders(Borders::ALL),
+        );
     frame.render_widget(composer, area);
 }
 
-fn render_clarification_status(frame: &mut Frame, status_area: Rect, theme: &Theme) {
+fn render_clarification_status(
+    frame: &mut Frame,
+    status_area: Rect,
+    theme: &Theme,
+    multi_select: bool,
+) {
     if status_area.width == 0 || status_area.height == 0 {
         return;
     }
@@ -3630,10 +3920,15 @@ fn render_clarification_status(frame: &mut Frame, status_area: Rect, theme: &The
         width: status_area.width.saturating_sub(2),
         height: 1,
     };
+    let hint = if multi_select {
+        CLARIFICATION_HINT_MULTI
+    } else {
+        CLARIFICATION_HINT_SINGLE
+    };
     frame.render_widget(Clear, status_area);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            CLARIFICATION_HINT,
+            hint,
             Style::default().fg(theme.text_muted),
         ))),
         line_area,
@@ -3649,16 +3944,59 @@ fn set_clarification_cursor(
     if area.width < 3 || area.height < 3 {
         return;
     }
-    let custom_row = 1 + 1 + clarification.options.len();
-    let custom_col = 1
-        + CLARIFICATION_CUSTOM_LABEL.chars().count()
-        + input_char_count(&ui_state.clarification_custom_answer);
+    let layout = clarification_layout(clarification, ui_state, &ui_state.theme);
+    let Some(cursor_col) = layout.custom_cursor_col else {
+        return;
+    };
+    let inner_width = usize::from(clarification_inner_width(area));
+    // The custom row is the last line; rows above it consume the wrapped height
+    // of everything before, and the cursor wraps within the custom line itself.
+    let last = layout.lines.len().saturating_sub(1);
+    let rows_above =
+        wrapped_event_line_count(&layout.lines[..last], clarification_inner_width(area));
+    let row = rows_above + cursor_col / inner_width;
+    let col = cursor_col % inner_width;
     let max_col = usize::from(area.width.saturating_sub(2));
     let max_row = usize::from(area.height.saturating_sub(2));
     frame.set_cursor_position(Position::new(
-        area.x + custom_col.min(max_col) as u16,
-        area.y + custom_row.min(max_row) as u16,
+        area.x + 1 + col.min(max_col) as u16,
+        area.y + 1 + row.min(max_row) as u16,
     ));
+}
+
+/// Resets the composer's transient selection when a new question arrives (and
+/// clears it once the clarification is dismissed), defaulting focus to the
+/// recommended option.
+fn sync_clarification_state(state: &AppState, ui_state: &mut TuiUiState) {
+    match &state.pending_clarification {
+        Some(view) => {
+            if ui_state.clarification_question_id.as_deref() != Some(view.question_id.as_str()) {
+                ui_state.clarification_question_id = Some(view.question_id.clone());
+                ui_state.clarification_selected.clear();
+                ui_state.clarification_custom_answer.clear();
+                ui_state.clarification_option_index = clarification_default_focus(view);
+            } else {
+                let row_count = view.options.len() + 1;
+                ui_state.clarification_option_index =
+                    ui_state.clarification_option_index.min(row_count - 1);
+            }
+        }
+        None => {
+            if ui_state.clarification_question_id.is_some() {
+                ui_state.clarification_question_id = None;
+                ui_state.clarification_selected.clear();
+                ui_state.clarification_custom_answer.clear();
+                ui_state.clarification_option_index = 0;
+            }
+        }
+    }
+}
+
+fn clarification_default_focus(view: &PendingClarificationView) -> usize {
+    view.recommended_option_id
+        .as_deref()
+        .and_then(|id| view.options.iter().position(|option| option.id == id))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -6215,6 +6553,7 @@ mod tests {
             question: "Test question".to_string(),
             options,
             recommended_option_id: None,
+            multi_select: false,
         }
     }
 
@@ -6366,7 +6705,10 @@ mod tests {
 
     #[tokio::test]
     async fn clarification_enter_with_custom_text_dispatches_custom_answer() {
+        // Focus the custom row (index == options.len()); the custom answer is
+        // submitted because that row is focused.
         let mut ui_state = TuiUiState {
+            clarification_option_index: 2,
             clarification_custom_answer: "  my own answer  ".to_string(),
             ..Default::default()
         };
@@ -6426,11 +6768,14 @@ mod tests {
         ]));
 
         let (sender, mut receiver) = mpsc::channel(4);
+        // Typing moves focus onto the custom row; FocusOption(0) returns focus to
+        // a real option so the trailing Submit has a concrete answer to send.
         for command in [
             TuiCommand::Clarification(ClarificationCommand::NextOption),
             TuiCommand::Clarification(ClarificationCommand::PreviousOption),
             TuiCommand::ClarificationInputCharacter('h'),
             TuiCommand::ClarificationInputBackspace,
+            TuiCommand::Clarification(ClarificationCommand::FocusOption(0)),
         ] {
             execute_tui_command(&mut app_state, &mut ui_state, &sender, command)
                 .await
@@ -6471,9 +6816,10 @@ mod tests {
             .iter()
             .position(|line| line.contains("Test question"))
             .unwrap();
+        // Focus defaults to the recommended option (opt1).
         let selected_row = lines
             .iter()
-            .position(|line| line.contains("> Feature scope"))
+            .position(|line| line.contains("❯") && line.contains("Feature scope"))
             .unwrap();
         let other_row = lines
             .iter()
@@ -6481,13 +6827,16 @@ mod tests {
             .unwrap();
         let custom_row = lines
             .iter()
-            .position(|line| line.contains("Custom:"))
+            .position(|line| line.contains("Custom"))
             .unwrap();
         assert!(question_row < selected_row);
         assert!(selected_row < other_row);
         assert!(other_row < custom_row);
+        // Single-select options are numbered.
+        assert!(lines[selected_row].contains("1. Feature scope"));
+        assert!(lines[other_row].contains("2. Bug fix scope"));
         assert!(lines[selected_row].contains("★ recommended"));
-        assert!(!lines[other_row].contains("> "));
+        assert!(!lines[other_row].contains("❯"));
         assert!(lines.join("\n").contains("Ctrl-C interrupt"));
     }
 
@@ -6500,7 +6849,10 @@ mod tests {
         ]);
         view.recommended_option_id = Some("opt1".to_string());
         state.pending_clarification = Some(view);
+        // Pre-sync the question id so the explicit focus on opt2 is preserved
+        // through the in-render reset.
         let mut ui_state = TuiUiState {
+            clarification_question_id: Some("q1".to_string()),
             clarification_option_index: 1,
             ..Default::default()
         };
@@ -6513,10 +6865,10 @@ mod tests {
             .unwrap();
         let selected_row = lines
             .iter()
-            .position(|line| line.contains("> Bug fix scope"))
+            .position(|line| line.contains("❯") && line.contains("Bug fix scope"))
             .unwrap();
         assert!(lines[recommended_row].contains("Feature scope"));
-        assert!(!lines[recommended_row].contains("> "));
+        assert!(!lines[recommended_row].contains("❯"));
         assert_ne!(recommended_row, selected_row);
         assert!(!lines[selected_row].contains("★"));
     }
@@ -6539,7 +6891,7 @@ mod tests {
             "Option two",
             "Option three",
             "Option four",
-            "Custom:",
+            "Custom",
         ]
         .iter()
         .map(|needle| {
@@ -6566,7 +6918,11 @@ mod tests {
             clarification_option("opt1", "Feature scope"),
             clarification_option("opt2", "Bug fix scope"),
         ]));
+        // Focus the synthetic custom row (index == options.len()) with the
+        // question id pre-synced so the typed text survives the in-render reset.
         let mut ui_state = TuiUiState {
+            clarification_question_id: Some("q1".to_string()),
+            clarification_option_index: 2,
             clarification_custom_answer: "abc".to_string(),
             ..Default::default()
         };
@@ -6577,11 +6933,220 @@ mod tests {
             .draw(|frame| render(frame, &state, &mut ui_state))
             .unwrap();
 
-        // composer box: y = 24 - 7 = 17; custom row = 17 + border + question + 2 options = 21
-        // cursor col = border (1) + "Custom: " (8) + "abc" (3) = 12
+        // Composer body (5 rows: question, spacer, 2 options, custom) → height 8,
+        // so the box starts at y = 24 - 8 = 16; the custom row is the 5th body row
+        // (4 rows above) at y = 16 + border(1) + 4 = 21.
+        // cursor col = border(1) + "❯ "(2) + "3. "(3) + "Custom: "(8) + "abc"(3) = 17
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(12, 21));
+            .assert_cursor_position(Position::new(17, 21));
+    }
+
+    #[test]
+    fn scrollbar_position_reaches_bottom_when_fully_scrolled() {
+        // content 100 lines, viewport 10 → max_scroll 90.
+        // ratatui parks the thumb at the bottom only at position content_len-1.
+        assert_eq!(scrollbar_position(90, 90, 100), 99);
+        assert_eq!(scrollbar_position(0, 90, 100), 0);
+        let mid = scrollbar_position(45, 90, 100);
+        assert!(
+            mid > 0 && mid < 99,
+            "mid-scroll thumb must be interior: {mid}"
+        );
+        // Monotonic and clamped.
+        assert!(scrollbar_position(30, 90, 100) <= scrollbar_position(60, 90, 100));
+        assert_eq!(scrollbar_position(200, 90, 100), 99);
+        // Degenerate: nothing to scroll.
+        assert_eq!(scrollbar_position(0, 0, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn multi_select_toggles_and_submits_joined_answer() {
+        let mut ui_state = TuiUiState::default();
+        let mut app_state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+            clarification_option("c", "Gamma"),
+        ]);
+        view.multi_select = true;
+        app_state.pending_clarification = Some(view);
+
+        let (sender, mut receiver) = mpsc::channel(4);
+        for command in [
+            TuiCommand::Clarification(ClarificationCommand::FocusOption(0)),
+            TuiCommand::Clarification(ClarificationCommand::ToggleOption),
+            TuiCommand::Clarification(ClarificationCommand::FocusOption(2)),
+            TuiCommand::Clarification(ClarificationCommand::ToggleOption),
+        ] {
+            execute_tui_command(&mut app_state, &mut ui_state, &sender, command)
+                .await
+                .unwrap();
+            assert!(receiver.try_recv().is_err());
+        }
+        execute_tui_command(
+            &mut app_state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::Clarification(ClarificationCommand::Submit),
+        )
+        .await
+        .unwrap();
+
+        match receiver.try_recv().unwrap() {
+            AppWorkerCommand::Event(AppEvent::ClarificationAnswered(answer)) => {
+                assert_eq!(answer.answer_source, "multi");
+                assert_eq!(answer.answer, "Alpha; Gamma");
+                assert_eq!(answer.selected_option_id.as_deref(), Some("a"));
+                assert_eq!(answer.selected_option_label.as_deref(), Some("Alpha"));
+            }
+            other => panic!("unexpected worker command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_multi_select_submit_does_not_emit() {
+        let mut ui_state = TuiUiState::default();
+        let mut app_state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+        ]);
+        view.multi_select = true;
+        app_state.pending_clarification = Some(view);
+
+        let (sender, mut receiver) = mpsc::channel(4);
+        execute_tui_command(
+            &mut app_state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::Clarification(ClarificationCommand::Submit),
+        )
+        .await
+        .unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn typing_focuses_custom_and_submits_custom_answer() {
+        let mut ui_state = TuiUiState::default();
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+        ]));
+
+        let (sender, mut receiver) = mpsc::channel(4);
+        for ch in ['h', 'i'] {
+            execute_tui_command(
+                &mut app_state,
+                &mut ui_state,
+                &sender,
+                TuiCommand::ClarificationInputCharacter(ch),
+            )
+            .await
+            .unwrap();
+        }
+        // Typing moves focus onto the synthetic custom row.
+        assert_eq!(ui_state.clarification_option_index, 2);
+
+        execute_tui_command(
+            &mut app_state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::Clarification(ClarificationCommand::Submit),
+        )
+        .await
+        .unwrap();
+
+        match receiver.try_recv().unwrap() {
+            AppWorkerCommand::Event(AppEvent::ClarificationAnswered(answer)) => {
+                assert_eq!(answer.answer_source, "custom");
+                assert_eq!(answer.answer, "hi");
+                assert!(answer.selected_option_id.is_none());
+            }
+            other => panic!("unexpected worker command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn digit_key_focuses_option_during_clarification() {
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+            clarification_option("c", "Gamma"),
+        ]));
+        let ui_state = TuiUiState::default();
+
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Char('2'))),
+            Some(TuiCommand::Clarification(
+                ClarificationCommand::FocusOption(1)
+            ))
+        );
+        // Out-of-range digits are ignored rather than typed into the custom field.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Char('9'))),
+            None
+        );
+    }
+
+    #[test]
+    fn space_toggles_in_multi_select_but_is_ignored_in_single_select() {
+        let ui_state = TuiUiState::default();
+
+        let mut multi = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+        ]);
+        view.multi_select = true;
+        multi.pending_clarification = Some(view);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&multi, &ui_state, key(KeyCode::Char(' '))),
+            Some(TuiCommand::Clarification(
+                ClarificationCommand::ToggleOption
+            ))
+        );
+
+        let mut single = state_with_input("", false);
+        single.pending_clarification = Some(clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+        ]));
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&single, &ui_state, key(KeyCode::Char(' '))),
+            None
+        );
+    }
+
+    #[test]
+    fn multi_select_renders_checkboxes_and_descriptions() {
+        let mut state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            ClarificationOption {
+                id: "a".to_string(),
+                label: "Alpha".to_string(),
+                description: Some("The first path".to_string()),
+            },
+            clarification_option("b", "Beta"),
+        ]);
+        view.multi_select = true;
+        state.pending_clarification = Some(view);
+        let mut ui_state = TuiUiState {
+            clarification_question_id: Some("q1".to_string()),
+            clarification_selected: BTreeSet::from([0]),
+            ..Default::default()
+        };
+
+        let lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 80, 24);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("[x] Alpha"), "checked option: {joined}");
+        assert!(joined.contains("[ ] Beta"), "unchecked option: {joined}");
+        assert!(joined.contains("The first path"), "description: {joined}");
+        assert!(joined.contains("Space toggle"), "multi hint: {joined}");
     }
 
     #[test]
@@ -6645,9 +7210,11 @@ runtime = "fake"
         assert!(text.contains("waiting for clarification"));
         // Composer answer controls.
         assert!(text.contains("Which target or constraint should guide this run?"));
-        assert!(text.contains("> Clarify the target scope"));
+        assert!(text.contains("1. Clarify the target scope"));
+        // Per-option descriptions are surfaced in the composer.
+        assert!(text.contains("Specify the file, workflow, or product area to prioritize."));
         assert!(text.contains("★ recommended"));
-        assert!(text.contains("Custom:"));
+        assert!(text.contains("Custom"));
         assert!(text.contains("Ctrl-C interrupt"));
     }
 
@@ -6674,6 +7241,7 @@ runtime = "fake"
             question: "Test question".to_string(),
             options: vec![],
             recommended_option_id: None,
+            multi_select: false,
         });
 
         let command = key_event_to_tui_command_with_ui(
