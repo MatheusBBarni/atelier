@@ -8,7 +8,7 @@
 | 02 | FileIndex walk and candidate model | completed | medium | task_01 |
 | 03 | FileIndex fuzzy query and ranking | completed | medium | task_02 |
 | 04 | Background file-index acquisition | completed | medium | task_02 |
-| 05 | TUI file-index state and consumer | pending | medium | task_04 |
+| 05 | TUI file-index state and consumer | completed | medium | task_04 |
 | 06 | File-mention dropdown model and activation | pending | medium | task_03, task_05 |
 | 07 | File-mention dropdown interaction and insertion | pending | medium | task_06 |
 | 08 | Render the file-mention dropdown | pending | medium | task_06 |

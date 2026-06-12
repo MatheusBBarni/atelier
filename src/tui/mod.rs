@@ -176,6 +176,19 @@ struct TuiUiState {
     /// dropdown stays suppressed only while the raw input matches, so editing
     /// the text re-activates discovery without mutating the input.
     command_dropdown_dismissed: Option<String>,
+    /// Latest file-index snapshot from the background worker walk (ADR-003);
+    /// the `@` dropdown queries this in-memory list per keystroke.
+    // Staged: written by the snapshot consumer in task_05; first read by the
+    // task_06 dropdown activation. The `#[allow(dead_code)]` shims are removed
+    // in task_09.
+    #[allow(dead_code)]
+    file_mention_entries: Vec<FileEntry>,
+    #[allow(dead_code)]
+    file_mention_selection_index: usize,
+    /// Input value the file-mention dropdown was last dismissed for (Escape),
+    /// mirroring `command_dropdown_dismissed`.
+    #[allow(dead_code)]
+    file_mention_dropdown_dismissed: Option<String>,
     clarification_option_index: usize,
     clarification_custom_answer: String,
     queue_selection_index: usize,
@@ -204,6 +217,9 @@ impl Default for TuiUiState {
             skill_selection_index: 0,
             command_selection_index: 0,
             command_dropdown_dismissed: None,
+            file_mention_entries: Vec::new(),
+            file_mention_selection_index: 0,
+            file_mention_dropdown_dismissed: None,
             clarification_option_index: 0,
             clarification_custom_answer: String::new(),
             queue_selection_index: 0,
@@ -319,9 +335,6 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
         file_index_sender,
         Some(working_directory.clone()),
     ));
-    // Parked until task_05 threads it into `run_loop`; held here so the watch
-    // channel stays open for the worker's snapshots in the meantime.
-    let _file_index_receiver = file_index_receiver;
 
     // No loading interstitial: the main UI (with the branded welcome item)
     // renders on the first frame, and skill scanning happens behind it inside
@@ -335,6 +348,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
         command_sender.clone(),
         interrupt_handle,
         approval_handle,
+        file_index_receiver,
         ui_state,
     )
     .await;
@@ -362,6 +376,7 @@ async fn run_loop(
     command_sender: mpsc::Sender<AppWorkerCommand>,
     interrupt_handle: InterruptHandle,
     approval_handle: ApprovalHandle,
+    mut file_index_receiver: watch::Receiver<Vec<FileEntry>>,
     mut ui_state: TuiUiState,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
@@ -374,6 +389,7 @@ async fn run_loop(
     }
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
+        sync_file_index(&mut ui_state, &mut file_index_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
         terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
 
@@ -544,6 +560,18 @@ fn sync_worker_state(state: &mut AppState, state_receiver: &mut watch::Receiver<
         let mut worker_state = state_receiver.borrow_and_update().clone();
         worker_state.input = input;
         *state = worker_state;
+    }
+}
+
+/// Non-blockingly adopt the latest file-index snapshot from the worker, the
+/// same shape as `sync_worker_state`. Only clones when a new snapshot has
+/// arrived, so an idle draw loop does no work.
+fn sync_file_index(
+    ui_state: &mut TuiUiState,
+    file_index_receiver: &mut watch::Receiver<Vec<FileEntry>>,
+) {
+    if file_index_receiver.has_changed().unwrap_or(false) {
+        ui_state.file_mention_entries = file_index_receiver.borrow_and_update().clone();
     }
 }
 
@@ -993,6 +1021,7 @@ fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
     ui_state.input_cursor = 0;
     ui_state.input_preferred_col = None;
     clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
 }
 
@@ -1020,6 +1049,7 @@ fn insert_input_character(state: &mut AppState, ui_state: &mut TuiUiState, ch: c
     ui_state.input_preferred_col = None;
     ui_state.status_message = None;
     clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
 }
 
@@ -1037,6 +1067,7 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     ui_state.input_preferred_col = None;
     ui_state.status_message = None;
     clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
 }
 
@@ -1240,6 +1271,14 @@ fn reset_dropdown_selections(ui_state: &mut TuiUiState) {
     reset_agent_dropdown_selection(ui_state);
     reset_skill_dropdown_selection(ui_state);
     reset_command_dropdown_selection(ui_state);
+    reset_file_mention_dropdown_selection(ui_state);
+}
+
+fn reset_file_mention_dropdown_selection(ui_state: &mut TuiUiState) {
+    // Only the selection index. Like the command dropdown, the Escape dismissal
+    // is keyed to the raw input and cleared on a content edit — never on a
+    // cursor move — so Escape survives Left/Right/Up after dismissal.
+    ui_state.file_mention_selection_index = 0;
 }
 
 fn reset_agent_dropdown_selection(ui_state: &mut TuiUiState) {
@@ -1260,6 +1299,13 @@ fn reset_command_dropdown_selection(ui_state: &mut TuiUiState) {
 /// Clear the Escape dismissal so a content edit re-activates command discovery.
 fn clear_command_dropdown_dismissal(ui_state: &mut TuiUiState) {
     ui_state.command_dropdown_dismissed = None;
+}
+
+/// Clear the file-mention Escape dismissal so a content edit re-activates the
+/// `@` picker. Mirrors `clear_command_dropdown_dismissal`: called on edits
+/// (insert/backspace/clear), never on cursor moves.
+fn clear_file_mention_dropdown_dismissal(ui_state: &mut TuiUiState) {
+    ui_state.file_mention_dropdown_dismissed = None;
 }
 
 fn apply_agent_dropdown_command(
@@ -6742,6 +6788,79 @@ runtime = "fake"
             .borrow()
             .iter()
             .any(|entry| entry.rel_path == "second.rs"));
+    }
+
+    // ── task_05 TUI file-index state and consumer ──
+
+    fn file_entry(rel_path: &str, is_dir: bool) -> FileEntry {
+        FileEntry {
+            rel_path: rel_path.to_string(),
+            is_dir,
+            mtime: UNIX_EPOCH,
+            depth: rel_path.split('/').count(),
+        }
+    }
+
+    #[test]
+    fn default_ui_state_initializes_file_mention_fields() {
+        let ui_state = TuiUiState::default();
+        assert!(ui_state.file_mention_entries.is_empty());
+        assert_eq!(ui_state.file_mention_selection_index, 0);
+        assert_eq!(ui_state.file_mention_dropdown_dismissed, None);
+    }
+
+    #[test]
+    fn reset_dropdown_selections_resets_file_mention_selection() {
+        let mut ui_state = TuiUiState {
+            file_mention_selection_index: 3,
+            ..Default::default()
+        };
+        reset_dropdown_selections(&mut ui_state);
+        assert_eq!(ui_state.file_mention_selection_index, 0);
+    }
+
+    #[test]
+    fn sync_file_index_adopts_published_snapshot() {
+        let (sender, mut receiver) = watch::channel(Vec::<FileEntry>::new());
+        let mut ui_state = TuiUiState::default();
+        let snapshot = vec![file_entry("src/main.rs", false), file_entry("src", true)];
+        sender.send(snapshot.clone()).unwrap();
+
+        sync_file_index(&mut ui_state, &mut receiver);
+        assert_eq!(ui_state.file_mention_entries, snapshot);
+    }
+
+    #[test]
+    fn content_edit_clears_file_mention_dismissal_but_cursor_move_does_not() {
+        let mut state = state_with_input("@mod", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: 4,
+            file_mention_dropdown_dismissed: Some("@mod".to_string()),
+            ..Default::default()
+        };
+
+        // A cursor move preserves the Escape dismissal.
+        move_input_cursor(&mut ui_state, &state.input, InputCursorCommand::Left);
+        assert_eq!(
+            ui_state.file_mention_dropdown_dismissed,
+            Some("@mod".to_string())
+        );
+
+        // A content edit (insert) clears it so discovery re-activates.
+        insert_input_character(&mut state, &mut ui_state, 'x');
+        assert_eq!(ui_state.file_mention_dropdown_dismissed, None);
+    }
+
+    #[test]
+    fn backspace_clears_file_mention_dismissal() {
+        let mut state = state_with_input("@mod", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: 4,
+            file_mention_dropdown_dismissed: Some("@mod".to_string()),
+            ..Default::default()
+        };
+        remove_input_character_before_cursor(&mut state, &mut ui_state);
+        assert_eq!(ui_state.file_mention_dropdown_dismissed, None);
     }
 
     // ── task_06 status footer ──
