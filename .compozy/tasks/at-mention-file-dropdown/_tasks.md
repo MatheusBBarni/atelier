@@ -13,4 +13,4 @@
 | 07 | File-mention dropdown interaction and insertion | completed | medium | task_06 |
 | 08 | Render the file-mention dropdown | completed | medium | task_06 |
 | 09 | Wire routing and render chains with integration tests | completed | medium | task_07, task_08 |
-| 10 | Document the @ file picker | pending | low | task_09 |
+| 10 | Document the @ file picker | completed | low | task_09 |

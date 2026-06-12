@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Document the @ file picker
 type: docs
 complexity: low
@@ -28,9 +28,9 @@ Document the `@` file picker in the README "TUI commands" section, alongside the
 </requirements>
 
 ## Subtasks
-- [ ] 10.1 Add the `@` picker description to the README "TUI commands" section.
-- [ ] 10.2 Cross-reference the shared dropdown conventions (Up/Down, Tab/Enter, Esc).
-- [ ] 10.3 Verify the rendered Markdown reads correctly and matches shipped behavior.
+- [x] 10.1 Add the `@` picker description to the README "TUI commands" section.
+- [x] 10.2 Cross-reference the shared dropdown conventions (Up/Down, Tab/Enter, Esc).
+- [x] 10.3 Verify the rendered Markdown reads correctly and matches shipped behavior.
 
 ## Implementation Details
 Modify `README.md` "TUI commands" section. Documentation-only — no source changes. Reference PRD "User Experience" for the described flow. Keep it factual and aligned with the behavior verified by task_09's tests.

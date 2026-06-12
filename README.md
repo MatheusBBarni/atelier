@@ -138,6 +138,20 @@ slash-prefixed answers like `/tmp/project` remain normal input.
 - `/skill:<skill_name>`: load skill context from a selected project or personal skill; in the TUI, type `/skill:` and use Up/Down plus Enter to insert a cached project or personal skill.
 - `/reload:skills`: refresh cached skill names from project and personal skill folders.
 
+Type `@` anywhere in the composer to open the file picker: it fuzzy-searches the
+project's files and folders, highlights the matched characters, and ranks the
+most likely path first (recently-edited and shallower paths surface above deep,
+old ones). A bare `@` lists your most recent files. Use `Up`/`Down` to select
+and `Tab` or `Enter` to accept — the `@fragment` is replaced in place by the
+bare path (folders end with `/`), a trailing space is added, and the cursor
+lands ready to keep typing, so a second `@` adds another reference. `Esc`
+dismisses it, and a query with no matches shows a compact "No matching files"
+row (without trapping `Enter`). Results respect `.gitignore` and exclude
+build/dependency noise and known secret files (e.g. `.env`, private keys); only
+paths inside the project appear, and selecting one inserts text only — it never
+reads file contents. Like the `/` dropdowns, it stays disabled during
+clarification and approval prompts.
+
 ## Configuration
 
 Configuration is merged in this order:
