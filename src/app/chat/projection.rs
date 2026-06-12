@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_SUMMARY_CHARS: usize = 240;
 const MAX_BODY_LINES: usize = 12;
+const MAX_WORKFLOW_UNFINISHED_TARGET_LINES: usize = 3;
+const MAX_WORKFLOW_EVIDENCE_LINES: usize = 1;
 
 #[derive(Clone, Debug, Default)]
 pub struct ChatProjection {
@@ -49,7 +51,9 @@ impl ChatProjection {
         match event.kind.as_str() {
             "session_started" | "session_ended" => {}
             "run_started" => self.apply_run_started(event),
-            "prompt_submitted" | "clarification_answered" => self.apply_user_prompt(event),
+            "prompt_submitted" => self.apply_user_prompt(event),
+            "clarification_requested" => self.apply_clarification_requested(event),
+            "clarification_answered" => self.apply_clarification_answered(event),
             "orchestrator_decision" => self.apply_orchestrator_decision(event),
             "agent_step_started" => self.apply_agent_step_started(event),
             "runtime_stream_delta" => self.apply_runtime_stream_delta(event),
@@ -62,13 +66,21 @@ impl ChatProjection {
             "action_denied" => self.apply_action_denied(event),
             "action_completed" => self.apply_action_completed(event),
             "artifact_written" => self.apply_artifact_written(event),
+            "skills_loaded" => self.apply_skills_loaded(event),
             "agent_result" | "councillor_agent_result" | "councillor_result" => {
                 self.apply_agent_result(event)
             }
             "parallel_group_joined" => self.apply_parallel_group_joined(event),
+            "workflow_started" => self.apply_workflow_started(event),
+            "workflow_completed" => self.apply_workflow_completed(event),
             "run_completed" | "run_failed" | "run_limit_reached" | "run_interrupted"
             | "subtask_completed" => self.apply_run_summary(event),
             "diagnostic" => self.apply_diagnostic(event),
+            "follow_up_queued"
+            | "follow_up_replay_started"
+            | "follow_up_replay_paused"
+            | "follow_up_replay_resumed"
+            | "follow_up_cancelled" => self.apply_follow_up_lifecycle(event),
             "blocker_reported" => self.apply_blocker(event),
             "config_viewed"
             | "session_goal_viewed"
@@ -307,7 +319,7 @@ impl ChatProjection {
         let item_status = match status.as_str() {
             "complete" => ChatItemStatus::Completed,
             "failed" => ChatItemStatus::Failed,
-            "waiting_for_user" => ChatItemStatus::WaitingApproval,
+            "waiting_for_user" => ChatItemStatus::WaitingForUser,
             _ => ChatItemStatus::Completed,
         };
         let lifecycle_key =
@@ -817,6 +829,35 @@ impl ChatProjection {
         });
     }
 
+    fn apply_skills_loaded(&mut self, event: &HistoryEvent) {
+        let rows = skills_loaded_rows(&event.payload);
+        if rows.is_empty() {
+            self.apply_projection_warning(event, "Malformed skills loaded event");
+            return;
+        }
+        let names = rows
+            .iter()
+            .map(|row| row.display_name.clone())
+            .collect::<Vec<_>>();
+        let body = rows
+            .iter()
+            .map(|row| ChatLineView::muted(row.display_line()))
+            .collect::<Vec<_>>();
+        self.upsert(ItemInput {
+            lifecycle_key: None,
+            kind: ChatItemKind::SkillContext,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "Skills loaded".to_string(),
+            summary: Some(summarize_items(&names, 4)),
+            body,
+            details: history_detail(event, "skills"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
     fn apply_agent_result(&mut self, event: &HistoryEvent) {
         let agent = string_field(&event.payload, "agent")
             .or_else(|| string_field(&event.payload, "member_id"))
@@ -907,6 +948,62 @@ impl ChatProjection {
             summary,
             body,
             details: history_detail(event, "group result"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    fn apply_workflow_started(&mut self, event: &HistoryEvent) {
+        let Some(key) = workflow_key(event) else {
+            return;
+        };
+        let original_command = string_field(&event.payload, "original_command");
+        let user_prompt = string_field(&event.payload, "user_prompt");
+        let mut body = Vec::new();
+        if let Some(command) = original_command.as_deref() {
+            body.push(ChatLineView::code(command));
+        }
+        if let Some(prompt) = user_prompt.as_deref() {
+            body.push(ChatLineView::plain(format!("prompt: {prompt}")));
+        }
+        if let Some(preflight) = workflow_preflight_line(&event.payload) {
+            body.push(ChatLineView::muted(preflight));
+        }
+        self.upsert(ItemInput {
+            lifecycle_key: Some(key),
+            kind: ChatItemKind::RunSummary,
+            status: ChatItemStatus::Running,
+            severity: ChatSeverity::Info,
+            title: "Workflow started".to_string(),
+            summary: user_prompt
+                .or(original_command)
+                .map(|summary| message_summary(&summary)),
+            body,
+            details: history_detail(event, "workflow"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    fn apply_workflow_completed(&mut self, event: &HistoryEvent) {
+        let Some(key) = workflow_key(event) else {
+            return;
+        };
+        let status =
+            string_field(&event.payload, "status").unwrap_or_else(|| "completed".to_string());
+        let (item_status, severity, title) = workflow_completion_view(&status);
+        let body = workflow_completion_body(&event.payload);
+        self.upsert(ItemInput {
+            lifecycle_key: Some(key),
+            kind: ChatItemKind::RunSummary,
+            status: item_status,
+            severity,
+            title,
+            summary: Some(workflow_completion_summary(&event.payload, &status)),
+            body,
+            details: history_detail(event, "workflow"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
             fallback_event_id: event.event_id.clone(),
@@ -1008,6 +1105,67 @@ impl ChatProjection {
         });
     }
 
+    /// Project the queued follow-up lifecycle (queued, replaying, paused,
+    /// resumed, cancelled) onto a single Chat item per follow-up id, so the
+    /// queue state is understandable without reading raw history.
+    fn apply_follow_up_lifecycle(&mut self, event: &HistoryEvent) {
+        let prompt = string_field(&event.payload, "prompt").unwrap_or_default();
+        let lifecycle_key = string_field(&event.payload, "id")
+            .map(|follow_up_id| ChatLifecycleKey::FollowUp { follow_up_id });
+        let (title, status, severity, body) = match event.kind.as_str() {
+            "follow_up_queued" => (
+                "Queued follow-up",
+                ChatItemStatus::Pending,
+                ChatSeverity::Info,
+                vec![ChatLineView::muted(
+                    "Queued for replay after the active run completes.",
+                )],
+            ),
+            "follow_up_replay_started" => (
+                "Replaying follow-up",
+                ChatItemStatus::Running,
+                ChatSeverity::Info,
+                vec![ChatLineView::muted("Started as a new run.")],
+            ),
+            "follow_up_replay_paused" => {
+                let reason = string_field(&event.payload, "pause_reason")
+                    .unwrap_or_else(|| "replay paused".to_string());
+                (
+                    "Paused follow-up",
+                    ChatItemStatus::Pending,
+                    ChatSeverity::Warning,
+                    vec![ChatLineView::warning(format!("Paused: {reason}"))],
+                )
+            }
+            "follow_up_replay_resumed" => (
+                "Resumed follow-up",
+                ChatItemStatus::Pending,
+                ChatSeverity::Info,
+                vec![ChatLineView::muted("Resumed; eligible for replay.")],
+            ),
+            "follow_up_cancelled" => (
+                "Cancelled follow-up",
+                ChatItemStatus::Skipped,
+                ChatSeverity::Info,
+                vec![ChatLineView::muted("Cancelled before replay.")],
+            ),
+            _ => return,
+        };
+        self.upsert(ItemInput {
+            lifecycle_key,
+            kind: ChatItemKind::Diagnostic,
+            status,
+            severity,
+            title: title.to_string(),
+            summary: Some(concise(&prompt, MAX_SUMMARY_CHARS)),
+            body,
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
     fn apply_blocker(&mut self, event: &HistoryEvent) {
         let question = string_field(&event.payload, "question")
             .unwrap_or_else(|| "Orchestrator needs clarification.".to_string());
@@ -1016,12 +1174,96 @@ impl ChatProjection {
                 .run_id
                 .clone()
                 .map(|run_id| ChatLifecycleKey::Run { run_id }),
-            kind: ChatItemKind::RunSummary,
-            status: ChatItemStatus::WaitingApproval,
+            kind: ChatItemKind::Clarification,
+            status: ChatItemStatus::WaitingForUser,
             severity: ChatSeverity::Warning,
             title: "Clarification needed".to_string(),
             summary: Some(concise(&question, MAX_SUMMARY_CHARS)),
             body: vec![ChatLineView::warning(question)],
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    fn apply_clarification_requested(&mut self, event: &HistoryEvent) {
+        let question = string_field(&event.payload, "question")
+            .unwrap_or_else(|| "Orchestrator needs clarification.".to_string());
+        let mut body = vec![ChatLineView::plain(question.clone())];
+
+        if let Some(options) = event.payload.get("options").and_then(|v| v.as_array()) {
+            body.push(ChatLineView::muted("Options:"));
+            for option in options {
+                let id = option.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let label = option.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                let recommended = event
+                    .payload
+                    .get("recommended_option_id")
+                    .and_then(|v| v.as_str())
+                    .map(|rec| rec == id)
+                    .unwrap_or(false);
+                let marker = if recommended { "★ " } else { "  " };
+                body.push(ChatLineView::muted(format!("{marker}{id}: {label}")));
+            }
+        }
+
+        self.upsert(ItemInput {
+            lifecycle_key: clarification_key(event),
+            kind: ChatItemKind::Clarification,
+            status: ChatItemStatus::WaitingForUser,
+            severity: ChatSeverity::Warning,
+            title: "Clarifying question".to_string(),
+            summary: Some(concise(&question, MAX_SUMMARY_CHARS)),
+            body,
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    fn apply_clarification_answered(&mut self, event: &HistoryEvent) {
+        let answer = string_field(&event.payload, "answer")
+            .unwrap_or_else(|| "No answer provided.".to_string());
+        let answer_source =
+            string_field(&event.payload, "answer_source").unwrap_or_else(|| "custom".to_string());
+        let selected_option_label = string_field(&event.payload, "selected_option_label");
+
+        let lifecycle_key = clarification_key(event);
+        let question = lifecycle_key
+            .as_ref()
+            .and_then(|key| self.index.get(key).copied())
+            .and_then(|index| self.items.get(index))
+            .and_then(|item| item.body.first())
+            .map(|line| line.text.clone());
+
+        let mut body = Vec::new();
+        if let Some(question) = question {
+            body.push(ChatLineView::muted(format!("Question: {question}")));
+        }
+        body.push(ChatLineView::plain(format!("Answer: {answer}")));
+
+        match answer_source.as_str() {
+            "recommended" => {
+                if let Some(label) = selected_option_label {
+                    body.push(ChatLineView::muted(format!("Option: {label}")));
+                }
+            }
+            "custom" => {
+                body.push(ChatLineView::muted("Custom answer"));
+            }
+            _ => {}
+        }
+
+        self.upsert(ItemInput {
+            lifecycle_key,
+            kind: ChatItemKind::Clarification,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "Clarifying question answered".to_string(),
+            summary: Some(concise(&answer, MAX_SUMMARY_CHARS)),
+            body,
             details: history_detail(event, "history"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
@@ -1081,6 +1323,15 @@ impl ChatProjection {
                     source.merge_event(event_id);
                 }
                 *existing = ChatItemView { source, ..item };
+                // A run/workflow conclusion was first inserted as a "started"
+                // placeholder at run start; on its terminal update, move it to
+                // the end so it renders in chronological position instead of
+                // staying pinned at the placeholder's original (top) index.
+                if is_terminal_run_conclusion(&self.items[index], &key) {
+                    let concluded = self.items.remove(index);
+                    self.items.push(concluded);
+                    self.rebuild_index();
+                }
                 return;
             }
             self.index.insert(key, self.items.len());
@@ -1124,6 +1375,21 @@ impl ChatProjection {
     }
 }
 
+/// True for a terminal run/workflow conclusion (a `RunSummary` keyed by `Run`
+/// or `Workflow` in a finished state). Such items begin life as a `Running`
+/// "started" placeholder at run start; recognizing the terminal update lets
+/// `upsert` move it to the end so it appears in chronological order.
+fn is_terminal_run_conclusion(item: &ChatItemView, key: &ChatLifecycleKey) -> bool {
+    matches!(
+        key,
+        ChatLifecycleKey::Run { .. } | ChatLifecycleKey::Workflow { .. }
+    ) && item.kind == ChatItemKind::RunSummary
+        && matches!(
+            item.status,
+            ChatItemStatus::Completed | ChatItemStatus::Failed | ChatItemStatus::Interrupted
+        )
+}
+
 #[derive(Clone, Debug)]
 struct ItemInput {
     lifecycle_key: Option<ChatLifecycleKey>,
@@ -1137,6 +1403,61 @@ struct ItemInput {
     source: ChatSourceRef,
     updated_at: String,
     fallback_event_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoadedSkillProjectionRow {
+    display_name: String,
+    canonical_id: String,
+    source_origin: String,
+    source_path: String,
+    load_reason: Option<String>,
+}
+
+impl LoadedSkillProjectionRow {
+    fn display_line(&self) -> String {
+        let mut line = format!(
+            "{} - {} ({})",
+            self.display_name, self.source_origin, self.source_path
+        );
+        if let Some(load_reason) = self.load_reason.as_deref() {
+            line.push_str(&format!(" [{load_reason}]"));
+        }
+        line
+    }
+}
+
+fn skills_loaded_rows(payload: &Value) -> Vec<LoadedSkillProjectionRow> {
+    let Some(skills) = payload.get("skills").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    for skill in skills {
+        let Some(row) = skill_loaded_row(skill) else {
+            continue;
+        };
+        if seen.insert(row.canonical_id.clone()) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+fn skill_loaded_row(skill: &Value) -> Option<LoadedSkillProjectionRow> {
+    let display_name = string_field(skill, "display_name")?;
+    let canonical_id = string_field(skill, "canonical_id")
+        .or_else(|| string_field(skill, "source_path"))
+        .filter(|value| !value.trim().is_empty())?;
+    let source_origin = string_field(skill, "source_origin")?;
+    let source_path = string_field(skill, "source_path")?;
+    Some(LoadedSkillProjectionRow {
+        display_name,
+        canonical_id,
+        source_origin,
+        source_path,
+        load_reason: string_field(skill, "load_reason"),
+    })
 }
 
 fn action_requested_view(
@@ -1417,6 +1738,22 @@ fn step_key(event: &HistoryEvent, item_kind: ChatItemKind) -> Option<ChatLifecyc
     })
 }
 
+fn clarification_key(event: &HistoryEvent) -> Option<ChatLifecycleKey> {
+    Some(ChatLifecycleKey::Clarification {
+        run_id: event.run_id.clone()?,
+        question_id: string_field(&event.payload, "question_id")?,
+    })
+}
+
+fn workflow_key(event: &HistoryEvent) -> Option<ChatLifecycleKey> {
+    Some(ChatLifecycleKey::Workflow {
+        run_id: event
+            .run_id
+            .clone()
+            .or_else(|| string_field(&event.payload, "run_id"))?,
+    })
+}
+
 fn live_step_key(live_step: &LiveStepView) -> ChatLifecycleKey {
     ChatLifecycleKey::Step {
         run_id: live_step.run_id.clone(),
@@ -1511,6 +1848,165 @@ fn append_string_array(body: &mut Vec<ChatLineView>, payload: &Value, field: &st
     };
     for value in values.iter().filter_map(Value::as_str).take(3) {
         body.push(ChatLineView::muted(format!("{label}: {value}")));
+    }
+}
+
+fn workflow_completion_view(status: &str) -> (ChatItemStatus, ChatSeverity, String) {
+    match status {
+        "completed" => (
+            ChatItemStatus::Completed,
+            ChatSeverity::Success,
+            "Workflow completed".to_string(),
+        ),
+        "completed_with_issues" => (
+            ChatItemStatus::Completed,
+            ChatSeverity::Warning,
+            "Workflow completed with issues".to_string(),
+        ),
+        "failed" => (
+            ChatItemStatus::Failed,
+            ChatSeverity::Error,
+            "Workflow failed".to_string(),
+        ),
+        other => (
+            ChatItemStatus::Completed,
+            ChatSeverity::Info,
+            format!("Workflow {}", other.replace('_', " ")),
+        ),
+    }
+}
+
+fn workflow_completion_summary(payload: &Value, status: &str) -> String {
+    workflow_target_counts_text(payload).unwrap_or_else(|| status.replace('_', " "))
+}
+
+fn workflow_completion_body(payload: &Value) -> Vec<ChatLineView> {
+    let mut body = Vec::new();
+    if let Some(counts) = workflow_target_counts_text(payload) {
+        body.push(ChatLineView::muted(counts));
+    }
+    append_unfinished_targets(&mut body, payload);
+    append_workflow_string_array(
+        &mut body,
+        payload,
+        "verification",
+        "verification",
+        ChatLineStyle::Muted,
+        MAX_WORKFLOW_EVIDENCE_LINES,
+    );
+    append_workflow_string_array(
+        &mut body,
+        payload,
+        "skipped_checks",
+        "skipped check",
+        ChatLineStyle::Warning,
+        MAX_WORKFLOW_EVIDENCE_LINES,
+    );
+    append_workflow_string_array(
+        &mut body,
+        payload,
+        "residual_risks",
+        "residual risk",
+        ChatLineStyle::Warning,
+        MAX_WORKFLOW_EVIDENCE_LINES,
+    );
+    body
+}
+
+fn workflow_target_counts_text(payload: &Value) -> Option<String> {
+    let counts = payload.get("target_counts")?.as_object()?;
+    let mut parts = Vec::new();
+    for key in ["completed", "skipped", "blocked", "failed", "planned"] {
+        if let Some(count) = counts.get(key).and_then(Value::as_u64) {
+            parts.push(format!("{} {}", count, key.replace('_', " ")));
+        }
+    }
+    (!parts.is_empty()).then(|| format!("targets: {}", parts.join(", ")))
+}
+
+fn append_unfinished_targets(body: &mut Vec<ChatLineView>, payload: &Value) {
+    let Some(targets) = payload.get("unfinished_targets").and_then(Value::as_array) else {
+        return;
+    };
+    for target in targets.iter().take(MAX_WORKFLOW_UNFINISHED_TARGET_LINES) {
+        if let Some(line) = unfinished_target_line(target) {
+            body.push(line);
+        }
+    }
+    if targets.len() > MAX_WORKFLOW_UNFINISHED_TARGET_LINES {
+        body.push(ChatLineView::warning(format!(
+            "unfinished targets: +{} more",
+            targets.len() - MAX_WORKFLOW_UNFINISHED_TARGET_LINES
+        )));
+    }
+}
+
+fn unfinished_target_line(target: &Value) -> Option<ChatLineView> {
+    let path = string_field(target, "path").unwrap_or_else(|| "<unknown target>".to_string());
+    let status = string_field(target, "status").unwrap_or_else(|| "unfinished".to_string());
+    let mut text = format!("unfinished target: {} ({})", path, status.replace('_', " "));
+    if let Some(label) = string_field(target, "source_step_label").filter(|label| !label.is_empty())
+    {
+        text.push_str(&format!(" from {label}"));
+    }
+    if let Some(reason) = string_field(target, "reason").filter(|reason| !reason.is_empty()) {
+        text.push_str(&format!(" - {reason}"));
+    }
+    let style = if status == "failed" {
+        ChatLineStyle::Error
+    } else {
+        ChatLineStyle::Warning
+    };
+    Some(styled_line(style, text))
+}
+
+fn append_workflow_string_array(
+    body: &mut Vec<ChatLineView>,
+    payload: &Value,
+    field: &str,
+    label: &str,
+    style: ChatLineStyle,
+    limit: usize,
+) {
+    let Some(values) = payload.get(field).and_then(Value::as_array) else {
+        return;
+    };
+    for value in values.iter().filter_map(Value::as_str).take(limit) {
+        body.push(styled_line(style.clone(), format!("{label}: {value}")));
+    }
+    let visible = values
+        .iter()
+        .filter(|value| value.as_str().is_some())
+        .count();
+    if visible > limit {
+        body.push(styled_line(
+            style,
+            format!("{label}: +{} more", visible - limit),
+        ));
+    }
+}
+
+fn workflow_preflight_line(payload: &Value) -> Option<String> {
+    let preflight = payload.get("preflight")?.as_object()?;
+    let parallel = preflight
+        .get("parallel_step_groups")
+        .and_then(Value::as_bool)
+        .map(|enabled| {
+            if enabled {
+                "parallel groups enabled".to_string()
+            } else {
+                "parallel groups disabled".to_string()
+            }
+        });
+    let max_steps = preflight
+        .get("max_parallel_agent_steps")
+        .and_then(Value::as_u64)
+        .map(|max| format!("max parallel agent steps: {max}"));
+    match (parallel, max_steps) {
+        (Some(parallel), Some(max_steps)) => Some(format!("{parallel}, {max_steps}")),
+        (Some(parallel), None) => Some(parallel),
+        (None, Some(max_steps)) => Some(max_steps),
+        (None, None) => None,
     }
 }
 
@@ -2065,6 +2561,35 @@ mod tests {
         }
     }
 
+    fn skill_payload(
+        display_name: &str,
+        canonical_id: &str,
+        source_origin: &str,
+        source_path: &str,
+    ) -> Value {
+        json!({
+            "requested_names": [display_name],
+            "display_name": display_name,
+            "canonical_id": canonical_id,
+            "source_origin": source_origin,
+            "source_path": source_path,
+            "load_reason": "explicit"
+        })
+    }
+
+    fn item_text(item: &ChatItemView) -> String {
+        let mut text = item.title.clone();
+        if let Some(summary) = item.summary.as_deref() {
+            text.push('\n');
+            text.push_str(summary);
+        }
+        for line in &item.body {
+            text.push('\n');
+            text.push_str(&line.text);
+        }
+        text
+    }
+
     #[test]
     fn rebuild_produces_stable_prompt_id() {
         let events = vec![event(
@@ -2077,6 +2602,417 @@ mod tests {
         let projection = ChatProjection::rebuild(&events);
 
         assert_eq!(projection.items()[0].id, "chat:prompt:run");
+    }
+
+    #[test]
+    fn workflow_started_projects_lifecycle_item() {
+        let events = vec![event(
+            "workflow_started",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "original_command": "/workflow migrate auth",
+                "user_prompt": "migrate auth",
+                "mode": "workflow",
+                "preflight": {
+                    "parallel_step_groups": true,
+                    "max_parallel_agent_steps": 2
+                }
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:workflow:run");
+        assert_eq!(
+            item.lifecycle_key,
+            Some(ChatLifecycleKey::Workflow {
+                run_id: "run".to_string()
+            })
+        );
+        assert_eq!(item.kind, ChatItemKind::RunSummary);
+        assert_eq!(item.status, ChatItemStatus::Running);
+        assert_eq!(item.severity, ChatSeverity::Info);
+        assert_eq!(item.title, "Workflow started");
+        let text = item_text(item);
+        assert!(text.contains("/workflow migrate auth"));
+        assert!(text.contains("prompt: migrate auth"));
+        assert!(text.contains("parallel groups enabled, max parallel agent steps: 2"));
+    }
+
+    #[test]
+    fn workflow_completed_projects_completed_as_success() {
+        let events = vec![event(
+            "workflow_completed",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "status": "completed",
+                "target_counts": {
+                    "completed": 2,
+                    "skipped": 0,
+                    "blocked": 0,
+                    "failed": 0,
+                    "planned": 0
+                }
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:workflow:run");
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.severity, ChatSeverity::Success);
+        assert_eq!(item.title, "Workflow completed");
+    }
+
+    #[test]
+    fn workflow_completed_projects_completed_with_issues_as_warning() {
+        let events = vec![event(
+            "workflow_completed",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "status": "completed_with_issues",
+                "target_counts": {
+                    "completed": 1,
+                    "skipped": 0,
+                    "blocked": 1,
+                    "failed": 0,
+                    "planned": 0
+                }
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.severity, ChatSeverity::Warning);
+        assert_eq!(item.title, "Workflow completed with issues");
+    }
+
+    #[test]
+    fn workflow_completed_projects_failed_as_error() {
+        let events = vec![event(
+            "workflow_completed",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "status": "failed",
+                "target_counts": {
+                    "completed": 0,
+                    "skipped": 0,
+                    "blocked": 0,
+                    "failed": 1,
+                    "planned": 0
+                }
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Failed);
+        assert_eq!(item.severity, ChatSeverity::Error);
+        assert_eq!(item.title, "Workflow failed");
+    }
+
+    #[test]
+    fn workflow_completed_body_includes_target_and_evidence_payload() {
+        let events = vec![event(
+            "workflow_completed",
+            Some("run"),
+            None,
+            json!({
+                "run_id": "run",
+                "status": "completed_with_issues",
+                "target_counts": {
+                    "completed": 2,
+                    "skipped": 0,
+                    "blocked": 4,
+                    "failed": 0,
+                    "planned": 0
+                },
+                "unfinished_targets": [
+                    {
+                        "path": "src/app/mod.rs",
+                        "source_group_id": "group-1",
+                        "source_step_id": "step-1",
+                        "source_step_label": "fix app",
+                        "status": "blocked",
+                        "reason": "approval denied"
+                    },
+                    {
+                        "path": "src/app/chat/mod.rs",
+                        "source_group_id": "group-1",
+                        "source_step_id": "step-2",
+                        "source_step_label": "fix chat",
+                        "status": "blocked",
+                        "reason": "scope changed"
+                    },
+                    {
+                        "path": "src/tui/mod.rs",
+                        "source_group_id": "group-1",
+                        "source_step_id": "step-3",
+                        "source_step_label": "fix tui",
+                        "status": "blocked",
+                        "reason": "pending review"
+                    },
+                    {
+                        "path": "README.md",
+                        "source_group_id": "group-1",
+                        "source_step_id": "step-4",
+                        "source_step_label": "fix docs",
+                        "status": "skipped",
+                        "reason": "out of scope"
+                    }
+                ],
+                "verification": ["cargo test workflow", "cargo clippy"],
+                "skipped_checks": ["clippy unavailable", "coverage skipped"],
+                "residual_risks": ["docs not reviewed", "manual QA pending"]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let text = item_text(&projection.items()[0]);
+        assert!(text.contains("targets: 2 completed, 0 skipped, 4 blocked, 0 failed, 0 planned"));
+        assert!(text.contains(
+            "unfinished target: src/app/mod.rs (blocked) from fix app - approval denied"
+        ));
+        assert!(text.contains("unfinished targets: +1 more"));
+        assert!(text.contains("verification: cargo test workflow"));
+        assert!(text.contains("verification: +1 more"));
+        assert!(text.contains("skipped check: clippy unavailable"));
+        assert!(text.contains("skipped check: +1 more"));
+        assert!(text.contains("residual risk: docs not reviewed"));
+        assert!(text.contains("residual risk: +1 more"));
+    }
+
+    #[test]
+    fn workflow_completed_stays_separate_after_later_run_completed() {
+        let events = vec![
+            event(
+                "workflow_completed",
+                Some("run"),
+                None,
+                json!({
+                    "run_id": "run",
+                    "status": "completed_with_issues",
+                    "target_counts": {
+                        "completed": 1,
+                        "skipped": 0,
+                        "blocked": 1,
+                        "failed": 0,
+                        "planned": 0
+                    }
+                }),
+            ),
+            event(
+                "run_completed",
+                Some("run"),
+                None,
+                json!({ "summary": "generic completion summary" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 2);
+        let workflow = projection
+            .items()
+            .iter()
+            .find(|item| item.id == "chat:workflow:run")
+            .unwrap();
+        let generic = projection
+            .items()
+            .iter()
+            .find(|item| item.id == "chat:run:run")
+            .unwrap();
+        assert_eq!(workflow.title, "Workflow completed with issues");
+        assert_eq!(workflow.severity, ChatSeverity::Warning);
+        assert_eq!(generic.title, "Run completed");
+        assert_eq!(generic.severity, ChatSeverity::Success);
+    }
+
+    #[test]
+    fn workflow_completed_missing_optional_arrays_renders_without_panic() {
+        let events = vec![event(
+            "workflow_completed",
+            None,
+            None,
+            json!({
+                "run_id": "run",
+                "status": "completed"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:workflow:run");
+        assert_eq!(item.severity, ChatSeverity::Success);
+        assert_eq!(item.summary.as_deref(), Some("completed"));
+        assert!(item.body.is_empty());
+    }
+
+    #[test]
+    fn skills_loaded_with_one_skill_renders_concise_standalone_item() {
+        let events = vec![event(
+            "skills_loaded",
+            Some("run"),
+            None,
+            json!({
+                "skills": [
+                    skill_payload(
+                        "reviewer",
+                        ".agents/skills/reviewer/SKILL.md",
+                        ".agents/skills",
+                        ".agents/skills/reviewer/SKILL.md"
+                    )
+                ]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.title, "Skills loaded");
+        assert_eq!(item.lifecycle_key, None);
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.summary.as_deref(), Some("reviewer"));
+        assert!(item.body.iter().any(|line| {
+            line.text == "reviewer - .agents/skills (.agents/skills/reviewer/SKILL.md) [explicit]"
+        }));
+    }
+
+    #[test]
+    fn skills_loaded_with_multiple_skills_preserves_first_use_order() {
+        let events = vec![event(
+            "skills_loaded",
+            Some("run"),
+            None,
+            json!({
+                "skills": [
+                    skill_payload(
+                        "reviewer",
+                        ".agents/skills/reviewer/SKILL.md",
+                        ".agents/skills",
+                        ".agents/skills/reviewer/SKILL.md"
+                    ),
+                    skill_payload(
+                        "planner",
+                        "~/.agents/skills/planner/SKILL.md",
+                        "~/.agents/skills",
+                        "~/.agents/skills/planner/SKILL.md"
+                    )
+                ]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.summary.as_deref(), Some("reviewer, planner"));
+        let lines = item
+            .body
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "reviewer - .agents/skills (.agents/skills/reviewer/SKILL.md) [explicit]",
+                "planner - ~/.agents/skills (~/.agents/skills/planner/SKILL.md) [explicit]"
+            ]
+        );
+    }
+
+    #[test]
+    fn skills_loaded_duplicate_aliases_do_not_create_duplicate_visible_rows() {
+        let events = vec![event(
+            "skills_loaded",
+            Some("run"),
+            None,
+            json!({
+                "skills": [
+                    {
+                        "requested_names": ["reviewer", "review"],
+                        "display_name": "reviewer",
+                        "canonical_id": ".agents/skills/reviewer/SKILL.md",
+                        "source_origin": ".agents/skills",
+                        "source_path": ".agents/skills/reviewer/SKILL.md",
+                        "load_reason": "explicit"
+                    },
+                    {
+                        "requested_names": ["review"],
+                        "display_name": "reviewer",
+                        "canonical_id": ".agents/skills/reviewer/SKILL.md",
+                        "source_origin": ".agents/skills",
+                        "source_path": ".agents/skills/reviewer/SKILL.md",
+                        "load_reason": "explicit"
+                    }
+                ]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.body.len(), 1);
+        assert_eq!(item.summary.as_deref(), Some("reviewer"));
+        assert!(item.body[0].text.contains("reviewer - .agents/skills"));
+    }
+
+    #[test]
+    fn skills_loaded_malformed_body_fields_are_not_displayed_by_projection() {
+        const SENTINEL: &str = "SENTINEL_FULL_SKILL_BODY_PRIVATE";
+        let events = vec![event(
+            "skills_loaded",
+            Some("run"),
+            None,
+            json!({
+                "content": SENTINEL,
+                "body": SENTINEL,
+                "skills": [
+                    {
+                        "requested_names": ["reviewer"],
+                        "display_name": "reviewer",
+                        "canonical_id": ".agents/skills/reviewer/SKILL.md",
+                        "source_origin": ".agents/skills",
+                        "source_path": ".agents/skills/reviewer/SKILL.md",
+                        "load_reason": "explicit",
+                        "content": SENTINEL,
+                        "body": SENTINEL
+                    },
+                    {
+                        "requested_names": ["malformed"],
+                        "display_name": "malformed",
+                        "content": SENTINEL,
+                        "body": SENTINEL
+                    }
+                ]
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        let text = item_text(item);
+        assert!(text.contains("reviewer"));
+        assert!(text.contains(".agents/skills/reviewer/SKILL.md"));
+        assert!(!text.contains(SENTINEL));
+        assert!(!text.contains("malformed"));
     }
 
     #[test]
@@ -2438,5 +3374,632 @@ mod tests {
             .body
             .iter()
             .any(|line| line.text == "[stdout:final] plan: verify"));
+    }
+
+    #[test]
+    fn clarification_requested_projects_as_clarification_kind() {
+        let events = vec![event(
+            "clarification_requested",
+            Some("run-1"),
+            None,
+            json!({
+                "question_id": "q1",
+                "question": "Which scope?",
+                "options": [
+                    {"id": "scope1", "label": "Feature scope"},
+                    {"id": "scope2", "label": "Bug fix scope"}
+                ],
+                "recommended_option_id": "scope1"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::Clarification);
+        assert_eq!(item.status, ChatItemStatus::WaitingForUser);
+        assert_eq!(item.title, "Clarifying question");
+        assert!(item.body.iter().any(|line| line.text == "Which scope?"));
+        assert!(item.body.iter().any(|line| line.text.contains("★")));
+    }
+
+    #[test]
+    fn clarification_answered_with_recommended_option_projects_completed() {
+        let events = vec![
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Which scope?",
+                    "options": [
+                        {"id": "scope1", "label": "Feature scope"},
+                        {"id": "scope2", "label": "Bug fix scope"}
+                    ],
+                    "recommended_option_id": "scope1"
+                }),
+            ),
+            event(
+                "clarification_answered",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "answer": "Feature scope",
+                    "answer_source": "recommended",
+                    "selected_option_id": "scope1",
+                    "selected_option_label": "Feature scope"
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.kind, ChatItemKind::Clarification);
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.title, "Clarifying question answered");
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "Question: Which scope?"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "Answer: Feature scope"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "Option: Feature scope"));
+    }
+
+    #[test]
+    fn clarification_answered_with_custom_text_projects_completed() {
+        let events = vec![
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "What's your name?",
+                    "options": [
+                        {"id": "opt1", "label": "Option 1"},
+                    ],
+                    "recommended_option_id": null
+                }),
+            ),
+            event(
+                "clarification_answered",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "answer": "Custom answer text",
+                    "answer_source": "custom",
+                    "selected_option_id": null,
+                    "selected_option_label": null
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert!(item.body.iter().any(|line| line.text == "Custom answer"));
+    }
+
+    #[test]
+    fn approval_requested_still_uses_approval_kind() {
+        let events = vec![event(
+            "approval_requested",
+            Some("run-1"),
+            Some("step-1"),
+            json!({
+                "action_id": "action-1",
+                "summary": "Execute dangerous command"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::Approval);
+        assert_eq!(item.status, ChatItemStatus::WaitingApproval);
+    }
+
+    #[test]
+    fn blocker_reported_projects_as_clarification() {
+        let events = vec![event(
+            "blocker_reported",
+            Some("run-1"),
+            None,
+            json!({
+                "question": "Some blocker"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::Clarification);
+        assert_eq!(item.status, ChatItemStatus::WaitingForUser);
+    }
+
+    #[test]
+    fn clarification_and_approval_are_distinct() {
+        let events = vec![
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Clarification question?",
+                    "options": [],
+                    "recommended_option_id": null
+                }),
+            ),
+            event(
+                "approval_requested",
+                Some("run-1"),
+                Some("step-1"),
+                json!({
+                    "action_id": "action-1",
+                    "summary": "Approval request"
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, ChatItemKind::Clarification);
+        assert_eq!(items[1].kind, ChatItemKind::Approval);
+        assert_ne!(items[0].status, items[1].status);
+    }
+
+    #[test]
+    fn orchestrator_decision_waiting_for_user_does_not_use_approval_status() {
+        let events = vec![event(
+            "orchestrator_decision",
+            Some("run-1"),
+            Some("step-1"),
+            json!({
+                "status": "waiting_for_user",
+                "reason": "Need more detail before routing."
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::RoutingDecision);
+        assert_eq!(item.status, ChatItemStatus::WaitingForUser);
+    }
+
+    #[test]
+    fn answered_clarification_survives_run_lifecycle() {
+        let events = vec![
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Which scope?",
+                    "options": [
+                        {"id": "scope1", "label": "Feature scope"},
+                        {"id": "scope2", "label": "Bug fix scope"}
+                    ],
+                    "recommended_option_id": "scope1"
+                }),
+            ),
+            event(
+                "clarification_answered",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "answer": "Feature scope",
+                    "answer_source": "recommended",
+                    "selected_option_id": "scope1",
+                    "selected_option_label": "Feature scope"
+                }),
+            ),
+            event(
+                "run_completed",
+                Some("run-1"),
+                None,
+                json!({ "summary": "done" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        let clarification = items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::Clarification)
+            .expect("answered clarification must survive run completion");
+        assert_eq!(clarification.status, ChatItemStatus::Completed);
+        assert!(clarification
+            .body
+            .iter()
+            .any(|line| line.text == "Question: Which scope?"));
+        assert!(clarification
+            .body
+            .iter()
+            .any(|line| line.text == "Answer: Feature scope"));
+        let run_summary = items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::RunSummary)
+            .expect("run summary item must exist");
+        assert_eq!(run_summary.title, "Run completed");
+    }
+
+    #[test]
+    fn run_failure_summary_orders_last_in_chronological_position() {
+        let events = vec![
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Scope?",
+                    "options": [{"id": "a", "label": "A"}]
+                }),
+            ),
+            event(
+                "run_failed",
+                Some("run-1"),
+                None,
+                json!({
+                    "reason": "Claude stream requested tool use or local action execution; harness-action boundary violated"
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        // The failure summary renders LAST (chronological), not pinned to the
+        // run-start placeholder position at the top.
+        let last = items.last().unwrap();
+        assert_eq!(last.kind, ChatItemKind::RunSummary);
+        assert_eq!(last.title, "Run failed");
+        assert_eq!(last.status, ChatItemStatus::Failed);
+        assert!(last
+            .body
+            .iter()
+            .any(|line| line.text.contains("harness-action boundary violated")));
+
+        // De-dup preserved: exactly one run-summary item for the run.
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == ChatItemKind::RunSummary)
+                .count(),
+            1
+        );
+
+        // Earlier progress (the clarification) precedes the failure.
+        let clar_idx = items
+            .iter()
+            .position(|item| item.kind == ChatItemKind::Clarification)
+            .unwrap();
+        let run_idx = items
+            .iter()
+            .position(|item| item.kind == ChatItemKind::RunSummary)
+            .unwrap();
+        assert!(
+            clar_idx < run_idx,
+            "progress must precede the failure summary"
+        );
+    }
+
+    #[test]
+    fn workflow_failure_summary_orders_last() {
+        let events = vec![
+            event(
+                "workflow_started",
+                Some("run-1"),
+                None,
+                json!({ "original_command": "/workflow do x" }),
+            ),
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Scope?",
+                    "options": [{"id": "a", "label": "A"}]
+                }),
+            ),
+            event(
+                "workflow_completed",
+                Some("run-1"),
+                None,
+                json!({ "status": "failed", "summary": "boom" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        let last = items.last().unwrap();
+        assert_eq!(last.kind, ChatItemKind::RunSummary);
+        assert_eq!(last.status, ChatItemStatus::Failed);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == ChatItemKind::RunSummary)
+                .count(),
+            1
+        );
+        let clar_idx = items
+            .iter()
+            .position(|item| item.kind == ChatItemKind::Clarification)
+            .unwrap();
+        assert!(
+            clar_idx < items.len() - 1,
+            "progress precedes the workflow summary"
+        );
+    }
+
+    #[test]
+    fn multiple_clarifications_in_one_run_project_distinct_items() {
+        let events = vec![
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "First question?",
+                    "options": [],
+                    "recommended_option_id": null
+                }),
+            ),
+            event(
+                "clarification_answered",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "answer": "First answer",
+                    "answer_source": "custom",
+                    "selected_option_id": null,
+                    "selected_option_label": null
+                }),
+            ),
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q2",
+                    "question": "Second question?",
+                    "options": [],
+                    "recommended_option_id": null
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, ChatItemKind::Clarification);
+        assert_eq!(items[0].status, ChatItemStatus::Completed);
+        assert!(items[0]
+            .body
+            .iter()
+            .any(|line| line.text == "Answer: First answer"));
+        assert_eq!(items[1].kind, ChatItemKind::Clarification);
+        assert_eq!(items[1].status, ChatItemStatus::WaitingForUser);
+        assert!(items[1]
+            .body
+            .iter()
+            .any(|line| line.text == "Second question?"));
+    }
+
+    #[test]
+    fn follow_up_queued_projects_visible_chat_item_with_prompt() {
+        let events = vec![event(
+            "follow_up_queued",
+            Some("run"),
+            None,
+            json!({ "id": "q1", "prompt": "update the docs", "created_at": "t", "status": "pending" }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:follow_up:q1");
+        assert_eq!(
+            item.lifecycle_key,
+            Some(ChatLifecycleKey::FollowUp {
+                follow_up_id: "q1".to_string()
+            })
+        );
+        assert_eq!(item.kind, ChatItemKind::Diagnostic);
+        assert_eq!(item.status, ChatItemStatus::Pending);
+        assert_eq!(item.severity, ChatSeverity::Info);
+        assert_eq!(item.title, "Queued follow-up");
+        assert!(item_text(item).contains("update the docs"));
+    }
+
+    #[test]
+    fn follow_up_cancelled_projects_cancelled_state() {
+        let events = vec![
+            event(
+                "follow_up_queued",
+                Some("run"),
+                None,
+                json!({ "id": "q1", "prompt": "cancel me", "status": "pending" }),
+            ),
+            event(
+                "follow_up_cancelled",
+                None,
+                None,
+                json!({ "id": "q1", "prompt": "cancel me", "status": "cancelled" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        // Both events for the same follow-up collapse into one evolving item.
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Skipped);
+        assert_eq!(item.title, "Cancelled follow-up");
+        assert!(item_text(item).contains("cancel me"));
+    }
+
+    #[test]
+    fn follow_up_replay_started_projects_replaying_state() {
+        let events = vec![event(
+            "follow_up_replay_started",
+            None,
+            None,
+            json!({ "id": "q1", "prompt": "replay me" }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Running);
+        assert_eq!(item.title, "Replaying follow-up");
+        assert!(item_text(item).contains("replay me"));
+    }
+
+    #[test]
+    fn follow_up_replay_paused_shows_pause_reason() {
+        let events = vec![event(
+            "follow_up_replay_paused",
+            None,
+            None,
+            json!({
+                "id": "q1",
+                "prompt": "paused work",
+                "status": "paused",
+                "pause_reason": "run is waiting for clarification"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Pending);
+        assert_eq!(item.severity, ChatSeverity::Warning);
+        assert_eq!(item.title, "Paused follow-up");
+        let text = item_text(item);
+        assert!(text.contains("paused work"));
+        assert!(text.contains("run is waiting for clarification"));
+    }
+
+    #[test]
+    fn follow_up_replay_resumed_shows_eligible_again() {
+        let events = vec![event(
+            "follow_up_replay_resumed",
+            None,
+            None,
+            json!({ "id": "q1", "prompt": "resume target", "status": "pending" }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Pending);
+        assert_eq!(item.title, "Resumed follow-up");
+        let text = item_text(item).to_lowercase();
+        assert!(text.contains("resume target"));
+        assert!(text.contains("eligible"));
+    }
+
+    #[test]
+    fn rebuilding_full_queue_lifecycle_produces_single_stable_item() {
+        let events = vec![
+            event(
+                "follow_up_queued",
+                Some("run"),
+                None,
+                json!({ "id": "q1", "prompt": "deferred", "status": "pending" }),
+            ),
+            event(
+                "follow_up_replay_paused",
+                None,
+                None,
+                json!({ "id": "q1", "prompt": "deferred", "status": "paused", "pause_reason": "previous run failed" }),
+            ),
+            event(
+                "follow_up_replay_resumed",
+                None,
+                None,
+                json!({ "id": "q1", "prompt": "deferred", "status": "pending" }),
+            ),
+            event(
+                "follow_up_replay_started",
+                None,
+                None,
+                json!({ "id": "q1", "prompt": "deferred" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+
+        // All lifecycle events for one follow-up id collapse to a single item.
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.id, "chat:follow_up:q1");
+        assert_eq!(item.title, "Replaying follow-up");
+        // Rebuild is deterministic for the same history.
+        let again = ChatProjection::rebuild(&events);
+        assert_eq!(again.items(), projection.items());
+    }
+
+    #[test]
+    fn queue_events_preserve_prompt_and_run_summary_projection() {
+        let events = vec![
+            event(
+                "prompt_submitted",
+                Some("run"),
+                None,
+                json!({ "prompt": "build it" }),
+            ),
+            event(
+                "follow_up_queued",
+                Some("run"),
+                None,
+                json!({ "id": "q1", "prompt": "later work", "status": "pending" }),
+            ),
+            event("run_completed", Some("run"), None, json!({})),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        // Existing user-prompt and run-summary projection is unchanged.
+        assert!(items
+            .iter()
+            .any(|item| item.id == "chat:prompt:run" && item.kind == ChatItemKind::UserPrompt));
+        assert!(items
+            .iter()
+            .any(|item| item.id == "chat:run:run" && item.kind == ChatItemKind::RunSummary));
+        // The queued follow-up projects as its own item alongside them.
+        assert!(items.iter().any(|item| item.id == "chat:follow_up:q1"));
     }
 }

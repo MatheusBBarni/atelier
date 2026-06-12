@@ -167,7 +167,9 @@ const visualFrames = [
       content="Atelier is a terminal-native agent orchestration harness for local repositories."
     />
     <title>Atelier - Terminal-native agent orchestration</title>
-    <link rel="icon" href={assetPath("/favicon.svg")} />
+    <link rel="icon" href={assetPath("/favicon.svg")} type="image/svg+xml" />
+    <link rel="apple-touch-icon" href={assetPath("/images/atelier-logo-256.png")} />
+    <meta name="theme-color" content="#08131f" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -186,7 +188,15 @@ const visualFrames = [
         <div class="hero__shade" aria-hidden="true"></div>
         <header class="nav" aria-label="Primary">
           <a class="brand" href="#top" aria-label="Atelier home">
-            <span class="brand__mark" aria-hidden="true">A</span>
+            <img
+              class="brand__mark"
+              src={assetPath("/images/atelier-logo-256.png")}
+              alt=""
+              aria-hidden="true"
+              width="36"
+              height="36"
+              loading="eager"
+            />
             <span>Atelier</span>
           </a>
           <div class="nav__right">
@@ -224,6 +234,14 @@ const visualFrames = [
         </header>
 
         <div class="hero__content" id="top">
+          <img
+            class="hero__logo"
+            src={assetPath("/images/atelier-logo.png")}
+            alt="Atelier app icon: a teal and cream wizard hat above a terminal prompt, framed in gold on deep navy."
+            width="104"
+            height="104"
+            loading="eager"
+          />
           <p class="eyebrow">Terminal-native agent orchestration</p>
           <h1 id="hero-title">Atelier</h1>
           <p class="hero__lede">

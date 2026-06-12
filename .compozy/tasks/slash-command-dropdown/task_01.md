@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add Shared Slash Command Catalog"
 type: backend
 complexity: medium
@@ -28,11 +28,11 @@ Create the shared metadata-only slash command catalog required by the TechSpec. 
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Create the shared slash command metadata module.
-- [ ] 1.2 Add the fixed V1 command entries from the TechSpec.
-- [ ] 1.3 Export the module from the crate root.
-- [ ] 1.4 Add catalog formatting helpers required by downstream help and error guidance.
-- [ ] 1.5 Add unit tests proving the catalog has exactly the approved V1 command set.
+- [x] 1.1 Create the shared slash command metadata module.
+- [x] 1.2 Add the fixed V1 command entries from the TechSpec.
+- [x] 1.3 Export the module from the crate root.
+- [x] 1.4 Add catalog formatting helpers required by downstream help and error guidance.
+- [x] 1.5 Add unit tests proving the catalog has exactly the approved V1 command set.
 
 ## Implementation Details
 Create `src/slash_commands.rs` and expose it from `src/lib.rs`. Follow the TechSpec "Core Interfaces" and ADR-003: keep the module metadata-only and avoid moving command execution out of existing TUI/app handlers.
@@ -58,12 +58,12 @@ Create `src/slash_commands.rs` and expose it from `src/lib.rs`. Follow the TechS
 
 ## Tests
 - Unit tests:
-  - [ ] Catalog labels are exactly `/help`, `/goal`, `/goal clear`, `/config`, `/subtask`, `/agent:`, `/skill:`, and `/reload:skills`.
-  - [ ] Every catalog entry has non-empty label, insert text, usage text, description, and kind.
-  - [ ] Prompt-prefix entries are categorized as prompt prefixes and do not imply dispatch behavior.
-  - [ ] TUI-local and app-command entries are categorized distinctly.
+  - [x] Catalog labels are exactly `/help`, `/goal`, `/goal clear`, `/config`, `/subtask`, `/agent:`, `/skill:`, and `/reload:skills`.
+  - [x] Every catalog entry has non-empty label, insert text, usage text, description, and kind.
+  - [x] Prompt-prefix entries are categorized as prompt prefixes and do not imply dispatch behavior.
+  - [x] TUI-local and app-command entries are categorized distinctly.
 - Integration tests:
-  - [ ] Public catalog accessor is usable from another module without exposing mutable state.
+  - [x] Public catalog accessor is usable from another module without exposing mutable state.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -72,3 +72,17 @@ Create `src/slash_commands.rs` and expose it from `src/lib.rs`. Follow the TechS
 - Test coverage >=80%
 - The shared catalog contains exactly the approved fixed V1 command set.
 - The catalog remains metadata-only and introduces no new command execution path.
+
+## Follow-up Notes (recorded during execution, 2026-06-11)
+- **Spec staleness — blocks task_02/task_03 scope, not task_01**: the app gained
+  `/workflow <prompt>` (commit a86b94e, 2026-06-07) and `/queue`/`/q`
+  (`handle_queue_command`) after the PRD/ADR command set was frozen on
+  2026-06-06. `/workflow` appears today in `AVAILABLE_SLASH_COMMANDS`
+  (`src/app/mod.rs:57`), the help modal (`src/tui/mod.rs:2304`), and is pinned
+  by the test `unknown_slash_command_is_not_submitted_as_agent_prompt`
+  (`src/app/mod.rs:8574`). Routing guidance/help through the catalog in
+  task_02/task_03 as currently specified would drop `/workflow` from visible
+  guidance and break that test. Decision needed before task_02: add `/workflow`
+  (and decide `/queue`) to the catalog via a PRD/ADR-001 scope amendment, or
+  amend task_02/task_03 to treat them as explicit catalog exceptions. task_01
+  intentionally follows the frozen "exactly these 8" requirement.

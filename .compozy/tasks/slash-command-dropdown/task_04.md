@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add Command Dropdown Model And Activation Rules"
 type: frontend
 complexity: medium
@@ -31,12 +31,12 @@ Add the command dropdown model, filtering behavior, selection state, and activat
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Add command dropdown state to the TUI UI state.
-- [ ] 4.2 Add a command dropdown model that reads shared command specs.
-- [ ] 4.3 Add beginning-of-input activation checks.
-- [ ] 4.4 Add pending-approval and waiting-for-user gating.
-- [ ] 4.5 Preserve agent and skill dropdown precedence.
-- [ ] 4.6 Add model-level tests for activation, filtering, selection, and no-match state.
+- [x] 4.1 Add command dropdown state to the TUI UI state.
+- [x] 4.2 Add a command dropdown model that reads shared command specs.
+- [x] 4.3 Add beginning-of-input activation checks.
+- [x] 4.4 Add pending-approval and waiting-for-user gating.
+- [x] 4.5 Preserve agent and skill dropdown precedence.
+- [x] 4.6 Add model-level tests for activation, filtering, selection, and no-match state.
 
 ## Implementation Details
 Modify `src/tui/mod.rs` around `TuiUiState`, dropdown reset helpers, and dropdown detection functions. Do not render the command dropdown or handle acceptance in this task; later tasks depend on this model.
@@ -63,17 +63,31 @@ Modify `src/tui/mod.rs` around `TuiUiState`, dropdown reset helpers, and dropdow
 
 ## Tests
 - Unit tests:
-  - [ ] Input `/` produces command dropdown suggestions for all fixed V1 commands.
-  - [ ] Input `/g` filters to `/goal` and `/goal clear`.
-  - [ ] Input `please /g` does not activate the command dropdown.
-  - [ ] Input `/unknown` produces a no-match model with no selected suggestion.
-  - [ ] Pending approval suppresses command dropdown activation.
-  - [ ] `WaitingForUser` suppresses command dropdown activation.
-  - [ ] `/agent:` and `/skill:` continue to resolve to specialized dropdown models.
+  - [x] Input `/` produces command dropdown suggestions for all fixed V1 commands.
+  - [x] Input `/g` filters to `/goal` and `/goal clear`.
+  - [x] Input `please /g` does not activate the command dropdown.
+  - [x] Input `/unknown` produces a no-match model with no selected suggestion.
+  - [x] Pending approval suppresses command dropdown activation.
+  - [x] `WaitingForUser` suppresses command dropdown activation.
+  - [x] `/agent:` and `/skill:` continue to resolve to specialized dropdown models.
 - Integration tests:
-  - [ ] Key routing continues to prefer help modal, then agent dropdown, then skill dropdown before the command dropdown.
+  - [x] Key routing continues to prefer help modal, then agent dropdown, then skill dropdown before the command dropdown. (model-level precedence asserted; key-routing wiring lands in task_06)
 - Test coverage target: >=80%
 - All tests must pass
+
+## Follow-up Notes (recorded during execution, 2026-06-11)
+- **Activation rule**: the dropdown is active only while the entire input is a
+  single `/`-prefixed token (starts with `/` at char 0, no whitespace). This
+  releases the dropdown the moment a space is typed, so argument-taking
+  commands (`/goal <text>`, `/subtask <agent> <task>`, `/workflow <prompt>`,
+  `/queue <message>`) stay normal input and are never trapped by the no-match
+  state. Filtering matches catalog labels that start with the typed query.
+- **Dismissal state**: `command_dropdown_dismissed: Option<String>` stores the
+  input the dropdown was dismissed for; Escape (task_06) sets it, and any edit
+  re-activates discovery without mutating the input.
+- **Staging**: `CommandDropdown`/`command_dropdown` carry a temporary
+  `#[allow(dead_code)]`; render (task_05) and key handling (task_06) consume
+  them and remove the allows.
 
 ## Success Criteria
 - All tests passing

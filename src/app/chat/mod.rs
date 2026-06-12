@@ -31,9 +31,14 @@ pub enum ChatItemKind {
     CommandResult,
     FileEdit,
     Approval,
+    Clarification,
     Diagnostic,
+    SkillContext,
     AgentResult,
     RunSummary,
+    /// Synthetic branded welcome item, injected at startup (ADR-005). Not an
+    /// orchestration event; carries no lifecycle key and never updates.
+    Welcome,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +47,7 @@ pub enum ChatItemStatus {
     Pending,
     Running,
     WaitingApproval,
+    WaitingForUser,
     Completed,
     Denied,
     Failed,
@@ -114,6 +120,13 @@ pub enum ChatLifecycleKey {
     Run {
         run_id: String,
     },
+    Clarification {
+        run_id: String,
+        question_id: String,
+    },
+    Workflow {
+        run_id: String,
+    },
     Step {
         run_id: String,
         step_id: String,
@@ -123,6 +136,9 @@ pub enum ChatLifecycleKey {
         run_id: String,
         step_id: String,
         action_id: String,
+    },
+    FollowUp {
+        follow_up_id: String,
     },
 }
 
@@ -190,6 +206,11 @@ impl ChatLifecycleKey {
         match self {
             ChatLifecycleKey::Prompt { run_id } => format!("chat:prompt:{run_id}"),
             ChatLifecycleKey::Run { run_id } => format!("chat:run:{run_id}"),
+            ChatLifecycleKey::Clarification {
+                run_id,
+                question_id,
+            } => format!("chat:clarification:{run_id}:{question_id}"),
+            ChatLifecycleKey::Workflow { run_id } => format!("chat:workflow:{run_id}"),
             ChatLifecycleKey::Step {
                 run_id,
                 step_id,
@@ -200,6 +221,9 @@ impl ChatLifecycleKey {
                 step_id,
                 action_id,
             } => format!("chat:action:{run_id}:{step_id}:{action_id}"),
+            ChatLifecycleKey::FollowUp { follow_up_id } => {
+                format!("chat:follow_up:{follow_up_id}")
+            }
         }
     }
 }
@@ -214,9 +238,38 @@ impl ChatItemKind {
             ChatItemKind::CommandResult => "command_result",
             ChatItemKind::FileEdit => "file_edit",
             ChatItemKind::Approval => "approval",
+            ChatItemKind::Clarification => "clarification",
             ChatItemKind::Diagnostic => "diagnostic",
+            ChatItemKind::SkillContext => "skill_context",
             ChatItemKind::AgentResult => "agent_result",
             ChatItemKind::RunSummary => "run_summary",
+            ChatItemKind::Welcome => "welcome",
+        }
+    }
+}
+
+impl ChatItemView {
+    /// The synthetic welcome chat item injected at startup (ADR-005). A stable
+    /// marker with no lifecycle key; its facts/wordmark are rendered from live
+    /// state by `tui::welcome`, so the item itself carries no body.
+    pub fn welcome() -> Self {
+        Self {
+            id: "chat:welcome".to_string(),
+            lifecycle_key: None,
+            kind: ChatItemKind::Welcome,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "Atelier".to_string(),
+            summary: None,
+            body: Vec::new(),
+            details: Vec::new(),
+            source: ChatSourceRef {
+                event_ids: Vec::new(),
+                run_id: None,
+                step_id: None,
+                action_id: None,
+            },
+            updated_at: String::new(),
         }
     }
 }
@@ -227,6 +280,7 @@ impl ChatItemStatus {
             ChatItemStatus::Pending => "pending",
             ChatItemStatus::Running => "running",
             ChatItemStatus::WaitingApproval => "waiting approval",
+            ChatItemStatus::WaitingForUser => "waiting for clarification",
             ChatItemStatus::Completed => "completed",
             ChatItemStatus::Denied => "denied",
             ChatItemStatus::Failed => "failed",

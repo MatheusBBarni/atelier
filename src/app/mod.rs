@@ -1,6 +1,8 @@
 pub mod chat;
+pub mod git;
 
 use self::chat::{ChatItemView, ChatProjection};
+use self::git::{fetch_git_context, GitContext};
 use crate::actions::{
     execute_action_request, is_vcs_mutation, vcs_action_explicitly_requested, ActionDecision,
     ActionExecutionContext, ActionKind, ActionRequest, ActionResult, ActionStatus,
@@ -13,7 +15,7 @@ use crate::history::{HistoryEvent, HistoryStore};
 use crate::ids::new_id;
 use crate::orchestrator::{
     agent_results, build_orchestrator_prompt, validate_orchestrator_decision, AgentResult,
-    AgentResultStatus, DecisionNextStep, DecisionStatus, ParallelBlockedScope,
+    AgentResultStatus, ClarificationOption, DecisionNextStep, DecisionStatus, ParallelBlockedScope,
     ParallelChildResultRef, ParallelFailedScope, ParallelFileScope, ParallelGroupPlan,
     ParallelGroupResult, ParallelGroupStatus, RunState, RunStepResult, COUNCIL_WORKFLOW_AGENT_ID,
 };
@@ -24,6 +26,9 @@ use crate::runtime::{
     RuntimeRecentContext, RuntimeRecentFile, RuntimeRequest, RuntimeStreamDelta,
     RUNTIME_EVENT_CHANNEL_CAPACITY,
 };
+use crate::skills::{
+    self, CompiledPrompt, LoadedSkillMetadata, SkillLoadError, SkillPromptContext,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -31,6 +36,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::future::{pending, Future};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -46,6 +52,8 @@ const RUNTIME_RECENT_CONTEXT_LIMIT: usize = 20;
 const LIVE_STREAM_CONTENT_LIMIT: usize = 16 * 1024;
 const STREAM_COALESCE_BYTES: usize = 2 * 1024;
 const STREAM_COALESCE_INTERVAL: Duration = Duration::from_millis(250);
+const WORKFLOW_COMMAND: &str = "/workflow";
+const WORKFLOW_USAGE: &str = "usage: /workflow <prompt>";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentView {
@@ -70,10 +78,15 @@ pub struct AppState {
     pub live_step: Option<LiveStepView>,
     pub live_steps: Vec<LiveStepView>,
     pub pending_approval: Option<PendingApprovalView>,
+    pub pending_clarification: Option<PendingClarificationView>,
     pub agents: Vec<AgentView>,
     pub chat_items: Vec<ChatItemView>,
+    pub queued_follow_ups: Vec<QueuedFollowUpView>,
     pub events: Vec<String>,
     pub input: String,
+    /// Repo + branch of the working directory, refreshed by the git poller
+    /// (ADR-006). `None` outside a git repo or while git is unavailable.
+    pub git_context: Option<GitContext>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,6 +116,24 @@ pub enum LiveStepStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueuedFollowUpView {
+    pub id: String,
+    pub prompt: String,
+    pub created_at: String,
+    pub status: QueuedFollowUpStatus,
+    pub pause_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedFollowUpStatus {
+    Pending,
+    Paused,
+    Replaying,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveStreamView {
     pub stream: String,
     pub content: String,
@@ -127,6 +158,15 @@ pub struct PendingApprovalView {
     pub agent: String,
     pub summary: String,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingClarificationView {
+    pub run_id: String,
+    pub question_id: String,
+    pub question: String,
+    pub options: Vec<ClarificationOption>,
+    pub recommended_option_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -156,10 +196,22 @@ impl ApprovalHandle {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClarificationAnswer {
+    pub question_id: String,
+    pub answer: String,
+    pub selected_option_id: Option<String>,
+    pub selected_option_label: Option<String>,
+    pub answer_source: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
     PromptSubmitted(String),
     ApprovalAnswered(bool),
+    ClarificationAnswered(ClarificationAnswer),
+    FollowUpCancelled(String),
+    FollowUpResumeRequested(String),
     InputCharacter(char),
     InputBackspace,
     RunInterruptRequested,
@@ -176,6 +228,7 @@ pub struct App {
     pending_clarification: Option<PendingClarification>,
     active_step: Option<ActiveStep>,
     active_steps: Vec<ActiveStep>,
+    follow_up_queue: VecDeque<QueuedFollowUp>,
     debug_enabled: bool,
     session_ended: bool,
     state_sender: Option<watch::Sender<AppState>>,
@@ -226,21 +279,330 @@ struct ActiveStep {
 }
 
 #[derive(Clone, Debug)]
+struct QueuedFollowUp {
+    id: String,
+    prompt: String,
+    created_at: String,
+    status: QueuedFollowUpStatus,
+    pause_reason: Option<String>,
+}
+
+impl QueuedFollowUp {
+    fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            id: new_id(),
+            prompt: prompt.into(),
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            status: QueuedFollowUpStatus::Pending,
+            pause_reason: None,
+        }
+    }
+
+    fn to_view(&self) -> QueuedFollowUpView {
+        QueuedFollowUpView {
+            id: self.id.clone(),
+            prompt: self.prompt.clone(),
+            created_at: self.created_at.clone(),
+            status: self.status.clone(),
+            pause_reason: self.pause_reason.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct RunDriveContext {
     run_id: String,
     parent_run_id: Option<String>,
+    submitted_prompt: String,
     prompt: String,
+    skill_context: Option<SkillPromptContext>,
     subtask: Option<SubtaskContext>,
+    workflow: Option<WorkflowRunContext>,
     previous_results: Vec<RunStepResult>,
     step_count: u32,
     started_at: Instant,
     parse_repair_attempts: u32,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowRunContext {
+    original_command: String,
+    user_prompt: String,
+    target_ledger: BTreeMap<String, Vec<WorkflowTarget>>,
+    verification: Vec<String>,
+    skipped_checks: Vec<String>,
+    residual_risks: Vec<String>,
+    #[serde(skip)]
+    completion_recorded: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowTarget {
+    path: String,
+    source_group_id: String,
+    source_step_id: Option<String>,
+    source_step_label: String,
+    status: WorkflowTargetStatus,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkflowTargetStatus {
+    Planned,
+    Completed,
+    Skipped,
+    Blocked,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCompletionStatus {
+    Completed,
+    CompletedWithIssues,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowTargetCounts {
+    planned: usize,
+    completed: usize,
+    skipped: usize,
+    blocked: usize,
+    failed: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowUnfinishedTarget {
+    path: String,
+    source_group_id: String,
+    source_step_id: Option<String>,
+    source_step_label: String,
+    status: WorkflowTargetStatus,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkflowCompletionPayload {
+    run_id: String,
+    status: WorkflowCompletionStatus,
+    target_counts: WorkflowTargetCounts,
+    unfinished_targets: Vec<WorkflowUnfinishedTarget>,
+    verification: Vec<String>,
+    skipped_checks: Vec<String>,
+    residual_risks: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkflowCommand {
+    original_command: String,
+    prompt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkflowStart {
+    command: WorkflowCommand,
+    preflight: WorkflowPreflight,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct WorkflowPreflight {
+    parallel_step_groups: bool,
+    max_parallel_agent_steps: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimePrompt<'a> {
+    text: &'a str,
+    skill_context: Option<&'a SkillPromptContext>,
+}
+
+impl<'a> RuntimePrompt<'a> {
+    fn new(text: &'a str, skill_context: Option<&'a SkillPromptContext>) -> Self {
+        Self {
+            text,
+            skill_context,
+        }
+    }
+}
+
+impl RunDriveContext {
+    fn new(
+        run_id: impl Into<String>,
+        parent_run_id: Option<String>,
+        submitted_prompt: impl Into<String>,
+        prompt: impl Into<String>,
+        skill_context: Option<SkillPromptContext>,
+        subtask: Option<SubtaskContext>,
+        workflow: Option<WorkflowRunContext>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            parent_run_id,
+            submitted_prompt: submitted_prompt.into(),
+            prompt: prompt.into(),
+            skill_context,
+            subtask,
+            workflow,
+            previous_results: Vec::new(),
+            step_count: 0,
+            started_at: Instant::now(),
+            parse_repair_attempts: 0,
+        }
+    }
+
+    fn loaded_skill_metadata(&self) -> Vec<LoadedSkillMetadata> {
+        self.skill_context
+            .as_ref()
+            .map(SkillPromptContext::metadata)
+            .unwrap_or_default()
+    }
+}
+
+impl WorkflowRunContext {
+    fn new(command: &WorkflowCommand) -> Self {
+        Self {
+            original_command: command.original_command.clone(),
+            user_prompt: command.prompt.clone(),
+            target_ledger: BTreeMap::new(),
+            verification: Vec::new(),
+            skipped_checks: Vec::new(),
+            residual_risks: Vec::new(),
+            completion_recorded: false,
+        }
+    }
+
+    fn record_planned_targets(
+        &mut self,
+        group_id: &str,
+        step_id: Option<&str>,
+        step_label: &str,
+        file_scope: &ParallelFileScope,
+        working_directory: &Path,
+        extra_write_roots: &[PathBuf],
+    ) -> Result<usize> {
+        let mut recorded = 0usize;
+        for write_file in &file_scope.write_files {
+            let path =
+                normalize_workflow_target_key(write_file, working_directory, extra_write_roots)?;
+            let target = WorkflowTarget {
+                path: path.clone(),
+                source_group_id: group_id.to_string(),
+                source_step_id: step_id.map(str::to_string),
+                source_step_label: step_label.to_string(),
+                status: WorkflowTargetStatus::Planned,
+                reason: None,
+            };
+            self.target_ledger.entry(path).or_default().push(target);
+            recorded += 1;
+        }
+        Ok(recorded)
+    }
+
+    fn record_child_result(
+        &mut self,
+        group_id: &str,
+        step_id: &str,
+        file_scope: &ParallelFileScope,
+        result: &AgentResult,
+        working_directory: &Path,
+        extra_write_roots: &[PathBuf],
+    ) -> Result<()> {
+        self.record_verification(result);
+        let (status, reason) = workflow_target_status_from_agent_result(result);
+        for write_file in &file_scope.write_files {
+            let path =
+                normalize_workflow_target_key(write_file, working_directory, extra_write_roots)?;
+            if let Some(targets) = self.target_ledger.get_mut(&path) {
+                for target in targets.iter_mut().filter(|target| {
+                    target.source_group_id == group_id
+                        && target.source_step_id.as_deref() == Some(step_id)
+                }) {
+                    target.status = status.clone();
+                    target.reason = reason.clone();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_verification(&mut self, result: &AgentResult) {
+        for item in result.commands.iter().chain(result.verification.iter()) {
+            if !item.trim().is_empty() && !self.verification.contains(item) {
+                self.verification.push(item.clone());
+            }
+        }
+    }
+
+    fn completion_payload(&self, run_id: &str, interrupted: bool) -> WorkflowCompletionPayload {
+        let target_counts = self.target_counts();
+        let unfinished_targets = self.unfinished_targets();
+        let status =
+            derive_workflow_completion_status(&target_counts, &unfinished_targets, interrupted);
+        WorkflowCompletionPayload {
+            run_id: run_id.to_string(),
+            status,
+            target_counts,
+            unfinished_targets,
+            verification: self.verification.clone(),
+            skipped_checks: self.skipped_checks.clone(),
+            residual_risks: self.residual_risks.clone(),
+        }
+    }
+
+    fn target_counts(&self) -> WorkflowTargetCounts {
+        let mut counts = WorkflowTargetCounts {
+            planned: 0,
+            completed: 0,
+            skipped: 0,
+            blocked: 0,
+            failed: 0,
+        };
+        for target in self.targets() {
+            match target.status {
+                WorkflowTargetStatus::Planned => counts.planned += 1,
+                WorkflowTargetStatus::Completed => counts.completed += 1,
+                WorkflowTargetStatus::Skipped => counts.skipped += 1,
+                WorkflowTargetStatus::Blocked => counts.blocked += 1,
+                WorkflowTargetStatus::Failed => counts.failed += 1,
+            }
+        }
+        counts
+    }
+
+    fn unfinished_targets(&self) -> Vec<WorkflowUnfinishedTarget> {
+        self.targets()
+            .filter(|target| target.status != WorkflowTargetStatus::Completed)
+            .map(|target| WorkflowUnfinishedTarget {
+                path: target.path.clone(),
+                source_group_id: target.source_group_id.clone(),
+                source_step_id: target.source_step_id.clone(),
+                source_step_label: target.source_step_label.clone(),
+                status: target.status.clone(),
+                reason: target.reason.clone().unwrap_or_else(|| {
+                    if matches!(target.status, WorkflowTargetStatus::Planned) {
+                        "planned target did not receive terminal workflow evidence".to_string()
+                    } else {
+                        "workflow target did not include a reason".to_string()
+                    }
+                }),
+            })
+            .collect()
+    }
+
+    fn targets(&self) -> impl Iterator<Item = &WorkflowTarget> {
+        self.target_ledger
+            .values()
+            .flat_map(|targets| targets.iter())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SubtaskContext {
     agent_id: String,
     request: String,
+    submitted_request: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -351,8 +713,12 @@ struct RunRecord {
     run_id: String,
     parent_run_id: Option<String>,
     session_id: String,
+    submitted_prompt: String,
     prompt: String,
+    loaded_skills: Vec<LoadedSkillMetadata>,
     session_goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow: Option<WorkflowRunContext>,
     subtask: Option<SubtaskRecord>,
     state: RunState,
     results: Vec<RunStepResult>,
@@ -361,6 +727,7 @@ struct RunRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SubtaskRecord {
     agent_id: String,
+    submitted_request: String,
     request: String,
 }
 
@@ -386,10 +753,15 @@ impl App {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            pending_clarification: None,
             agents: build_agent_views(&config, &availability),
-            chat_items: Vec::new(),
+            // Branded welcome item present from the first frame (ADR-005);
+            // `sync_chat_items` keeps it prepended across projection updates.
+            chat_items: vec![ChatItemView::welcome()],
+            queued_follow_ups: Vec::new(),
             events: Vec::new(),
             input: String::new(),
+            git_context: None,
         };
         let mut app = Self {
             config,
@@ -401,6 +773,7 @@ impl App {
             pending_clarification: None,
             active_step: None,
             active_steps: Vec::new(),
+            follow_up_queue: VecDeque::new(),
             debug_enabled: debug_enabled || debug_enabled_from_env(),
             session_ended: false,
             state_sender: None,
@@ -459,6 +832,9 @@ impl App {
         match event {
             AppEvent::PromptSubmitted(prompt) => {
                 self.state.input.clear();
+                // Refresh git before the run so the footer/welcome reflect the
+                // branch the prompt actually runs against (ADR-006).
+                self.refresh_git_context().await;
                 self.publish_state();
                 self.submit_prompt(prompt).await
             }
@@ -466,6 +842,27 @@ impl App {
                 self.state.input.clear();
                 self.publish_state();
                 self.resolve_pending_approval(approved).await?;
+                Ok(())
+            }
+            AppEvent::ClarificationAnswered(answer) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resolve_pending_clarification(answer).await
+            }
+            AppEvent::FollowUpCancelled(id) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.cancel_follow_up(&id)
+            }
+            AppEvent::FollowUpResumeRequested(id) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resume_follow_up(&id)?;
+                // Resume only replays when the app is already in a clean idle state;
+                // it never pauses, so it cannot undo the resume it just performed.
+                if self.can_replay_now() {
+                    self.react_to_run_end_for_queue().await?;
+                }
                 Ok(())
             }
             AppEvent::InputCharacter(ch) => {
@@ -521,31 +918,44 @@ impl App {
         if self.handle_subtask_command(&prompt).await? {
             return Ok(());
         }
+        if self.handle_queue_command(&prompt)? {
+            return Ok(());
+        }
         if matches!(self.state.run_state, RunState::WaitingForUser) {
             if self.state.pending_approval.is_some() {
                 bail!("a run is waiting for action approval");
             }
-            if let Some(mut pending) = self.pending_clarification.take() {
-                let answer = prompt.trim().to_string();
-                self.record_event(
-                    Some(pending.run.run_id.clone()),
-                    None,
-                    "clarification_answered",
-                    json!({ "answer": answer }),
-                    user_event_display(&answer),
-                )?;
-                pending.run.prompt =
-                    format!("{}\n\nUser clarification: {}", pending.run.prompt, answer);
-                self.state.run_state = RunState::Planning;
-                return self.drive_run(pending.run, None).await;
+            if self.pending_clarification.is_some() {
+                bail!("a run is waiting for clarification; use the structured clarification answer event");
             }
         }
-        reject_unknown_slash_command(&prompt)?;
+        let workflow_start = self.handle_workflow_command(&prompt)?;
+        if workflow_start.is_none() {
+            reject_unknown_slash_command(&prompt)?;
+        }
         if matches!(
             self.state.run_state,
             RunState::Planning | RunState::Running | RunState::WaitingForUser
         ) {
             bail!("a run is already active");
+        }
+        let compiled_prompt = compile_app_prompt(
+            &self.config.working_directory,
+            workflow_start
+                .as_ref()
+                .map_or(prompt.as_str(), |start| start.command.prompt.as_str()),
+        )?;
+        let mut visible_prompt = compiled_prompt.user_prompt.clone();
+        let mut run_prompt = compiled_prompt.user_prompt.clone();
+        let mut submitted_prompt = compiled_prompt.submitted_prompt.clone();
+        if let Some(start) = workflow_start.as_ref() {
+            visible_prompt = start.command.original_command.clone();
+            submitted_prompt = start.command.original_command.clone();
+            run_prompt = workflow_runtime_prompt(
+                &start.command,
+                &compiled_prompt.user_prompt,
+                &start.preflight,
+            );
         }
 
         self.reset_enabled_agent_statuses();
@@ -559,25 +969,49 @@ impl App {
             json!({ "run_id": run_id }),
             "Run started.",
         )?;
+        if let Some(start) = workflow_start.as_ref() {
+            self.record_event(
+                Some(run_id.clone()),
+                None,
+                "workflow_started",
+                workflow_started_payload(&run_id, start),
+                "Workflow started.",
+            )?;
+        }
         self.record_event(
             Some(run_id.clone()),
             None,
             "prompt_submitted",
-            json!({ "prompt": prompt }),
-            user_event_display(&prompt),
+            json!({
+                "prompt": visible_prompt.clone(),
+                "submitted_prompt": submitted_prompt.clone(),
+            }),
+            user_event_display(&visible_prompt),
         )?;
+        self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
 
-        let run = RunDriveContext {
+        let run = RunDriveContext::new(
             run_id,
-            parent_run_id: None,
-            prompt,
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 0,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
-        self.drive_run(run, None).await
+            None,
+            submitted_prompt,
+            run_prompt,
+            compiled_prompt.skill_context,
+            None,
+            workflow_start
+                .as_ref()
+                .map(|start| WorkflowRunContext::new(&start.command)),
+        );
+        self.drive_and_replay(run, None).await
+    }
+
+    fn handle_workflow_command(&self, prompt: &str) -> Result<Option<WorkflowStart>> {
+        let command = parse_workflow_command(prompt)?;
+        command
+            .map(|command| {
+                let preflight = preflight_workflow_prerequisites(&self.config)?;
+                Ok(WorkflowStart { command, preflight })
+            })
+            .transpose()
     }
 
     fn handle_goal_command(&mut self, prompt: &str) -> Result<bool> {
@@ -653,6 +1087,257 @@ impl App {
         Ok(true)
     }
 
+    fn handle_queue_command(&mut self, prompt: &str) -> Result<bool> {
+        let Some(message) = parse_queue_command(prompt)? else {
+            return Ok(false);
+        };
+        let item = QueuedFollowUp::new(message);
+        let view = item.to_view();
+        self.follow_up_queue.push_back(item);
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_queued",
+            json!({
+                "id": view.id,
+                "prompt": view.prompt,
+                "created_at": view.created_at,
+                "status": view.status,
+            }),
+            format!("Queued follow-up: {}", single_line_event_text(&view.prompt)),
+        )?;
+        Ok(true)
+    }
+
+    /// Drive a run to its terminal/waiting state, then replay or pause queued
+    /// follow-ups based on how the run ended.
+    async fn drive_and_replay(
+        &mut self,
+        run: RunDriveContext,
+        resume: Option<StepResume>,
+    ) -> Result<()> {
+        self.drive_run(run, resume).await?;
+        self.react_to_run_end_for_queue().await
+    }
+
+    /// Replay is only safe immediately after a clean completed Run with no
+    /// outstanding user input and no active Run.
+    fn can_replay_now(&self) -> bool {
+        matches!(self.state.run_state, RunState::Completed)
+            && self.state.active_run_id.is_none()
+            && self.pending_approval.is_none()
+            && self.pending_clarification.is_none()
+    }
+
+    /// React to the Run that just ended: drain queued follow-ups FIFO after a
+    /// clean completion (chaining across each replayed Run's completion), or
+    /// pause the oldest pending item after a non-clean ending. Replays at most
+    /// one item per completed Run and preserves the one-active-Run invariant.
+    async fn react_to_run_end_for_queue(&mut self) -> Result<()> {
+        loop {
+            if self.can_replay_now() {
+                let Some(prompt) = self.pop_oldest_pending_for_replay()? else {
+                    break;
+                };
+                let run = self.build_follow_up_run(prompt)?;
+                self.drive_run(run, None).await?;
+            } else if matches!(
+                self.state.run_state,
+                RunState::Failed
+                    | RunState::Interrupted
+                    | RunState::LimitReached
+                    | RunState::WaitingForUser
+            ) {
+                self.pause_oldest_pending_for_queue()?;
+                break;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn first_pending_index(&self) -> Option<usize> {
+        self.follow_up_queue
+            .iter()
+            .position(|item| item.status == QueuedFollowUpStatus::Pending)
+    }
+
+    /// Remove the oldest pending follow-up and record that it began replaying.
+    /// The item leaves the queue because it becomes a normal Run.
+    fn pop_oldest_pending_for_replay(&mut self) -> Result<Option<String>> {
+        let Some(index) = self.first_pending_index() else {
+            return Ok(None);
+        };
+        let item = self
+            .follow_up_queue
+            .remove(index)
+            .expect("first_pending_index returns a valid index");
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_replay_started",
+            json!({
+                "id": item.id,
+                "prompt": item.prompt,
+            }),
+            format!(
+                "Replaying queued follow-up: {}",
+                single_line_event_text(&item.prompt)
+            ),
+        )?;
+        Ok(Some(item.prompt))
+    }
+
+    /// Pause the oldest pending follow-up with a reason describing the unsafe
+    /// Run ending. No-op when nothing is pending.
+    fn pause_oldest_pending_for_queue(&mut self) -> Result<()> {
+        let reason = self.queue_pause_reason();
+        let Some(index) = self.first_pending_index() else {
+            return Ok(());
+        };
+        let item = &mut self.follow_up_queue[index];
+        item.status = QueuedFollowUpStatus::Paused;
+        item.pause_reason = Some(reason.to_string());
+        let view = item.to_view();
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_replay_paused",
+            json!({
+                "id": view.id,
+                "prompt": view.prompt,
+                "status": view.status,
+                "pause_reason": reason,
+            }),
+            format!(
+                "Paused queued follow-up ({reason}): {}",
+                single_line_event_text(&view.prompt)
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn queue_pause_reason(&self) -> &'static str {
+        match self.state.run_state {
+            RunState::Failed => "previous run failed",
+            RunState::Interrupted => "previous run interrupted",
+            RunState::LimitReached => "previous run reached a limit",
+            RunState::WaitingForUser => {
+                if self.pending_approval.is_some() {
+                    "run is waiting for action approval"
+                } else if self.pending_clarification.is_some() {
+                    "run is waiting for clarification"
+                } else {
+                    "run is waiting for user"
+                }
+            }
+            _ => "queue paused",
+        }
+    }
+
+    /// Build a normal Run for a replayed follow-up prompt, mirroring the
+    /// run-creation path used by `submit_prompt` for ordinary prompts.
+    fn build_follow_up_run(&mut self, prompt: String) -> Result<RunDriveContext> {
+        let compiled_prompt = compile_app_prompt(&self.config.working_directory, &prompt)?;
+        let visible_prompt = compiled_prompt.user_prompt.clone();
+        let run_prompt = compiled_prompt.user_prompt.clone();
+        let submitted_prompt = compiled_prompt.submitted_prompt.clone();
+
+        self.reset_enabled_agent_statuses();
+        let run_id = new_id();
+        self.state.active_run_id = Some(run_id.clone());
+        self.state.run_state = RunState::Planning;
+        self.record_event(
+            Some(run_id.clone()),
+            None,
+            "run_started",
+            json!({ "run_id": run_id }),
+            "Run started.",
+        )?;
+        self.record_event(
+            Some(run_id.clone()),
+            None,
+            "prompt_submitted",
+            json!({
+                "prompt": visible_prompt.clone(),
+                "submitted_prompt": submitted_prompt.clone(),
+            }),
+            user_event_display(&visible_prompt),
+        )?;
+        self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
+        Ok(RunDriveContext::new(
+            run_id,
+            None,
+            submitted_prompt,
+            run_prompt,
+            compiled_prompt.skill_context,
+            None,
+            None,
+        ))
+    }
+
+    /// Cancel a queued follow-up before it begins replaying.
+    fn cancel_follow_up(&mut self, id: &str) -> Result<()> {
+        let Some(item) = self.follow_up_queue.iter_mut().find(|item| item.id == id) else {
+            bail!("no queued follow-up with id {id}");
+        };
+        if item.status == QueuedFollowUpStatus::Cancelled {
+            return Ok(());
+        }
+        item.status = QueuedFollowUpStatus::Cancelled;
+        item.pause_reason = None;
+        let view = item.to_view();
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_cancelled",
+            json!({
+                "id": view.id,
+                "prompt": view.prompt,
+                "status": view.status,
+            }),
+            format!(
+                "Cancelled queued follow-up: {}",
+                single_line_event_text(&view.prompt)
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Resume a paused follow-up, making it eligible for replay again.
+    fn resume_follow_up(&mut self, id: &str) -> Result<()> {
+        let Some(item) = self.follow_up_queue.iter_mut().find(|item| item.id == id) else {
+            bail!("no queued follow-up with id {id}");
+        };
+        if item.status != QueuedFollowUpStatus::Paused {
+            bail!("queued follow-up {id} is not paused");
+        }
+        item.status = QueuedFollowUpStatus::Pending;
+        item.pause_reason = None;
+        let view = item.to_view();
+        self.sync_queued_follow_ups();
+        self.record_event(
+            self.state.active_run_id.clone(),
+            None,
+            "follow_up_replay_resumed",
+            json!({
+                "id": view.id,
+                "prompt": view.prompt,
+                "status": view.status,
+            }),
+            format!(
+                "Resumed queued follow-up: {}",
+                single_line_event_text(&view.prompt)
+            ),
+        )?;
+        Ok(())
+    }
+
     async fn handle_subtask_command(&mut self, prompt: &str) -> Result<bool> {
         let trimmed = prompt.trim();
         if !trimmed.starts_with("/subtask") {
@@ -680,13 +1365,15 @@ impl App {
         if !agent.enabled {
             bail!("subtask references disabled agent {agent_id}");
         }
+        let compiled_task = compile_app_prompt(&self.config.working_directory, task)?;
 
         self.reset_enabled_agent_statuses();
         let run_id = new_id();
         let parent_run_id = self.state.active_run_id.clone();
         self.state.active_run_id = Some(run_id.clone());
         self.state.run_state = RunState::Running;
-        let prompt = subtask_prompt(task);
+        let submitted_prompt = subtask_prompt(&compiled_task.submitted_prompt);
+        let prompt = subtask_prompt(&compiled_task.user_prompt);
         self.record_event(
             Some(run_id.clone()),
             None,
@@ -695,24 +1382,26 @@ impl App {
                 "run_id": run_id,
                 "parent_run_id": parent_run_id,
                 "agent": agent_id,
-                "request": task,
+                "request": compiled_task.user_prompt.clone(),
+                "submitted_request": compiled_task.submitted_prompt.clone(),
             }),
             format!("Subtask started: {agent_id}."),
         )?;
-        let run = RunDriveContext {
+        self.record_skills_loaded(run_id.as_str(), compiled_task.skill_context.as_ref())?;
+        let run = RunDriveContext::new(
             run_id,
             parent_run_id,
+            submitted_prompt,
             prompt,
-            subtask: Some(SubtaskContext {
+            compiled_task.skill_context,
+            Some(SubtaskContext {
                 agent_id: agent.id.clone(),
-                request: task.to_string(),
+                request: compiled_task.user_prompt,
+                submitted_request: compiled_task.submitted_prompt,
             }),
-            previous_results: Vec::new(),
-            step_count: 0,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
-        self.drive_run(run, None).await
+            None,
+        );
+        self.drive_and_replay(run, None).await
     }
 
     pub async fn resolve_pending_approval(
@@ -742,12 +1431,14 @@ impl App {
             self.stop_for_wall_clock_limit(&pending.run)?;
             self.write_run_record(&pending.run)?;
             self.state.active_run_id = None;
+            self.pause_oldest_pending_for_queue()?;
             return Ok(None);
         }
         if self.step_time_limit_reached(pending.step_started_at) {
             self.stop_for_step_time_limit(&pending.run, &pending.step_id, pending.step_started_at)?;
             self.write_run_record(&pending.run)?;
             self.state.active_run_id = None;
+            self.pause_oldest_pending_for_queue()?;
             return Ok(None);
         }
 
@@ -779,6 +1470,7 @@ impl App {
                 )?;
                 self.write_run_record(&pending.run)?;
                 self.state.active_run_id = None;
+                self.pause_oldest_pending_for_queue()?;
                 return Ok(None);
             };
             result
@@ -808,8 +1500,57 @@ impl App {
             step_started_at: pending.step_started_at,
             request: pending.request,
         };
-        self.drive_run(pending.run, Some(resume)).await?;
+        self.drive_and_replay(pending.run, Some(resume)).await?;
         Ok(Some(result))
+    }
+
+    pub async fn resolve_pending_clarification(
+        &mut self,
+        answer: ClarificationAnswer,
+    ) -> Result<()> {
+        let Some(clarification_view) = &self.state.pending_clarification else {
+            bail!("no clarification is pending");
+        };
+
+        if answer.question_id != clarification_view.question_id {
+            return Err(anyhow!(
+                "answer question id does not match pending clarification (expected: {}, got: {})",
+                clarification_view.question_id,
+                answer.question_id
+            ));
+        }
+
+        if answer.answer.trim().is_empty() {
+            return Err(anyhow!("clarification answer cannot be empty"));
+        }
+
+        let Some(pending) = self.pending_clarification.take() else {
+            bail!("no clarification is pending");
+        };
+
+        self.record_event(
+            Some(pending.run.run_id.clone()),
+            None,
+            "clarification_answered",
+            json!({
+                "question_id": answer.question_id.clone(),
+                "answer": answer.answer.clone(),
+                "answer_source": answer.answer_source.clone(),
+                "selected_option_id": answer.selected_option_id.clone(),
+                "selected_option_label": answer.selected_option_label.clone(),
+            }),
+            user_event_display(&answer.answer),
+        )?;
+
+        let mut run = pending.run;
+        run.prompt = format!("{}\n\nUser clarification: {}", run.prompt, answer.answer);
+
+        self.state.pending_clarification = None;
+        self.state.run_state = RunState::Planning;
+        self.publish_state();
+
+        self.drive_and_replay(run, None).await?;
+        Ok(())
     }
 
     pub fn interrupt(&mut self) -> Result<()> {
@@ -840,12 +1581,14 @@ impl App {
             self.state.live_step = None;
             self.state.live_steps.clear();
             self.state.pending_approval = None;
+            self.state.pending_clarification = None;
             self.pending_approval = None;
             self.pending_clarification = None;
             self.active_step = None;
             self.active_steps.clear();
             self.sync_chat_items();
             self.publish_state();
+            self.pause_oldest_pending_for_queue()?;
         }
         Ok(())
     }
@@ -857,6 +1600,12 @@ impl App {
     ) -> Result<()> {
         let drive_result = self.drive_run_inner(&mut run, resume).await;
         if drive_result.is_ok() {
+            if !matches!(self.state.run_state, RunState::WaitingForUser) {
+                self.record_workflow_completed(
+                    &mut run,
+                    matches!(self.state.run_state, RunState::Interrupted),
+                )?;
+            }
             self.write_run_record(&run)?;
             if !matches!(self.state.run_state, RunState::WaitingForUser) {
                 self.state.active_run_id = None;
@@ -962,18 +1711,36 @@ impl App {
             DecisionStatus::WaitingForUser => {
                 self.state.run_state = RunState::WaitingForUser;
                 self.pending_clarification = Some(PendingClarification { run: run.clone() });
+                let question = decision
+                    .clarifying_question
+                    .clone()
+                    .context("validated waiting_for_user decision missing clarifying_question")?;
+                let view = PendingClarificationView {
+                    run_id: run.run_id.clone(),
+                    question_id: new_id(),
+                    question,
+                    options: decision.clarifying_options.clone(),
+                    recommended_option_id: decision.recommended_option_id.clone(),
+                };
+                self.state.pending_clarification = Some(view.clone());
                 self.set_agent_status("orchestrator", "waiting_for_user");
                 self.record_event(
                     Some(run.run_id.clone()),
                     None,
-                    "blocker_reported",
-                    json!({ "question": decision.clarifying_question }),
+                    "clarification_requested",
+                    json!({
+                        "question_id": view.question_id,
+                        "question": view.question,
+                        "options": view.options,
+                        "recommended_option_id": view.recommended_option_id,
+                    }),
                     "Orchestrator asked a clarifying question.",
                 )?;
                 Ok(false)
             }
             DecisionStatus::Complete => {
                 self.state.run_state = RunState::Completed;
+                self.record_workflow_completed(run, false)?;
                 self.record_event(
                     Some(run.run_id.clone()),
                     None,
@@ -985,6 +1752,7 @@ impl App {
             }
             DecisionStatus::Failed => {
                 self.state.run_state = RunState::Failed;
+                self.record_workflow_completed(run, false)?;
                 self.record_event(
                     Some(run.run_id.clone()),
                     None,
@@ -1083,6 +1851,18 @@ impl App {
         )?;
 
         let child_specs = self.prepare_parallel_children(run, &group)?;
+        if let Some(workflow) = run.workflow.as_mut() {
+            for child in &child_specs {
+                workflow.record_planned_targets(
+                    &group.group_id,
+                    Some(&child.step_id),
+                    &child.step_label,
+                    &child.file_scope,
+                    &self.config.working_directory,
+                    &self.config.workspace.extra_write_roots,
+                )?;
+            }
+        }
         let (sender, mut receiver) =
             mpsc::channel(RUNTIME_EVENT_CHANNEL_CAPACITY * child_specs.len().max(1));
         let resume_handle = ParallelRuntimeResumeHandle {
@@ -1367,6 +2147,7 @@ impl App {
         self.sync_chat_items();
         self.publish_state();
         if interrupted {
+            self.record_workflow_completed(run, true)?;
             return Ok(AgentStepOutcome::Stop);
         }
         Ok(AgentStepOutcome::Completed)
@@ -1438,10 +2219,11 @@ impl App {
             }
             let agent = self.agent(&step.agent)?.clone();
             run.step_count += 1;
+            let prompt = parallel_child_prompt(&run.prompt, step);
             let mut request = self.runtime_request(
                 &run.run_id,
                 &step_id,
-                &parallel_child_prompt(&run.prompt, step),
+                RuntimePrompt::new(&prompt, run.skill_context.as_ref()),
                 agent,
                 run.previous_results.clone(),
                 "agent_result",
@@ -1507,7 +2289,7 @@ impl App {
             workspace: self.config.workspace.clone(),
             approval_mode: self.config.approval_mode.clone(),
             command_timeout: command_timeout(&self.config.limits.max_command_minutes),
-            user_prompt: Some(child.request.prompt.clone()),
+            user_prompt: Some(run.prompt.clone()),
             action_scope: crate::actions::ActionScope::ParallelFileScope(child.file_scope.clone()),
         };
         self.record_command_started_if_executable_with_group(
@@ -1798,7 +2580,7 @@ impl App {
 
     fn record_parallel_child_result(
         &mut self,
-        run: &RunDriveContext,
+        run: &mut RunDriveContext,
         group_id: &str,
         child: &mut ParallelChildRuntimeState,
         result: AgentResult,
@@ -1851,6 +2633,16 @@ impl App {
                 LiveStepStatus::Failed
             },
         );
+        if let Some(workflow) = run.workflow.as_mut() {
+            workflow.record_child_result(
+                group_id,
+                &child.step_id,
+                &child.file_scope,
+                &result,
+                &self.config.working_directory,
+                &self.config.workspace.extra_write_roots,
+            )?;
+        }
         child.terminal_result = Some(result);
         child.result_recorded = true;
         Ok(())
@@ -1895,7 +2687,7 @@ impl App {
             let request = self.runtime_request(
                 &run.run_id,
                 &step_id,
-                &run.prompt,
+                RuntimePrompt::new(&run.prompt, run.skill_context.as_ref()),
                 orchestrator,
                 run.previous_results.clone(),
                 "orchestrator_decision",
@@ -2040,7 +2832,7 @@ impl App {
             let request = self.runtime_request(
                 &run.run_id,
                 &step_id,
-                &run.prompt,
+                RuntimePrompt::new(&run.prompt, run.skill_context.as_ref()),
                 agent,
                 run.previous_results.clone(),
                 "agent_result",
@@ -2209,7 +3001,7 @@ impl App {
             let request = self.runtime_request(
                 &run.run_id,
                 &step_id,
-                &prompt,
+                RuntimePrompt::new(&prompt, run.skill_context.as_ref()),
                 agent,
                 run.previous_results.clone(),
                 "agent_result",
@@ -2419,10 +3211,14 @@ impl App {
             run_id: run.run_id.clone(),
             parent_run_id: run.parent_run_id.clone(),
             session_id: self.history.session_id().to_string(),
+            submitted_prompt: run.submitted_prompt.clone(),
             prompt: run.prompt.clone(),
+            loaded_skills: run.loaded_skill_metadata(),
             session_goal: self.state.session_goal.clone(),
+            workflow: run.workflow.clone(),
             subtask: run.subtask.as_ref().map(|subtask| SubtaskRecord {
                 agent_id: subtask.agent_id.clone(),
+                submitted_request: subtask.submitted_request.clone(),
                 request: subtask.request.clone(),
             }),
             state: self.state.run_state.clone(),
@@ -2752,7 +3548,7 @@ impl App {
         &self,
         run_id: &str,
         step_id: &str,
-        prompt: &str,
+        prompt: RuntimePrompt<'_>,
         agent_profile: AgentProfile,
         previous_results: Vec<RunStepResult>,
         output_schema: &str,
@@ -2761,10 +3557,11 @@ impl App {
         if agent_profile.id == "orchestrator" {
             agent_profile.instructions = build_orchestrator_prompt(&self.config);
         }
+        let prompt = skills::render_runtime_prompt(prompt.skill_context, prompt.text);
         Ok(RuntimeRequest {
             run_id: run_id.to_string(),
             step_id: step_id.to_string(),
-            prompt: prompt.to_string(),
+            prompt,
             session_goal: self.state.session_goal.clone(),
             working_directory: self.config.working_directory.clone(),
             capability_constraints: agent_profile.capabilities.clone(),
@@ -2948,7 +3745,7 @@ impl App {
                         workspace: self.config.workspace.clone(),
                         approval_mode: self.config.approval_mode.clone(),
                         command_timeout: command_timeout(&self.config.limits.max_command_minutes),
-                        user_prompt: Some(request.prompt.clone()),
+                        user_prompt: Some(run.prompt.clone()),
                         action_scope: crate::actions::ActionScope::Unrestricted,
                     };
                     self.record_command_started_if_executable(
@@ -3126,6 +3923,46 @@ impl App {
         self.record_event_with_group(run_id, None, step_id, kind, payload, display)
     }
 
+    fn record_skills_loaded(
+        &mut self,
+        run_id: &str,
+        skill_context: Option<&SkillPromptContext>,
+    ) -> Result<()> {
+        let Some(skill_context) = skill_context.filter(|context| !context.loaded.is_empty()) else {
+            return Ok(());
+        };
+        let metadata = skill_context.metadata();
+        self.record_event(
+            Some(run_id.to_string()),
+            None,
+            "skills_loaded",
+            skills_loaded_payload_from_metadata(&metadata),
+            loaded_skills_display(&metadata),
+        )
+    }
+
+    fn record_workflow_completed(
+        &mut self,
+        run: &mut RunDriveContext,
+        interrupted: bool,
+    ) -> Result<()> {
+        let Some(workflow) = run.workflow.as_mut() else {
+            return Ok(());
+        };
+        if workflow.completion_recorded {
+            return Ok(());
+        }
+        let payload = workflow.completion_payload(&run.run_id, interrupted);
+        workflow.completion_recorded = true;
+        self.record_event(
+            Some(run.run_id.clone()),
+            None,
+            "workflow_completed",
+            serde_json::to_value(payload)?,
+            "Workflow completed.",
+        )
+    }
+
     fn record_event_with_group(
         &mut self,
         run_id: Option<String>,
@@ -3183,13 +4020,44 @@ impl App {
             .apply_live_steps(&self.state.live_steps);
         self.chat_projection
             .apply_pending_approval(self.state.pending_approval.as_ref());
-        self.state.chat_items = self.chat_projection.items().to_vec();
+        // The welcome item is prepended (not part of the projection) so it stays
+        // first and stable across re-syncs (ADR-005).
+        let mut items = Vec::with_capacity(self.chat_projection.items().len() + 1);
+        items.push(ChatItemView::welcome());
+        items.extend(self.chat_projection.items().iter().cloned());
+        self.state.chat_items = items;
+    }
+
+    fn sync_queued_follow_ups(&mut self) {
+        self.state.queued_follow_ups = self
+            .follow_up_queue
+            .iter()
+            .map(QueuedFollowUp::to_view)
+            .collect();
     }
 
     fn publish_state(&self) {
         if let Some(sender) = &self.state_sender {
             let _ = sender.send(self.state.clone());
         }
+    }
+
+    /// Apply a freshly fetched git context, publishing a state update only when
+    /// the value changed (ADR-006 change gate). Returns whether it published.
+    fn set_git_context(&mut self, context: Option<GitContext>) -> bool {
+        if self.state.git_context == context {
+            return false;
+        }
+        self.state.git_context = context;
+        self.publish_state();
+        true
+    }
+
+    /// Fetch the working directory's git context and apply it through the change
+    /// gate. Driven by the startup refresh, the 5s poll, and prompt submission.
+    pub(crate) async fn refresh_git_context(&mut self) {
+        let context = fetch_git_context(&self.config.working_directory).await;
+        self.set_git_context(context);
     }
 
     fn record_action_completed(
@@ -3368,6 +4236,7 @@ impl App {
         )?;
         self.state.active_run_id = None;
         self.state.pending_approval = None;
+        self.state.pending_clarification = None;
         self.pending_approval = None;
         self.pending_clarification = None;
         if self
@@ -4717,6 +5586,28 @@ fn user_event_display(message: &str) -> String {
     format!("You: {}", single_line_event_text(message))
 }
 
+fn compile_app_prompt(working_directory: &Path, prompt: &str) -> Result<CompiledPrompt> {
+    skills::compile_prompt(working_directory, prompt)
+        .map_err(|error| anyhow!(skill_load_diagnostic(&error)))
+}
+
+fn skill_load_diagnostic(error: &SkillLoadError) -> String {
+    format!("failed to load skill reference: {error}")
+}
+
+fn skills_loaded_payload_from_metadata(metadata: &[LoadedSkillMetadata]) -> Value {
+    json!({ "skills": metadata })
+}
+
+fn loaded_skills_display(metadata: &[LoadedSkillMetadata]) -> String {
+    let skills = metadata
+        .iter()
+        .map(|skill| format!("{} ({})", skill.display_name, skill.source_origin))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Skills loaded: {skills}.")
+}
+
 fn config_status_display(status: &ConfigStatusView) -> String {
     let sources = status.sources.join(", ");
     let preset = status.preset.as_deref().unwrap_or("none");
@@ -4728,6 +5619,189 @@ fn config_status_display(status: &ConfigStatusView) -> String {
             status.warnings.join("; ")
         )
     }
+}
+
+fn parse_workflow_command(input: &str) -> Result<Option<WorkflowCommand>> {
+    let trimmed = input.trim();
+    if trimmed == WORKFLOW_COMMAND {
+        bail!(WORKFLOW_USAGE);
+    }
+    let Some(rest) = trimmed.strip_prefix(WORKFLOW_COMMAND) else {
+        return Ok(None);
+    };
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return Ok(None);
+    }
+    let prompt = rest.trim();
+    if prompt.is_empty() {
+        bail!(WORKFLOW_USAGE);
+    }
+    Ok(Some(WorkflowCommand {
+        original_command: trimmed.to_string(),
+        prompt: prompt.to_string(),
+    }))
+}
+
+fn preflight_workflow_prerequisites(config: &EffectiveConfig) -> Result<WorkflowPreflight> {
+    if !config.features.parallel_step_groups {
+        bail!(
+            "workflow mode requires Parallel Step Groups; parallel step groups are disabled by features.parallel_step_groups"
+        );
+    }
+    if config.limits.max_parallel_agent_steps == 0 {
+        bail!(
+            "workflow mode requires Parallel Step Groups; parallel step groups are disabled by limits.max_parallel_agent_steps = 0"
+        );
+    }
+    Ok(WorkflowPreflight {
+        parallel_step_groups: config.features.parallel_step_groups,
+        max_parallel_agent_steps: config.limits.max_parallel_agent_steps,
+    })
+}
+
+fn normalize_workflow_target_key(
+    path: &str,
+    working_directory: &Path,
+    extra_write_roots: &[PathBuf],
+) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        bail!("workflow target path is empty");
+    }
+    if trimmed.split('/').any(|component| component == ".") {
+        bail!("current-directory components are not allowed in workflow target path: {path}");
+    }
+
+    let candidate = Path::new(trimmed);
+    let relative = if candidate.is_absolute() {
+        // The path is already validated against the workspace and the configured
+        // extra write roots. Strip whichever base actually matches: an extra
+        // write root can live outside the repo, where stripping the working
+        // directory would fail and abort the whole workflow.
+        let base = std::iter::once(working_directory)
+            .chain(extra_write_roots.iter().map(PathBuf::as_path))
+            .find(|base| candidate.starts_with(base));
+        match base {
+            Some(base) => candidate
+                .strip_prefix(base)
+                .expect("candidate starts_with the matched base"),
+            None => {
+                bail!("absolute paths are not allowed in workflow target paths: {path}")
+            }
+        }
+    } else {
+        candidate
+    };
+
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::ParentDir => {
+                bail!("path traversal is not allowed in workflow target path: {path}")
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                bail!("rooted paths are not allowed in workflow target paths: {path}")
+            }
+            Component::CurDir => {
+                bail!(
+                    "current-directory components are not allowed in workflow target path: {path}"
+                )
+            }
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+        }
+    }
+    if parts.is_empty() {
+        bail!("workflow target path is empty");
+    }
+    Ok(parts.join("/"))
+}
+
+fn workflow_started_payload(run_id: &str, start: &WorkflowStart) -> Value {
+    json!({
+        "run_id": run_id,
+        "original_command": start.command.original_command.as_str(),
+        "user_prompt": start.command.prompt.as_str(),
+        "mode": "workflow",
+        "preflight": &start.preflight,
+    })
+}
+
+fn workflow_target_status_from_agent_result(
+    result: &AgentResult,
+) -> (WorkflowTargetStatus, Option<String>) {
+    match result.status {
+        AgentResultStatus::Completed | AgentResultStatus::NoChanges => {
+            (WorkflowTargetStatus::Completed, None)
+        }
+        AgentResultStatus::Blocked | AgentResultStatus::ApprovalDenied => (
+            WorkflowTargetStatus::Blocked,
+            Some(workflow_result_diagnostic(result)),
+        ),
+        AgentResultStatus::Failed
+        | AgentResultStatus::ParseError
+        | AgentResultStatus::LimitReached
+        | AgentResultStatus::Cancelled => (
+            WorkflowTargetStatus::Failed,
+            Some(workflow_result_diagnostic(result)),
+        ),
+    }
+}
+
+fn workflow_result_diagnostic(result: &AgentResult) -> String {
+    result
+        .blocker
+        .clone()
+        .filter(|diagnostic| !diagnostic.trim().is_empty())
+        .unwrap_or_else(|| result.summary.clone())
+}
+
+fn derive_workflow_completion_status(
+    counts: &WorkflowTargetCounts,
+    unfinished_targets: &[WorkflowUnfinishedTarget],
+    interrupted: bool,
+) -> WorkflowCompletionStatus {
+    // A workflow that finished without interruption and left no planned target
+    // unaccounted for is a success. Having zero declared file-edit targets is
+    // normal for orchestrator-driven runs that write via single-agent actions
+    // (or that legitimately make no edits) — it must NOT be reported as failed.
+    if interrupted || counts.planned > 0 {
+        return WorkflowCompletionStatus::Failed;
+    }
+    if unfinished_targets.is_empty() {
+        WorkflowCompletionStatus::Completed
+    } else {
+        WorkflowCompletionStatus::CompletedWithIssues
+    }
+}
+
+fn workflow_runtime_prompt(
+    command: &WorkflowCommand,
+    user_prompt: &str,
+    preflight: &WorkflowPreflight,
+) -> String {
+    format!(
+        r#"Workflow mode instructions:
+- Treat this as one normal app Run in workflow mode.
+- Decompose the user's broad request into a concrete Run Plan before mutation-capable work.
+- Execute safe specialized-agent steps, using Parallel Step Groups only when file scopes are exact, disjoint, and policy-compliant.
+- Validate completed work with appropriate checks, or explain skipped checks with reasons.
+- Account for planned file-edit targets explicitly: completed, skipped, blocked, or failed.
+- Final synthesis must include plan evidence, child outcomes, changed files, verification evidence, skipped checks, and residual risks.
+
+Workflow preflight:
+- parallel_step_groups: {parallel_step_groups}
+- max_parallel_agent_steps: {max_parallel_agent_steps}
+
+Original command:
+{original_command}
+
+Extracted user prompt:
+{user_prompt}"#,
+        parallel_step_groups = preflight.parallel_step_groups,
+        max_parallel_agent_steps = preflight.max_parallel_agent_steps,
+        original_command = command.original_command,
+        user_prompt = user_prompt,
+    )
 }
 
 fn parse_subtask_command(input: &str) -> Result<(&str, &str)> {
@@ -4742,18 +5816,35 @@ fn parse_subtask_command(input: &str) -> Result<(&str, &str)> {
     Ok((agent.trim(), task))
 }
 
+fn parse_queue_command(prompt: &str) -> Result<Option<String>> {
+    let trimmed = prompt.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(None);
+    }
+    let (command, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((command, rest)) => (command, rest.trim()),
+        None => (trimmed, ""),
+    };
+    if command != "/queue" && command != "/q" {
+        return Ok(None);
+    }
+    if rest.is_empty() {
+        bail!("usage: /queue <message> or /q <message>");
+    }
+    Ok(Some(rest.to_string()))
+}
+
 fn reject_unknown_slash_command(prompt: &str) -> Result<()> {
     let trimmed = prompt.trim();
     if !trimmed.starts_with('/') {
         return Ok(());
     }
-    if is_named_prompt_prefix(trimmed, "/agent:") || is_named_prompt_prefix(trimmed, "/skill:") {
+    if is_named_prompt_prefix(trimmed, "/agent:") || trimmed.starts_with("/skill:") {
         return Ok(());
     }
     let command = trimmed.split_whitespace().next().unwrap_or(trimmed);
-    bail!(
-        "unknown command {command}. Available commands: /help, /goal, /goal clear, /config, /subtask <agent> <task>, /agent:<name>, /skill:<name>"
-    )
+    let available = crate::slash_commands::available_commands_summary();
+    bail!("unknown command {command}. Available commands: {available}")
 }
 
 fn is_named_prompt_prefix(prompt: &str, prefix: &str) -> bool {
@@ -4944,9 +6035,12 @@ fn single_line_event_text(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::chat::{ChatItemKind, ChatItemStatus, ChatSeverity};
+    use crate::app::chat::{ChatItemKind, ChatItemStatus, ChatLifecycleKey, ChatSeverity};
     use crate::config::{load_effective_config, ConfigLoadOptions};
+    use crate::skills::{LoadedSkill, SkillLoadErrorKind};
+    use serde_json::Value;
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn fake_config(dir: &std::path::Path) -> EffectiveConfig {
@@ -4993,6 +6087,1000 @@ runtime = "fake"
         .unwrap()
     }
 
+    fn write_project_skill(
+        project_root: &Path,
+        directory_name: &str,
+        frontmatter_name: Option<&str>,
+        body: &str,
+    ) {
+        let skill_dir = project_root.join(".agents/skills").join(directory_name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        let contents = if let Some(name) = frontmatter_name {
+            format!("---\nname: {name}\ndescription: test skill\n---\n{body}\n")
+        } else {
+            format!("{body}\n")
+        };
+        fs::write(skill_dir.join("SKILL.md"), contents).unwrap();
+    }
+
+    fn test_loaded_skill(display_name: &str, content: &str) -> LoadedSkill {
+        LoadedSkill {
+            metadata: LoadedSkillMetadata {
+                requested_names: vec![display_name.to_string()],
+                display_name: display_name.to_string(),
+                canonical_id: format!(".agents/skills/{display_name}/SKILL.md"),
+                source_origin: ".agents/skills".to_string(),
+                source_path: format!(".agents/skills/{display_name}/SKILL.md"),
+                load_reason: "explicit".to_string(),
+            },
+            content: content.to_string(),
+        }
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    fn chat_item_text(item: &ChatItemView) -> String {
+        let mut text = item.title.clone();
+        if let Some(summary) = item.summary.as_deref() {
+            text.push('\n');
+            text.push_str(summary);
+        }
+        for line in &item.body {
+            text.push('\n');
+            text.push_str(&line.text);
+        }
+        text
+    }
+
+    fn runtime_skill_context(display_name: &str, content: &str) -> SkillPromptContext {
+        SkillPromptContext {
+            loaded: vec![test_loaded_skill(display_name, content)],
+        }
+    }
+
+    #[test]
+    fn run_drive_context_stores_prompt_provenance_and_skill_context_only_in_memory() {
+        let skill_context = SkillPromptContext {
+            loaded: vec![test_loaded_skill(
+                "reviewer",
+                "SENTINEL_FULL_SKILL_BODY_PRIVATE",
+            )],
+        };
+
+        let run = RunDriveContext::new(
+            "run",
+            None,
+            "/skill:reviewer inspect README",
+            "inspect README",
+            Some(skill_context),
+            None,
+            None,
+        );
+
+        assert_eq!(run.submitted_prompt, "/skill:reviewer inspect README");
+        assert_eq!(run.prompt, "inspect README");
+        assert!(!run.prompt.contains("/skill:reviewer"));
+        assert!(!run.prompt.contains("SENTINEL_FULL_SKILL_BODY_PRIVATE"));
+        assert!(!run.prompt.contains("<Skill:"));
+        assert_eq!(
+            run.skill_context
+                .as_ref()
+                .unwrap()
+                .loaded
+                .first()
+                .unwrap()
+                .content,
+            "SENTINEL_FULL_SKILL_BODY_PRIVATE"
+        );
+    }
+
+    #[test]
+    fn skills_loaded_payload_serializes_loaded_skill_metadata_only() {
+        let skill = test_loaded_skill("reviewer", "SENTINEL_FULL_SKILL_BODY_PRIVATE");
+
+        let payload = skills_loaded_payload_from_metadata(&[skill.metadata]);
+
+        let loaded = payload["skills"].as_array().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0]["requested_names"], json!(["reviewer"]));
+        assert_eq!(loaded[0]["display_name"], "reviewer");
+        assert_eq!(
+            loaded[0]["canonical_id"],
+            ".agents/skills/reviewer/SKILL.md"
+        );
+        assert_eq!(loaded[0]["source_origin"], ".agents/skills");
+        assert_eq!(loaded[0]["source_path"], ".agents/skills/reviewer/SKILL.md");
+        assert_eq!(loaded[0]["load_reason"], "explicit");
+        assert!(!payload
+            .to_string()
+            .contains("SENTINEL_FULL_SKILL_BODY_PRIVATE"));
+        assert!(loaded[0].get("content").is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_request_renders_skill_context_once_for_runtime_prompt_shapes() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+        let skill_context =
+            runtime_skill_context("reviewer", "SENTINEL_RUNTIME_SKILL_BODY_PRIVATE");
+        let parallel_step = crate::orchestrator::ParallelChildStepPlan {
+            step_label: "inspect docs".to_string(),
+            agent: "explorer".to_string(),
+            instruction: "Inspect README only.".to_string(),
+            required_capabilities: vec![Capability::Read],
+            file_scope: ParallelFileScope {
+                write_files: Vec::new(),
+                read_roots: vec![".".to_string()],
+            },
+        };
+        let decision = crate::orchestrator::OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: Vec::new(),
+            next_agent: Some(COUNCIL_WORKFLOW_AGENT_ID.to_string()),
+            next_step: None,
+            reason: "High-risk architecture review requested.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Council returns a recommendation.".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            final_summary: None,
+        };
+        let council_member = app
+            .config
+            .council
+            .presets
+            .get("default")
+            .unwrap()
+            .get("architect")
+            .unwrap();
+
+        let cases = vec![
+            (
+                "orchestrator",
+                "inspect README".to_string(),
+                app.agent("orchestrator").unwrap().clone(),
+                "orchestrator_decision",
+                "inspect README",
+            ),
+            (
+                "specialized",
+                "inspect README".to_string(),
+                app.agent("explorer").unwrap().clone(),
+                "agent_result",
+                "inspect README",
+            ),
+            (
+                "parallel",
+                parallel_child_prompt("inspect README", &parallel_step),
+                app.agent("explorer").unwrap().clone(),
+                "agent_result",
+                "Parallel child step:",
+            ),
+            (
+                "council",
+                council_member_prompt("inspect README", &decision),
+                council_member_agent("architect", council_member),
+                "agent_result",
+                "Council review request:",
+            ),
+            (
+                "subtask",
+                subtask_prompt("inspect README"),
+                app.agent("explorer").unwrap().clone(),
+                "agent_result",
+                "Scope guard:",
+            ),
+        ];
+
+        for (label, prompt, agent, output_schema, expected_prompt_text) in cases {
+            let request = app
+                .runtime_request(
+                    "run",
+                    &format!("step-{label}"),
+                    RuntimePrompt::new(&prompt, Some(&skill_context)),
+                    agent,
+                    Vec::new(),
+                    output_schema,
+                )
+                .unwrap();
+
+            assert_eq!(
+                count_occurrences(&request.prompt, "<Skill: reviewer"),
+                1,
+                "{label} request should render one skill section"
+            );
+            assert_eq!(
+                count_occurrences(&request.prompt, "SENTINEL_RUNTIME_SKILL_BODY_PRIVATE"),
+                1,
+                "{label} request should render the skill body once"
+            );
+            assert!(request.prompt.contains("<User Prompt>"));
+            assert!(request.prompt.contains(expected_prompt_text));
+            let envelope = crate::runtime::prompt_envelope_json(&request).unwrap();
+            assert_eq!(
+                count_occurrences(&envelope, "<Skill: reviewer"),
+                1,
+                "{label} envelope should contain one rendered skill section"
+            );
+            assert_eq!(
+                count_occurrences(&envelope, "SENTINEL_RUNTIME_SKILL_BODY_PRIVATE"),
+                1,
+                "{label} envelope should contain the skill body once"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_prompt_helpers_keep_skill_sections_out_of_helper_strings() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "SENTINEL_DERIVED_SKILL_BODY_PRIVATE",
+        );
+        let compiled = compile_app_prompt(dir.path(), "/skill:reviewer inspect README").unwrap();
+        let parallel_step = crate::orchestrator::ParallelChildStepPlan {
+            step_label: "inspect docs".to_string(),
+            agent: "explorer".to_string(),
+            instruction: "Inspect README only.".to_string(),
+            required_capabilities: vec![Capability::Read],
+            file_scope: ParallelFileScope {
+                write_files: Vec::new(),
+                read_roots: vec![".".to_string()],
+            },
+        };
+        let decision = crate::orchestrator::OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: Vec::new(),
+            next_agent: Some(COUNCIL_WORKFLOW_AGENT_ID.to_string()),
+            next_step: None,
+            reason: "High-risk architecture review requested.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Council returns a recommendation.".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            final_summary: None,
+        };
+
+        let prompts = [
+            parallel_child_prompt(&compiled.user_prompt, &parallel_step),
+            council_member_prompt(&compiled.user_prompt, &decision),
+            subtask_prompt(&compiled.user_prompt),
+        ];
+
+        for prompt in prompts {
+            assert!(prompt.contains("inspect README"));
+            assert!(!prompt.contains("/skill:reviewer"));
+            assert!(!prompt.contains("<Skill:"));
+            assert!(!prompt.contains("SENTINEL_DERIVED_SKILL_BODY_PRIVATE"));
+        }
+    }
+
+    #[tokio::test]
+    async fn action_authorization_uses_normalized_prompt_not_rendered_skill_body() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+        let agent = app.agent("fixer").unwrap().clone();
+        let skill_context = runtime_skill_context(
+            "reviewer",
+            "This workflow body mentions commit, but it is not user intent.",
+        );
+        let request = app
+            .runtime_request(
+                "run",
+                "step",
+                RuntimePrompt::new("inspect README", Some(&skill_context)),
+                agent.clone(),
+                Vec::new(),
+                "agent_result",
+            )
+            .unwrap();
+        let action_request = ActionRequest {
+            schema_version: 1,
+            action_id: "commit".to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::RunCommand,
+            params: json!({ "command": "git commit -m test" }),
+        };
+        let normalized_context = ActionExecutionContext {
+            working_directory: app.config.working_directory.clone(),
+            workspace: app.config.workspace.clone(),
+            approval_mode: app.config.approval_mode.clone(),
+            command_timeout: None,
+            user_prompt: Some("inspect README".to_string()),
+            action_scope: crate::actions::ActionScope::Unrestricted,
+        };
+        let rendered_context = ActionExecutionContext {
+            user_prompt: Some(request.prompt.clone()),
+            ..normalized_context.clone()
+        };
+
+        assert!(request.prompt.contains("commit"));
+        assert!(!action_executable_without_approval(
+            &agent,
+            &normalized_context,
+            &action_request
+        ));
+        assert!(action_executable_without_approval(
+            &agent,
+            &rendered_context,
+            &action_request
+        ));
+    }
+
+    #[test]
+    fn skill_load_error_diagnostic_includes_resolver_suggestions() {
+        let error = SkillLoadError {
+            requested_name: "revier".to_string(),
+            kind: SkillLoadErrorKind::Unknown,
+            suggestions: vec!["reviewer".to_string()],
+        };
+
+        let diagnostic = skill_load_diagnostic(&error);
+
+        assert!(diagnostic.contains("failed to load skill reference"));
+        assert!(diagnostic.contains("unknown skill 'revier'"));
+        assert!(diagnostic.contains("Did you mean reviewer?"));
+    }
+
+    #[test]
+    fn workflow_command_parser_extracts_prompt() {
+        let command =
+            parse_workflow_command("/workflow parallel scoped write action create a feature")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            command.prompt,
+            "parallel scoped write action create a feature"
+        );
+        assert_eq!(
+            command.original_command,
+            "/workflow parallel scoped write action create a feature"
+        );
+    }
+
+    #[test]
+    fn workflow_command_parser_rejects_empty_prompt() {
+        for input in ["/workflow", "/workflow     "] {
+            let error = parse_workflow_command(input).unwrap_err();
+
+            assert!(error.to_string().contains(WORKFLOW_USAGE));
+        }
+    }
+
+    #[test]
+    fn workflow_command_parser_does_not_match_longer_slash_command() {
+        assert!(parse_workflow_command("/workflowfoo create a feature")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn workflow_prompt_envelope_includes_user_prompt_and_evidence_requirements() {
+        let command = WorkflowCommand {
+            original_command: "/workflow parallel create a feature".to_string(),
+            prompt: "parallel create a feature".to_string(),
+        };
+        let preflight = WorkflowPreflight {
+            parallel_step_groups: true,
+            max_parallel_agent_steps: 2,
+        };
+
+        let envelope = workflow_runtime_prompt(&command, &command.prompt, &preflight);
+
+        assert!(envelope.contains("Workflow mode instructions"));
+        assert!(envelope.contains("Decompose the user's broad request"));
+        assert!(envelope.contains("Execute safe specialized-agent steps"));
+        assert!(envelope.contains("Validate completed work"));
+        assert!(envelope.contains("planned file-edit targets"));
+        assert!(envelope.contains("verification evidence"));
+        assert!(envelope.contains("Extracted user prompt:\nparallel create a feature"));
+    }
+
+    #[test]
+    fn workflow_started_payload_includes_mode_and_preflight_details() {
+        let start = WorkflowStart {
+            command: WorkflowCommand {
+                original_command: "/workflow migrate auth module".to_string(),
+                prompt: "migrate auth module".to_string(),
+            },
+            preflight: WorkflowPreflight {
+                parallel_step_groups: true,
+                max_parallel_agent_steps: 2,
+            },
+        };
+
+        let payload = workflow_started_payload("run-123", &start);
+
+        assert_eq!(payload["run_id"], "run-123");
+        assert_eq!(payload["original_command"], "/workflow migrate auth module");
+        assert_eq!(payload["user_prompt"], "migrate auth module");
+        assert_eq!(payload["mode"], "workflow");
+        assert_eq!(payload["preflight"]["parallel_step_groups"], true);
+        assert_eq!(payload["preflight"]["max_parallel_agent_steps"], 2);
+    }
+
+    fn test_workflow_context() -> WorkflowRunContext {
+        WorkflowRunContext::new(&WorkflowCommand {
+            original_command: "/workflow parallel create a feature".to_string(),
+            prompt: "parallel create a feature".to_string(),
+        })
+    }
+
+    fn workflow_test_scope() -> ParallelFileScope {
+        ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-a.txt".to_string()],
+            read_roots: vec!["src/runtime".to_string()],
+        }
+    }
+
+    fn workflow_test_result(status: AgentResultStatus, summary: &str) -> AgentResult {
+        let mut result = AgentResult::completed("fixer", "step-1", summary);
+        result.status = status;
+        result.summary = summary.to_string();
+        result
+    }
+
+    fn workflow_test_result_with_blocker(
+        status: AgentResultStatus,
+        summary: &str,
+        blocker: &str,
+    ) -> AgentResult {
+        let mut result = workflow_test_result(status, summary);
+        result.blocker = Some(blocker.to_string());
+        result
+    }
+
+    fn workflow_with_planned_test_target(
+        config: &EffectiveConfig,
+        scope: &ParallelFileScope,
+    ) -> WorkflowRunContext {
+        let mut workflow = test_workflow_context();
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "fix scoped file",
+                scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+    }
+
+    fn first_workflow_target<'a>(
+        workflow: &'a WorkflowRunContext,
+        path: &str,
+    ) -> &'a WorkflowTarget {
+        workflow.target_ledger.get(path).unwrap().first().unwrap()
+    }
+
+    #[test]
+    fn workflow_ledger_records_child_write_file_as_planned_target() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let scope = ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-a.txt".to_string()],
+            read_roots: vec!["src/runtime".to_string()],
+        };
+
+        let recorded = workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "fix first scoped file",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        assert_eq!(recorded, 1);
+        let targets = workflow
+            .target_ledger
+            .get("parallel-output/fixer-a.txt")
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].path, "parallel-output/fixer-a.txt");
+        assert_eq!(targets[0].source_group_id, "group-1");
+        assert_eq!(targets[0].source_step_id.as_deref(), Some("step-1"));
+        assert_eq!(targets[0].source_step_label, "fix first scoped file");
+        assert_eq!(targets[0].status, WorkflowTargetStatus::Planned);
+        assert_eq!(targets[0].reason, None);
+    }
+
+    #[test]
+    fn workflow_ledger_ignores_read_only_child_without_write_files() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let scope = ParallelFileScope {
+            write_files: Vec::new(),
+            read_roots: vec!["src/app".to_string()],
+        };
+
+        let recorded = workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-review"),
+                "review app scope",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        assert_eq!(recorded, 0);
+        assert!(workflow.target_ledger.is_empty());
+    }
+
+    #[test]
+    fn workflow_ledger_records_multiple_write_files_with_same_source_metadata() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let scope = ParallelFileScope {
+            write_files: vec![
+                "parallel-output/fixer-a.txt".to_string(),
+                "parallel-output/fixer-b.txt".to_string(),
+            ],
+            read_roots: vec!["src".to_string()],
+        };
+
+        let recorded = workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "fix scoped files",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        assert_eq!(recorded, 2);
+        for path in ["parallel-output/fixer-a.txt", "parallel-output/fixer-b.txt"] {
+            let target = workflow.target_ledger.get(path).unwrap().first().unwrap();
+            assert_eq!(target.source_group_id, "group-1");
+            assert_eq!(target.source_step_id.as_deref(), Some("step-1"));
+            assert_eq!(target.source_step_label, "fix scoped files");
+            assert_eq!(target.status, WorkflowTargetStatus::Planned);
+        }
+    }
+
+    #[test]
+    fn workflow_target_keys_normalize_workspace_relative_paths() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+
+        let key = normalize_workflow_target_key(
+            " parallel-output//nested/fixer-a.txt ",
+            &config.working_directory,
+            &config.workspace.extra_write_roots,
+        )
+        .unwrap();
+
+        assert_eq!(key, "parallel-output/nested/fixer-a.txt");
+    }
+
+    #[test]
+    fn workflow_ledger_retains_duplicate_path_source_evidence_across_groups() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let scope = ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-a.txt".to_string()],
+            read_roots: vec!["src".to_string()],
+        };
+
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "first pass",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_planned_targets(
+                "group-2",
+                Some("step-2"),
+                "second pass",
+                &scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let targets = workflow
+            .target_ledger
+            .get("parallel-output/fixer-a.txt")
+            .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].source_group_id, "group-1");
+        assert_eq!(targets[0].source_step_label, "first pass");
+        assert_eq!(targets[1].source_group_id, "group-2");
+        assert_eq!(targets[1].source_step_label, "second pass");
+    }
+
+    #[test]
+    fn workflow_child_completed_marks_planned_targets_completed() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let mut workflow = workflow_with_planned_test_target(&config, &scope);
+        let result = workflow_test_result(AgentResultStatus::Completed, "done");
+
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &scope,
+                &result,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+        assert_eq!(target.status, WorkflowTargetStatus::Completed);
+        assert_eq!(target.reason, None);
+    }
+
+    #[test]
+    fn workflow_child_no_changes_marks_planned_targets_completed() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let mut workflow = workflow_with_planned_test_target(&config, &scope);
+        let result = workflow_test_result(AgentResultStatus::NoChanges, "validated no changes");
+
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &scope,
+                &result,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+        assert_eq!(target.status, WorkflowTargetStatus::Completed);
+        assert_eq!(target.reason, None);
+    }
+
+    #[test]
+    fn workflow_child_blocked_marks_planned_targets_blocked_with_reason() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let mut workflow = workflow_with_planned_test_target(&config, &scope);
+        let result = workflow_test_result_with_blocker(
+            AgentResultStatus::Blocked,
+            "blocked summary",
+            "scope needs clarification",
+        );
+
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &scope,
+                &result,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+        assert_eq!(target.status, WorkflowTargetStatus::Blocked);
+        assert_eq!(target.reason.as_deref(), Some("scope needs clarification"));
+    }
+
+    #[test]
+    fn workflow_child_approval_denied_marks_planned_targets_blocked_with_reason() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let mut workflow = workflow_with_planned_test_target(&config, &scope);
+        let result = workflow_test_result_with_blocker(
+            AgentResultStatus::ApprovalDenied,
+            "approval stopped",
+            "user denied action approval",
+        );
+
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &scope,
+                &result,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+        assert_eq!(target.status, WorkflowTargetStatus::Blocked);
+        assert_eq!(
+            target.reason.as_deref(),
+            Some("user denied action approval")
+        );
+    }
+
+    #[test]
+    fn workflow_child_failed_statuses_mark_planned_targets_failed() {
+        for status in [
+            AgentResultStatus::Failed,
+            AgentResultStatus::ParseError,
+            AgentResultStatus::LimitReached,
+            AgentResultStatus::Cancelled,
+        ] {
+            let dir = tempdir().unwrap();
+            let config = fake_parallel_config(dir.path());
+            let scope = workflow_test_scope();
+            let mut workflow = workflow_with_planned_test_target(&config, &scope);
+            let result =
+                workflow_test_result_with_blocker(status, "failed summary", "terminal diagnostic");
+
+            workflow
+                .record_child_result(
+                    "group-1",
+                    "step-1",
+                    &scope,
+                    &result,
+                    &config.working_directory,
+                    &config.workspace.extra_write_roots,
+                )
+                .unwrap();
+
+            let target = first_workflow_target(&workflow, "parallel-output/fixer-a.txt");
+            assert_eq!(target.status, WorkflowTargetStatus::Failed);
+            assert_eq!(target.reason.as_deref(), Some("terminal diagnostic"));
+        }
+    }
+
+    #[test]
+    fn workflow_completion_status_derives_completed_with_issues_for_terminal_unfinished_targets() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let completed_scope = ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-a.txt".to_string()],
+            read_roots: vec!["src/runtime".to_string()],
+        };
+        let blocked_scope = ParallelFileScope {
+            write_files: vec!["parallel-output/fixer-b.txt".to_string()],
+            read_roots: vec!["src/app".to_string()],
+        };
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-1"),
+                "fix first scoped file",
+                &completed_scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-2"),
+                "fix second scoped file",
+                &blocked_scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-1",
+                &completed_scope,
+                &workflow_test_result(AgentResultStatus::Completed, "done"),
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-2",
+                &blocked_scope,
+                &workflow_test_result_with_blocker(
+                    AgentResultStatus::Blocked,
+                    "blocked",
+                    "blocked by dependency",
+                ),
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let payload = workflow.completion_payload("run-1", false);
+
+        assert_eq!(
+            payload.status,
+            WorkflowCompletionStatus::CompletedWithIssues
+        );
+        assert_eq!(payload.target_counts.completed, 1);
+        assert_eq!(payload.target_counts.blocked, 1);
+        assert_eq!(payload.unfinished_targets.len(), 1);
+        assert_eq!(
+            payload.unfinished_targets[0].path,
+            "parallel-output/fixer-b.txt"
+        );
+    }
+
+    #[test]
+    fn workflow_completion_status_derives_failed_for_unaccounted_planned_targets() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let scope = workflow_test_scope();
+        let workflow = workflow_with_planned_test_target(&config, &scope);
+
+        let payload = workflow.completion_payload("run-1", false);
+
+        assert_eq!(payload.status, WorkflowCompletionStatus::Failed);
+        assert_eq!(payload.target_counts.planned, 1);
+        assert_eq!(payload.unfinished_targets.len(), 1);
+        assert_eq!(
+            payload.unfinished_targets[0].reason,
+            "planned target did not receive terminal workflow evidence"
+        );
+    }
+
+    #[test]
+    fn workflow_completion_status_completes_when_no_targets_were_declared() {
+        // Orchestrator-driven runs that write via single-agent actions (or make
+        // no edits) declare no parallel file-scope targets. A clean, finished
+        // run with zero targets is a success, not a failure.
+        let counts = WorkflowTargetCounts {
+            planned: 0,
+            completed: 0,
+            skipped: 0,
+            blocked: 0,
+            failed: 0,
+        };
+
+        let status = derive_workflow_completion_status(&counts, &[], false);
+
+        assert_eq!(status, WorkflowCompletionStatus::Completed);
+    }
+
+    #[test]
+    fn workflow_target_key_normalizes_external_write_root_without_erroring() {
+        // Regression: an absolute write_file under an extra write root OUTSIDE
+        // the workspace previously aborted the whole workflow because the key
+        // was stripped against the working directory (not a prefix). It must
+        // normalize against the matching root instead.
+        let working_directory = Path::new("/workspace/repo");
+        let extra_write_roots = vec![PathBuf::from("/var/out")];
+
+        let key = normalize_workflow_target_key(
+            "/var/out/reports/summary.md",
+            working_directory,
+            &extra_write_roots,
+        )
+        .unwrap();
+
+        assert_eq!(key, "reports/summary.md");
+    }
+
+    #[test]
+    fn workflow_target_key_rejects_absolute_path_under_no_allowed_root() {
+        let working_directory = Path::new("/workspace/repo");
+
+        let error = normalize_workflow_target_key(
+            "/etc/passwd",
+            working_directory,
+            &[PathBuf::from("/var/out")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("absolute paths are not allowed"));
+    }
+
+    #[test]
+    fn workflow_completion_payload_includes_unfinished_blocked_and_failed_reasons() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut workflow = test_workflow_context();
+        let blocked_scope = ParallelFileScope {
+            write_files: vec!["parallel-output/blocked.txt".to_string()],
+            read_roots: vec!["src/runtime".to_string()],
+        };
+        let failed_scope = ParallelFileScope {
+            write_files: vec!["parallel-output/failed.txt".to_string()],
+            read_roots: vec!["src/app".to_string()],
+        };
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-blocked"),
+                "blocked scoped file",
+                &blocked_scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_planned_targets(
+                "group-1",
+                Some("step-failed"),
+                "failed scoped file",
+                &failed_scope,
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-blocked",
+                &blocked_scope,
+                &workflow_test_result_with_blocker(
+                    AgentResultStatus::Blocked,
+                    "blocked",
+                    "waiting on user decision",
+                ),
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+        workflow
+            .record_child_result(
+                "group-1",
+                "step-failed",
+                &failed_scope,
+                &workflow_test_result_with_blocker(
+                    AgentResultStatus::Failed,
+                    "failed",
+                    "test command failed",
+                ),
+                &config.working_directory,
+                &config.workspace.extra_write_roots,
+            )
+            .unwrap();
+
+        let payload = workflow.completion_payload("run-1", false);
+        let reasons = payload
+            .unfinished_targets
+            .iter()
+            .map(|target| (target.path.as_str(), target.reason.as_str()))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            reasons.get("parallel-output/blocked.txt").copied(),
+            Some("waiting on user decision")
+        );
+        assert_eq!(
+            reasons.get("parallel-output/failed.txt").copied(),
+            Some("test command failed")
+        );
+    }
+
     fn fake_parallel_config(dir: &std::path::Path) -> EffectiveConfig {
         let config_path = dir.join("multiagent.toml");
         fs::write(
@@ -5032,6 +7120,21 @@ runtime = "fake"
             config_path: Some(config_path),
         })
         .unwrap()
+    }
+
+    fn assert_no_workflow_run_start_events(events: &[HistoryEvent]) {
+        assert!(events.iter().all(|event| {
+            event.kind != "run_started"
+                && event.kind != "workflow_started"
+                && event.kind != "prompt_submitted"
+        }));
+    }
+
+    fn workflow_completed_event(events: &[HistoryEvent]) -> &HistoryEvent {
+        events
+            .iter()
+            .find(|event| event.kind == "workflow_completed")
+            .unwrap()
     }
 
     fn fake_parallel_normal_approval_config(dir: &std::path::Path) -> EffectiveConfig {
@@ -5500,6 +7603,9 @@ prompt = "{reviewer_prompt}"
             "created by fake runtime\n"
         );
         let events = app.history.read_events().unwrap();
+        assert!(!events.iter().any(|event| {
+            event.kind == "workflow_started" || event.kind == "workflow_completed"
+        }));
         let joined = events
             .iter()
             .find(|event| event.kind == "parallel_group_joined")
@@ -5899,16 +8005,8 @@ prompt = "{reviewer_prompt}"
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
-        let run = RunDriveContext {
-            run_id: "run".to_string(),
-            parent_run_id: None,
-            prompt: "prompt".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 1,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+        let mut run = RunDriveContext::new("run", None, "prompt", "prompt", None, None, None);
+        run.step_count = 1;
 
         app.set_active_step("run", "step", "explorer");
         app.record_runtime_stream_deltas(
@@ -6029,16 +8127,9 @@ prompt = "{reviewer_prompt}"
         let mut app = App::new(config).await.unwrap();
         app.state.active_run_id = Some("run".to_string());
         app.set_active_step("run", "step", "explorer");
-        let run = RunDriveContext {
-            run_id: "run".to_string(),
-            parent_run_id: None,
-            prompt: "slow stream".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 1,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+        let mut run =
+            RunDriveContext::new("run", None, "slow stream", "slow stream", None, None, None);
+        run.step_count = 1;
         let elapsed = tokio::time::timeout(Duration::ZERO, pending::<Result<RuntimeOutput>>())
             .await
             .unwrap_err();
@@ -6207,16 +8298,8 @@ prompt = "{reviewer_prompt}"
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
-        let mut run = RunDriveContext {
-            run_id: "run".to_string(),
-            parent_run_id: None,
-            prompt: "fix a typo".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 0,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+        let mut run =
+            RunDriveContext::new("run", None, "fix a typo", "fix a typo", None, None, None);
         let decision = crate::orchestrator::OrchestratorDecision {
             schema_version: 1,
             decision_id: "decision".to_string(),
@@ -6229,6 +8312,8 @@ prompt = "{reviewer_prompt}"
             required_capabilities: Vec::new(),
             stop_condition: "Council returns a recommendation.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 
@@ -6269,7 +8354,7 @@ prompt = "{reviewer_prompt}"
             .runtime_request(
                 "current-run",
                 "current-step",
-                "create another feature",
+                RuntimePrompt::new("create another feature", None),
                 orchestrator,
                 Vec::new(),
                 "orchestrator_decision",
@@ -6310,7 +8395,7 @@ prompt = "{reviewer_prompt}"
             .runtime_request(
                 "next-run",
                 "next-step",
-                "continue",
+                RuntimePrompt::new("continue", None),
                 orchestrator,
                 Vec::new(),
                 "orchestrator_decision",
@@ -6331,6 +8416,94 @@ prompt = "{reviewer_prompt}"
                 && action.status.as_deref() == Some("completed")));
         let serialized = serde_json::to_string(&request.recent_context).unwrap();
         assert!(!serialized.contains("created by fake runtime"));
+    }
+
+    // ── task_05 git context ──
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git available");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_git_repo(dir: &std::path::Path, branch: &str) {
+        run_git(dir, &["init"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+        run_git(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("seed.txt"), "seed").unwrap();
+        run_git(dir, &["add", "seed.txt"]);
+        run_git(dir, &["commit", "-m", "init"]);
+        run_git(dir, &["checkout", "-b", branch]);
+    }
+
+    #[tokio::test]
+    async fn set_git_context_publishes_only_on_change() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        let (sender, mut receiver) = watch::channel(app.state.clone());
+        app.attach_state_sender(sender);
+        receiver.borrow_and_update(); // consume the publish from attach
+
+        let context = GitContext {
+            repo_name: "atelier".to_string(),
+            branch: "main".to_string(),
+        };
+        assert!(app.set_git_context(Some(context.clone())));
+        assert!(receiver.has_changed().unwrap(), "change published");
+        receiver.borrow_and_update();
+
+        assert!(!app.set_git_context(Some(context)));
+        assert!(
+            !receiver.has_changed().unwrap(),
+            "identical context must not publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_git_context_populates_from_repo() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/start");
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+
+        assert!(app.state.git_context.is_none());
+        app.refresh_git_context().await;
+
+        let context = app.state.git_context.as_ref().expect("Some after refresh");
+        assert_eq!(context.branch, "feat/start");
+        assert_eq!(
+            context.repo_name,
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_git_working_directory_refreshes_to_none_without_error() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.refresh_git_context().await;
+        assert!(app.state.git_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_submission_refreshes_git_context_to_current_branch() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/one");
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.refresh_git_context().await;
+        assert_eq!(app.state.git_context.as_ref().unwrap().branch, "feat/one");
+
+        // Switch branch outside the app, then submit a prompt.
+        run_git(dir.path(), &["checkout", "-b", "feat/two"]);
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.git_context.as_ref().unwrap().branch, "feat/two");
     }
 
     #[tokio::test]
@@ -6450,12 +8623,1026 @@ instructions_file = "agents/explorer.md"
         let error = app.submit_prompt("/doctor").await.unwrap_err();
 
         assert!(error.to_string().contains("unknown command /doctor"));
+        assert!(error.to_string().contains("/workflow <prompt>"));
         assert_eq!(app.state.run_state, RunState::Idle);
         assert!(app.state.active_run_id.is_none());
         let events = app.history.read_events().unwrap();
         assert!(!events
             .iter()
             .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+    }
+
+    #[test]
+    fn unknown_command_guidance_is_catalog_derived() {
+        // Guidance must come from the shared catalog so it stays aligned with
+        // the dropdown and help overlay — including `/reload:skills`, which the
+        // old hardcoded list omitted.
+        let error = reject_unknown_slash_command("/doctor").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unknown command /doctor"), "{message}");
+        for spec in crate::slash_commands::catalog() {
+            assert!(
+                message.contains(spec.label),
+                "guidance missing {}: {message}",
+                spec.label
+            );
+        }
+        assert!(message.contains("/reload:skills"), "{message}");
+        assert!(message.contains("/workflow <prompt>"), "{message}");
+    }
+
+    #[test]
+    fn prompt_prefixes_are_allowed_through_unknown_command_guard() {
+        // Named `/agent:` and `/skill:` prompts are prefixes, not commands, so
+        // the unknown-command guard must let them pass through to submission.
+        assert!(reject_unknown_slash_command("/agent:fixer inspect README").is_ok());
+        assert!(reject_unknown_slash_command("/skill:reviewer inspect README").is_ok());
+    }
+
+    #[test]
+    fn parse_queue_command_accepts_explicit_commands_and_rejects_empty() {
+        assert_eq!(
+            parse_queue_command("/queue update docs").unwrap(),
+            Some("update docs".to_string())
+        );
+        assert_eq!(
+            parse_queue_command("/q update docs").unwrap(),
+            Some("update docs".to_string())
+        );
+        // Text after the alias is preserved verbatim, including internal spacing.
+        assert_eq!(
+            parse_queue_command("/q update  the   docs").unwrap(),
+            Some("update  the   docs".to_string())
+        );
+        // Empty queue commands are usage errors, not silent no-ops.
+        assert!(parse_queue_command("/queue").is_err());
+        assert!(parse_queue_command("/q").is_err());
+        assert!(parse_queue_command("/queue    ").is_err());
+        // Non-queue input is never treated as a queue command.
+        assert_eq!(parse_queue_command("q").unwrap(), None);
+        assert_eq!(parse_queue_command("queue later").unwrap(), None);
+        assert_eq!(parse_queue_command("/queueextra now").unwrap(), None);
+        assert_eq!(parse_queue_command("/goal something").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn queue_command_creates_pending_follow_up_without_starting_run() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/queue update docs").await.unwrap();
+
+        assert_eq!(app.state.queued_follow_ups.len(), 1);
+        let item = &app.state.queued_follow_ups[0];
+        assert_eq!(item.prompt, "update docs");
+        assert_eq!(item.status, QueuedFollowUpStatus::Pending);
+        assert!(item.pause_reason.is_none());
+        assert!(!item.id.is_empty());
+        assert!(!item.created_at.is_empty());
+
+        // A queue command must not start a Run.
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+        assert!(events.iter().any(|event| event.kind == "follow_up_queued"
+            && event.payload["prompt"] == "update docs"
+            && event.payload["status"] == "pending"));
+    }
+
+    #[tokio::test]
+    async fn q_alias_queues_follow_up_and_preserves_prompt_text() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/q update the README docs")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.queued_follow_ups.len(), 1);
+        assert_eq!(
+            app.state.queued_follow_ups[0].prompt,
+            "update the README docs"
+        );
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Pending
+        );
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_queue_command_returns_usage_and_leaves_queue_empty() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app.submit_prompt("/queue").await.unwrap_err();
+
+        assert!(error.to_string().contains("usage"));
+        assert!(error.to_string().contains("/queue"));
+        assert!(app.state.queued_follow_ups.is_empty());
+        assert_eq!(app.state.run_state, RunState::Idle);
+        let events = app.history.read_events().unwrap();
+        assert!(!events.iter().any(|event| event.kind == "follow_up_queued"));
+    }
+
+    #[tokio::test]
+    async fn empty_q_alias_returns_usage_and_leaves_queue_empty() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app.submit_prompt("/q").await.unwrap_err();
+
+        assert!(error.to_string().contains("usage"));
+        assert!(app.state.queued_follow_ups.is_empty());
+        assert_eq!(app.state.run_state, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn plain_q_is_not_queued_and_follows_normal_prompt_path() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("q").await.unwrap();
+
+        // Plain "q" is ordinary input, not the /q alias.
+        assert!(app.state.queued_follow_ups.is_empty());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "run_started"));
+        assert!(!events.iter().any(|event| event.kind == "follow_up_queued"));
+    }
+
+    async fn queue_via_event(app: &mut App, message: &str) {
+        app.handle_event(AppEvent::PromptSubmitted(format!("/queue {message}")))
+            .await
+            .unwrap();
+    }
+
+    fn replay_started_prompts(app: &App) -> Vec<String> {
+        app.history
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "follow_up_replay_started")
+            .map(|event| event.payload["prompt"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn approval_mode_config(dir: &Path) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+approval_mode = "normal"
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn single_agent_step_limit_config(dir: &Path) -> EffectiveConfig {
+        let config_path = dir.join("multiagent.toml");
+        fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[limits]
+max_agent_steps = 1
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_queued_prompts_replay_oldest_first_across_two_completed_runs() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "first follow up").await;
+        app.handle_event(AppEvent::PromptSubmitted("/q second follow up".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(app.state.queued_follow_ups.len(), 2);
+
+        // A clean completed Run drains both queued items oldest-first.
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert!(app.state.queued_follow_ups.is_empty());
+        assert_eq!(
+            replay_started_prompts(&app),
+            vec![
+                "first follow up".to_string(),
+                "second follow up".to_string()
+            ]
+        );
+        let events = app.history.read_events().unwrap();
+        let submitted: Vec<&str> = events
+            .iter()
+            .filter(|event| event.kind == "prompt_submitted")
+            .filter_map(|event| event.payload["prompt"].as_str())
+            .collect();
+        assert!(submitted.contains(&"first follow up"));
+        assert!(submitted.contains(&"second follow up"));
+    }
+
+    #[tokio::test]
+    async fn clean_completed_run_replays_only_one_queued_item() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        // The first queued item will pause its own replay on a clarification;
+        // the second must not start while the first is still waiting.
+        queue_via_event(&mut app, "needs clarification create a feature").await;
+        queue_via_event(&mut app, "second follow up").await;
+
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_clarification.is_some());
+        // Exactly one item was replayed from the single completed Run.
+        assert_eq!(
+            replay_started_prompts(&app),
+            vec!["needs clarification create a feature".to_string()]
+        );
+        // The second item remains queued and is paused, not replayed.
+        assert_eq!(app.state.queued_follow_ups.len(), 1);
+        assert_eq!(app.state.queued_follow_ups[0].prompt, "second follow up");
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_queued_item_prevents_replay() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "cancel me").await;
+        let id = app.state.queued_follow_ups[0].id.clone();
+        app.handle_event(AppEvent::FollowUpCancelled(id))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Cancelled
+        );
+
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "follow_up_cancelled"));
+        assert!(replay_started_prompts(&app).is_empty());
+        assert!(app
+            .state
+            .queued_follow_ups
+            .iter()
+            .all(|item| item.status == QueuedFollowUpStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn resuming_paused_queued_item_makes_it_eligible_for_replay() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "resume target").await;
+
+        // A clarification-waiting Run pauses the queue.
+        app.handle_event(AppEvent::PromptSubmitted(
+            "needs clarification create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
+        let id = app.state.queued_follow_ups[0].id.clone();
+
+        // Resolving the clarification must NOT auto-replay the paused item.
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+        app.handle_event(AppEvent::ClarificationAnswered(ClarificationAnswer {
+            question_id,
+            answer: "use the CLI path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
+        assert!(replay_started_prompts(&app).is_empty());
+
+        // Resuming makes the item eligible and it replays against the completed state.
+        app.handle_event(AppEvent::FollowUpResumeRequested(id))
+            .await
+            .unwrap();
+
+        assert!(app.state.queued_follow_ups.is_empty());
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "follow_up_replay_resumed"));
+        assert_eq!(
+            replay_started_prompts(&app),
+            vec!["resume target".to_string()]
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "prompt_submitted"
+                && event.payload["prompt"] == "resume target"));
+    }
+
+    #[tokio::test]
+    async fn replay_records_replay_started_and_normal_prompt_submitted() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "replay me").await;
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let replay_started = events
+            .iter()
+            .find(|event| event.kind == "follow_up_replay_started")
+            .unwrap();
+        assert_eq!(replay_started.payload["prompt"], "replay me");
+        let replay_submitted = events
+            .iter()
+            .find(|event| {
+                event.kind == "prompt_submitted" && event.payload["prompt"] == "replay me"
+            })
+            .unwrap();
+        assert!(replay_submitted.run_id.is_some());
+        let original_submitted = events
+            .iter()
+            .find(|event| {
+                event.kind == "prompt_submitted" && event.payload["prompt"] == "create a feature"
+            })
+            .unwrap();
+        // The replayed item runs as its own distinct Run.
+        assert_ne!(replay_submitted.run_id, original_submitted.run_id);
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert!(app.state.queued_follow_ups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_after_successful_run_starts_as_next_run() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "deferred work").await;
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        // Exactly two Runs started: the original prompt and the one replayed follow-up.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "run_started")
+                .count(),
+            2
+        );
+        let replay_submitted = events
+            .iter()
+            .find(|event| {
+                event.kind == "prompt_submitted" && event.payload["prompt"] == "deferred work"
+            })
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "run_completed" && event.run_id == replay_submitted.run_id));
+        assert!(app.state.queued_follow_ups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clarification_waiting_pauses_queue_with_reason() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "queued doc update").await;
+        app.handle_event(AppEvent::PromptSubmitted(
+            "needs clarification create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_clarification.is_some());
+        let item = &app.state.queued_follow_ups[0];
+        assert_eq!(item.status, QueuedFollowUpStatus::Paused);
+        assert!(item
+            .pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("clarification")));
+        assert!(replay_started_prompts(&app).is_empty());
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "follow_up_replay_paused"));
+    }
+
+    #[tokio::test]
+    async fn approval_waiting_pauses_queue_while_pending() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "post-approval work").await;
+        app.handle_event(AppEvent::PromptSubmitted(
+            "approval action create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_approval.is_some());
+        let item = &app.state.queued_follow_ups[0];
+        assert_eq!(item.status, QueuedFollowUpStatus::Paused);
+        assert!(item
+            .pause_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("approval")));
+        assert!(replay_started_prompts(&app).is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_error_run_does_not_replay_queued_items() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "post-failure work").await;
+        app.handle_event(AppEvent::PromptSubmitted(
+            "always parse error create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Failed);
+        assert!(replay_started_prompts(&app).is_empty());
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_reached_run_does_not_replay_queued_items() {
+        let dir = tempdir().unwrap();
+        let config = single_agent_step_limit_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        queue_via_event(&mut app, "post-limit work").await;
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::LimitReached);
+        assert!(replay_started_prompts(&app).is_empty());
+        assert_eq!(
+            app.state.queued_follow_ups[0].status,
+            QueuedFollowUpStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_command_disabled_parallel_feature_fails_before_run_creation() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/workflow create a feature")
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("workflow mode requires Parallel Step Groups"));
+        assert!(message.contains("features.parallel_step_groups"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert_no_workflow_run_start_events(&events);
+        let runs_dir = dir.path().join(".multiagent/runs");
+        assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn workflow_command_zero_parallel_limit_fails_before_run_creation() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_parallel_config(dir.path());
+        config.limits.max_parallel_agent_steps = 0;
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/workflow create a feature")
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("workflow mode requires Parallel Step Groups"));
+        assert!(message.contains("limits.max_parallel_agent_steps = 0"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert_no_workflow_run_start_events(&events);
+        let runs_dir = dir.path().join(".multiagent/runs");
+        assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn workflow_command_start_records_workflow_event_and_preserves_visible_command() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let run_started_index = events
+            .iter()
+            .position(|event| event.kind == "run_started")
+            .unwrap();
+        let workflow_started_index = events
+            .iter()
+            .position(|event| event.kind == "workflow_started")
+            .unwrap();
+        let prompt_submitted_index = events
+            .iter()
+            .position(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert!(run_started_index < workflow_started_index);
+        assert!(workflow_started_index < prompt_submitted_index);
+
+        let run_id = events[run_started_index].run_id.as_ref().unwrap();
+        let workflow_started = &events[workflow_started_index];
+        assert_eq!(workflow_started.run_id.as_ref(), Some(run_id));
+        assert_eq!(workflow_started.payload["run_id"], run_id.as_str());
+        assert_eq!(
+            workflow_started.payload["original_command"],
+            "/workflow parallel create a feature"
+        );
+        assert_eq!(
+            workflow_started.payload["user_prompt"],
+            "parallel create a feature"
+        );
+        assert_eq!(workflow_started.payload["mode"], "workflow");
+        assert_eq!(
+            workflow_started.payload["preflight"]["parallel_step_groups"],
+            true
+        );
+        assert_eq!(
+            workflow_started.payload["preflight"]["max_parallel_agent_steps"],
+            2
+        );
+
+        let prompt = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert_eq!(
+            prompt
+                .payload
+                .get("prompt")
+                .and_then(serde_json::Value::as_str),
+            Some("/workflow parallel create a feature")
+        );
+        assert_eq!(
+            prompt
+                .payload
+                .get("submitted_prompt")
+                .and_then(serde_json::Value::as_str),
+            Some("/workflow parallel create a feature")
+        );
+        assert!(!prompt
+            .payload
+            .to_string()
+            .contains("Workflow mode instructions"));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started"));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision"));
+
+        let run_record =
+            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+        assert!(
+            run_record.contains("\"submitted_prompt\": \"/workflow parallel create a feature\"")
+        );
+        assert!(run_record.contains("Workflow mode instructions"));
+        assert!(run_record.contains("Extracted user prompt:\\nparallel create a feature"));
+        assert!(run_record.contains("planned file-edit targets"));
+        assert!(run_record.contains("verification evidence"));
+    }
+
+    #[tokio::test]
+    async fn workflow_parallel_prompt_persists_planned_targets_from_fake_group() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let run_id = events
+            .iter()
+            .find(|event| event.kind == "run_started")
+            .and_then(|event| event.payload["run_id"].as_str())
+            .unwrap();
+        let record_path = dir.path().join(format!(".multiagent/runs/{run_id}.json"));
+        let record: Value =
+            serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
+        let ledger = record["workflow"]["target_ledger"].as_object().unwrap();
+        let targets = ledger["src/runtime/fake.rs"].as_array().unwrap();
+
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["path"], "src/runtime/fake.rs");
+        assert_eq!(targets[0]["source_step_label"], "fix runtime scope");
+        assert_eq!(targets[0]["status"], "completed");
+        assert_eq!(targets[0]["reason"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn workflow_parallel_scoped_write_action_records_completed_workflow_evidence() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel scoped write action create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "workflow_started"));
+        let completed = workflow_completed_event(&events);
+        assert_eq!(completed.payload["status"], "completed");
+        assert_eq!(completed.payload["target_counts"]["completed"], 2);
+        assert_eq!(completed.payload["target_counts"]["planned"], 0);
+        assert_eq!(completed.payload["unfinished_targets"], json!([]));
+        assert!(completed.payload["verification"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("fake verification passed")));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parallel-output/fixer-a.txt")).unwrap(),
+            "created by fake runtime\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parallel-output/fixer-b.txt")).unwrap(),
+            "created by fake runtime\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_parallel_approval_denial_records_completed_with_issues_evidence() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_normal_approval_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let approval_handle = app.approval_handle();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("/workflow parallel approval action create a feature")
+                .await
+                .unwrap();
+            app
+        });
+
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => panic!("workflow approval did not become pending before deadline"),
+                changed = receiver.changed() => {
+                    changed.unwrap();
+                    let state = receiver.borrow_and_update().clone();
+                    if state.pending_approval.as_ref().is_some_and(|approval| {
+                        approval.agent == "fixer"
+                    }) {
+                        break;
+                    }
+                }
+            }
+        }
+        approval_handle.answer(false);
+
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let completed = workflow_completed_event(&events);
+        assert_eq!(completed.payload["status"], "completed_with_issues");
+        assert_eq!(completed.payload["target_counts"]["blocked"], 1);
+        let unfinished = completed.payload["unfinished_targets"].as_array().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0]["path"], "src/runtime/fake.rs");
+        assert_eq!(unfinished[0]["status"], "blocked");
+        assert!(unfinished[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("approval"));
+        let workflow_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.title == "Workflow completed with issues")
+            .unwrap();
+        assert_eq!(workflow_item.kind, ChatItemKind::RunSummary);
+        assert_eq!(workflow_item.severity, ChatSeverity::Warning);
+        let workflow_text = workflow_item
+            .body
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(workflow_text.contains("targets:"));
+        assert!(workflow_text.contains("unfinished target: src/runtime/fake.rs (blocked)"));
+    }
+
+    #[tokio::test]
+    async fn workflow_scoped_write_child_parse_error_records_failed_target_evidence() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt(
+            "/workflow parallel scoped write action child parse error create a feature",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parallel-output/fixer-a.txt")).unwrap(),
+            "created by fake runtime\n"
+        );
+        assert!(!dir.path().join("parallel-output/fixer-b.txt").exists());
+
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "parallel_child_failed"
+                && event.group_id.is_some()
+                && event.payload["status"] == "parse_error"
+                && event.payload["file_scope"]["write_files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path.as_str() == Some("parallel-output/fixer-b.txt"))
+        }));
+
+        let completed = workflow_completed_event(&events);
+        assert_eq!(completed.payload["status"], "completed_with_issues");
+        assert_eq!(completed.payload["target_counts"]["completed"], 1);
+        assert_eq!(completed.payload["target_counts"]["failed"], 1);
+        assert_eq!(completed.payload["target_counts"]["blocked"], 0);
+        assert_eq!(completed.payload["target_counts"]["planned"], 0);
+        let unfinished = completed.payload["unfinished_targets"].as_array().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0]["path"], "parallel-output/fixer-b.txt");
+        assert_eq!(unfinished[0]["status"], "failed");
+        assert!(unfinished[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("fake runtime emitted malformed control output"));
+    }
+
+    #[tokio::test]
+    async fn workflow_completed_event_precedes_generic_run_completed_event() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel scoped write action create a feature")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let workflow_completed_index = events
+            .iter()
+            .position(|event| event.kind == "workflow_completed")
+            .unwrap();
+        let run_completed_index = events
+            .iter()
+            .position(|event| event.kind == "run_completed")
+            .unwrap();
+        assert!(workflow_completed_index < run_completed_index);
+    }
+
+    #[tokio::test]
+    async fn interrupted_workflow_records_failed_workflow_evidence() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let interrupt_handle = app.interrupt_handle();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let run = tokio::spawn(async move {
+            app.submit_prompt("/workflow parallel interrupt create a feature")
+                .await
+                .unwrap();
+            app
+        });
+
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => panic!("workflow parallel live steps did not start before deadline"),
+                changed = receiver.changed() => {
+                    changed.unwrap();
+                    let state = receiver.borrow_and_update().clone();
+                    if state.live_steps.len() == 2 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        interrupt_handle.request_interrupt();
+        let app = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        let events = app.history.read_events().unwrap();
+        let completed = workflow_completed_event(&events);
+        assert_eq!(completed.payload["status"], "failed");
+        assert_eq!(completed.payload["target_counts"]["failed"], 1);
+        let unfinished = completed.payload["unfinished_targets"].as_array().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0]["path"], "src/runtime/fake.rs");
+        assert_eq!(unfinished[0]["status"], "failed");
+        assert!(unfinished[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn workflow_parallel_prompt_excludes_read_only_reviewer_from_planned_targets() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/workflow parallel create a feature")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let run_id = events
+            .iter()
+            .find(|event| event.kind == "run_started")
+            .and_then(|event| event.payload["run_id"].as_str())
+            .unwrap();
+        let record_path = dir.path().join(format!(".multiagent/runs/{run_id}.json"));
+        let record: Value =
+            serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
+        let ledger = record["workflow"]["target_ledger"].as_object().unwrap();
+
+        assert!(!ledger.values().any(|targets| {
+            targets.as_array().unwrap().iter().any(|target| {
+                target["source_step_label"] == "review app scope" || target["path"] == "src/app"
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn normal_parallel_prompt_records_no_workflow_started_event() {
+        let dir = tempdir().unwrap();
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("parallel create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(!events.iter().any(|event| event.kind == "workflow_started"));
+        let run_id = events
+            .iter()
+            .find(|event| event.kind == "run_started")
+            .and_then(|event| event.payload["run_id"].as_str())
+            .unwrap()
+            .to_string();
+        let generic_run_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| {
+                item.lifecycle_key.as_ref()
+                    == Some(&ChatLifecycleKey::Run {
+                        run_id: run_id.clone(),
+                    })
+            })
+            .unwrap();
+        assert_eq!(generic_run_item.title, "Run completed");
+        assert_eq!(generic_run_item.severity, ChatSeverity::Success);
+        assert!(!app.state.chat_items.iter().any(|item| matches!(
+            item.lifecycle_key.as_ref(),
+            Some(ChatLifecycleKey::Workflow { .. })
+        )));
+        let prompt = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert_eq!(
+            prompt
+                .payload
+                .get("prompt")
+                .and_then(serde_json::Value::as_str),
+            Some("parallel create a feature")
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started"));
     }
 
     #[tokio::test]
@@ -6484,8 +9671,14 @@ instructions_file = "agents/explorer.md"
     }
 
     #[tokio::test]
-    async fn skill_prompt_prefix_is_allowed_as_agent_prompt() {
+    async fn skill_prompt_prefix_loads_skill_before_runtime_work() {
         let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "Review workflow guidance.",
+        );
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
 
@@ -6494,8 +9687,28 @@ instructions_file = "agents/explorer.md"
             .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
-        let history_events = app.history.read_events().unwrap();
-        let prompt = history_events
+        let events = app.history.read_events().unwrap();
+        let run_started_index = events
+            .iter()
+            .position(|event| event.kind == "run_started")
+            .unwrap();
+        let prompt_submitted_index = events
+            .iter()
+            .position(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        let skills_loaded_index = events
+            .iter()
+            .position(|event| event.kind == "skills_loaded")
+            .unwrap();
+        let runtime_index = events
+            .iter()
+            .position(|event| event.kind == "agent_step_started")
+            .unwrap();
+        assert!(run_started_index < prompt_submitted_index);
+        assert!(prompt_submitted_index < skills_loaded_index);
+        assert!(skills_loaded_index < runtime_index);
+
+        let prompt = events
             .iter()
             .find(|event| event.kind == "prompt_submitted")
             .unwrap();
@@ -6504,8 +9717,219 @@ instructions_file = "agents/explorer.md"
                 .payload
                 .get("prompt")
                 .and_then(serde_json::Value::as_str),
+            Some("inspect README")
+        );
+        assert_eq!(
+            prompt
+                .payload
+                .get("submitted_prompt")
+                .and_then(serde_json::Value::as_str),
             Some("/skill:reviewer inspect README")
         );
+        let skills_loaded = events
+            .iter()
+            .find(|event| event.kind == "skills_loaded")
+            .unwrap();
+        assert_eq!(skills_loaded.payload["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            skills_loaded.payload["skills"][0]["display_name"],
+            Value::String("reviewer".to_string())
+        );
+        assert_eq!(
+            skills_loaded.payload["skills"][0]["source_origin"],
+            Value::String(".agents/skills".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_skill_reference_fails_before_run_creation() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/skill:missing inspect README")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unknown skill 'missing'"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().all(|event| {
+            event.kind != "run_started"
+                && event.kind != "prompt_submitted"
+                && event.kind != "skills_loaded"
+        }));
+        let runs_dir = dir.path().join(".multiagent/runs");
+        assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_skill_reference_reports_skill_load_diagnostic() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/skill: inspect README")
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("empty /skill: reference"));
+        assert!(!message.contains("unknown command"));
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().all(|event| {
+            event.kind != "run_started"
+                && event.kind != "prompt_submitted"
+                && event.kind != "skills_loaded"
+        }));
+    }
+
+    #[tokio::test]
+    async fn mid_prompt_skill_reference_loads_and_normalizes_prompt() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "Review workflow guidance.",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("please use /skill:reviewer here")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let prompt = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert_eq!(prompt.payload["prompt"], "please use here");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "skills_loaded")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_skill_references_emit_one_loaded_skill_entry() {
+        let dir = tempdir().unwrap();
+        write_project_skill(dir.path(), "a", Some("a"), "Skill A guidance.");
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/skill:a do x /skill:a").await.unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let skills_loaded = events
+            .iter()
+            .find(|event| event.kind == "skills_loaded")
+            .unwrap();
+        let skills = skills_loaded.payload["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["requested_names"], json!(["a"]));
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.kind == "prompt_submitted")
+                .unwrap()
+                .payload["prompt"],
+            "do x"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_bodies_are_not_persisted_to_history_debug_log_or_run_record() {
+        let dir = tempdir().unwrap();
+        const SENTINEL: &str = "SENTINEL_FULL_SKILL_BODY_PRIVATE";
+        write_project_skill(dir.path(), "reviewer", Some("reviewer"), SENTINEL);
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.debug_enabled = true;
+
+        app.submit_prompt("/skill:reviewer inspect README")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let run_id = events
+            .iter()
+            .find(|event| event.kind == "run_started")
+            .and_then(|event| event.run_id.clone())
+            .unwrap();
+        let prompt_submitted = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .unwrap();
+        assert!(!prompt_submitted.payload.to_string().contains(SENTINEL));
+
+        let events_jsonl =
+            fs::read_to_string(app.history.session_dir().join("events.jsonl")).unwrap();
+        let debug_log = fs::read_to_string(dir.path().join(".multiagent/debug.log")).unwrap();
+        let run_record =
+            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+        let chat_projection = serde_json::to_string(&app.state.chat_items).unwrap();
+        let skill_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.title == "Skills loaded")
+            .unwrap();
+        let skill_item_text = chat_item_text(skill_item);
+        assert!(!events_jsonl.contains(SENTINEL));
+        assert!(!debug_log.contains(SENTINEL));
+        assert!(!run_record.contains(SENTINEL));
+        assert!(!chat_projection.contains(SENTINEL));
+        assert!(events_jsonl.contains("\"kind\":\"skills_loaded\""));
+        assert!(events_jsonl.contains(".agents/skills/reviewer/SKILL.md"));
+        assert!(debug_log.contains("\"kind\":\"skills_loaded\""));
+        assert!(debug_log.contains(".agents/skills/reviewer/SKILL.md"));
+        assert!(run_record.contains("\"submitted_prompt\""));
+        assert!(run_record.contains("\"loaded_skills\""));
+        assert_eq!(skill_item.kind, ChatItemKind::SkillContext);
+        assert_eq!(skill_item.status, ChatItemStatus::Completed);
+        assert_eq!(skill_item.severity, ChatSeverity::Info);
+        assert!(skill_item_text.contains("reviewer"));
+        assert!(skill_item_text.contains(".agents/skills"));
+        assert!(skill_item_text.contains(".agents/skills/reviewer/SKILL.md"));
+        assert!(!skill_item_text.contains(SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_ignores_skill_body_trigger_words_for_fixture_routing() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "trigger",
+            Some("trigger"),
+            "SENTINEL_TRIGGER_SKILL_BODY_PRIVATE parallel use action approval action command action write action retryable provider error needs clarification high-risk architecture typo",
+        );
+        let config = fake_parallel_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/skill:trigger inspect README")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "skills_loaded"));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started"));
+        assert!(!events.iter().any(|event| event.kind == "action_requested"));
+        assert!(!events.iter().any(|event| event.kind == "blocker_reported"));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "clarification_requested"));
+        assert!(!events.iter().any(|event| event.kind == "council_started"));
     }
 
     #[tokio::test]
@@ -6590,6 +10014,88 @@ instructions_file = "agents/explorer.md"
                 .and_then(serde_json::Value::as_str),
             Some("inspect src only")
         );
+        assert_eq!(
+            record
+                .get("subtask")
+                .and_then(|subtask| subtask.get("submitted_request"))
+                .and_then(serde_json::Value::as_str),
+            Some("inspect src only")
+        );
+    }
+
+    #[tokio::test]
+    async fn subtask_skill_reference_loads_before_subtask_runtime_work() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "Review workflow guidance.",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/subtask explorer /skill:reviewer inspect README")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let subtask_started_index = events
+            .iter()
+            .position(|event| event.kind == "subtask_started")
+            .unwrap();
+        let skills_loaded_index = events
+            .iter()
+            .position(|event| event.kind == "skills_loaded")
+            .unwrap();
+        let runtime_index = events
+            .iter()
+            .position(|event| event.kind == "agent_step_started")
+            .unwrap();
+        assert!(subtask_started_index < skills_loaded_index);
+        assert!(skills_loaded_index < runtime_index);
+
+        let subtask_started = events
+            .iter()
+            .find(|event| event.kind == "subtask_started")
+            .unwrap();
+        assert_eq!(subtask_started.payload["request"], "inspect README");
+        assert_eq!(
+            subtask_started.payload["submitted_request"],
+            "/skill:reviewer inspect README"
+        );
+        let run_id = subtask_started.run_id.as_ref().unwrap();
+        let run_record =
+            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+        assert!(run_record.contains("\"request\": \"inspect README\""));
+        assert!(run_record.contains("\"submitted_request\": \"/skill:reviewer inspect README\""));
+        assert!(!run_record.contains("Review workflow guidance."));
+    }
+
+    #[tokio::test]
+    async fn failed_subtask_skill_reference_creates_no_subtask_run() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app
+            .submit_prompt("/subtask explorer /skill:missing inspect README")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unknown skill 'missing'"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .all(|event| event.kind != "subtask_started" && event.kind != "skills_loaded"));
+        assert_eq!(
+            fs::read_dir(dir.path().join(".multiagent/runs"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -6620,7 +10126,7 @@ instructions_file = "agents/explorer.md"
             .runtime_request(
                 "run",
                 "step",
-                "create a feature",
+                RuntimePrompt::new("create a feature", None),
                 orchestrator,
                 Vec::new(),
                 "orchestrator_decision",
@@ -6794,16 +10300,16 @@ runtime = "fake"
         let run_id = "expired-run".to_string();
         app.state.active_run_id = Some(run_id.clone());
         app.state.run_state = RunState::Planning;
-        let run = RunDriveContext {
+        let mut run = RunDriveContext::new(
             run_id,
-            parent_run_id: None,
-            prompt: "create a feature".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 0,
-            started_at: Instant::now() - Duration::from_secs(61),
-            parse_repair_attempts: 0,
-        };
+            None,
+            "create a feature",
+            "create a feature",
+            None,
+            None,
+            None,
+        );
+        run.started_at = Instant::now() - Duration::from_secs(61);
 
         app.drive_run(run, None).await.unwrap();
 
@@ -6845,7 +10351,7 @@ runtime = "fake"
             .runtime_request(
                 &run_id,
                 &step_id,
-                "create a feature",
+                RuntimePrompt::new("create a feature", None),
                 orchestrator,
                 Vec::new(),
                 "orchestrator_decision",
@@ -6853,16 +10359,16 @@ runtime = "fake"
             .unwrap();
         app.state.active_run_id = Some(run_id.clone());
         app.state.run_state = RunState::Planning;
-        let run = RunDriveContext {
+        let mut run = RunDriveContext::new(
             run_id,
-            parent_run_id: None,
-            prompt: "create a feature".to_string(),
-            subtask: None,
-            previous_results: Vec::new(),
-            step_count: 1,
-            started_at: Instant::now(),
-            parse_repair_attempts: 0,
-        };
+            None,
+            "create a feature",
+            "create a feature",
+            None,
+            None,
+            None,
+        );
+        run.step_count = 1;
         let resume = StepResume {
             step: PausedStep::Orchestrator { step_id },
             step_started_at: Instant::now() - Duration::from_secs(61),
@@ -7283,6 +10789,8 @@ runtime = "fake"
         assert!(app.state.active_run_id.is_some());
         let pending = app.state.pending_approval.as_ref().unwrap();
         assert_eq!(pending.agent, "fixer");
+        assert!(app.state.pending_clarification.is_none());
+        assert!(app.pending_clarification.is_none());
         assert_eq!(agent_status(&app, "fixer"), "waiting_approval");
         assert!(pending
             .diagnostic
@@ -7303,6 +10811,37 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn app_state_defaults_to_no_pending_clarification() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+
+        assert!(app.state.pending_clarification.is_none());
+        assert!(app.pending_clarification.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupt_clears_pending_clarification_state() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_clarification.is_some());
+        assert!(app.pending_clarification.is_some());
+
+        app.interrupt().unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        assert!(app.state.active_run_id.is_none());
+        assert!(app.state.pending_clarification.is_none());
+        assert!(app.pending_clarification.is_none());
+    }
+
+    #[tokio::test]
     async fn clarifying_answer_resumes_waiting_run() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
@@ -7316,18 +10855,187 @@ runtime = "fake"
         assert!(app.state.active_run_id.is_some());
         assert!(app.state.pending_approval.is_none());
         assert_eq!(agent_status(&app, "orchestrator"), "waiting_for_user");
+        let view = app.state.pending_clarification.as_ref().unwrap();
+        assert_eq!(
+            Some(view.run_id.as_str()),
+            app.state.active_run_id.as_deref()
+        );
+        assert!(!view.question_id.is_empty());
+        assert_eq!(
+            view.question,
+            "Which target or constraint should guide this run?"
+        );
+        assert_eq!(
+            view.options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["target_scope", "success_criteria", "constraints"]
+        );
+        assert_eq!(view.recommended_option_id.as_deref(), Some("target_scope"));
         let events = app.state.events.join("\n");
         assert!(events.contains("Orchestrator asked a clarifying question."));
+        let history_events = app.history.read_events().unwrap();
+        let requested = history_events
+            .iter()
+            .find(|event| event.kind == "clarification_requested")
+            .unwrap();
+        assert_eq!(
+            requested.run_id.as_deref(),
+            app.state.active_run_id.as_deref()
+        );
+        assert_eq!(
+            requested.payload.get("question_id").and_then(Value::as_str),
+            Some(view.question_id.as_str())
+        );
+        assert_eq!(
+            requested.payload.get("question").and_then(Value::as_str),
+            Some(view.question.as_str())
+        );
+        let requested_options = requested
+            .payload
+            .get("options")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(
+            requested_options
+                .iter()
+                .map(|option| option.get("id").and_then(Value::as_str).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["target_scope", "success_criteria", "constraints"]
+        );
+        assert_eq!(
+            requested
+                .payload
+                .get("recommended_option_id")
+                .and_then(Value::as_str),
+            Some("target_scope")
+        );
+        let decision_event = history_events
+            .iter()
+            .find(|event| event.kind == "orchestrator_decision")
+            .unwrap();
+        let options = decision_event
+            .payload
+            .get("clarifying_options")
+            .and_then(Value::as_array)
+            .unwrap();
+        let option_pairs = options
+            .iter()
+            .map(|option| {
+                (
+                    option.get("id").and_then(Value::as_str).unwrap(),
+                    option.get("label").and_then(Value::as_str).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            option_pairs,
+            vec![
+                ("target_scope", "Clarify the target scope"),
+                ("success_criteria", "Clarify success criteria"),
+                ("constraints", "Clarify constraints"),
+            ]
+        );
+        assert_eq!(
+            decision_event
+                .payload
+                .get("recommended_option_id")
+                .and_then(Value::as_str),
+            Some("target_scope")
+        );
 
-        app.submit_prompt("use the CLI path").await.unwrap();
+        let question_id = view.question_id.clone();
+        let answer = ClarificationAnswer {
+            question_id,
+            answer: "use the CLI path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer))
+            .await
+            .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         assert!(app.state.active_run_id.is_none());
+        assert!(app.state.pending_clarification.is_none());
+        assert!(app.pending_clarification.is_none());
         assert_eq!(agent_status(&app, "orchestrator"), "idle");
         let events = app.state.events.join("\n");
         assert!(events.contains("You: use the CLI path"));
         assert!(events.contains("explorer:"));
         assert!(events.contains("Run completed."));
+    }
+
+    #[tokio::test]
+    async fn clarification_flow_chat_items_never_use_approval_kind() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+
+        let pending_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::Clarification)
+            .unwrap();
+        assert_eq!(pending_item.status, ChatItemStatus::WaitingForUser);
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.kind == ChatItemKind::Approval));
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.status == ChatItemStatus::WaitingApproval));
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+        app.handle_event(AppEvent::ClarificationAnswered(ClarificationAnswer {
+            question_id,
+            answer: "use the CLI path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let answered_item = app
+            .state
+            .chat_items
+            .iter()
+            .find(|item| item.kind == ChatItemKind::Clarification)
+            .unwrap();
+        assert_eq!(answered_item.status, ChatItemStatus::Completed);
+        assert!(answered_item
+            .body
+            .iter()
+            .any(|line| line.text == "Answer: use the CLI path"));
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.kind == ChatItemKind::Approval));
+        assert!(!app
+            .state
+            .chat_items
+            .iter()
+            .any(|item| item.status == ChatItemStatus::WaitingApproval));
     }
 
     #[tokio::test]
@@ -7341,20 +11049,186 @@ runtime = "fake"
             .unwrap();
         assert_eq!(app.state.run_state, RunState::WaitingForUser);
 
-        app.submit_prompt("/tmp/project").await.unwrap();
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id,
+            answer: "/tmp/project".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer))
+            .await
+            .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
-        let answer = events
+        let answered = events
             .iter()
             .find(|event| event.kind == "clarification_answered")
             .unwrap();
         assert_eq!(
-            answer
+            answered
                 .payload
                 .get("answer")
                 .and_then(serde_json::Value::as_str),
             Some("/tmp/project")
+        );
+        assert!(events.iter().all(|event| event.kind != "skills_loaded"));
+    }
+
+    #[tokio::test]
+    async fn clarifying_answer_with_skill_reference_does_not_load_new_skill() {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "Review workflow guidance.",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id,
+            answer: "/skill:reviewer".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answered = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answered
+                .payload
+                .get("answer")
+                .and_then(serde_json::Value::as_str),
+            Some("/skill:reviewer")
+        );
+        assert!(events.iter().all(|event| event.kind != "skills_loaded"));
+    }
+
+    #[tokio::test]
+    async fn clarification_resume_preserves_existing_skill_context_without_resolving_answer_skill()
+    {
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "base",
+            Some("base"),
+            "SENTINEL_BASE_SKILL_BODY_PRIVATE",
+        );
+        write_project_skill(
+            dir.path(),
+            "new",
+            Some("new"),
+            "SENTINEL_NEW_SKILL_BODY_PRIVATE",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/skill:base needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let pending = app.pending_clarification.as_ref().unwrap();
+        let resume_prompt = format!(
+            "{}\n\nUser clarification: /skill:new use the CLI path",
+            pending.run.prompt
+        );
+        let resume_request = app
+            .runtime_request(
+                &pending.run.run_id,
+                "resume-step",
+                RuntimePrompt::new(&resume_prompt, pending.run.skill_context.as_ref()),
+                app.agent("orchestrator").unwrap().clone(),
+                pending.run.previous_results.clone(),
+                "orchestrator_decision",
+            )
+            .unwrap();
+        assert_eq!(
+            count_occurrences(&resume_request.prompt, "SENTINEL_BASE_SKILL_BODY_PRIVATE"),
+            1
+        );
+        assert!(!resume_request
+            .prompt
+            .contains("SENTINEL_NEW_SKILL_BODY_PRIVATE"));
+        assert!(resume_request
+            .prompt
+            .contains("/skill:new use the CLI path"));
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id,
+            answer: "/skill:new use the CLI path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let loaded_events = events
+            .iter()
+            .filter(|event| event.kind == "skills_loaded")
+            .collect::<Vec<_>>();
+        assert_eq!(loaded_events.len(), 1);
+        assert_eq!(
+            loaded_events[0].payload["skills"][0]["display_name"],
+            Value::String("base".to_string())
+        );
+        let answered = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answered
+                .payload
+                .get("answer")
+                .and_then(serde_json::Value::as_str),
+            Some("/skill:new use the CLI path")
         );
     }
 
@@ -7394,10 +11268,13 @@ runtime = "fake"
             .await
             .unwrap();
 
-        let error = app.submit_prompt("yes").await.unwrap_err();
+        let error = app.submit_prompt("/skill:missing yes").await.unwrap_err();
         assert!(error.to_string().contains("waiting for action approval"));
+        assert!(!error.to_string().contains("unknown skill"));
         assert_eq!(app.state.run_state, RunState::WaitingForUser);
         assert!(app.state.pending_approval.is_some());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().all(|event| event.kind != "skills_loaded"));
     }
 
     #[tokio::test]
@@ -7633,5 +11510,240 @@ runtime = "fake"
             .and_then(serde_json::Value::as_str)
             .unwrap();
         assert!(dir.path().join(".multiagent").join(artifact_path).exists());
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_with_recommended_option() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id: question_id.clone(),
+            answer: "Option A selected".to_string(),
+            selected_option_id: Some("opt-a".to_string()),
+            selected_option_label: Some("Option A".to_string()),
+            answer_source: "recommended".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answered = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answered.payload.get("answer_source"),
+            Some(&Value::String("recommended".to_string()))
+        );
+        assert_eq!(
+            answered.payload.get("selected_option_id"),
+            Some(&Value::String("opt-a".to_string()))
+        );
+        assert_eq!(
+            answered.payload.get("selected_option_label"),
+            Some(&Value::String("Option A".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_with_custom_text() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id: question_id.clone(),
+            answer: "Use the custom answer path".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answered = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answered.payload.get("answer_source"),
+            Some(&Value::String("custom".to_string()))
+        );
+        assert_eq!(
+            answered.payload.get("selected_option_id"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_with_slash_prefixed_custom_answer() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id: question_id.clone(),
+            answer: "/tmp/project".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        app.handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let events = app.history.read_events().unwrap();
+        let answered = events
+            .iter()
+            .find(|event| event.kind == "clarification_answered")
+            .unwrap();
+        assert_eq!(
+            answered
+                .payload
+                .get("answer")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_rejects_wrong_question_id() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let answer = ClarificationAnswer {
+            question_id: "wrong-id".to_string(),
+            answer: "Some answer".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        let result = app
+            .handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("question id does not match"));
+        assert!(app.pending_clarification.is_some());
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    #[tokio::test]
+    async fn clarification_answered_rejects_empty_answer() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let question_id = app
+            .state
+            .pending_clarification
+            .as_ref()
+            .unwrap()
+            .question_id
+            .clone();
+
+        let answer = ClarificationAnswer {
+            question_id: question_id.clone(),
+            answer: "   ".to_string(),
+            selected_option_id: None,
+            selected_option_label: None,
+            answer_source: "custom".to_string(),
+        };
+
+        let result = app
+            .handle_event(AppEvent::ClarificationAnswered(answer.clone()))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+        assert!(app.pending_clarification.is_some());
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    #[tokio::test]
+    async fn submit_prompt_blocked_while_clarification_pending() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("needs clarification create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        let result = app.submit_prompt("some answer").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("waiting for clarification"));
+        assert!(app.pending_clarification.is_some());
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
     }
 }

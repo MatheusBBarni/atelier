@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add App Queue State And Command Parsing"
 type: backend
 complexity: medium
@@ -29,12 +29,12 @@ Add the app-owned queue data model and parse explicit `/queue <message>` plus `/
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Add queued follow-up status and view data types.
-- [ ] 1.2 Add queue storage to `App` and queue view data to `AppState`.
-- [ ] 1.3 Add parser support for `/queue <message>` and `/q <message>`.
-- [ ] 1.4 Wire accepted queue commands into `App::submit_prompt`.
-- [ ] 1.5 Add usage errors for empty queue commands.
-- [ ] 1.6 Add app-level tests for parsing and state updates.
+- [x] 1.1 Add queued follow-up status and view data types.
+- [x] 1.2 Add queue storage to `App` and queue view data to `AppState`.
+- [x] 1.3 Add parser support for `/queue <message>` and `/q <message>`.
+- [x] 1.4 Wire accepted queue commands into `App::submit_prompt`.
+- [x] 1.5 Add usage errors for empty queue commands.
+- [x] 1.6 Add app-level tests for parsing and state updates.
 
 ## Implementation Details
 Modify the app layer first. Follow the TechSpec "Core Interfaces", "Data Models", and "Command Parsing" sections for fields and behavior. Do not implement replay, pause, cancellation, resume, Chat projection, or TUI rendering in this task.
@@ -64,15 +64,15 @@ Modify the app layer first. Follow the TechSpec "Core Interfaces", "Data Models"
 
 ## Tests
 - Unit tests:
-  - [ ] Submitting `/queue update docs` creates one pending queued follow-up and does not create `run_started`.
-  - [ ] Submitting `/q update docs` creates one pending queued follow-up and preserves prompt text after the alias.
-  - [ ] Submitting `/queue` returns usage guidance and leaves the queue empty.
-  - [ ] Submitting `/q` returns usage guidance and leaves the queue empty.
-  - [ ] Submitting plain `q` remains a normal prompt path and is not parsed as a queue command.
+  - [x] Submitting `/queue update docs` creates one pending queued follow-up and does not create `run_started`.
+  - [x] Submitting `/q update docs` creates one pending queued follow-up and preserves prompt text after the alias.
+  - [x] Submitting `/queue` returns usage guidance and leaves the queue empty.
+  - [x] Submitting `/q` returns usage guidance and leaves the queue empty.
+  - [x] Submitting plain `q` remains a normal prompt path and is not parsed as a queue command.
 - Integration tests:
-  - [ ] Existing `/goal`, `/config`, and `/subtask` tests still pass.
-  - [ ] Existing `/agent:` and `/skill:` prompt-prefix tests still pass.
-  - [ ] Existing unknown slash-command test still rejects `/doctor`.
+  - [x] Existing `/goal`, `/config`, and `/subtask` tests still pass.
+  - [x] Existing `/agent:` and `/skill:` prompt-prefix tests still pass.
+  - [x] Existing unknown slash-command test still rejects `/doctor`.
 - Test coverage target: >=80%
 - All tests must pass
 

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add Command Dropdown Keyboard Handling And Text Insertion"
 type: frontend
 complexity: medium
@@ -32,12 +32,12 @@ Add the interactive behavior for the command dropdown: selection movement, `Tab`
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Add command dropdown key routing after agent and skill dropdown routing.
-- [ ] 6.2 Add selection cycling for command suggestions.
-- [ ] 6.3 Add `Tab` and `Enter` acceptance for selected command suggestions.
-- [ ] 6.4 Add text-only insertion and cursor update behavior.
-- [ ] 6.5 Add Escape dismissal and no-match `Enter` trapping.
-- [ ] 6.6 Add interaction tests proving no app events are dispatched during dropdown acceptance.
+- [x] 6.1 Add command dropdown key routing after agent and skill dropdown routing.
+- [x] 6.2 Add selection cycling for command suggestions.
+- [x] 6.3 Add `Tab` and `Enter` acceptance for selected command suggestions.
+- [x] 6.4 Add text-only insertion and cursor update behavior.
+- [x] 6.5 Add Escape dismissal and no-match `Enter` trapping.
+- [x] 6.6 Add interaction tests proving no app events are dispatched during dropdown acceptance.
 
 ## Implementation Details
 Modify key handling and dropdown command execution paths in `src/tui/mod.rs`. Use existing input cursor and byte/char index helpers for insertion safety. Keep app submission behavior untouched; accepted suggestions only edit the local input.
@@ -64,19 +64,30 @@ Modify key handling and dropdown command execution paths in `src/tui/mod.rs`. Us
 
 ## Tests
 - Unit tests:
-  - [ ] Up selects the previous command suggestion and wraps as expected.
-  - [ ] Down selects the next command suggestion and wraps as expected.
-  - [ ] `Tab` accepts `/config` and leaves input as `/config` without submitting.
-  - [ ] `Enter` accepts `/help` and leaves input as `/help` without toggling help.
-  - [ ] Accepting `/goal` leaves the cursor ready for additional goal text.
-  - [ ] Escape dismisses the dropdown and preserves raw input.
-  - [ ] `Enter` on `No commands found` does not dispatch `PromptSubmitted`.
-  - [ ] Normal Enter still submits input when no command dropdown is active.
+  - [x] Up selects the previous command suggestion and wraps as expected.
+  - [x] Down selects the next command suggestion and wraps as expected.
+  - [x] `Tab` accepts `/config` and leaves input as `/config` without submitting.
+  - [x] `Enter` accepts `/help` and leaves input as `/help` without toggling help.
+  - [x] Accepting `/goal` leaves the cursor ready for additional goal text.
+  - [x] Escape dismisses the dropdown and preserves raw input.
+  - [x] `Enter` on `No commands found` does not dispatch `PromptSubmitted`.
+  - [x] Normal Enter still submits input when no command dropdown is active.
 - Integration tests:
-  - [ ] Channel receiver remains empty after command dropdown acceptance.
-  - [ ] Existing agent and skill dropdown key tests still pass.
+  - [x] Channel receiver remains empty after command dropdown acceptance.
+  - [x] Existing agent and skill dropdown key tests still pass.
 - Test coverage target: >=80%
 - All tests must pass
+
+## Follow-up Notes (recorded during execution, 2026-06-12)
+- **No trailing space on accept**: command acceptance replaces the whole
+  `/`-token with `insert_text` exactly (no trailing space). Prompt prefixes
+  (`/agent:`, `/skill:`) must keep no trailing text so the specialized
+  dropdowns' token detection takes over; argument commands let the user type
+  their own space, which then releases the dropdown.
+- **Re-accept guard**: accepting sets `command_dropdown_dismissed` to the
+  inserted text so a second `Enter` submits (or toggles `/help`) instead of
+  re-accepting the same row; the agent/skill dropdowns ignore this dismissal,
+  preserving handoff.
 
 ## Success Criteria
 - All tests passing

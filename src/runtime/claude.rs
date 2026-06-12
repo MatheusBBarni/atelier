@@ -22,19 +22,46 @@ pub(crate) const REQUIRED_HELP_FLAGS: &[&str] = &[
     "--include-partial-messages",
     "--no-session-persistence",
     "--tools",
+    "--strict-mcp-config",
     "--setting-sources",
+    "--system-prompt",
+    "--exclude-dynamic-system-prompt-sections",
 ];
+
+// Replaces Claude Code's full default system prompt (skills, MCP servers, and
+// slash-command catalogues — measured at ~8k tokens in the init frame) with a
+// minimal adapter brief. The task protocol and JSON envelope still arrive over
+// stdin; stripping the default prompt keeps the model from behaving like a
+// standalone coding agent and markedly improves contract adherence on smaller
+// models (haiku otherwise returns malformed multi-action contracts or empty
+// turns).
+const CLAUDE_ADAPTER_SYSTEM_PROMPT: &str = "You are atelier's structured runtime adapter, not a standalone coding agent. Read the protocol and JSON envelope in the user message and reply with exactly one JSON contract inside the contract delimiters. Never use tools, edit files, run commands, inspect the repository, or emit any prose outside the contract.";
 
 const PROTECTED_DEFAULT_ARGS: &[&str] = &[
     "-p",
     "--output-format",
     "stream-json",
+    // The Claude CLI rejects `--print --output-format=stream-json` unless
+    // `--verbose` is also set.
+    "--verbose",
     "--include-partial-messages",
     "--no-session-persistence",
     "--tools",
     "",
+    // `--tools ""` drops the built-in/skill tools, but `--setting-sources user`
+    // still loads the user's MCP servers, leaving the model tools it can slip
+    // into mid-flow (a stray tool_use trips the harness-action boundary).
+    // `--strict-mcp-config` (with no --mcp-config) loads ZERO MCP servers, so
+    // the tool set is empty and a tool_use is physically impossible.
+    "--strict-mcp-config",
     "--setting-sources",
     "user",
+    // Strip the bloated default system prompt down to the adapter brief and
+    // drop the dynamic (skills/MCP/command) sections so the model stays in
+    // structured-contract mode.
+    "--system-prompt",
+    CLAUDE_ADAPTER_SYSTEM_PROMPT,
+    "--exclude-dynamic-system-prompt-sections",
 ];
 
 const DEFAULT_RUNTIME_TIMEOUT: Duration = Duration::from_secs(600);
@@ -364,7 +391,10 @@ fn validate_synthesized_args(args: &[String]) -> Result<()> {
     require_arg(args, "--include-partial-messages")?;
     require_arg(args, "--no-session-persistence")?;
     require_arg_value(args, "--tools", "")?;
+    require_arg(args, "--strict-mcp-config")?;
     require_arg_value(args, "--setting-sources", "user")?;
+    require_arg_value(args, "--system-prompt", CLAUDE_ADAPTER_SYSTEM_PROMPT)?;
+    require_arg(args, "--exclude-dynamic-system-prompt-sections")?;
     validate_synthesized_model_args(args)?;
     if args.iter().any(|arg| {
         matches!(
@@ -593,7 +623,12 @@ impl ClaudeStreamState {
             ))
         })?;
         if frame_requests_local_action(&value) {
-            return Err(RuntimeProviderError::non_retryable(
+            // The model went off-protocol and emitted a tool_use instead of an
+            // action_request contract. Because tools are disabled (`--tools ""`)
+            // nothing actually executed, so this is a safe, transient off-script
+            // turn: retry (same model, then any fallback) rather than killing
+            // the run on the first stray tool_use.
+            return Err(RuntimeProviderError::retryable(
                 "Claude stream requested tool use or local action execution; harness-action boundary violated",
             )
             .into());
@@ -686,14 +721,19 @@ impl ClaudeStreamState {
             ))
             .into());
         }
+        // An empty (or omitted) final result is a transient model hiccup: with
+        // thinking enabled the model can spend a turn reasoning and end without
+        // emitting a text block, so the CLI reports success with no `result`.
+        // Treat it as retryable so a fresh attempt (same model, then any
+        // fallback) can recover instead of failing the whole run.
         let Some(result_text) = result_text else {
-            return Err(RuntimeProviderError::non_retryable(
+            return Err(RuntimeProviderError::retryable(
                 "Claude final result frame omitted result text",
             )
             .into());
         };
         if result_text.trim().is_empty() {
-            return Err(RuntimeProviderError::non_retryable(
+            return Err(RuntimeProviderError::retryable(
                 "Claude final result frame contained empty result text",
             )
             .into());
@@ -923,7 +963,8 @@ fn claude_prompt_text(request: &RuntimeRequest) -> Result<String> {
 Follow this protocol exactly:
 - Use the JSON envelope below as the only task input.
 - Do not solve the user's prompt directly in prose.
-- Do not edit files, run commands, inspect the repository, use Claude Code tools, use MCP tools, or call local tool surfaces directly.
+- Do not edit files, run commands, inspect the repository, use Claude Code tools, use MCP tools, use skills, or call local tool surfaces directly.
+- You have NO tools available. To perform ANY file read, file write, edit, or command, you MUST return one action_request JSON contract (for example kind "write_file" to create a file). Never emit a tool_use for Write, Edit, Bash, Read, Skill, or any other tool — the harness rejects every tool_use and fails the run.
 - If you need repository data or a file/command/edit operation, return one action_request JSON contract. The harness will execute it and call you again with action_results.
 - If you can complete your current step, return one {output_schema} JSON contract.
 - Return no Markdown, no commentary, and no text outside the contract delimiters.
@@ -945,23 +986,33 @@ When output_schema is orchestrator_decision, return:
   "required_capabilities": ["read"],
   "stop_condition": "what should be true after the next step",
   "clarifying_question": null,
+  "clarifying_options": [],
+  "recommended_option_id": null,
   "final_summary": null
 }}
 
-When output_schema is agent_result, return:
+When status is waiting_for_user:
+- Set clarifying_question to one targeted question.
+- Set clarifying_options to 2-4 concise recommended answers, each shaped as {{"id": "stable-id", "label": "short answer", "description": "optional detail or null"}}.
+- Keep option ids unique and every id and label non-empty.
+- Set recommended_option_id to the strongest option id, or null when no option stands out.
+- Do not add a custom, other, or free-text option; the app always provides its own custom text answer path.
+
+When output_schema is agent_result, return (findings, changed_files, commands, and verification are each a list of plain strings — never objects or action descriptors):
 {{
   "schema_version": 1,
   "agent": "{agent_id}",
   "step_id": "{step_id}",
   "status": "completed|blocked|failed|cancelled|parse_error|limit_reached|approval_denied|no_changes",
   "summary": "brief result",
-  "findings": [],
-  "changed_files": [],
-  "commands": [],
-  "verification": [],
+  "findings": ["short factual finding"],
+  "changed_files": ["relative/path/to/file"],
+  "commands": ["short description of a command you ran, e.g. cargo test"],
+  "verification": ["how you confirmed the result, e.g. cargo test passed"],
   "blocker": null,
   "artifacts": []
 }}
+Never embed action objects (read_file, list_files, run_command, ...) inside any agent_result field; to perform an action, return one action_request contract at a time.
 
 When an action is needed instead, return:
 {{
@@ -1102,12 +1153,21 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--output-format", "stream-json"]));
         assert!(args.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--setting-sources", "user"]));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--model", "claude-opus-4"]));
+        // The bloated default system prompt is replaced by the adapter brief
+        // and the dynamic sections are excluded.
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--system-prompt", CLAUDE_ADAPTER_SYSTEM_PROMPT]));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--exclude-dynamic-system-prompt-sections"));
         assert!(args.contains(&"--safe-compat".to_string()));
     }
 
@@ -1116,6 +1176,20 @@ mod tests {
         let args = claude_step_args(&[], "default");
 
         assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn claude_step_args_pass_verbose_with_print_stream_json() {
+        // `claude --print --output-format=stream-json` errors without --verbose.
+        let args = claude_step_args(&[], "default");
+
+        assert!(args.iter().any(|arg| arg == "-p"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--output-format", "stream-json"]));
+        assert!(args.iter().any(|arg| arg == "--verbose"));
+        // --verbose must also survive validation (not on the forbidden list).
+        validate_synthesized_args(&args).unwrap();
     }
 
     #[test]
@@ -1216,7 +1290,12 @@ printf '%s\n' {}
         assert!(args.contains("--include-partial-messages\n"));
         assert!(args.contains("--no-session-persistence\n"));
         assert!(args.contains("--tools\n\n"));
+        assert!(args.contains("--strict-mcp-config\n"));
         assert!(args.contains("--setting-sources\nuser\n"));
+        assert!(args.contains(&format!(
+            "--system-prompt\n{CLAUDE_ADAPTER_SYSTEM_PROMPT}\n"
+        )));
+        assert!(args.contains("--exclude-dynamic-system-prompt-sections\n"));
         assert!(args.contains("--model\nclaude-opus-4\n"));
         assert!(stdin.contains("through the Claude CLI as a structured runtime adapter"));
         assert!(stdin.contains("Do not edit files, run commands"));
@@ -1482,6 +1561,9 @@ exec sleep 30
             emitted.push(event);
         }
         assert!(error.to_string().contains("harness-action boundary"));
+        // A stray tool_use is a transient off-protocol turn; nothing executed
+        // (tools are disabled), so the run retries instead of dying.
+        assert!(super::super::is_retryable_provider_error(&error));
         assert!(emitted.iter().any(|event| {
             event.is_transient()
                 && event.stream_name() == "message"
@@ -1579,7 +1661,10 @@ exec sleep 30
             .await
             .unwrap_err();
 
+        // Fails closed (the tool_use is rejected, never executed) but retryably,
+        // so a stray off-protocol turn does not kill the whole run.
         assert!(error.to_string().contains("harness-action boundary"));
+        assert!(super::super::is_retryable_provider_error(&error));
     }
 
     #[tokio::test]
@@ -1597,6 +1682,54 @@ exec sleep 30
             .await
             .unwrap_err();
 
+        assert!(super::super::is_retryable_provider_error(&error));
+    }
+
+    #[tokio::test]
+    async fn claude_empty_final_result_is_retryable() {
+        // A thinking-only turn can end with subtype=success/is_error=false but
+        // no text, so `result` is empty. That is a transient hiccup: it must be
+        // retryable, not a hard run failure.
+        for empty in ["", "   \n\t "] {
+            let mut state = ClaudeStreamState::default();
+            let frame = serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": empty
+            });
+
+            let error = state
+                .apply_line(&frame.to_string(), &RuntimeEventSink::channel(4).0)
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("empty result text"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                super::super::is_retryable_provider_error(&error),
+                "empty result should be retryable: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_omitted_final_result_is_retryable() {
+        let mut state = ClaudeStreamState::default();
+        let frame = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false
+        });
+
+        let error = state
+            .apply_line(&frame.to_string(), &RuntimeEventSink::channel(4).0)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("omitted result text"));
         assert!(super::super::is_retryable_provider_error(&error));
     }
 
@@ -1724,6 +1857,38 @@ exec sleep 30
         assert!(prompt.contains("return one action_request JSON contract"));
         assert!(prompt.contains(crate::orchestrator::JSON_START));
         assert!(!prompt.contains("--system-prompt"));
+    }
+
+    #[test]
+    fn claude_prompt_text_types_agent_result_arrays_as_strings() {
+        let prompt = claude_prompt_text(&runtime_request(
+            std::path::PathBuf::from("/tmp/project"),
+            "explorer",
+            "default",
+        ))
+        .unwrap();
+
+        assert!(prompt.contains("each a list of plain strings"));
+        assert!(prompt.contains("Never embed action objects"));
+        assert!(!prompt.contains("\"commands\": []"));
+    }
+
+    #[test]
+    fn claude_prompt_text_describes_structured_clarification_contract() {
+        let prompt = claude_prompt_text(&runtime_request(
+            std::path::PathBuf::from("/tmp/project"),
+            "orchestrator",
+            "default",
+        ))
+        .unwrap();
+
+        assert!(prompt.contains("\"clarifying_options\": []"));
+        assert!(prompt.contains("\"recommended_option_id\": null"));
+        assert!(prompt.contains("2-4 concise recommended answers"));
+        assert!(prompt.contains("Set recommended_option_id to the strongest option id"));
+        assert!(prompt.contains("the app always provides its own custom text answer path"));
+        assert!(!prompt.contains("question tool"));
+        assert!(!prompt.contains("ask_user"));
     }
 
     fn final_result_frame(agent: &str, step_id: &str, summary: &str) -> String {

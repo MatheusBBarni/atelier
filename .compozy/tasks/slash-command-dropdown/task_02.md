@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Route App Unknown-Command Guidance Through Catalog"
 type: backend
 complexity: low
@@ -29,11 +29,11 @@ Update app-level unknown slash-command guidance to consume the shared slash comm
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Update unknown-command guidance to use the shared command catalog.
-- [ ] 2.2 Preserve existing named prompt-prefix handling.
-- [ ] 2.3 Preserve current app command handlers and execution order.
-- [ ] 2.4 Add assertions for catalog-derived unknown-command guidance.
-- [ ] 2.5 Re-run app slash-command tests affected by the guidance change.
+- [x] 2.1 Update unknown-command guidance to use the shared command catalog.
+- [x] 2.2 Preserve existing named prompt-prefix handling.
+- [x] 2.3 Preserve current app command handlers and execution order.
+- [x] 2.4 Add assertions for catalog-derived unknown-command guidance.
+- [x] 2.5 Re-run app slash-command tests affected by the guidance change.
 
 ## Implementation Details
 Modify `reject_unknown_slash_command` in `src/app/mod.rs` to build available-command text from `src/slash_commands.rs`. Do not move app command handling or dispatch logic; this task is limited to visible guidance alignment.
@@ -59,14 +59,14 @@ Modify `reject_unknown_slash_command` in `src/app/mod.rs` to build available-com
 
 ## Tests
 - Unit tests:
-  - [ ] Submitting `/doctor` still returns an unknown-command error.
-  - [ ] Unknown-command error includes `/reload:skills`.
-  - [ ] Unknown-command error includes all fixed V1 command labels.
-  - [ ] `/agent:fixer inspect README` is still allowed as a prompt prefix.
-  - [ ] `/skill:reviewer inspect README` is still allowed as a prompt prefix.
+  - [x] Submitting `/doctor` still returns an unknown-command error.
+  - [x] Unknown-command error includes `/reload:skills`.
+  - [x] Unknown-command error includes all fixed V1 command labels.
+  - [x] `/agent:fixer inspect README` is still allowed as a prompt prefix.
+  - [x] `/skill:reviewer inspect README` is still allowed as a prompt prefix.
 - Integration tests:
-  - [ ] Existing clarification answer test still accepts `/tmp/project` while waiting for user input.
-  - [ ] Existing `/goal`, `/config`, and `/subtask` command tests still pass.
+  - [x] Existing clarification answer test still accepts `/tmp/project` while waiting for user input.
+  - [x] Existing `/goal`, `/config`, and `/subtask` command tests still pass.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -75,3 +75,20 @@ Modify `reject_unknown_slash_command` in `src/app/mod.rs` to build available-com
 - Test coverage >=80%
 - App unknown-command guidance is catalog-derived and no longer omits `/reload:skills`.
 - No command execution behavior changes are introduced.
+
+## Follow-up Notes (recorded during execution, 2026-06-11)
+- **Catalog scope amendment (resolves task_01 follow-up)**: per a recorded
+  decision, `/workflow <prompt>` and `/queue <message>` (alias `/q`) were added
+  to `src/slash_commands.rs` as `AppCommand` entries. Both shipped as real app
+  commands after the ADR-001 freeze and were already user-visible (`/workflow`
+  in app guidance + help; `/queue` handled before unknown-command rejection).
+  Routing guidance purely through the frozen 8-command catalog would have
+  dropped `/workflow` from guidance and broken
+  `unknown_slash_command_is_not_submitted_as_agent_prompt`. The amendment keeps
+  the catalog the single source of truth. `/agent:` and `/skill:` usage strings
+  were also aligned to the README/help wording (`<agent_name>`/`<skill_name>`)
+  so task_03's catalog-derived help rows match existing README-consistency
+  tests without README churn.
+- task_01's unit tests (`FIXED_V1_LABELS`, AppCommand categorization) and the
+  `tests/slash_command_catalog.rs` length assertion were updated to the amended
+  10-command set.

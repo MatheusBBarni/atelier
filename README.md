@@ -1,7 +1,28 @@
 # Atelier
 
+<p align="center">
+  <img src="web/public/images/atelier-logo.png" alt="Atelier logo: a teal and cream wizard hat above a terminal prompt, framed in gold on deep navy" width="168">
+</p>
+
 `atelier` is a terminal-native Rust harness that routes each user prompt through
 an orchestrator and a sequence of specialized agent profiles.
+
+<!-- RELEASE GATE (ADR-002): the two assets below must be captured against the
+shipped TUI and placed in web/public/images/ before this hero is merged. Capture
+specs and the manual 3-terminal checklist live in
+.compozy/tasks/atelier-tui-redesign/release-verification.md. -->
+
+<p align="center">
+  <img src="web/public/images/atelier-tui-welcome.png" alt="Atelier branded welcome screen: the Atelier wordmark above a facts box with version, working directory, repo and branch, agent summary, active preset, and a /help hint" width="900">
+</p>
+
+<p align="center">
+  <em>Parallel agents, each with a distinct accent color, under a live status footer:</em>
+</p>
+
+<p align="center">
+  <img src="web/public/images/atelier-tui-parallel-agents.gif" alt="Two Atelier agents running in parallel with distinct accent colors and a persistent repo, branch, and run-state footer" width="900">
+</p>
 
 ## Features
 
@@ -113,11 +134,21 @@ make the workspace stale by itself.
 
 ## TUI commands
 
+Type `/` at the start of the composer to open the command dropdown: it lists the
+built-in commands with short descriptions, filters as you type, and inserts the
+selected command with `Tab` or `Enter` (text only — it never submits). `Esc`
+dismisses it, and an unmatched command shows a compact "No commands found"
+state. The dropdown stays disabled during clarification and approval prompts so
+slash-prefixed answers like `/tmp/project` remain normal input.
+
+- `/help`: toggle the help overlay.
 - `/goal <text>`, `/goal`, `/goal clear`: manage the active session goal.
 - `/config`: show active config files, selected preset, and warnings without raw prompt bodies.
 - `/subtask <agent> <task>`: run one bounded child task through a specialized enabled agent.
+- `/workflow <prompt>`: execute a broad implementation or refactor prompt inside one normal run with plan, child-outcome, verification, and risk evidence. V1 does not support saved workflow scripts, worktree-isolated workflow children, or background workflow execution.
+- `/queue <message>` (alias `/q`): queue a follow-up prompt to run after the active run finishes.
 - `/agent:<name>`: prefix a prompt with a selected agent; in the TUI, type `/agent:` and use Up/Down plus Enter to insert an enabled agent id.
-- `/skill:<name>`: prefix a prompt with a selected skill; in the TUI, type `/skill:` and use Up/Down plus Enter to insert a cached project or personal skill.
+- `/skill:<skill_name>`: load skill context from a selected project or personal skill; in the TUI, type `/skill:` and use Up/Down plus Enter to insert a cached project or personal skill.
 - `/reload:skills`: refresh cached skill names from project and personal skill folders.
 
 ## Configuration

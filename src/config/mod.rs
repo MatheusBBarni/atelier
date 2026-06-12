@@ -198,6 +198,11 @@ pub struct Features {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiConfig {
+    pub hide_banner: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspacePolicy {
     pub extra_read_roots: Vec<PathBuf>,
     pub extra_write_roots: Vec<PathBuf>,
@@ -364,6 +369,7 @@ pub struct EffectiveConfig {
     pub approval_mode: ApprovalMode,
     pub workspace: WorkspacePolicy,
     pub features: Features,
+    pub ui: UiConfig,
     pub limits: Limits,
     pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
@@ -378,6 +384,7 @@ struct RawConfig {
     approval_mode: Option<ApprovalMode>,
     workspace: Option<RawWorkspacePolicy>,
     features: Option<RawFeatures>,
+    ui: Option<RawUiConfig>,
     limits: Option<RawLimits>,
     council: Option<RawCouncilConfig>,
     runtimes: Option<BTreeMap<String, RawRuntimeConfig>>,
@@ -402,6 +409,12 @@ struct RawWorkspacePolicy {
 #[serde(deny_unknown_fields)]
 struct RawFeatures {
     parallel_step_groups: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUiConfig {
+    hide_banner: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -556,6 +569,7 @@ struct MergedConfig {
     approval_mode: ApprovalMode,
     workspace: WorkspacePolicy,
     features: Features,
+    ui: UiConfig,
     limits: Limits,
     council: MergedCouncilConfig,
     runtimes: BTreeMap<String, MergedRuntimeConfig>,
@@ -757,6 +771,7 @@ impl MergedConfig {
             approval_mode: ApprovalMode::Yolo,
             workspace: WorkspacePolicy::default(),
             features: Features::default(),
+            ui: UiConfig::default(),
             limits: Limits::default(),
             council: builtin_council_config(),
             runtimes,
@@ -795,6 +810,12 @@ impl MergedConfig {
         if let Some(features) = raw.features {
             if let Some(value) = features.parallel_step_groups {
                 self.features.parallel_step_groups = value;
+            }
+        }
+
+        if let Some(ui) = raw.ui {
+            if let Some(value) = ui.hide_banner {
+                self.ui.hide_banner = value;
             }
         }
 
@@ -1319,6 +1340,7 @@ impl MergedConfig {
             approval_mode: self.approval_mode,
             workspace: self.workspace,
             features: self.features,
+            ui: self.ui,
             limits: self.limits,
             council,
             runtimes,
@@ -1671,6 +1693,7 @@ const CLAUDE_PROTECTED_ARG_NAMES: &[&str] = &[
     "--system-prompt-file",
     "--append-system-prompt",
     "--append-system-prompt-file",
+    "--exclude-dynamic-system-prompt-sections",
     "--model",
     "-m",
     "--fallback-model",
@@ -1774,6 +1797,7 @@ struct PrintableConfig {
     approval_mode: ApprovalMode,
     workspace: WorkspacePolicy,
     features: Features,
+    ui: UiConfig,
     limits: Limits,
     council: PrintableCouncilConfig,
     runtimes: BTreeMap<String, PrintableRuntime>,
@@ -1846,6 +1870,7 @@ pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
         approval_mode: config.approval_mode.clone(),
         workspace: config.workspace.clone(),
         features: config.features.clone(),
+        ui: config.ui.clone(),
         limits: config.limits.clone(),
         council: PrintableCouncilConfig {
             default_preset: config.council.default_preset.clone(),
@@ -1998,6 +2023,10 @@ approval_mode = "yolo"
 
 [features]
 parallel_step_groups = false
+
+# Optional UI tweaks. Uncomment to suppress the welcome banner.
+# [ui]
+# hide_banner = true
 
 [runtimes.codex]
 type = "codex"
@@ -2326,6 +2355,74 @@ max_parallel_agent_steps = 0
 
         assert!(config.features.parallel_step_groups);
         assert_eq!(config.limits.max_parallel_agent_steps, 0);
+    }
+
+    #[test]
+    fn ui_section_absent_defaults_hide_banner_false() {
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+
+        assert!(!config.ui.hide_banner);
+    }
+
+    #[test]
+    fn ui_hide_banner_true_parses() {
+        let config = load_from_temp(
+            r#"
+[ui]
+hide_banner = true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.ui.hide_banner);
+    }
+
+    #[test]
+    fn ui_unknown_key_rejected() {
+        let error = load_from_temp(
+            r#"
+[ui]
+unknown_key = 1
+"#,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown_key"));
+    }
+
+    #[test]
+    fn redacted_toml_includes_ui_section_with_effective_value() {
+        let config = load_from_temp(
+            r#"
+[ui]
+hide_banner = true
+"#,
+        )
+        .unwrap();
+
+        let rendered = to_redacted_toml(&config).unwrap();
+        assert!(rendered.contains("[ui]"));
+        assert!(rendered.contains("hide_banner = true"));
+    }
+
+    #[test]
+    fn ui_section_merges_over_preset_from_project_file() {
+        let config = load_from_temp(
+            r#"
+preset = "fast"
+
+[ui]
+hide_banner = true
+
+[presets.fast.agents.fixer]
+model = "preset-model"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.active_preset.as_deref(), Some("fast"));
+        assert_eq!(config.agents.get("fixer").unwrap().model, "preset-model");
+        assert!(config.ui.hide_banner);
     }
 
     #[test]

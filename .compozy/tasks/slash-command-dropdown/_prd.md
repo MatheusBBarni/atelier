@@ -24,7 +24,7 @@ The feature prioritizes reducing unknown-command errors. It does not execute com
 
 ## Core Features
 
-- **Fixed V1 command suggestions:** Show only `/help`, `/goal`, `/goal clear`, `/config`, `/subtask`, `/agent:`, `/skill:`, and `/reload:skills`.
+- **Fixed V1 command suggestions:** Show only `/help`, `/goal`, `/goal clear`, `/config`, `/subtask`, `/workflow`, `/queue`, `/agent:`, `/skill:`, and `/reload:skills`. (`/workflow` and `/queue` were added by an approved 2026-06-12 scope amendment — see ADR-001 — because they shipped as real app commands after the original freeze; the set remains fixed and closed.)
 - **Filter as typed:** Narrow visible suggestions as users type after `/`.
 - **Compact empty state:** Show "No commands found" when no command matches.
 - **Keyboard navigation:** Use Up/Down for selection and `Tab` or `Enter` to accept.

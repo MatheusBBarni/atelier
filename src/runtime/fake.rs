@@ -6,11 +6,13 @@ use crate::actions::{ActionKind, ActionRequest, ActionStatus};
 use crate::config::{Capability, RuntimeConfig};
 use crate::ids::new_id;
 use crate::orchestrator::{
-    agent_results, AgentResult, AgentResultStatus, DecisionNextStep, DecisionStatus,
-    OrchestratorDecision, ParallelChildStepPlan, ParallelFileScope, ParallelGroupPlan,
+    agent_results, AgentResult, AgentResultStatus, ClarificationOption, DecisionNextStep,
+    DecisionStatus, OrchestratorDecision, ParallelChildStepPlan, ParallelFileScope,
+    ParallelGroupPlan,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -42,6 +44,13 @@ impl Runtime for FakeRuntime {
         events: RuntimeEventSink,
         cancellation: CancellationToken,
     ) -> Result<RuntimeOutput> {
+        if should_emit_fake_non_retryable_provider_error(&request) {
+            return Err(RuntimeProviderError::non_retryable(format!(
+                "fake non-retryable provider error for model {}",
+                request.agent_profile.model
+            ))
+            .into());
+        }
         if should_emit_fake_retryable_provider_error(&request) {
             return Err(RuntimeProviderError::retryable(format!(
                 "fake retryable provider error for model {}",
@@ -146,7 +155,7 @@ async fn emit_fake_progress(
 }
 
 fn fake_stream_delay(request: &RuntimeRequest) -> Duration {
-    let prompt = request.prompt.to_ascii_lowercase();
+    let prompt = fake_control_text(request);
     if request.parallel_context.is_some() {
         if prompt.contains("approval action") && request.agent_profile.id == "fixer" {
             return Duration::from_millis(50);
@@ -180,7 +189,7 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             crate::orchestrator::RunStepResult::Agent { result } => result.agent.as_str(),
             crate::orchestrator::RunStepResult::ParallelGroup { .. } => "parallel_group",
         });
-    let prompt = request.prompt.to_ascii_lowercase();
+    let prompt = fake_control_text(request);
     if last_agent.is_none() && prompt.contains("parallel") {
         let steps = if prompt.contains("same agent") || prompt.contains("scoped write action") {
             vec![
@@ -269,6 +278,8 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             required_capabilities: Vec::new(),
             stop_condition: "All parallel children have terminal results.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
     }
@@ -362,11 +373,39 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             Some("Fake runtime completed the run through the orchestrator and specialized agents.".to_string()),
         ),
     };
-    let clarifying_question = if matches!(status, DecisionStatus::WaitingForUser) {
-        Some("Which target or constraint should guide this run?".to_string())
-    } else {
-        None
-    };
+    let (clarifying_question, clarifying_options, recommended_option_id) =
+        if matches!(status, DecisionStatus::WaitingForUser) {
+            (
+                Some("Which target or constraint should guide this run?".to_string()),
+                vec![
+                    ClarificationOption {
+                        id: "target_scope".to_string(),
+                        label: "Clarify the target scope".to_string(),
+                        description: Some(
+                            "Specify the file, workflow, or product area to prioritize."
+                                .to_string(),
+                        ),
+                    },
+                    ClarificationOption {
+                        id: "success_criteria".to_string(),
+                        label: "Clarify success criteria".to_string(),
+                        description: Some(
+                            "Describe the outcome that should make the run complete.".to_string(),
+                        ),
+                    },
+                    ClarificationOption {
+                        id: "constraints".to_string(),
+                        label: "Clarify constraints".to_string(),
+                        description: Some(
+                            "Call out limits, dependencies, or risky areas.".to_string(),
+                        ),
+                    },
+                ],
+                Some("target_scope".to_string()),
+            )
+        } else {
+            (None, Vec::new(), None)
+        };
 
     OrchestratorDecision {
         schema_version: 1,
@@ -384,6 +423,8 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
         required_capabilities,
         stop_condition,
         clarifying_question,
+        clarifying_options,
+        recommended_option_id,
         final_summary,
     }
 }
@@ -474,42 +515,32 @@ fn looks_like_code_change(prompt: &str) -> bool {
 fn should_emit_fake_action_request(request: &RuntimeRequest) -> bool {
     request.action_results.is_empty()
         && request.agent_profile.has_capability(&Capability::Read)
-        && request.prompt.to_ascii_lowercase().contains("use action")
+        && fake_control_text(request).contains("use action")
 }
 
 fn should_emit_fake_approval_action_request(request: &RuntimeRequest) -> bool {
     request.action_results.is_empty()
         && request.agent_profile.id == "fixer"
         && request.agent_profile.has_capability(&Capability::Command)
-        && request
-            .prompt
-            .to_ascii_lowercase()
-            .contains("approval action")
+        && fake_control_text(request).contains("approval action")
 }
 
 fn should_emit_fake_command_action_request(request: &RuntimeRequest) -> bool {
     request.action_results.is_empty()
         && request.agent_profile.id == "fixer"
         && request.agent_profile.has_capability(&Capability::Command)
-        && request
-            .prompt
-            .to_ascii_lowercase()
-            .contains("command action")
+        && fake_control_text(request).contains("command action")
 }
 
 fn should_emit_fake_write_action_request(request: &RuntimeRequest) -> bool {
     request.action_results.is_empty()
         && request.agent_profile.id == "fixer"
         && request.agent_profile.has_capability(&Capability::Edit)
-        && request.prompt.to_ascii_lowercase().contains("write action")
+        && fake_control_text(request).contains("write action")
 }
 
 fn fake_write_action_path(request: &RuntimeRequest) -> String {
-    if request
-        .prompt
-        .to_ascii_lowercase()
-        .contains("scoped write action")
-    {
+    if fake_control_text(request).contains("scoped write action") {
         if let Some(path) = request
             .parallel_context
             .as_ref()
@@ -538,7 +569,7 @@ fn completed_action_paths(request: &RuntimeRequest) -> Vec<String> {
 }
 
 fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
-    let prompt = request.prompt.to_ascii_lowercase();
+    let prompt = fake_control_text(request);
     if request
         .agent_profile
         .instructions
@@ -550,6 +581,17 @@ fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
     if prompt.contains("always parse error") {
         return true;
     }
+    if prompt.contains("child parse error")
+        && request.parallel_context.as_ref().is_some_and(|context| {
+            context
+                .file_scope
+                .write_files
+                .iter()
+                .any(|path| path == "parallel-output/fixer-b.txt")
+        })
+    {
+        return true;
+    }
 
     let agent_id = request.agent_profile.id.as_str();
     let requested_once = (agent_id == "orchestrator"
@@ -559,15 +601,162 @@ fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
 }
 
 fn should_emit_fake_retryable_provider_error(request: &RuntimeRequest) -> bool {
-    request
-        .prompt
-        .to_ascii_lowercase()
-        .contains("retryable provider error")
+    let control = fake_control_text(request);
+    control.contains("retryable provider error")
+        // "non-retryable provider error" contains "retryable provider error" as
+        // a substring; keep the two control phrases disjoint.
+        && !control.contains("non-retryable provider error")
         && request.agent_profile.model == "primary-fails"
+}
+
+fn should_emit_fake_non_retryable_provider_error(request: &RuntimeRequest) -> bool {
+    fake_control_text(request).contains("non-retryable provider error")
+}
+
+fn fake_control_text(request: &RuntimeRequest) -> String {
+    fake_control_prompt(request).to_ascii_lowercase()
+}
+
+fn fake_control_prompt(request: &RuntimeRequest) -> Cow<'_, str> {
+    const SYSTEM_PROMPT_OPEN: &str = "<System Prompt>\n";
+    const USER_PROMPT_OPEN: &str = "<User Prompt>\n";
+    const USER_PROMPT_CLOSE: &str = "\n</User Prompt>";
+    const WORKFLOW_USER_PROMPT_OPEN: &str = "\nExtracted user prompt:\n";
+
+    let prompt = request.prompt.as_str();
+    if let Some(body_start) = prompt
+        .find(WORKFLOW_USER_PROMPT_OPEN)
+        .map(|start| start + WORKFLOW_USER_PROMPT_OPEN.len())
+    {
+        return Cow::Borrowed(&prompt[body_start..]);
+    }
+    if !prompt.starts_with(SYSTEM_PROMPT_OPEN) {
+        return Cow::Borrowed(prompt);
+    }
+    let Some(body_start) = prompt
+        .find(USER_PROMPT_OPEN)
+        .map(|start| start + USER_PROMPT_OPEN.len())
+    else {
+        return Cow::Borrowed(prompt);
+    };
+    let Some(body_end) = prompt[body_start..]
+        .find(USER_PROMPT_CLOSE)
+        .map(|end| body_start + end)
+    else {
+        return Cow::Borrowed(prompt);
+    };
+    Cow::Borrowed(&prompt[body_start..body_end])
 }
 
 fn has_prior_parse_error(request: &RuntimeRequest, agent_id: &str) -> bool {
     agent_results(&request.previous_results).any(|result| {
         result.agent == agent_id && matches!(result.status, AgentResultStatus::ParseError)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AgentEffort, AgentPromptMetadata, Limits};
+    use std::path::PathBuf;
+
+    fn orchestrator_request(prompt: &str) -> RuntimeRequest {
+        RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: prompt.to_string(),
+            session_goal: None,
+            working_directory: PathBuf::from("/tmp/project"),
+            agent_profile: crate::config::AgentProfile {
+                id: "orchestrator".to_string(),
+                name: "Orchestrator".to_string(),
+                runtime: "fake".to_string(),
+                model: "default".to_string(),
+                model_fallbacks: Vec::new(),
+                effort: AgentEffort::Medium,
+                thinking: false,
+                capabilities: Vec::new(),
+                tools: None,
+                instructions: String::new(),
+                orchestrator_description: None,
+                prompt_metadata: AgentPromptMetadata::default(),
+                enabled: true,
+            },
+            session_events: Vec::new(),
+            recent_context: crate::runtime::RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "orchestrator_decision".to_string(),
+            parallel_context: None,
+            capability_constraints: Vec::new(),
+            limits: Limits::default(),
+        }
+    }
+
+    fn assert_scoped_parallel_write_plan(prompt: &str) {
+        let request = orchestrator_request(prompt);
+        let decision = fake_decision(&request);
+        let Some(DecisionNextStep::ParallelGroup(group)) = decision.next_step else {
+            panic!("expected fake runtime to select a parallel group");
+        };
+
+        assert_eq!(group.steps.len(), 2);
+        assert_eq!(
+            group.steps[0].file_scope.write_files,
+            ["parallel-output/fixer-a.txt"]
+        );
+        assert_eq!(
+            group.steps[1].file_scope.write_files,
+            ["parallel-output/fixer-b.txt"]
+        );
+    }
+
+    #[test]
+    fn workflow_envelope_prompt_matching_recognizes_parallel_scoped_write_action() {
+        let prompt = r#"Workflow mode instructions:
+- Treat this as one normal app Run in workflow mode.
+- Execute safe specialized-agent steps, using Parallel Step Groups only when file scopes are exact.
+
+Original command:
+/workflow parallel scoped write action create a feature
+
+Extracted user prompt:
+parallel scoped write action create a feature"#;
+
+        assert_scoped_parallel_write_plan(prompt);
+    }
+
+    #[test]
+    fn non_workflow_prompt_matching_still_recognizes_parallel_scoped_write_action() {
+        assert_scoped_parallel_write_plan("parallel scoped write action create a feature");
+    }
+
+    #[test]
+    fn needs_clarification_decision_has_deterministic_options() {
+        let request = orchestrator_request("needs clarification create a feature");
+
+        let decision = fake_decision(&request);
+
+        assert_eq!(decision.status, DecisionStatus::WaitingForUser);
+        assert_eq!(
+            decision.clarifying_question.as_deref(),
+            Some("Which target or constraint should guide this run?")
+        );
+        assert_eq!(
+            decision
+                .clarifying_options
+                .iter()
+                .map(|option| (option.id.as_str(), option.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("target_scope", "Clarify the target scope"),
+                ("success_criteria", "Clarify success criteria"),
+                ("constraints", "Clarify constraints"),
+            ]
+        );
+        assert_eq!(
+            decision.recommended_option_id.as_deref(),
+            Some("target_scope")
+        );
+    }
 }

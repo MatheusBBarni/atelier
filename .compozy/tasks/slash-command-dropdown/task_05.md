@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Render Command Dropdown And Empty State"
 type: frontend
 complexity: medium
@@ -30,11 +30,11 @@ Render the command dropdown and compact no-match state above the TUI composer us
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Add command dropdown rendering to the TUI render precedence.
-- [ ] 5.2 Add command suggestion row rendering with labels and descriptions.
-- [ ] 5.3 Add compact no-match empty-state rendering.
-- [ ] 5.4 Preserve existing agent and skill dropdown render output.
-- [ ] 5.5 Add render tests for matching, filtering, empty state, and layout constraints.
+- [x] 5.1 Add command dropdown rendering to the TUI render precedence.
+- [x] 5.2 Add command suggestion row rendering with labels and descriptions.
+- [x] 5.3 Add compact no-match empty-state rendering.
+- [x] 5.4 Preserve existing agent and skill dropdown render output.
+- [x] 5.5 Add render tests for matching, filtering, empty state, and layout constraints.
 
 ## Implementation Details
 Modify `render`, dropdown rendering helpers, and render tests in `src/tui/mod.rs`. Reference the TechSpec "Integration Points" and "Known Risks" sections for the visual reuse and truncation requirements.
@@ -61,15 +61,15 @@ Modify `render`, dropdown rendering helpers, and render tests in `src/tui/mod.rs
 
 ## Tests
 - Unit tests:
-  - [ ] Rendering `/` shows a `Commands` dropdown with fixed V1 command labels.
-  - [ ] Rendering `/g` shows `/goal` and `/goal clear`.
-  - [ ] Rendering `/zz` shows `No commands found`.
-  - [ ] Command rows include descriptions without overflowing the input area.
-  - [ ] Existing agent dropdown render test still shows `Agents`.
-  - [ ] Existing skill dropdown render test still shows `Skills`.
+  - [x] Rendering `/` shows a `Commands` dropdown with fixed V1 command labels.
+  - [x] Rendering `/g` shows `/goal` and `/goal clear`.
+  - [x] Rendering `/zz` shows `No commands found`.
+  - [x] Command rows include descriptions without overflowing the input area.
+  - [x] Existing agent dropdown render test still shows `Agents`.
+  - [x] Existing skill dropdown render test still shows `Skills`.
 - Integration tests:
-  - [ ] Help modal rendering still suppresses dropdown rendering while help is visible.
-  - [ ] Command dropdown renders only after agent and skill dropdowns are not active.
+  - [x] Help modal rendering still suppresses dropdown rendering while help is visible.
+  - [x] Command dropdown renders only after agent and skill dropdowns are not active.
 - Test coverage target: >=80%
 - All tests must pass
 

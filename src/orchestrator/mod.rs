@@ -1,7 +1,7 @@
 use crate::config::{AgentProfile, Capability, EffectiveConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 pub const JSON_START: &str = "<<<MULTIAGENT_JSON_START>>>";
@@ -62,7 +62,19 @@ pub struct OrchestratorDecision {
     pub required_capabilities: Vec<Capability>,
     pub stop_condition: String,
     pub clarifying_question: Option<String>,
+    #[serde(default)]
+    pub clarifying_options: Vec<ClarificationOption>,
+    #[serde(default)]
+    pub recommended_option_id: Option<String>,
     pub final_summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClarificationOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -395,6 +407,7 @@ pub fn validate_orchestrator_decision(
             {
                 bail!("waiting_for_user decision is missing clarifying_question");
             }
+            validate_clarification_options(decision)?;
         }
         DecisionStatus::Complete => {
             validate_terminal_decision_has_no_next_step(decision)?;
@@ -423,6 +436,45 @@ fn validate_terminal_decision_has_no_next_step(decision: &OrchestratorDecision) 
     if decision.next_agent.is_some() || decision.next_step.is_some() {
         bail!("non-continue decision must not contain a next step");
     }
+    Ok(())
+}
+
+fn validate_clarification_options(decision: &OrchestratorDecision) -> Result<()> {
+    let option_count = decision.clarifying_options.len();
+    if !(2..=4).contains(&option_count) {
+        bail!(
+            "waiting_for_user decision must include 2-4 clarifying_options, found {option_count}"
+        );
+    }
+
+    let mut option_ids = BTreeSet::new();
+    for (index, option) in decision.clarifying_options.iter().enumerate() {
+        let id = option.id.trim();
+        if id.is_empty() {
+            bail!("waiting_for_user clarifying_options[{index}] is missing id");
+        }
+
+        if option.label.trim().is_empty() {
+            bail!("waiting_for_user clarifying_options[{index}] is missing label");
+        }
+
+        if !option_ids.insert(id.to_string()) {
+            bail!("waiting_for_user clarifying_options contains duplicate id '{id}'");
+        }
+    }
+
+    if let Some(recommended_option_id) = decision.recommended_option_id.as_deref() {
+        let recommended_option_id = recommended_option_id.trim();
+        if recommended_option_id.is_empty() {
+            bail!("waiting_for_user recommended_option_id is blank");
+        }
+        if !option_ids.contains(recommended_option_id) {
+            bail!(
+                "waiting_for_user recommended_option_id '{recommended_option_id}' does not match any clarifying_options id"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -657,7 +709,9 @@ pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
             .to_string(),
         "- Do not route to disabled or unknown agents.".to_string(),
         "- Keep required_capabilities no broader than the next step needs.".to_string(),
-        "- Ask a clarifying question when the next safe step is ambiguous.".to_string(),
+        "- Ask a clarifying question when the next safe step is ambiguous, and include 2-4 concise recommended answers as clarifying_options.".to_string(),
+        "- Set recommended_option_id to the strongest option id, or leave it null when no option stands out.".to_string(),
+        "- Do not add a custom, other, or free-text option; the app always provides its own custom text answer path.".to_string(),
         "- Mark the run complete only when the original user request is satisfied.".to_string(),
     ]);
     if config.features.parallel_step_groups && config.limits.max_parallel_agent_steps > 0 {
@@ -749,6 +803,94 @@ mod tests {
         }
     }
 
+    fn validation_config() -> crate::config::EffectiveConfig {
+        let dir = tempdir().unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap()
+    }
+
+    fn clarification_option(id: &str, label: &str) -> ClarificationOption {
+        ClarificationOption {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: None,
+        }
+    }
+
+    fn waiting_decision(
+        clarifying_options: Vec<ClarificationOption>,
+        recommended_option_id: Option<&str>,
+    ) -> OrchestratorDecision {
+        OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::WaitingForUser,
+            plan: vec!["Clarify the target.".to_string()],
+            next_agent: None,
+            next_step: None,
+            reason: "The requested target is ambiguous.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "User provides clarification.".to_string(),
+            clarifying_question: Some("Which target should this run prioritize?".to_string()),
+            clarifying_options,
+            recommended_option_id: recommended_option_id.map(str::to_string),
+            final_summary: None,
+        }
+    }
+
+    fn valid_clarification_options(count: usize) -> Vec<ClarificationOption> {
+        (0..count)
+            .map(|index| {
+                clarification_option(
+                    &format!("option_{}", index + 1),
+                    &format!("Option {}", index + 1),
+                )
+            })
+            .collect()
+    }
+
+    fn continue_decision_without_options() -> OrchestratorDecision {
+        OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: vec!["Read context.".to_string()],
+            next_agent: Some("explorer".to_string()),
+            next_step: None,
+            reason: "Need repository context.".to_string(),
+            required_capabilities: vec![Capability::Read],
+            stop_condition: "Explorer returns context.".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            final_summary: None,
+        }
+    }
+
+    fn complete_decision_without_options() -> OrchestratorDecision {
+        OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Complete,
+            plan: Vec::new(),
+            next_agent: None,
+            next_step: None,
+            reason: "The run is complete.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Run complete.".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            final_summary: Some("Completed the run.".to_string()),
+        }
+    }
+
     #[test]
     fn parses_delimited_orchestrator_decision() {
         let decision = OrchestratorDecision {
@@ -763,6 +905,8 @@ mod tests {
             required_capabilities: vec![Capability::Read],
             stop_condition: "Context gathered.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
         let wrapped = wrap_json_contract(&decision).unwrap();
@@ -792,6 +936,247 @@ mod tests {
 
         assert_eq!(decision.next_agent.as_deref(), Some("explorer"));
         assert_eq!(decision.required_capabilities, vec![Capability::Read]);
+    }
+
+    #[test]
+    fn parses_decision_omitting_structured_clarification_fields() {
+        let raw = r#"{
+  "schema_version": 1,
+  "decision_id": "decision",
+  "run_id": "run",
+  "status": "continue",
+  "plan": ["Read context."],
+  "next_agent": "explorer",
+  "next_step": null,
+  "reason": "Need repository context.",
+  "required_capabilities": ["read"],
+  "stop_condition": "Explorer returns context.",
+  "clarifying_question": null,
+  "final_summary": null
+}"#;
+
+        let decision = parse_orchestrator_decision(raw).unwrap();
+
+        assert!(decision.clarifying_options.is_empty());
+        assert_eq!(decision.recommended_option_id, None);
+    }
+
+    #[test]
+    fn parses_waiting_decision_with_structured_clarification_options() {
+        let raw = r#"{
+  "schema_version": 1,
+  "decision_id": "decision",
+  "run_id": "run",
+  "status": "waiting_for_user",
+  "plan": ["Clarify the target."],
+  "next_agent": null,
+  "next_step": null,
+  "reason": "The requested target is ambiguous.",
+  "required_capabilities": [],
+  "stop_condition": "User provides clarification.",
+  "clarifying_question": "Which target should this run prioritize?",
+  "clarifying_options": [
+    {
+      "id": "tests",
+      "label": "Prioritize tests",
+      "description": "Focus on regression coverage first."
+    },
+    {
+      "id": "docs",
+      "label": "Prioritize docs"
+    }
+  ],
+  "recommended_option_id": "tests",
+  "final_summary": null
+}"#;
+
+        let decision = parse_orchestrator_decision(raw).unwrap();
+
+        assert_eq!(decision.status, DecisionStatus::WaitingForUser);
+        assert_eq!(decision.clarifying_options.len(), 2);
+        assert_eq!(decision.clarifying_options[0].id, "tests");
+        assert_eq!(decision.clarifying_options[0].label, "Prioritize tests");
+        assert_eq!(
+            decision.clarifying_options[0].description.as_deref(),
+            Some("Focus on regression coverage first.")
+        );
+        assert_eq!(decision.clarifying_options[1].id, "docs");
+        assert_eq!(decision.clarifying_options[1].description, None);
+        assert_eq!(decision.recommended_option_id.as_deref(), Some("tests"));
+    }
+
+    #[test]
+    fn serializes_decision_with_structured_clarification_fields() {
+        let decision = OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::WaitingForUser,
+            plan: vec!["Clarify the target.".to_string()],
+            next_agent: None,
+            next_step: None,
+            reason: "The requested target is ambiguous.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "User provides clarification.".to_string(),
+            clarifying_question: Some("Which target should this run prioritize?".to_string()),
+            clarifying_options: vec![
+                ClarificationOption {
+                    id: "tests".to_string(),
+                    label: "Prioritize tests".to_string(),
+                    description: Some("Focus on regression coverage first.".to_string()),
+                },
+                ClarificationOption {
+                    id: "docs".to_string(),
+                    label: "Prioritize docs".to_string(),
+                    description: None,
+                },
+            ],
+            recommended_option_id: Some("tests".to_string()),
+            final_summary: None,
+        };
+
+        let value = serde_json::to_value(&decision).unwrap();
+
+        assert!(value.get("clarifying_options").is_some());
+        assert_eq!(
+            value
+                .get("clarifying_options")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            value
+                .get("recommended_option_id")
+                .and_then(|value| value.as_str()),
+            Some("tests")
+        );
+    }
+
+    #[test]
+    fn validates_waiting_decision_with_two_clarification_options() {
+        let config = validation_config();
+        let decision = waiting_decision(valid_clarification_options(2), Some("option_1"));
+
+        validate_orchestrator_decision(&decision, &config).unwrap();
+    }
+
+    #[test]
+    fn validates_waiting_decision_with_four_clarification_options() {
+        let config = validation_config();
+        let decision = waiting_decision(valid_clarification_options(4), Some("option_4"));
+
+        validate_orchestrator_decision(&decision, &config).unwrap();
+    }
+
+    #[test]
+    fn rejects_waiting_decision_with_invalid_clarification_option_count() {
+        let config = validation_config();
+
+        for option_count in [0, 1, 5] {
+            let decision = waiting_decision(valid_clarification_options(option_count), None);
+            let error = validate_orchestrator_decision(&decision, &config).unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("2-4 clarifying_options, found {option_count}")),
+                "unexpected error for {option_count} options: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_waiting_decision_with_blank_option_id() {
+        let config = validation_config();
+        let decision = waiting_decision(
+            vec![
+                clarification_option(" ", "Use the CLI path"),
+                clarification_option("web", "Use the web path"),
+            ],
+            None,
+        );
+
+        let error = validate_orchestrator_decision(&decision, &config).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("clarifying_options[0] is missing id"));
+    }
+
+    #[test]
+    fn rejects_waiting_decision_with_blank_option_label() {
+        let config = validation_config();
+        let decision = waiting_decision(
+            vec![
+                clarification_option("cli", " "),
+                clarification_option("web", "Use the web path"),
+            ],
+            None,
+        );
+
+        let error = validate_orchestrator_decision(&decision, &config).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("clarifying_options[0] is missing label"));
+    }
+
+    #[test]
+    fn rejects_waiting_decision_with_duplicate_option_ids() {
+        let config = validation_config();
+        let decision = waiting_decision(
+            vec![
+                clarification_option("cli", "Use the CLI path"),
+                clarification_option("cli", "Use the terminal path"),
+            ],
+            None,
+        );
+
+        let error = validate_orchestrator_decision(&decision, &config).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("clarifying_options contains duplicate id 'cli'"));
+    }
+
+    #[test]
+    fn rejects_waiting_decision_with_invalid_recommended_option_id() {
+        let config = validation_config();
+        let decision = waiting_decision(
+            vec![
+                clarification_option("cli", "Use the CLI path"),
+                clarification_option("web", "Use the web path"),
+            ],
+            Some("docs"),
+        );
+
+        let error = validate_orchestrator_decision(&decision, &config).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("recommended_option_id 'docs' does not match any clarifying_options id"));
+    }
+
+    #[test]
+    fn non_waiting_decisions_do_not_require_clarification_options() {
+        let config = validation_config();
+
+        validate_orchestrator_decision(&continue_decision_without_options(), &config).unwrap();
+        validate_orchestrator_decision(&complete_decision_without_options(), &config).unwrap();
+    }
+
+    #[test]
+    fn waiting_decision_still_rejects_next_agent() {
+        let config = validation_config();
+        let mut decision = waiting_decision(valid_clarification_options(2), Some("option_1"));
+        decision.next_agent = Some("explorer".to_string());
+
+        let error = validate_orchestrator_decision(&decision, &config).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("non-continue decision must not contain a next step"));
     }
 
     #[test]
@@ -837,6 +1222,8 @@ mod tests {
             required_capabilities: vec![Capability::Edit],
             stop_condition: "Done.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
         let error = validate_orchestrator_decision(&decision, &config).unwrap_err();
@@ -857,6 +1244,8 @@ mod tests {
             required_capabilities: vec![Capability::Read],
             stop_condition: "Explorer returns context.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 
@@ -886,6 +1275,8 @@ mod tests {
             required_capabilities: vec![Capability::Read],
             stop_condition: "Explorer returns context.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 
@@ -897,11 +1288,15 @@ mod tests {
     #[test]
     fn rejects_parallel_group_when_feature_disabled() {
         let dir = tempdir().unwrap();
-        let config = load_effective_config(ConfigLoadOptions {
+        let mut config = load_effective_config(ConfigLoadOptions {
             working_directory: dir.path().to_path_buf(),
             config_path: None,
         })
         .unwrap();
+        // Force the feature off so this stays hermetic regardless of the
+        // developer's home config (config_path: None reads it), mirroring
+        // parallel_enabled_config which forces it on.
+        config.features.parallel_step_groups = false;
         let decision = OrchestratorDecision {
             schema_version: 2,
             decision_id: "01".to_string(),
@@ -939,6 +1334,8 @@ mod tests {
             required_capabilities: Vec::new(),
             stop_condition: "Group joins.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 
@@ -1135,10 +1532,31 @@ orchestrator_description = "Use for official documentation and API lookup."
             required_capabilities: vec![Capability::Read, Capability::Challenge],
             stop_condition: "Council returns a recommendation.".to_string(),
             clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
             final_summary: None,
         };
 
         validate_orchestrator_decision(&decision, &config).unwrap();
+    }
+
+    #[test]
+    fn generated_orchestrator_prompt_includes_structured_clarification_guidance() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        let prompt = build_orchestrator_prompt(&config);
+
+        assert!(prompt.contains("Ask a clarifying question when the next safe step is ambiguous"));
+        assert!(prompt.contains("2-4 concise recommended answers as clarifying_options"));
+        assert!(prompt.contains("Set recommended_option_id to the strongest option id"));
+        assert!(prompt.contains("the app always provides its own custom text answer path"));
+        assert!(!prompt.contains("question tool"));
+        assert!(!prompt.contains("ask_user"));
     }
 
     #[test]
