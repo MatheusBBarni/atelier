@@ -639,6 +639,24 @@ async fn refresh_file_index(
     }
 }
 
+/// Kick off a file-index refresh on a detached task instead of awaiting it.
+///
+/// The walk is unbounded (no timeout, one `canonicalize` syscall per entry) and
+/// can outlive the 15s poll cadence on a large repo. Awaiting it inside the
+/// worker `select!` would park the worker at that `await`, so queued
+/// `AppWorkerCommand`s (including `Shutdown`) could not be serviced until the
+/// walk returned. Detaching keeps the command arm pollable; the snapshot lands
+/// via the `watch` channel whenever the walk finishes (last-writer-wins, so an
+/// occasional overlap between two in-flight walks is harmless).
+fn spawn_file_index_refresh(
+    working_directory: Option<PathBuf>,
+    file_index_sender: watch::Sender<Vec<FileEntry>>,
+) {
+    tokio::spawn(async move {
+        refresh_file_index(working_directory.as_deref(), &file_index_sender).await;
+    });
+}
+
 async fn run_app_worker(
     mut app: App,
     mut command_receiver: mpsc::Receiver<AppWorkerCommand>,
@@ -653,9 +671,15 @@ async fn run_app_worker(
     git_poll.tick().await; // consume the immediate first tick (startup covered it)
 
     // Initial off-thread file-index walk at startup, then a coarse periodic
-    // refresh — mirrors the git poller (ADR-003).
-    refresh_file_index(working_directory.as_deref(), &file_index_sender).await;
+    // refresh — mirrors the git poller (ADR-003). Both are detached
+    // (`spawn_file_index_refresh`) rather than awaited so the cold startup walk
+    // never blocks the command loop from servicing the first prompt, and so a
+    // slow walk cannot starve `Shutdown`.
+    spawn_file_index_refresh(working_directory.clone(), file_index_sender.clone());
     let mut file_index_poll = tokio::time::interval(FILE_INDEX_REFRESH_INTERVAL);
+    // A walk that overruns the interval must not trigger a burst of catch-up
+    // walks; skip missed ticks and resume the coarse cadence.
+    file_index_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     file_index_poll.tick().await; // consume the immediate first tick (startup covered it)
 
     loop {
@@ -676,7 +700,7 @@ async fn run_app_worker(
                 app.refresh_git_context().await;
             }
             _ = file_index_poll.tick() => {
-                refresh_file_index(working_directory.as_deref(), &file_index_sender).await;
+                spawn_file_index_refresh(working_directory.clone(), file_index_sender.clone());
             }
         }
     }
@@ -2606,7 +2630,7 @@ fn render_file_mention_dropdown(
         ]));
         frame.render_widget(Clear, area);
         frame.render_widget(
-            List::new(vec![row]).block(file_mention_dropdown_block(theme)),
+            List::new(vec![row]).block(file_mention_dropdown_block(theme, " Esc ")),
             area,
         );
         return;
@@ -2647,15 +2671,18 @@ fn render_file_mention_dropdown(
     };
     frame.render_widget(Clear, area);
     frame.render_widget(
-        List::new(items).block(file_mention_dropdown_block(theme)),
+        List::new(items).block(file_mention_dropdown_block(theme, " Up/Down Tab/Enter ")),
         area,
     );
 }
 
-fn file_mention_dropdown_block(theme: &Theme) -> Block<'static> {
+/// `hint` is the right-aligned key affordance. The populated list advertises
+/// navigation/acceptance; the no-match row only honors `Esc`, so it passes a
+/// narrower hint rather than implying `Up/Down`/`Tab`/`Enter` do something.
+fn file_mention_dropdown_block(theme: &Theme, hint: &str) -> Block<'static> {
     Block::default()
         .title(" Files ")
-        .title(Line::from(" Up/Down Tab/Enter ").right_aligned())
+        .title(Line::from(hint.to_string()).right_aligned())
         .title_style(Style::default().fg(theme.accent))
         .border_style(Style::default().fg(theme.accent))
         .borders(Borders::ALL)
@@ -7630,6 +7657,10 @@ runtime = "fake"
         let dropdown = dropdown_with(Vec::new(), 0, true);
         let joined = render_file_dropdown_rows(&dropdown, 60, 24).join("\n");
         assert!(joined.contains("No matching files"));
+        // The no-match row only honors Esc, so the hint must not advertise the
+        // Up/Down/Tab/Enter affordances that do nothing in this state.
+        assert!(joined.contains("Esc"));
+        assert!(!joined.contains("Tab/Enter"));
     }
 
     #[test]

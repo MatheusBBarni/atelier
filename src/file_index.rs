@@ -238,7 +238,17 @@ impl FileIndex {
             .map(|scored| FileSuggestion {
                 rel_path: scored.entry.rel_path.clone(),
                 is_dir: scored.entry.is_dir,
-                match_indices: scored.match_indices,
+                // `nucleo` builds its haystack from grapheme clusters, keeping
+                // only the first codepoint of each, so the offsets it returns
+                // line up with our per-`char` indices only for ASCII paths. For
+                // a path with a combining mark or a multi-codepoint emoji the
+                // offsets would highlight the wrong characters, so drop the
+                // highlights there — the match (and ranking) is still correct.
+                match_indices: if scored.entry.rel_path.is_ascii() {
+                    scored.match_indices
+                } else {
+                    Vec::new()
+                },
             })
             .collect()
     }
@@ -276,17 +286,22 @@ fn is_force_excluded_dir(name: &str) -> bool {
 }
 
 fn is_secret_dir(name: &str) -> bool {
-    SECRET_DIRS.contains(&name)
+    SECRET_DIRS.iter().any(|dir| name.eq_ignore_ascii_case(dir))
 }
 
 /// A static, best-effort secret-name denylist (`.env*`, `*.pem`, `*.key`,
 /// `id_rsa*`). Combined with the working-dir pin and symlink rejection, this is
 /// the primary guard against surfacing a sensitive filename by name.
+///
+/// Matched case-insensitively: the default filesystems on macOS (APFS) and
+/// Windows (NTFS) are case-insensitive, so a file stored as `.ENV` or `ID_RSA`
+/// is the same secret and must be excluded just like its lowercase form.
 fn is_secret_name(name: &str) -> bool {
-    name.starts_with(".env")
-        || name.ends_with(".pem")
-        || name.ends_with(".key")
-        || name.starts_with("id_rsa")
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with(".env")
+        || lower.ends_with(".pem")
+        || lower.ends_with(".key")
+        || lower.starts_with("id_rsa")
 }
 
 #[cfg(test)]
@@ -364,6 +379,29 @@ mod tests {
         assert!(!paths.contains("server.pem"));
         assert!(!paths.contains("id_rsa"));
         assert!(!paths.iter().any(|p| p.starts_with(".ssh")));
+    }
+
+    #[test]
+    fn walk_excludes_secret_files_and_dirs_case_insensitively() {
+        // macOS/Windows default filesystems are case-insensitive, so an
+        // uppercased secret name is the same secret and must still be pruned.
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".SSH")).unwrap();
+        fs::write(dir.path().join(".ENV"), "SECRET=1").unwrap();
+        fs::write(dir.path().join("Server.PEM"), "key").unwrap();
+        fs::write(dir.path().join("private.KEY"), "key").unwrap();
+        fs::write(dir.path().join("ID_RSA"), "key").unwrap();
+        fs::write(dir.path().join(".SSH/known_hosts"), "host").unwrap();
+        fs::write(dir.path().join("keep.rs"), "fn main() {}").unwrap();
+
+        let paths = rel_paths(&FileIndex::walk(dir.path()));
+        assert!(!paths.contains(".ENV"));
+        assert!(!paths.contains("Server.PEM"));
+        assert!(!paths.contains("private.KEY"));
+        assert!(!paths.contains("ID_RSA"));
+        assert!(!paths.iter().any(|p| p.starts_with(".SSH")));
+        // A non-secret file alongside them is still surfaced.
+        assert!(paths.contains("keep.rs"));
     }
 
     #[cfg(unix)]
@@ -538,6 +576,27 @@ mod tests {
         assert_eq!(matched.to_lowercase(), "tuimod");
         // The single occurrence of each character makes the offsets exact.
         assert_eq!(suggestion.match_indices, vec![4, 5, 6, 8, 9, 10]);
+    }
+
+    #[test]
+    fn query_drops_highlights_for_non_ascii_paths() {
+        // `nucleo`'s match offsets are taken over grapheme-collapsed codepoints,
+        // so for a non-ASCII path they would not line up with our `char`
+        // indices. The match must still rank, but with no (misaligned)
+        // highlights rather than emphasizing the wrong characters.
+        let entries = vec![entry("café/main.rs", false, 10)];
+        let suggestions = FileIndex::query(&entries, "main", 6);
+        let suggestion = suggestions.first().expect("non-ascii path still matches");
+        assert_eq!(suggestion.rel_path, "café/main.rs");
+        assert!(
+            suggestion.match_indices.is_empty(),
+            "highlights are suppressed for non-ascii paths"
+        );
+
+        // An ASCII path with the same query keeps its highlights (control).
+        let ascii = vec![entry("core/main.rs", false, 10)];
+        let ascii_hit = &FileIndex::query(&ascii, "main", 6)[0];
+        assert!(!ascii_hit.match_indices.is_empty());
     }
 
     #[test]

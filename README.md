@@ -271,6 +271,7 @@ needs it.
 - `src/runtime` – runtime adapters and contracts
 - `src/actions` – file and command action execution
 - `src/skills` – skill discovery and prompt injection
+- `src/file_index` – gitignore-aware file walk and fuzzy ranking for the `@` picker
 - `src/history` – event/artifact/run persistence
 - `src/codemap` – folder-level repository map generation
 - `src/diagnostics` – shared diagnostic severity and message types
