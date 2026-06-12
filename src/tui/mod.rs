@@ -52,6 +52,7 @@ const INPUT_PROMPT: &str = "> ";
 const INPUT_PROMPT_WIDTH: usize = 2;
 const AGENT_PREFIX: &str = "/agent:";
 const SKILL_PREFIX: &str = "/skill:";
+const FILE_MENTION_PREFIX: &str = "@";
 const RELOAD_SKILLS_COMMAND: &str = "/reload:skills";
 const DROPDOWN_MAX_ITEMS: usize = 6;
 const WORK_HINT: &str = "/help";
@@ -286,6 +287,22 @@ struct SkillDropdown {
 struct CommandDropdown {
     suggestions: Vec<&'static crate::slash_commands::SlashCommandSpec>,
     selected: Option<usize>,
+    empty: bool,
+}
+
+/// The `@`-mention file/folder dropdown (ADR-005). Token-based like the skill
+/// dropdown (it carries a `PromptToken` and activates mid-prompt), plus a
+/// command-style `empty` no-match flag. Its suggestions are the ranked
+/// `FileSuggestion`s from `FileIndex::query` over the cached index.
+// Staged in task_06 (model + activation only); keys (task_07), render
+// (task_08), and routing (task_09) consume it. The `#[allow(dead_code)]` shims
+// are removed in task_09.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileMentionDropdown {
+    token: PromptToken,
+    suggestions: Vec<crate::file_index::FileSuggestion>,
+    selected: usize,
     empty: bool,
 }
 
@@ -1609,6 +1626,54 @@ fn command_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<CommandDr
         (Some(index), false)
     };
     Some(CommandDropdown {
+        suggestions,
+        selected,
+        empty,
+    })
+}
+
+/// Activation + ranking model for the `@`-mention file dropdown (ADR-005).
+///
+/// Token-based: it activates on an `@` token at the cursor via the shared
+/// `active_prompt_token` detector, exactly like `/agent:` and `/skill:`, so it
+/// works mid-prompt and for a second `@` later in the line. A bare `@` lists
+/// recents (most-recently-modified); a non-empty query with zero matches sets
+/// `empty` so the renderer can show the "No matching files" row. Suppressed
+/// while the run waits on the user (pending approval, pending clarification, or
+/// `WaitingForUser`) so a literal `@` in an answer stays normal text, and while
+/// the user has dismissed it for the current input (Escape). Returns `None`
+/// when there is nothing to show (e.g. a bare `@` before the index has loaded),
+/// so the dropdown never appears with a misleading empty body.
+#[allow(dead_code)] // wired into the routing/render chains in task_09.
+fn file_mention_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<FileMentionDropdown> {
+    if state.pending_approval.is_some()
+        || state.pending_clarification.is_some()
+        || matches!(state.run_state, RunState::WaitingForUser)
+    {
+        return None;
+    }
+    let input = state.input.as_str();
+    let token = active_prompt_token(input, ui_state.input_cursor, FILE_MENTION_PREFIX)?;
+    if ui_state.file_mention_dropdown_dismissed.as_deref() == Some(input) {
+        return None;
+    }
+
+    let suggestions = FileIndex::query(
+        &ui_state.file_mention_entries,
+        &token.query,
+        DROPDOWN_MAX_ITEMS,
+    );
+    // No-match only when the user has actually typed a query; a bare `@` with no
+    // candidates (empty/loading index) is not a "no match" and shows nothing.
+    let empty = !token.query.is_empty() && suggestions.is_empty();
+    if suggestions.is_empty() && !empty {
+        return None;
+    }
+    let selected = ui_state
+        .file_mention_selection_index
+        .min(suggestions.len().saturating_sub(1));
+    Some(FileMentionDropdown {
+        token,
         suggestions,
         selected,
         empty,
@@ -6861,6 +6926,142 @@ runtime = "fake"
         };
         remove_input_character_before_cursor(&mut state, &mut ui_state);
         assert_eq!(ui_state.file_mention_dropdown_dismissed, None);
+    }
+
+    // ── task_06 file-mention dropdown model and activation ──
+
+    fn file_entry_at(rel_path: &str, is_dir: bool, mtime_secs: u64) -> FileEntry {
+        FileEntry {
+            rel_path: rel_path.to_string(),
+            is_dir,
+            mtime: UNIX_EPOCH + Duration::from_secs(mtime_secs),
+            depth: rel_path.split('/').count(),
+        }
+    }
+
+    /// A representative seeded index with distinct mtimes for recency tests.
+    fn seeded_file_entries() -> Vec<FileEntry> {
+        vec![
+            file_entry_at("src/tui/mod.rs", false, 50),
+            file_entry_at("src/runtime/claude.rs", false, 40),
+            file_entry_at("src/runtime/mod.rs", false, 30),
+            file_entry_at("README.md", false, 20),
+            file_entry_at("src", true, 10),
+        ]
+    }
+
+    fn ui_state_with_file_entries(input: &str, entries: Vec<FileEntry>) -> TuiUiState {
+        TuiUiState {
+            input_cursor: input_char_count(input),
+            file_mention_entries: entries,
+            ..TuiUiState::default()
+        }
+    }
+
+    #[test]
+    fn file_mention_activates_for_token_at_cursor() {
+        let state = state_with_input("see @run", false);
+        let ui_state = ui_state_with_file_entries("see @run", seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active for @run");
+        assert!(!dropdown.empty);
+        assert!(!dropdown.suggestions.is_empty());
+        assert!(dropdown
+            .suggestions
+            .iter()
+            .all(|s| s.rel_path.contains("runtime")));
+    }
+
+    #[test]
+    fn bare_at_lists_recents_most_recent_first() {
+        let state = state_with_input("@", false);
+        let ui_state = ui_state_with_file_entries("@", seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active for @");
+        assert!(!dropdown.empty);
+        assert_eq!(dropdown.selected, 0);
+        assert_eq!(dropdown.suggestions.first().unwrap().rel_path, "src/tui/mod.rs");
+    }
+
+    #[test]
+    fn no_match_query_sets_empty_with_no_rows() {
+        let state = state_with_input("@zzzz", false);
+        let ui_state = ui_state_with_file_entries("@zzzz", seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active no-match");
+        assert!(dropdown.empty);
+        assert!(dropdown.suggestions.is_empty());
+    }
+
+    #[test]
+    fn cursor_outside_token_does_not_activate() {
+        let state = state_with_input("@run done", false);
+        // Cursor at the end sits in the "done" token, not the `@run` token.
+        let ui_state = ui_state_with_file_entries("@run done", seeded_file_entries());
+        assert!(file_mention_dropdown(&state, &ui_state).is_none());
+    }
+
+    #[test]
+    fn pending_states_suppress_activation() {
+        let entries = seeded_file_entries();
+        let ui_state = ui_state_with_file_entries("@run", entries);
+
+        // Pending approval (state_with_input sets approval + WaitingForUser).
+        let approval = state_with_input("@run", true);
+        assert!(file_mention_dropdown(&approval, &ui_state).is_none());
+
+        // Pending clarification.
+        let mut clarification = state_with_input("@run", false);
+        clarification.pending_clarification =
+            Some(clarification_view(vec![clarification_option("a", "Option A")]));
+        assert!(file_mention_dropdown(&clarification, &ui_state).is_none());
+
+        // WaitingForUser run state on its own.
+        let mut waiting = state_with_input("@run", false);
+        waiting.run_state = RunState::WaitingForUser;
+        assert!(file_mention_dropdown(&waiting, &ui_state).is_none());
+    }
+
+    #[test]
+    fn dismissed_input_suppresses_until_edited() {
+        let state = state_with_input("@run", false);
+        let mut ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+        ui_state.file_mention_dropdown_dismissed = Some("@run".to_string());
+        assert!(file_mention_dropdown(&state, &ui_state).is_none());
+
+        // Clearing the dismissal (as a content edit does) re-activates it.
+        ui_state.file_mention_dropdown_dismissed = None;
+        assert!(file_mention_dropdown(&state, &ui_state).is_some());
+    }
+
+    #[test]
+    fn second_at_token_activates_for_token_at_cursor() {
+        let input = "a @one b @mod";
+        let state = state_with_input(input, false);
+        let ui_state = ui_state_with_file_entries(input, seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active for 2nd @");
+        assert_eq!(dropdown.token.query, "mod");
+        assert!(dropdown
+            .suggestions
+            .iter()
+            .any(|s| s.rel_path == "src/tui/mod.rs"));
+    }
+
+    #[test]
+    fn file_mention_model_produces_ranked_suggestions() {
+        let state = state_with_input("@mod", false);
+        let ui_state = ui_state_with_file_entries("@mod", seeded_file_entries());
+        let dropdown = file_mention_dropdown(&state, &ui_state).expect("active for @mod");
+        let paths: Vec<&str> = dropdown
+            .suggestions
+            .iter()
+            .map(|s| s.rel_path.as_str())
+            .collect();
+        // Both mod.rs files match; equal depth/score, so the more recent wins.
+        assert_eq!(paths.first(), Some(&"src/tui/mod.rs"));
+        assert!(paths.contains(&"src/runtime/mod.rs"));
+        // Highlights are present for fuzzy matches.
+        assert!(dropdown
+            .suggestions
+            .iter()
+            .all(|s| !s.match_indices.is_empty()));
     }
 
     // ── task_06 status footer ──
