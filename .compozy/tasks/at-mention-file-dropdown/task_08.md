@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Render the file-mention dropdown
 type: frontend
 complexity: medium
@@ -30,12 +30,16 @@ Render the file-mention dropdown as an upward overlay above the composer, with m
 </requirements>
 
 ## Subtasks
-- [ ] 8.1 Add the render function with the upward overlay.
-- [ ] 8.2 Apply the selected-row highlight.
-- [ ] 8.3 Emphasize the matched characters from the offsets.
-- [ ] 8.4 Show the folder trailing-slash affordance.
-- [ ] 8.5 Render the "No matching files" row for the empty state.
-- [ ] 8.6 Add render tests via the test backend.
+- [x] 8.1 Add the render function with the upward overlay.
+- [x] 8.2 Apply the selected-row highlight.
+- [x] 8.3 Emphasize the matched characters from the offsets.
+- [x] 8.4 Show the folder trailing-slash affordance.
+- [x] 8.5 Render the "No matching files" row for the empty state.
+- [x] 8.6 Add render tests via the test backend.
+
+> Note: help-overlay suppression is enforced by the render chain placement
+> (task_09), exactly as `render_skill_dropdown` sits inside `if !help_visible`;
+> the render function itself takes no UI state.
 
 ## Implementation Details
 Modify `src/tui/mod.rs`, mirroring `render_skill_dropdown` (overlay, list, block) and the command dropdown's no-match row. Use the match offsets from the suggestion to style matched characters. See TechSpec "Component Overview". Do NOT add the render-chain branch here — that is task_09.

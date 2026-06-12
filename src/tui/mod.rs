@@ -2581,6 +2581,164 @@ fn command_dropdown_item(
     }
 }
 
+#[allow(dead_code)] // wired into the render chain in task_09.
+fn render_file_mention_dropdown(
+    frame: &mut Frame,
+    input_area: Rect,
+    dropdown: &FileMentionDropdown,
+    theme: &Theme,
+) {
+    if input_area.y == 0 || input_area.width < 8 {
+        return;
+    }
+    let available_height = input_area.y.saturating_sub(frame.area().y);
+    if available_height < 3 {
+        return;
+    }
+
+    // No-match: a single compact "No matching files" row, still framed as the
+    // file dropdown so the user knows they are in discovery (it does not trap
+    // Enter — see task_07).
+    if dropdown.empty {
+        let height = 3u16;
+        let area = Rect {
+            x: input_area.x,
+            y: input_area.y.saturating_sub(height),
+            width: input_area.width,
+            height,
+        };
+        let row = ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("No matching files", Style::default().fg(theme.text_muted)),
+        ]));
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            List::new(vec![row]).block(file_mention_dropdown_block(theme)),
+            area,
+        );
+        return;
+    }
+
+    if dropdown.suggestions.is_empty() {
+        return;
+    }
+    let visible_count = dropdown
+        .suggestions
+        .len()
+        .min(DROPDOWN_MAX_ITEMS)
+        .min(usize::from(available_height.saturating_sub(2)));
+    if visible_count == 0 {
+        return;
+    }
+    let height = (visible_count as u16).saturating_add(2);
+    let selected = dropdown
+        .selected
+        .min(dropdown.suggestions.len().saturating_sub(1));
+    let row_width = input_area.width.saturating_sub(2);
+    let first_visible = selected.saturating_sub(visible_count.saturating_sub(1));
+    let items = dropdown
+        .suggestions
+        .iter()
+        .enumerate()
+        .skip(first_visible)
+        .take(visible_count)
+        .map(|(index, suggestion)| {
+            file_mention_dropdown_item(theme, suggestion, index == selected, row_width)
+        })
+        .collect::<Vec<_>>();
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width: input_area.width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items).block(file_mention_dropdown_block(theme)),
+        area,
+    );
+}
+
+#[allow(dead_code)] // used by the render chain wired in task_09.
+fn file_mention_dropdown_block(theme: &Theme) -> Block<'static> {
+    Block::default()
+        .title(" Files ")
+        .title(Line::from(" Up/Down Tab/Enter ").right_aligned())
+        .title_style(Style::default().fg(theme.accent))
+        .border_style(Style::default().fg(theme.accent))
+        .borders(Borders::ALL)
+}
+
+#[allow(dead_code)] // used by the render chain wired in task_09.
+fn file_mention_dropdown_item(
+    theme: &Theme,
+    suggestion: &FileSuggestion,
+    selected: bool,
+    row_width: u16,
+) -> ListItem<'static> {
+    let marker_style = if selected {
+        selection_style(theme)
+    } else {
+        Style::default().fg(theme.text_dim)
+    };
+    let marker = if selected { "> " } else { "  " };
+    let marker_width = input_char_count(marker);
+    let content_width = usize::from(row_width).saturating_sub(marker_width);
+
+    // Folder affordance: a trailing `/` distinguishes folders from files.
+    let mut display = suggestion.rel_path.clone();
+    if suggestion.is_dir {
+        display.push('/');
+    }
+    let display = truncate_to_char_width(&display, content_width);
+    let matched: std::collections::HashSet<usize> = suggestion
+        .match_indices
+        .iter()
+        .map(|&index| index as usize)
+        .collect();
+
+    let mut spans = vec![Span::styled(marker.to_string(), marker_style)];
+    spans.extend(highlighted_path_spans(theme, &display, &matched, selected));
+    let item = ListItem::new(Line::from(spans));
+    if selected {
+        item.style(Style::default().bg(theme.border))
+    } else {
+        item
+    }
+}
+
+/// Build one styled span per character of `display`, emphasizing the matched
+/// offsets (bold accent) so the fuzzy match is confirmable at a glance
+/// (ADR-002 — highlighting is a V1 trust mechanism, not optional polish).
+#[allow(dead_code)] // used by the render chain wired in task_09.
+fn highlighted_path_spans(
+    theme: &Theme,
+    display: &str,
+    matched: &std::collections::HashSet<usize>,
+    selected: bool,
+) -> Vec<Span<'static>> {
+    let matched_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let base_style = if selected {
+        Style::default().fg(theme.accent)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    display
+        .chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            let style = if matched.contains(&index) {
+                matched_style
+            } else {
+                base_style
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
+}
+
 fn queue_prompt_summary(prompt: &str) -> String {
     prompt.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -7371,6 +7529,147 @@ runtime = "fake"
         insert_input_character(&mut state, &mut ui_state, '@');
         assert_eq!(state.input, "look at src/runtime/mod.rs @");
         assert!(file_mention_dropdown(&state, &ui_state).is_some());
+    }
+
+    // ── task_08 render the file-mention dropdown ──
+
+    fn file_suggestion(rel_path: &str, is_dir: bool, match_indices: Vec<u32>) -> FileSuggestion {
+        FileSuggestion {
+            rel_path: rel_path.to_string(),
+            is_dir,
+            match_indices,
+        }
+    }
+
+    fn dropdown_with(
+        suggestions: Vec<FileSuggestion>,
+        selected: usize,
+        empty: bool,
+    ) -> FileMentionDropdown {
+        FileMentionDropdown {
+            token: PromptToken {
+                value_start: 1,
+                value_end: 1,
+                query: String::new(),
+            },
+            suggestions,
+            selected,
+            empty,
+        }
+    }
+
+    /// Draw only the file-mention dropdown onto a test backend and return its
+    /// rows. The dropdown opens upward above an input area near the bottom.
+    fn render_file_dropdown_rows(
+        dropdown: &FileMentionDropdown,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = TuiUiState::default().theme;
+        let input_area = Rect {
+            x: 0,
+            y: height.saturating_sub(INPUT_COMPOSER_HEIGHT),
+            width,
+            height: INPUT_BOX_HEIGHT,
+        };
+        terminal
+            .draw(|frame| render_file_mention_dropdown(frame, input_area, dropdown, &theme))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn render_shows_both_paths_and_the_selection_marker() {
+        let dropdown = dropdown_with(
+            vec![
+                file_suggestion("src/tui/mod.rs", false, Vec::new()),
+                file_suggestion("README.md", false, Vec::new()),
+            ],
+            0,
+            false,
+        );
+        let joined = render_file_dropdown_rows(&dropdown, 60, 24).join("\n");
+        assert!(joined.contains("Files"));
+        assert!(joined.contains("src/tui/mod.rs"));
+        assert!(joined.contains("README.md"));
+        // The selected (first) row carries the `> ` marker.
+        assert!(joined.contains("> src/tui/mod.rs"));
+    }
+
+    #[test]
+    fn render_emphasizes_matched_characters() {
+        let theme = TuiUiState::default().theme;
+        let matched: std::collections::HashSet<usize> = [4usize, 5, 6].into_iter().collect();
+        let spans = highlighted_path_spans(&theme, "src/tui/mod.rs", &matched, false);
+        let bold: Vec<bool> = spans
+            .iter()
+            .map(|span| span.style.add_modifier.contains(Modifier::BOLD))
+            .collect();
+        for (index, is_bold) in bold.iter().enumerate() {
+            assert_eq!(*is_bold, [4, 5, 6].contains(&index), "char index {index}");
+        }
+    }
+
+    #[test]
+    fn render_shows_folder_trailing_slash() {
+        let dropdown = dropdown_with(vec![file_suggestion("src/tui", true, Vec::new())], 0, false);
+        let joined = render_file_dropdown_rows(&dropdown, 60, 24).join("\n");
+        assert!(joined.contains("src/tui/"));
+    }
+
+    #[test]
+    fn render_no_match_shows_single_row() {
+        let dropdown = dropdown_with(Vec::new(), 0, true);
+        let joined = render_file_dropdown_rows(&dropdown, 60, 24).join("\n");
+        assert!(joined.contains("No matching files"));
+    }
+
+    #[test]
+    fn render_caps_visible_rows_at_six() {
+        let suggestions: Vec<FileSuggestion> = (0..8)
+            .map(|i| file_suggestion(&format!("f{i}.rs"), false, Vec::new()))
+            .collect();
+        let dropdown = dropdown_with(suggestions, 0, false);
+        let joined = render_file_dropdown_rows(&dropdown, 60, 24).join("\n");
+        let shown = (0..8)
+            .filter(|i| joined.contains(&format!("f{i}.rs")))
+            .count();
+        assert_eq!(shown, DROPDOWN_MAX_ITEMS);
+    }
+
+    #[test]
+    fn render_truncates_paths_wider_than_the_row() {
+        let long = "src/very/deeply/nested/directory/structure/with/a/long/file_name.rs";
+        let dropdown = dropdown_with(vec![file_suggestion(long, false, Vec::new())], 0, false);
+        let joined = render_file_dropdown_rows(&dropdown, 40, 24).join("\n");
+        assert!(!joined.contains(long));
+        assert!(joined.contains("src/very/deeply"));
+    }
+
+    #[test]
+    fn render_integration_overlay_layout_on_standard_backend() {
+        let dropdown = dropdown_with(
+            vec![
+                file_suggestion("src/tui/mod.rs", false, vec![4, 5, 6]),
+                file_suggestion("src/runtime/mod.rs", false, vec![12, 13, 14]),
+            ],
+            1,
+            false,
+        );
+        let rows = render_file_dropdown_rows(&dropdown, 80, 24);
+        let joined = rows.join("\n");
+        assert!(joined.contains("Files"));
+        assert!(joined.contains("src/tui/mod.rs"));
+        // The selected second row carries the marker.
+        assert!(joined.contains("> src/runtime/mod.rs"));
     }
 
     // ── task_06 status footer ──
