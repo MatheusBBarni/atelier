@@ -7,7 +7,7 @@ use crate::app::{
     QueuedFollowUpStatus, QueuedFollowUpView,
 };
 use crate::config::EffectiveConfig;
-use crate::file_index::{FileEntry, FileIndex};
+use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
 use crate::orchestrator::RunState;
 use crate::skills::{
     self, SkillSourceTag, SkillSuggestion, SKILL_DISCOVERY_MAX_DEPTH, SKILL_FILE_NAME,
@@ -87,6 +87,7 @@ enum TuiCommand {
     AgentDropdown(DropdownCommand),
     SkillDropdown(DropdownCommand),
     CommandDropdown(CommandDropdownCommand),
+    FileMentionDropdown(FileMentionDropdownCommand),
     Clarification(ClarificationCommand),
     ClarificationInputCharacter(char),
     ClarificationInputBackspace,
@@ -135,6 +136,20 @@ enum CommandDropdownCommand {
     /// Consume `Enter` while the no-match state is visible so invalid slash
     /// input is not submitted.
     TrapNoMatch,
+}
+
+/// File-mention dropdown actions (ADR-005). Like `CommandDropdownCommand` it
+/// supports Escape dismissal, but — unlike the command dropdown — it does NOT
+/// trap `Enter` in the no-match state: a typed `@query` with no matches still
+/// submits normally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileMentionDropdownCommand {
+    Previous,
+    Next,
+    /// Insert the selected suggestion's bare path; never dispatches an app event.
+    Accept,
+    /// Escape: suppress the dropdown for the current input without mutating it.
+    Dismiss,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -483,6 +498,10 @@ async fn execute_tui_command_with_interrupt(
         }
         TuiCommand::CommandDropdown(command) => {
             apply_command_dropdown_command(state, ui_state, command);
+            Ok(true)
+        }
+        TuiCommand::FileMentionDropdown(command) => {
+            apply_file_mention_dropdown_command(state, ui_state, command);
             Ok(true)
         }
         TuiCommand::Clarification(command) => {
@@ -885,6 +904,28 @@ fn command_dropdown_key_command(dropdown: &CommandDropdown, key: KeyEvent) -> Op
         // No-match: trap Enter so invalid slash input is never submitted. Other
         // keys (chars, Backspace) fall through so editing re-filters the list.
         KeyCode::Enter => Some(TuiCommand::CommandDropdown(TrapNoMatch)),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)] // wired into the key-routing chain in task_09.
+fn file_mention_dropdown_key_command(
+    dropdown: &FileMentionDropdown,
+    key: KeyEvent,
+) -> Option<TuiCommand> {
+    use FileMentionDropdownCommand::{Accept, Dismiss, Next, Previous};
+    match key.code {
+        // Escape dismisses in either state; the input is left untouched.
+        KeyCode::Esc => Some(TuiCommand::FileMentionDropdown(Dismiss)),
+        // Selection and acceptance only apply when there are selectable rows.
+        KeyCode::Up if !dropdown.empty => Some(TuiCommand::FileMentionDropdown(Previous)),
+        KeyCode::Down if !dropdown.empty => Some(TuiCommand::FileMentionDropdown(Next)),
+        KeyCode::Tab | KeyCode::Enter if !dropdown.empty => {
+            Some(TuiCommand::FileMentionDropdown(Accept))
+        }
+        // No-match: unlike the command dropdown, do NOT trap Enter — a typed
+        // `@query` with no matches submits normally. All other keys fall through
+        // so editing re-filters the list.
         _ => None,
     }
 }
@@ -1549,6 +1590,84 @@ fn apply_command_dropdown_command(
         }
         CommandDropdownCommand::TrapNoMatch => {}
     }
+}
+
+fn apply_file_mention_dropdown_command(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    command: FileMentionDropdownCommand,
+) {
+    let Some(dropdown) = file_mention_dropdown(state, ui_state) else {
+        return;
+    };
+    match command {
+        FileMentionDropdownCommand::Previous => {
+            let count = dropdown.suggestions.len();
+            if count == 0 {
+                return;
+            }
+            ui_state.file_mention_selection_index = if dropdown.selected == 0 {
+                count - 1
+            } else {
+                dropdown.selected - 1
+            };
+        }
+        FileMentionDropdownCommand::Next => {
+            let count = dropdown.suggestions.len();
+            if count == 0 {
+                return;
+            }
+            ui_state.file_mention_selection_index = (dropdown.selected + 1) % count;
+        }
+        FileMentionDropdownCommand::Accept => {
+            if dropdown.empty {
+                return;
+            }
+            let suggestion = dropdown.suggestions[dropdown.selected].clone();
+            apply_file_mention_suggestion(state, ui_state, &dropdown.token, &suggestion);
+        }
+        FileMentionDropdownCommand::Dismiss => {
+            ui_state.file_mention_dropdown_dismissed = Some(state.input.clone());
+        }
+    }
+}
+
+/// Accept a file suggestion by replacing the `@token` — INCLUDING the leading
+/// `@` — with the bare path, so the inserted text is a plain path (ADR-005).
+/// Folders get a trailing `/`; a trailing space is added when none follows so
+/// the cursor lands ready to keep typing (and a second `@` re-opens the
+/// picker). Text-only: no app event is dispatched.
+fn apply_file_mention_suggestion(
+    state: &mut AppState,
+    ui_state: &mut TuiUiState,
+    token: &PromptToken,
+    suggestion: &FileSuggestion,
+) {
+    let mut inserted = suggestion.rel_path.clone();
+    if suggestion.is_dir {
+        inserted.push('/');
+    }
+
+    // Extend the replaced range back over the `@` prefix so it is consumed.
+    let prefix_len = input_char_count(FILE_MENTION_PREFIX);
+    let replace_start = token.value_start.saturating_sub(prefix_len);
+    let start = byte_index_for_char(&state.input, replace_start);
+    let end = byte_index_for_char(&state.input, token.value_end);
+    state.input.replace_range(start..end, &inserted);
+
+    let inserted_len = input_char_count(&inserted);
+    let path_end = replace_start + inserted_len;
+    let after_path = byte_index_for_char(&state.input, path_end);
+    if !state.input[after_path..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        state.input.insert(after_path, ' ');
+    }
+    ui_state.input_cursor = path_end.saturating_add(1);
+    ui_state.input_preferred_col = None;
+    reset_dropdown_selections(ui_state);
 }
 
 /// Accept a command suggestion by replacing the whole `/`-token input with its
@@ -7062,6 +7181,196 @@ runtime = "fake"
             .suggestions
             .iter()
             .all(|s| !s.match_indices.is_empty()));
+    }
+
+    // ── task_07 file-mention interaction and insertion ──
+
+    fn file_dropdown_with(empty: bool) -> FileMentionDropdown {
+        FileMentionDropdown {
+            token: PromptToken {
+                value_start: 1,
+                value_end: 4,
+                query: "mod".to_string(),
+            },
+            suggestions: if empty {
+                Vec::new()
+            } else {
+                vec![FileSuggestion {
+                    rel_path: "src/tui/mod.rs".to_string(),
+                    is_dir: false,
+                    match_indices: vec![4, 5, 6],
+                }]
+            },
+            selected: 0,
+            empty,
+        }
+    }
+
+    #[test]
+    fn file_mention_key_mapping_matches_spec() {
+        let dropdown = file_dropdown_with(false);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        use FileMentionDropdownCommand::{Accept, Dismiss, Next, Previous};
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Up)),
+            Some(TuiCommand::FileMentionDropdown(Previous))
+        );
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Down)),
+            Some(TuiCommand::FileMentionDropdown(Next))
+        );
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Tab)),
+            Some(TuiCommand::FileMentionDropdown(Accept))
+        );
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Enter)),
+            Some(TuiCommand::FileMentionDropdown(Accept))
+        );
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Esc)),
+            Some(TuiCommand::FileMentionDropdown(Dismiss))
+        );
+    }
+
+    #[test]
+    fn file_mention_no_match_does_not_trap_enter_but_esc_dismisses() {
+        let dropdown = file_dropdown_with(true);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // Enter falls through (None) so the prompt submits normally.
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Enter)),
+            None
+        );
+        // Up/Down also fall through with no selectable rows.
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Up)),
+            None
+        );
+        // Esc still dismisses.
+        assert_eq!(
+            file_mention_dropdown_key_command(&dropdown, key(KeyCode::Esc)),
+            Some(TuiCommand::FileMentionDropdown(
+                FileMentionDropdownCommand::Dismiss
+            ))
+        );
+    }
+
+    #[test]
+    fn file_mention_selection_wraps_at_both_ends() {
+        let mut state = state_with_input("@mod", false);
+        let mut ui_state = ui_state_with_file_entries("@mod", seeded_file_entries());
+        // Exactly two matches (src/tui/mod.rs, src/runtime/mod.rs).
+        assert_eq!(
+            file_mention_dropdown(&state, &ui_state).unwrap().suggestions.len(),
+            2
+        );
+
+        // Previous from 0 wraps to the last row.
+        apply_file_mention_dropdown_command(
+            &mut state,
+            &mut ui_state,
+            FileMentionDropdownCommand::Previous,
+        );
+        assert_eq!(ui_state.file_mention_selection_index, 1);
+        // Next from the last row wraps back to the first.
+        apply_file_mention_dropdown_command(
+            &mut state,
+            &mut ui_state,
+            FileMentionDropdownCommand::Next,
+        );
+        assert_eq!(ui_state.file_mention_selection_index, 0);
+    }
+
+    #[tokio::test]
+    async fn file_mention_accept_consumes_at_and_inserts_bare_path() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("see @run", false);
+        let mut ui_state = ui_state_with_file_entries("see @run", seeded_file_entries());
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::FileMentionDropdown(FileMentionDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+
+        // The `@` is gone, a bare path is inserted, a trailing space added, and
+        // the cursor follows — with surrounding text intact. No app event.
+        assert_eq!(state.input, "see src/runtime/claude.rs ");
+        assert_eq!(
+            ui_state.input_cursor,
+            input_char_count("see src/runtime/claude.rs ")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn file_mention_accept_folder_gets_trailing_slash() {
+        let mut state = state_with_input("@src", false);
+        let mut ui_state = ui_state_with_file_entries("@src", Vec::new());
+        let token = active_prompt_token("@src", 4, FILE_MENTION_PREFIX).unwrap();
+        let folder = FileSuggestion {
+            rel_path: "src/tui".to_string(),
+            is_dir: true,
+            match_indices: Vec::new(),
+        };
+        apply_file_mention_suggestion(&mut state, &mut ui_state, &token, &folder);
+        assert_eq!(state.input, "src/tui/ ");
+        assert_eq!(ui_state.input_cursor, input_char_count("src/tui/ "));
+    }
+
+    #[tokio::test]
+    async fn file_mention_esc_records_input_in_dismissal() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("@run", false);
+        let mut ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::FileMentionDropdown(FileMentionDropdownCommand::Dismiss),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ui_state.file_mention_dropdown_dismissed, Some("@run".to_string()));
+    }
+
+    #[tokio::test]
+    async fn file_mention_accept_and_continue_supports_second_reference() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let input = "look at @mod";
+        let mut state = state_with_input(input, false);
+        let mut ui_state = ui_state_with_file_entries(input, seeded_file_entries());
+
+        // Navigate to the second match, then accept.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::FileMentionDropdown(FileMentionDropdownCommand::Next),
+        )
+        .await
+        .unwrap();
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::FileMentionDropdown(FileMentionDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "look at src/runtime/mod.rs ");
+        assert!(receiver.try_recv().is_err());
+
+        // Typing a second `@` afterward re-opens the picker at the new cursor.
+        insert_input_character(&mut state, &mut ui_state, '@');
+        assert_eq!(state.input, "look at src/runtime/mod.rs @");
+        assert!(file_mention_dropdown(&state, &ui_state).is_some());
     }
 
     // ── task_06 status footer ──
