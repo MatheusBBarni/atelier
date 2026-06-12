@@ -1693,6 +1693,7 @@ const CLAUDE_PROTECTED_ARG_NAMES: &[&str] = &[
     "--system-prompt-file",
     "--append-system-prompt",
     "--append-system-prompt-file",
+    "--exclude-dynamic-system-prompt-sections",
     "--model",
     "-m",
     "--fallback-model",

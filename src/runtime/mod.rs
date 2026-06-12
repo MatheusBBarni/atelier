@@ -448,6 +448,11 @@ pub async fn check_runtime_availability(runtime: &RuntimeConfig) -> RuntimeAvail
     }
 }
 
+/// Total attempts per model on transient (retryable) provider errors before
+/// moving to the next model in the chain. Two means one retry — enough to
+/// recover from an occasional empty Claude turn without amplifying load.
+const SAME_MODEL_PROVIDER_ATTEMPTS: u32 = 2;
+
 pub async fn execute_runtime_step(
     config: &EffectiveConfig,
     request: RuntimeRequest,
@@ -483,28 +488,52 @@ pub async fn execute_runtime_step_streaming(
     let model_chain = request.agent_profile.model_chain();
     let mut last_retryable_error = None;
     for (index, model) in model_chain.iter().enumerate() {
-        if cancellation.is_cancelled() {
-            bail!("runtime step cancelled");
-        }
-        let mut attempt = request.clone();
-        attempt.agent_profile.model = model.clone();
-        match execute_runtime_step_once(runtime, attempt, events.clone(), cancellation.clone())
-            .await
-        {
-            Ok(result) => return Ok(result),
-            Err(error) if index + 1 < model_chain.len() && is_retryable_provider_error(&error) => {
-                events
-                    .status(format!(
-                        "retryable provider error for model {model}; trying fallback model {}",
-                        model_chain[index + 1]
-                    ))
-                    .await?;
-                last_retryable_error = Some(error);
+        let has_fallback_model = index + 1 < model_chain.len();
+        // Retry the same model on transient provider errors (e.g. a Claude turn
+        // that ends with an empty result) before falling back to the next model
+        // in the chain. Single-model agents otherwise die on the first hiccup.
+        for attempt_number in 1..=SAME_MODEL_PROVIDER_ATTEMPTS {
+            if cancellation.is_cancelled() {
+                bail!("runtime step cancelled");
             }
-            Err(error) => return Err(error),
+            let mut attempt = request.clone();
+            attempt.agent_profile.model = model.clone();
+            match execute_runtime_step_once(runtime, attempt, events.clone(), cancellation.clone())
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) if is_retryable_provider_error(&error) => {
+                    if attempt_number < SAME_MODEL_PROVIDER_ATTEMPTS {
+                        events
+                            .status(format!(
+                                "retryable provider error for model {model}; retrying same model (attempt {}/{})",
+                                attempt_number + 1,
+                                SAME_MODEL_PROVIDER_ATTEMPTS
+                            ))
+                            .await?;
+                        continue;
+                    }
+                    if has_fallback_model {
+                        events
+                            .status(format!(
+                                "retryable provider error for model {model}; trying fallback model {}",
+                                model_chain[index + 1]
+                            ))
+                            .await?;
+                        last_retryable_error = Some(error);
+                        break;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
+    // Defensive only: model_chain() is never empty and the final model always
+    // returns from inside the loop (Ok, or its own error), so neither of these
+    // is reachable in practice. They keep `last_retryable_error` honest and give
+    // a sane result if model_chain() ever becomes empty.
     if let Some(error) = last_retryable_error {
         return Err(error);
     }
@@ -1025,6 +1054,113 @@ model_fallbacks = ["fallback-succeeds"]
     }
 
     #[tokio::test]
+    async fn execute_runtime_step_retries_same_model_before_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.explorer]
+runtime = "fake"
+model = "primary-fails"
+model_fallbacks = ["fallback-succeeds"]
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let request = RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: "retryable provider error".to_string(),
+            session_goal: None,
+            working_directory: dir.path().to_path_buf(),
+            agent_profile: config.agents["explorer"].clone(),
+            session_events: Vec::new(),
+            recent_context: RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "agent_result".to_string(),
+            parallel_context: None,
+            capability_constraints: vec![Capability::Read],
+            limits: Limits::default(),
+        };
+
+        let result = execute_runtime_step(&config, request).await.unwrap();
+
+        let statuses: Vec<String> = result
+            .stream_deltas
+            .iter()
+            .filter(|delta| delta.stream == "status")
+            .map(|delta| delta.content.clone())
+            .collect();
+        assert!(
+            statuses.iter().any(|s| s.contains("retrying same model")),
+            "expected a same-model retry status; got {statuses:?}"
+        );
+        assert!(
+            statuses
+                .iter()
+                .any(|s| s.contains("trying fallback model fallback-succeeds")),
+            "expected a fallback status after retries; got {statuses:?}"
+        );
+        match result.output {
+            RuntimeOutput::AgentResult { result } => assert_eq!(result.agent, "explorer"),
+            other => panic!("unexpected runtime output: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_runtime_step_surfaces_retryable_error_when_no_fallback_remains() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.explorer]
+runtime = "fake"
+model = "primary-fails"
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let request = RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: "retryable provider error".to_string(),
+            session_goal: None,
+            working_directory: dir.path().to_path_buf(),
+            agent_profile: config.agents["explorer"].clone(),
+            session_events: Vec::new(),
+            recent_context: RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "agent_result".to_string(),
+            parallel_context: None,
+            capability_constraints: vec![Capability::Read],
+            limits: Limits::default(),
+        };
+
+        // No fallback model: same-model retries are exhausted and the retryable
+        // error is surfaced (the run does not hang or panic).
+        let error = execute_runtime_step(&config, request).await.unwrap_err();
+        assert!(is_retryable_provider_error(&error));
+    }
+
+    #[tokio::test]
     async fn execute_runtime_step_does_not_retry_parse_outputs_as_provider_errors() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("multiagent.toml");
@@ -1175,6 +1311,169 @@ model_fallbacks = ["fallback-succeeds"]
                     .content
                     .contains("retryable provider error for model primary-fails")
         }));
+    }
+
+    #[tokio::test]
+    async fn execute_runtime_step_does_not_retry_non_retryable_provider_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[agents.explorer]
+runtime = "fake"
+model = "only-model"
+"#,
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let request = RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: "non-retryable provider error".to_string(),
+            session_goal: None,
+            working_directory: dir.path().to_path_buf(),
+            agent_profile: config.agents["explorer"].clone(),
+            session_events: Vec::new(),
+            recent_context: RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "agent_result".to_string(),
+            parallel_context: None,
+            capability_constraints: vec![Capability::Read],
+            limits: Limits::default(),
+        };
+
+        // A non-retryable provider error must fail fast: it takes the catch-all
+        // error arm (no same-model retry, no fallback) and surfaces unchanged.
+        let error = execute_runtime_step(&config, request).await.unwrap_err();
+        assert!(!is_retryable_provider_error(&error));
+        assert!(error.to_string().contains("non-retryable provider error"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_runtime_step_recovers_from_empty_claude_result_via_same_model_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("claude-empty-then-recover.sh");
+        let attempts_path = dir.path().join("attempts.txt");
+        let init_frame = serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "s1",
+            "model": "claude-test"
+        });
+        let empty_frame = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": ""
+        });
+        let valid_frame = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": wrap_json_contract(&AgentResult::completed("explorer", "step", "claude recovered")).unwrap()
+        });
+        // First invocation returns an empty (thinking-only) result; the second
+        // returns a valid contract. A single-model agent must recover on the
+        // second SAME-model attempt without any fallback.
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "claude 2.0.0"; exit 0; fi
+printf 'x' >> "{attempts}"
+cat >/dev/null
+count=$(wc -c < "{attempts}" | tr -d ' ')
+printf '%s\n' {init}
+if [ "$count" -le 1 ]; then
+  printf '%s\n' {empty}
+else
+  printf '%s\n' {valid}
+fi
+exit 0
+"#,
+                attempts = attempts_path.display(),
+                init = shell_single_quoted(&init_frame.to_string()),
+                empty = shell_single_quoted(&empty_frame.to_string()),
+                valid = shell_single_quoted(&valid_frame.to_string()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = dir.path().join("multiagent.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[runtimes.claude]
+command = "{}"
+
+[agents.explorer]
+runtime = "claude"
+model = "claude-test"
+"#,
+                script_path.display()
+            ),
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let request = RuntimeRequest {
+            run_id: "run".to_string(),
+            step_id: "step".to_string(),
+            prompt: "explore the repository".to_string(),
+            session_goal: None,
+            working_directory: dir.path().to_path_buf(),
+            agent_profile: config.agents["explorer"].clone(),
+            session_events: Vec::new(),
+            recent_context: RuntimeRecentContext::default(),
+            previous_results: Vec::new(),
+            action_results: Vec::new(),
+            output_schema: "agent_result".to_string(),
+            parallel_context: None,
+            capability_constraints: vec![Capability::Read],
+            limits: Limits::default(),
+        };
+
+        let result = execute_runtime_step(&config, request).await.unwrap();
+
+        match result.output {
+            RuntimeOutput::AgentResult { result } => {
+                assert_eq!(result.summary, "claude recovered");
+            }
+            other => panic!("unexpected runtime output: {other:?}"),
+        }
+        // Exactly two spawns: the empty turn plus the recovering retry.
+        let attempts = std::fs::read_to_string(&attempts_path).unwrap();
+        assert_eq!(attempts.len(), 2, "expected exactly two claude invocations");
+        let statuses: Vec<String> = result
+            .stream_deltas
+            .iter()
+            .filter(|delta| delta.stream == "status")
+            .map(|delta| delta.content.clone())
+            .collect();
+        assert!(
+            statuses.iter().any(|s| s.contains("retrying same model")),
+            "expected a same-model retry status; got {statuses:?}"
+        );
+        assert!(
+            !statuses.iter().any(|s| s.contains("trying fallback model")),
+            "recovery must come from the same model, not a fallback; got {statuses:?}"
+        );
     }
 
     #[cfg(unix)]

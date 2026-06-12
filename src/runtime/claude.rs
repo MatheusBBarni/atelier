@@ -23,18 +23,38 @@ pub(crate) const REQUIRED_HELP_FLAGS: &[&str] = &[
     "--no-session-persistence",
     "--tools",
     "--setting-sources",
+    "--system-prompt",
+    "--exclude-dynamic-system-prompt-sections",
 ];
+
+// Replaces Claude Code's full default system prompt (skills, MCP servers, and
+// slash-command catalogues — measured at ~8k tokens in the init frame) with a
+// minimal adapter brief. The task protocol and JSON envelope still arrive over
+// stdin; stripping the default prompt keeps the model from behaving like a
+// standalone coding agent and markedly improves contract adherence on smaller
+// models (haiku otherwise returns malformed multi-action contracts or empty
+// turns).
+const CLAUDE_ADAPTER_SYSTEM_PROMPT: &str = "You are atelier's structured runtime adapter, not a standalone coding agent. Read the protocol and JSON envelope in the user message and reply with exactly one JSON contract inside the contract delimiters. Never use tools, edit files, run commands, inspect the repository, or emit any prose outside the contract.";
 
 const PROTECTED_DEFAULT_ARGS: &[&str] = &[
     "-p",
     "--output-format",
     "stream-json",
+    // The Claude CLI rejects `--print --output-format=stream-json` unless
+    // `--verbose` is also set.
+    "--verbose",
     "--include-partial-messages",
     "--no-session-persistence",
     "--tools",
     "",
     "--setting-sources",
     "user",
+    // Strip the bloated default system prompt down to the adapter brief and
+    // drop the dynamic (skills/MCP/command) sections so the model stays in
+    // structured-contract mode.
+    "--system-prompt",
+    CLAUDE_ADAPTER_SYSTEM_PROMPT,
+    "--exclude-dynamic-system-prompt-sections",
 ];
 
 const DEFAULT_RUNTIME_TIMEOUT: Duration = Duration::from_secs(600);
@@ -365,6 +385,8 @@ fn validate_synthesized_args(args: &[String]) -> Result<()> {
     require_arg(args, "--no-session-persistence")?;
     require_arg_value(args, "--tools", "")?;
     require_arg_value(args, "--setting-sources", "user")?;
+    require_arg_value(args, "--system-prompt", CLAUDE_ADAPTER_SYSTEM_PROMPT)?;
+    require_arg(args, "--exclude-dynamic-system-prompt-sections")?;
     validate_synthesized_model_args(args)?;
     if args.iter().any(|arg| {
         matches!(
@@ -686,14 +708,19 @@ impl ClaudeStreamState {
             ))
             .into());
         }
+        // An empty (or omitted) final result is a transient model hiccup: with
+        // thinking enabled the model can spend a turn reasoning and end without
+        // emitting a text block, so the CLI reports success with no `result`.
+        // Treat it as retryable so a fresh attempt (same model, then any
+        // fallback) can recover instead of failing the whole run.
         let Some(result_text) = result_text else {
-            return Err(RuntimeProviderError::non_retryable(
+            return Err(RuntimeProviderError::retryable(
                 "Claude final result frame omitted result text",
             )
             .into());
         };
         if result_text.trim().is_empty() {
-            return Err(RuntimeProviderError::non_retryable(
+            return Err(RuntimeProviderError::retryable(
                 "Claude final result frame contained empty result text",
             )
             .into());
@@ -1118,6 +1145,14 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--model", "claude-opus-4"]));
+        // The bloated default system prompt is replaced by the adapter brief
+        // and the dynamic sections are excluded.
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--system-prompt", CLAUDE_ADAPTER_SYSTEM_PROMPT]));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--exclude-dynamic-system-prompt-sections"));
         assert!(args.contains(&"--safe-compat".to_string()));
     }
 
@@ -1126,6 +1161,20 @@ mod tests {
         let args = claude_step_args(&[], "default");
 
         assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn claude_step_args_pass_verbose_with_print_stream_json() {
+        // `claude --print --output-format=stream-json` errors without --verbose.
+        let args = claude_step_args(&[], "default");
+
+        assert!(args.iter().any(|arg| arg == "-p"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--output-format", "stream-json"]));
+        assert!(args.iter().any(|arg| arg == "--verbose"));
+        // --verbose must also survive validation (not on the forbidden list).
+        validate_synthesized_args(&args).unwrap();
     }
 
     #[test]
@@ -1227,6 +1276,10 @@ printf '%s\n' {}
         assert!(args.contains("--no-session-persistence\n"));
         assert!(args.contains("--tools\n\n"));
         assert!(args.contains("--setting-sources\nuser\n"));
+        assert!(args.contains(&format!(
+            "--system-prompt\n{CLAUDE_ADAPTER_SYSTEM_PROMPT}\n"
+        )));
+        assert!(args.contains("--exclude-dynamic-system-prompt-sections\n"));
         assert!(args.contains("--model\nclaude-opus-4\n"));
         assert!(stdin.contains("through the Claude CLI as a structured runtime adapter"));
         assert!(stdin.contains("Do not edit files, run commands"));
@@ -1607,6 +1660,54 @@ exec sleep 30
             .await
             .unwrap_err();
 
+        assert!(super::super::is_retryable_provider_error(&error));
+    }
+
+    #[tokio::test]
+    async fn claude_empty_final_result_is_retryable() {
+        // A thinking-only turn can end with subtype=success/is_error=false but
+        // no text, so `result` is empty. That is a transient hiccup: it must be
+        // retryable, not a hard run failure.
+        for empty in ["", "   \n\t "] {
+            let mut state = ClaudeStreamState::default();
+            let frame = serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": empty
+            });
+
+            let error = state
+                .apply_line(&frame.to_string(), &RuntimeEventSink::channel(4).0)
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("empty result text"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                super::super::is_retryable_provider_error(&error),
+                "empty result should be retryable: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_omitted_final_result_is_retryable() {
+        let mut state = ClaudeStreamState::default();
+        let frame = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false
+        });
+
+        let error = state
+            .apply_line(&frame.to_string(), &RuntimeEventSink::channel(4).0)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("omitted result text"));
         assert!(super::super::is_retryable_provider_error(&error));
     }
 

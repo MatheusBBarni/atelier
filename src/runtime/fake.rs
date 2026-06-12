@@ -44,6 +44,13 @@ impl Runtime for FakeRuntime {
         events: RuntimeEventSink,
         cancellation: CancellationToken,
     ) -> Result<RuntimeOutput> {
+        if should_emit_fake_non_retryable_provider_error(&request) {
+            return Err(RuntimeProviderError::non_retryable(format!(
+                "fake non-retryable provider error for model {}",
+                request.agent_profile.model
+            ))
+            .into());
+        }
         if should_emit_fake_retryable_provider_error(&request) {
             return Err(RuntimeProviderError::retryable(format!(
                 "fake retryable provider error for model {}",
@@ -594,8 +601,16 @@ fn should_emit_fake_parse_error(request: &RuntimeRequest) -> bool {
 }
 
 fn should_emit_fake_retryable_provider_error(request: &RuntimeRequest) -> bool {
-    fake_control_text(request).contains("retryable provider error")
+    let control = fake_control_text(request);
+    control.contains("retryable provider error")
+        // "non-retryable provider error" contains "retryable provider error" as
+        // a substring; keep the two control phrases disjoint.
+        && !control.contains("non-retryable provider error")
         && request.agent_profile.model == "primary-fails"
+}
+
+fn should_emit_fake_non_retryable_provider_error(request: &RuntimeRequest) -> bool {
+    fake_control_text(request).contains("non-retryable provider error")
 }
 
 fn fake_control_text(request: &RuntimeRequest) -> String {

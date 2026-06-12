@@ -1323,6 +1323,15 @@ impl ChatProjection {
                     source.merge_event(event_id);
                 }
                 *existing = ChatItemView { source, ..item };
+                // A run/workflow conclusion was first inserted as a "started"
+                // placeholder at run start; on its terminal update, move it to
+                // the end so it renders in chronological position instead of
+                // staying pinned at the placeholder's original (top) index.
+                if is_terminal_run_conclusion(&self.items[index], &key) {
+                    let concluded = self.items.remove(index);
+                    self.items.push(concluded);
+                    self.rebuild_index();
+                }
                 return;
             }
             self.index.insert(key, self.items.len());
@@ -1364,6 +1373,21 @@ impl ChatProjection {
             }
         }
     }
+}
+
+/// True for a terminal run/workflow conclusion (a `RunSummary` keyed by `Run`
+/// or `Workflow` in a finished state). Such items begin life as a `Running`
+/// "started" placeholder at run start; recognizing the terminal update lets
+/// `upsert` move it to the end so it appears in chronological order.
+fn is_terminal_run_conclusion(item: &ChatItemView, key: &ChatLifecycleKey) -> bool {
+    matches!(
+        key,
+        ChatLifecycleKey::Run { .. } | ChatLifecycleKey::Workflow { .. }
+    ) && item.kind == ChatItemKind::RunSummary
+        && matches!(
+            item.status,
+            ChatItemStatus::Completed | ChatItemStatus::Failed | ChatItemStatus::Interrupted
+        )
 }
 
 #[derive(Clone, Debug)]
@@ -3620,6 +3644,118 @@ mod tests {
             .find(|item| item.kind == ChatItemKind::RunSummary)
             .expect("run summary item must exist");
         assert_eq!(run_summary.title, "Run completed");
+    }
+
+    #[test]
+    fn run_failure_summary_orders_last_in_chronological_position() {
+        let events = vec![
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Scope?",
+                    "options": [{"id": "a", "label": "A"}]
+                }),
+            ),
+            event(
+                "run_failed",
+                Some("run-1"),
+                None,
+                json!({
+                    "reason": "Claude stream requested tool use or local action execution; harness-action boundary violated"
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        // The failure summary renders LAST (chronological), not pinned to the
+        // run-start placeholder position at the top.
+        let last = items.last().unwrap();
+        assert_eq!(last.kind, ChatItemKind::RunSummary);
+        assert_eq!(last.title, "Run failed");
+        assert_eq!(last.status, ChatItemStatus::Failed);
+        assert!(last
+            .body
+            .iter()
+            .any(|line| line.text.contains("harness-action boundary violated")));
+
+        // De-dup preserved: exactly one run-summary item for the run.
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == ChatItemKind::RunSummary)
+                .count(),
+            1
+        );
+
+        // Earlier progress (the clarification) precedes the failure.
+        let clar_idx = items
+            .iter()
+            .position(|item| item.kind == ChatItemKind::Clarification)
+            .unwrap();
+        let run_idx = items
+            .iter()
+            .position(|item| item.kind == ChatItemKind::RunSummary)
+            .unwrap();
+        assert!(
+            clar_idx < run_idx,
+            "progress must precede the failure summary"
+        );
+    }
+
+    #[test]
+    fn workflow_failure_summary_orders_last() {
+        let events = vec![
+            event(
+                "workflow_started",
+                Some("run-1"),
+                None,
+                json!({ "original_command": "/workflow do x" }),
+            ),
+            event(
+                "clarification_requested",
+                Some("run-1"),
+                None,
+                json!({
+                    "question_id": "q1",
+                    "question": "Scope?",
+                    "options": [{"id": "a", "label": "A"}]
+                }),
+            ),
+            event(
+                "workflow_completed",
+                Some("run-1"),
+                None,
+                json!({ "status": "failed", "summary": "boom" }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+
+        let last = items.last().unwrap();
+        assert_eq!(last.kind, ChatItemKind::RunSummary);
+        assert_eq!(last.status, ChatItemStatus::Failed);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == ChatItemKind::RunSummary)
+                .count(),
+            1
+        );
+        let clar_idx = items
+            .iter()
+            .position(|item| item.kind == ChatItemKind::Clarification)
+            .unwrap();
+        assert!(
+            clar_idx < items.len() - 1,
+            "progress precedes the workflow summary"
+        );
     }
 
     #[test]

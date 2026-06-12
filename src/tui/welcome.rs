@@ -94,7 +94,28 @@ fn big_text_lines(
         .lines(vec![Line::from(WORDMARK)])
         .build()
         .render(area, &mut buffer);
-    buffer_to_lines(&buffer)
+    trim_blank_edges(buffer_to_lines(&buffer))
+}
+
+/// Drop fully-blank leading/trailing rows from a rendered wordmark. The glyph
+/// buffer is a fixed height (so the font has room to paint), but `font8x8`
+/// leaves the bottom row empty for ascender-only words like "Atelier"; that dead
+/// row plus the welcome separator read as excess space before the facts box.
+/// Interior rows are kept (they carry glyph structure).
+fn trim_blank_edges(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let is_blank = |line: &Line<'static>| {
+        line.spans
+            .iter()
+            .all(|span| span.content.chars().all(char::is_whitespace))
+    };
+    match (
+        lines.iter().position(|line| !is_blank(line)),
+        lines.iter().rposition(|line| !is_blank(line)),
+    ) {
+        (Some(first), Some(last)) => lines[first..=last].to_vec(),
+        // Defensive: an all-blank render keeps its rows rather than vanishing.
+        _ => lines,
+    }
 }
 
 /// Convert a rendered buffer into owned `Line`s, coalescing runs of same-styled
@@ -250,12 +271,38 @@ mod tests {
     #[test]
     fn width_ladder_selects_full_compact_or_plain() {
         let theme = truecolor();
-        assert_eq!(wordmark_lines(&theme, 100).len(), FULL_HEIGHT as usize);
-        assert_eq!(wordmark_lines(&theme, 70).len(), COMPACT_HEIGHT as usize);
+        let full = wordmark_lines(&theme, 100);
+        let compact = wordmark_lines(&theme, 70);
+        // Full keeps the most rows but is trimmed of its dead bottom row, so it
+        // is shorter than the raw buffer height and taller than compact.
+        assert!(full.len() < FULL_HEIGHT as usize);
+        assert!(full.len() > compact.len());
+        assert_eq!(compact.len(), COMPACT_HEIGHT as usize);
 
         let plain = wordmark_lines(&theme, 50);
         assert_eq!(plain.len(), 1);
         assert!(line_text(&plain[0]).contains("Atelier"));
+    }
+
+    #[test]
+    fn wordmark_has_no_blank_edge_rows() {
+        let theme = truecolor();
+        let blank = |line: &Line| {
+            line.spans
+                .iter()
+                .all(|span| span.content.chars().all(char::is_whitespace))
+        };
+        for width in [100, 70] {
+            let lines = wordmark_lines(&theme, width);
+            assert!(
+                !blank(lines.first().unwrap()),
+                "leading row blank at {width}"
+            );
+            assert!(
+                !blank(lines.last().unwrap()),
+                "trailing row blank at {width}"
+            );
+        }
     }
 
     #[test]

@@ -2183,20 +2183,52 @@ fn chat_item_header_line(
 }
 
 fn chat_body_line(theme: &Theme, line: &ChatLineView) -> Line<'static> {
-    let (prefix, style) = match line.style {
-        ChatLineStyle::Plain => ("  ", Style::default().fg(theme.text)),
-        ChatLineStyle::Muted => ("  ", Style::default().fg(theme.text_muted)),
-        ChatLineStyle::Code => ("  ", Style::default().fg(theme.accent)),
-        ChatLineStyle::DiffAdd => ("  ", Style::default().fg(theme.status_ok)),
-        ChatLineStyle::DiffRemove => ("  ", Style::default().fg(theme.status_error)),
-        ChatLineStyle::DiffContext => ("  ", Style::default().fg(theme.text_dim)),
-        ChatLineStyle::Warning => ("  ", Style::default().fg(theme.status_warn)),
-        ChatLineStyle::Error => ("  ", Style::default().fg(theme.status_error)),
+    let value_style = match line.style {
+        ChatLineStyle::Plain => Style::default().fg(theme.text),
+        ChatLineStyle::Muted => Style::default().fg(theme.text_muted),
+        ChatLineStyle::Code => Style::default().fg(theme.accent),
+        ChatLineStyle::DiffAdd => Style::default().fg(theme.status_ok),
+        ChatLineStyle::DiffRemove => Style::default().fg(theme.status_error),
+        ChatLineStyle::DiffContext => Style::default().fg(theme.text_dim),
+        ChatLineStyle::Warning => Style::default().fg(theme.status_warn),
+        ChatLineStyle::Error => Style::default().fg(theme.status_error),
     };
+    // Prose-style lines carry a "label: value" structure (finding/verified/plan/
+    // …) baked into the text. Render the recognized label distinctly so agent
+    // output reads as a scannable list. Text is byte-identical; only styling
+    // changes. Code/diff lines are left verbatim.
+    if matches!(line.style, ChatLineStyle::Plain | ChatLineStyle::Muted) {
+        if let Some(label_style) = body_label_style(theme, &line.text) {
+            if let Some((label, value)) = line.text.split_once(": ") {
+                return Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(format!("{label}: "), label_style),
+                    Span::styled(value.to_string(), value_style),
+                ]);
+            }
+        }
+    }
     Line::from(vec![
-        Span::styled(prefix, Style::default()),
-        Span::styled(line.text.clone(), style),
+        Span::styled("  ", Style::default()),
+        Span::styled(line.text.clone(), value_style),
     ])
+}
+
+/// Style for a recognized leading semantic label in a body line ("finding: …",
+/// "verified: …", etc.), or `None` when the line is plain prose. Only the fixed
+/// set of labels the projection emits is recognized, so arbitrary "Word:" prose
+/// is never mis-styled.
+fn body_label_style(theme: &Theme, text: &str) -> Option<Style> {
+    let label = text.split_once(": ")?.0;
+    let color = match label {
+        "verified" | "verification" | "changed" => theme.status_ok,
+        "risk" => theme.status_warn,
+        "blocker" => theme.status_error,
+        "finding" | "plan" => theme.accent,
+        "command" | "summary" => theme.text_dim,
+        _ => return None,
+    };
+    Some(Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
 fn detail_label(detail: &ChatDetailRef) -> String {
@@ -6087,5 +6119,98 @@ runtime = "fake"
         let clar_border = box_corner_fg(&clar_buf, "Clarifying question");
         assert_eq!(clar_border, Some(theme.accent));
         assert_ne!(clar_border, Some(theme.border_focused));
+    }
+
+    // ── agent-output readability (label/value styling) ──
+
+    fn body(style: ChatLineStyle, text: &str) -> ChatLineView {
+        ChatLineView {
+            style,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn chat_body_line_styles_known_label_distinctly_from_value() {
+        let theme = TuiUiState::default().theme;
+
+        // "finding" -> accent label; value keeps the muted base; text identical.
+        let line = chat_body_line(
+            &theme,
+            &body(ChatLineStyle::Muted, "finding: Entrypoint: src/main.rs"),
+        );
+        let label = line
+            .spans
+            .iter()
+            .find(|s| s.content.starts_with("finding"))
+            .unwrap();
+        let value = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Entrypoint"))
+            .unwrap();
+        assert_eq!(label.style.fg, Some(theme.accent));
+        assert!(label.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(value.style.fg, Some(theme.text_muted));
+        assert_ne!(label.style.fg, value.style.fg);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "  finding: Entrypoint: src/main.rs");
+
+        // "verified" -> status_ok label (split only on the first ": ").
+        let verified = chat_body_line(
+            &theme,
+            &body(ChatLineStyle::Muted, "verified: cargo test passed"),
+        );
+        let vlabel = verified
+            .spans
+            .iter()
+            .find(|s| s.content.starts_with("verified"))
+            .unwrap();
+        assert_eq!(vlabel.style.fg, Some(theme.status_ok));
+    }
+
+    #[test]
+    fn chat_body_line_leaves_prose_and_code_unsplit() {
+        let theme = TuiUiState::default().theme;
+
+        // Prose with no recognized label renders as one value span.
+        let prose = chat_body_line(
+            &theme,
+            &body(ChatLineStyle::Plain, "Explored the codebase structure"),
+        );
+        assert_eq!(
+            prose
+                .spans
+                .iter()
+                .filter(|s| !s.content.trim().is_empty())
+                .count(),
+            1
+        );
+
+        // An unknown "Word:" prefix is not treated as a label.
+        let note = chat_body_line(&theme, &body(ChatLineStyle::Plain, "Note: did something"));
+        assert_eq!(
+            note.spans
+                .iter()
+                .filter(|s| !s.content.trim().is_empty())
+                .count(),
+            1
+        );
+
+        // Code lines are never split, even with a colon.
+        let code = chat_body_line(&theme, &body(ChatLineStyle::Code, "key: value"));
+        let code_span = code
+            .spans
+            .iter()
+            .find(|s| s.content.contains("key"))
+            .unwrap();
+        assert_eq!(code_span.style.fg, Some(theme.accent));
+        assert_eq!(
+            code.spans
+                .iter()
+                .filter(|s| !s.content.trim().is_empty())
+                .count(),
+            1
+        );
     }
 }
