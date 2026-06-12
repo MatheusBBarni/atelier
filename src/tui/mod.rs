@@ -943,6 +943,7 @@ fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
     state.input.clear();
     ui_state.input_cursor = 0;
     ui_state.input_preferred_col = None;
+    clear_command_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
 }
 
@@ -969,6 +970,7 @@ fn insert_input_character(state: &mut AppState, ui_state: &mut TuiUiState, ch: c
     ui_state.input_cursor += 1;
     ui_state.input_preferred_col = None;
     ui_state.status_message = None;
+    clear_command_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
 }
 
@@ -985,6 +987,7 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     ui_state.input_cursor = removed_char_index;
     ui_state.input_preferred_col = None;
     ui_state.status_message = None;
+    clear_command_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
 }
 
@@ -1199,7 +1202,14 @@ fn reset_skill_dropdown_selection(ui_state: &mut TuiUiState) {
 }
 
 fn reset_command_dropdown_selection(ui_state: &mut TuiUiState) {
+    // Only the selection index. The Escape dismissal is keyed to the raw input
+    // and is cleared on a content edit (insert/backspace) or clear_input — never
+    // on a cursor move — so Escape survives Left/Right/Up after dismissal.
     ui_state.command_selection_index = 0;
+}
+
+/// Clear the Escape dismissal so a content edit re-activates command discovery.
+fn clear_command_dropdown_dismissal(ui_state: &mut TuiUiState) {
     ui_state.command_dropdown_dismissed = None;
 }
 
@@ -4662,6 +4672,107 @@ mod tests {
         clar_state.pending_clarification = Some(clarification_view(vec![]));
         let clar_ui = ui_state_with_cursor_at_end("/tmp/project");
         assert!(command_dropdown(&clar_state, &clar_ui).is_none());
+    }
+
+    #[tokio::test]
+    async fn command_dropdown_escape_survives_cursor_move() {
+        // Regression: a cursor move is not an edit, so it must not clear the
+        // Escape dismissal and re-open the dropdown for unchanged input.
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/g", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/g");
+        apply_command_dropdown_command(&mut state, &mut ui_state, CommandDropdownCommand::Dismiss);
+        assert!(command_dropdown(&state, &ui_state).is_none());
+
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::MoveInputCursor(InputCursorCommand::Left),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "/g");
+        assert_eq!(ui_state.command_dropdown_dismissed, Some("/g".to_string()));
+        assert!(command_dropdown(&state, &ui_state).is_none());
+    }
+
+    #[tokio::test]
+    async fn command_dropdown_reactivates_after_edit_following_dismiss() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/g", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/g");
+        apply_command_dropdown_command(&mut state, &mut ui_state, CommandDropdownCommand::Dismiss);
+        assert!(command_dropdown(&state, &ui_state).is_none());
+
+        // Editing the input clears the dismissal and re-activates discovery.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::InputCharacter('o'),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "/go");
+        assert_eq!(ui_state.command_dropdown_dismissed, None);
+        assert!(command_dropdown(&state, &ui_state).is_some());
+    }
+
+    #[tokio::test]
+    async fn command_dropdown_second_enter_submits_no_arg_command() {
+        // The re-accept guard: after accepting /config, a second Enter is no
+        // longer intercepted and submits the command.
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/config", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/config");
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::CommandDropdown(CommandDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "/config");
+        assert!(receiver.try_recv().is_err());
+
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+                "/config".to_string()
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn command_dropdown_second_enter_toggles_help() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("/help", false);
+        let mut ui_state = ui_state_with_cursor_at_end("/help");
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::CommandDropdown(CommandDropdownCommand::Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "/help");
+
+        // Second Enter falls through to the /help toggle, no longer intercepted.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::ToggleHelp)
+        );
     }
 
     #[test]
