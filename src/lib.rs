@@ -10,6 +10,7 @@ pub mod ids;
 pub mod orchestrator;
 pub mod runtime;
 pub mod skills;
+pub mod slash_commands;
 pub mod tui;
 
 pub use cli::{run_cli, Cli};
