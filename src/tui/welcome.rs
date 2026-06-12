@@ -30,6 +30,31 @@ const COMPACT_HEIGHT: u16 = 4;
 /// Maximum agent names listed inline before collapsing to "+N more".
 const AGENT_PREVIEW: usize = 4;
 
+/// Block-art wizard hat placed to the left of the wordmark (echoes the app
+/// icon): a *solid* teal cone with a gold tassel and a brim. The cone is built
+/// from quadrant block elements (`▟`/`▙` for the sloped edges, `█` fill) which
+/// tile seamlessly into a filled triangle — unlike thin box-drawing diagonals,
+/// which render as a disconnected outline. Each row is a list of
+/// `(glyph, is_tassel)` segments; `is_tassel` selects the gold accent. Every row
+/// is the same cell width so the wordmark starts at a fixed column per line.
+const HAT_WIDTH_FULL: usize = 15;
+const HAT_FULL: [&[(&str, bool)]; 7] = [
+    &[("      ▟▙", false), ("╮", true), ("      ", false)],
+    &[("     ▟██▙", false), ("┊", true), ("     ", false)],
+    &[("    ▟████▙", false), ("◦", true), ("    ", false)],
+    &[("   ▟██████▙    ", false)],
+    &[("  ▟████████▙   ", false)],
+    &[(" ▟██████████▙  ", false)],
+    &[("▗▄▄▄▄▄▄▄▄▄▄▄▄▄▖", false)],
+];
+const HAT_WIDTH_COMPACT: usize = 10;
+const HAT_COMPACT: [&[(&str, bool)]; 4] = [
+    &[("   ▟▙ ", false), ("╮", true), ("   ", false)],
+    &[("  ▟██▙", false), ("┊", true), ("   ", false)],
+    &[(" ▟████▙", false), ("◦", true), ("  ", false)],
+    &[("▗▄▄▄▄▄▄▄▖ ", false)],
+];
+
 /// Facts shown beneath the wordmark, borrowed from live app state at render
 /// time. `git` is the cross-task integration point: `None` until task_05 wires
 /// `AppState.git_context`, at which point the caller passes the repo/branch.
@@ -94,7 +119,90 @@ fn big_text_lines(
         .lines(vec![Line::from(WORDMARK)])
         .build()
         .render(area, &mut buffer);
-    trim_blank_edges(buffer_to_lines(&buffer))
+    // Trim the dead glyph rows, then drop the trailing blank columns each row
+    // carries (the buffer is full chat width) so the hat can be prefixed without
+    // pushing the line past `width` and wrapping.
+    let word: Vec<Line<'static>> = trim_blank_edges(buffer_to_lines(&buffer))
+        .into_iter()
+        .map(right_trim_line)
+        .collect();
+    let full = matches!(pixel_size, PixelSize::Full);
+    let hat = hat_lines(theme, full);
+    let hat_width = if full {
+        HAT_WIDTH_FULL
+    } else {
+        HAT_WIDTH_COMPACT
+    };
+    combine_hat_and_word(hat, word, hat_width)
+}
+
+/// Build the wizard-hat rows as styled lines: cone in the brand accent, tassel
+/// in the gold/warn token, matching the wordmark's bold weight.
+fn hat_lines(theme: &Theme, full: bool) -> Vec<Line<'static>> {
+    let rows: &[&[(&str, bool)]] = if full { &HAT_FULL } else { &HAT_COMPACT };
+    rows.iter()
+        .map(|row| {
+            let spans = row
+                .iter()
+                .map(|(glyph, tassel)| {
+                    let color = if *tassel {
+                        theme.status_warn
+                    } else {
+                        theme.accent
+                    };
+                    Span::styled(
+                        (*glyph).to_string(),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Place the hat to the left of the wordmark, bottom-aligned so the brim sits on
+/// the wordmark baseline (a taller hat lets its tip rise above the letters).
+/// Blank-padded rows keep `hat_width` cells so the wordmark stays column-aligned.
+fn combine_hat_and_word(
+    hat: Vec<Line<'static>>,
+    word: Vec<Line<'static>>,
+    hat_width: usize,
+) -> Vec<Line<'static>> {
+    let height = hat.len().max(word.len());
+    let hat_pad = height - hat.len();
+    let word_pad = height - word.len();
+    (0..height)
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if row >= hat_pad {
+                spans.extend(hat[row - hat_pad].spans.clone());
+            } else {
+                spans.push(Span::raw(" ".repeat(hat_width)));
+            }
+            spans.push(Span::raw("  "));
+            if row >= word_pad {
+                spans.extend(word[row - word_pad].spans.clone());
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Drop trailing whitespace spans (and trailing spaces on the last span) so a
+/// wordmark row is only as wide as its glyphs.
+fn right_trim_line(line: Line<'static>) -> Line<'static> {
+    let mut spans = line.spans;
+    while spans
+        .last()
+        .is_some_and(|span| span.content.chars().all(char::is_whitespace))
+    {
+        spans.pop();
+    }
+    if let Some(last) = spans.last_mut() {
+        *last = Span::styled(last.content.trim_end().to_string(), last.style);
+    }
+    Line::from(spans)
 }
 
 /// Drop fully-blank leading/trailing rows from a rendered wordmark. The glyph
@@ -266,6 +374,47 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn hat_rows_have_consistent_cell_width() {
+        // Every hat row must be the same width so the wordmark starts at a fixed
+        // column on each line; a mismatch would jag the wordmark's left edge.
+        let widths = |rows: &[&[(&str, bool)]]| -> Vec<usize> {
+            rows.iter()
+                .map(|row| row.iter().map(|(g, _)| g.chars().count()).sum())
+                .collect()
+        };
+        for w in widths(&HAT_FULL) {
+            assert_eq!(w, HAT_WIDTH_FULL, "full hat row width");
+        }
+        for w in widths(&HAT_COMPACT) {
+            assert_eq!(w, HAT_WIDTH_COMPACT, "compact hat row width");
+        }
+    }
+
+    #[test]
+    fn wordmark_includes_hat_at_full_and_compact() {
+        let theme = truecolor();
+        for width in [100, 70] {
+            let text: String = wordmark_lines(&theme, width)
+                .iter()
+                .map(line_text)
+                .collect();
+            assert!(
+                text.contains('▟') && text.contains('▙'),
+                "solid cone edges missing at width {width}"
+            );
+            assert!(text.contains('▄'), "brim missing at width {width}");
+            // The tassel is painted with the gold/warn token, distinct from the
+            // accent cone — proving the two-color hat renders.
+            let has_gold = wordmark_lines(&theme, width).iter().any(|line| {
+                line.spans
+                    .iter()
+                    .any(|s| s.style.fg == Some(theme.status_warn))
+            });
+            assert!(has_gold, "tassel gold token missing at width {width}");
+        }
     }
 
     #[test]
