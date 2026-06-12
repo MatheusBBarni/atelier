@@ -11,6 +11,7 @@
 
 use std::cmp::Ordering;
 use std::path::{Component, Path};
+use std::sync::atomic::{self, AtomicBool};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
@@ -91,6 +92,16 @@ impl FileIndex {
     /// rather than aborting the whole walk; a fully failed walk yields an empty
     /// `Vec`.
     pub fn walk(root: &Path) -> Vec<FileEntry> {
+        Self::walk_cancellable(root, &AtomicBool::new(false))
+    }
+
+    /// Like [`FileIndex::walk`], but aborts the traversal as soon as `cancel`
+    /// is set. The TUI hands in a shutdown flag so an in-flight background walk
+    /// (run on a `spawn_blocking` thread) stops promptly on quit instead of
+    /// keeping that blocking thread — and therefore process exit — alive on a
+    /// large workspace. The partial result is discarded by the caller, so
+    /// bailing mid-walk is safe.
+    pub fn walk_cancellable(root: &Path, cancel: &AtomicBool) -> Vec<FileEntry> {
         // Canonicalize the root once so containment checks compare like-for-like
         // (on macOS, tempdirs live under a `/var -> /private/var` symlink).
         let canonical_root = match root.canonicalize() {
@@ -117,6 +128,11 @@ impl FileIndex {
             .build();
 
         for result in walker {
+            // Stop the moment a shutdown is requested so the blocking thread
+            // running this walk frees promptly.
+            if cancel.load(atomic::Ordering::Relaxed) {
+                break;
+            }
             let Ok(dir_entry) = result else {
                 // Permission denied on a subtree, etc. — skip and keep walking.
                 continue;
@@ -464,6 +480,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(FileIndex::walk(&missing).is_empty());
+    }
+
+    #[test]
+    fn walk_cancelled_before_start_yields_empty() {
+        // A pre-set cancellation flag stops the walk before it lists anything,
+        // so the blocking thread returns immediately on shutdown.
+        let dir = tempdir().unwrap();
+        seed_tree(dir.path());
+        let cancel = AtomicBool::new(true);
+        assert!(FileIndex::walk_cancellable(dir.path(), &cancel).is_empty());
+        // The uncancelled walk over the same tree is non-empty (control).
+        assert!(!FileIndex::walk(dir.path()).is_empty());
     }
 
     #[test]

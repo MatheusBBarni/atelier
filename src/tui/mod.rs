@@ -35,6 +35,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -628,13 +630,16 @@ const FILE_INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 async fn refresh_file_index(
     working_directory: Option<&Path>,
     file_index_sender: &watch::Sender<Vec<FileEntry>>,
+    cancel: Arc<AtomicBool>,
 ) {
     let Some(root) = working_directory.map(Path::to_path_buf) else {
         return;
     };
     // A join error (walk panic) leaves the previous snapshot in place; a send
     // error means every receiver is gone (TUI shutting down).
-    if let Ok(entries) = tokio::task::spawn_blocking(move || FileIndex::walk(&root)).await {
+    if let Ok(entries) =
+        tokio::task::spawn_blocking(move || FileIndex::walk_cancellable(&root, &cancel)).await
+    {
         let _ = file_index_sender.send(entries);
     }
 }
@@ -648,12 +653,17 @@ async fn refresh_file_index(
 /// walk returned. Detaching keeps the command arm pollable; the snapshot lands
 /// via the `watch` channel whenever the walk finishes (last-writer-wins, so an
 /// occasional overlap between two in-flight walks is harmless).
+///
+/// `cancel` is the worker's shutdown flag: it is shared across every spawned
+/// walk so that, on quit, any in-flight walk stops promptly rather than holding
+/// a `spawn_blocking` thread alive and delaying runtime (process) shutdown.
 fn spawn_file_index_refresh(
     working_directory: Option<PathBuf>,
     file_index_sender: watch::Sender<Vec<FileEntry>>,
+    cancel: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
-        refresh_file_index(working_directory.as_deref(), &file_index_sender).await;
+        refresh_file_index(working_directory.as_deref(), &file_index_sender, cancel).await;
     });
 }
 
@@ -670,12 +680,21 @@ async fn run_app_worker(
     let mut git_poll = tokio::time::interval(GIT_POLL_INTERVAL);
     git_poll.tick().await; // consume the immediate first tick (startup covered it)
 
+    // Shared shutdown flag for every detached file-index walk. Set on worker
+    // exit so an in-flight `spawn_blocking` walk bails instead of keeping its
+    // blocking thread (and thus process exit) alive on a large workspace.
+    let walk_cancel = Arc::new(AtomicBool::new(false));
+
     // Initial off-thread file-index walk at startup, then a coarse periodic
     // refresh — mirrors the git poller (ADR-003). Both are detached
     // (`spawn_file_index_refresh`) rather than awaited so the cold startup walk
     // never blocks the command loop from servicing the first prompt, and so a
     // slow walk cannot starve `Shutdown`.
-    spawn_file_index_refresh(working_directory.clone(), file_index_sender.clone());
+    spawn_file_index_refresh(
+        working_directory.clone(),
+        file_index_sender.clone(),
+        walk_cancel.clone(),
+    );
     let mut file_index_poll = tokio::time::interval(FILE_INDEX_REFRESH_INTERVAL);
     // A walk that overruns the interval must not trigger a burst of catch-up
     // walks; skip missed ticks and resume the coarse cadence.
@@ -691,6 +710,7 @@ async fn run_app_worker(
                     }
                 }
                 Some(AppWorkerCommand::Shutdown) => {
+                    walk_cancel.store(true, Ordering::Relaxed);
                     app.end_session()?;
                     return Ok(());
                 }
@@ -700,11 +720,17 @@ async fn run_app_worker(
                 app.refresh_git_context().await;
             }
             _ = file_index_poll.tick() => {
-                spawn_file_index_refresh(working_directory.clone(), file_index_sender.clone());
+                spawn_file_index_refresh(
+                    working_directory.clone(),
+                    file_index_sender.clone(),
+                    walk_cancel.clone(),
+                );
             }
         }
     }
 
+    // Channel closed (sender dropped) — signal any in-flight walk to stop too.
+    walk_cancel.store(true, Ordering::Relaxed);
     app.end_session()
 }
 
@@ -7093,6 +7119,12 @@ runtime = "fake"
 
     // ── task_04 background file-index acquisition ──
 
+    /// A never-set cancellation flag for refresh tests that don't exercise the
+    /// shutdown path.
+    fn no_cancel() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     #[test]
     fn file_index_refresh_interval_has_expected_default() {
         assert_eq!(FILE_INDEX_REFRESH_INTERVAL, Duration::from_secs(15));
@@ -7106,7 +7138,7 @@ runtime = "fake"
         fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
 
         let (sender, receiver) = watch::channel(Vec::<FileEntry>::new());
-        refresh_file_index(Some(dir.path()), &sender).await;
+        refresh_file_index(Some(dir.path()), &sender, no_cancel()).await;
 
         let published = receiver.borrow().clone();
         assert_eq!(published, FileIndex::walk(dir.path()));
@@ -7122,10 +7154,25 @@ runtime = "fake"
             mtime: UNIX_EPOCH,
             depth: 1,
         }]);
-        refresh_file_index(None, &sender).await;
+        refresh_file_index(None, &sender, no_cancel()).await;
         // No working directory → the previous snapshot is left untouched.
         assert_eq!(receiver.borrow().len(), 1);
         assert_eq!(receiver.borrow()[0].rel_path, "kept.rs");
+    }
+
+    #[tokio::test]
+    async fn refresh_file_index_honors_cancellation() {
+        // A pre-set cancel flag makes the spawned walk bail immediately, so the
+        // refresh publishes an empty snapshot rather than scanning the tree —
+        // the mechanism that keeps quit from blocking on a large workspace.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
+
+        let (sender, receiver) = watch::channel(Vec::<FileEntry>::new());
+        refresh_file_index(Some(dir.path()), &sender, Arc::new(AtomicBool::new(true))).await;
+        assert!(receiver.borrow().is_empty());
     }
 
     #[tokio::test]
@@ -7134,7 +7181,7 @@ runtime = "fake"
         fs::write(dir.path().join("first.rs"), "fn main() {}").unwrap();
 
         let (sender, receiver) = watch::channel(Vec::<FileEntry>::new());
-        refresh_file_index(Some(dir.path()), &sender).await;
+        refresh_file_index(Some(dir.path()), &sender, no_cancel()).await;
         assert!(receiver
             .borrow()
             .iter()
@@ -7142,7 +7189,7 @@ runtime = "fake"
 
         // A file created mid-session appears on the next refresh.
         fs::write(dir.path().join("second.rs"), "fn second() {}").unwrap();
-        refresh_file_index(Some(dir.path()), &sender).await;
+        refresh_file_index(Some(dir.path()), &sender, no_cancel()).await;
         assert!(receiver
             .borrow()
             .iter()
