@@ -473,10 +473,7 @@ mod tests {
             entry("middle.rs", false, 20),
         ];
         let suggestions = FileIndex::query(&entries, "", 6);
-        assert_eq!(
-            paths_of(&suggestions),
-            ["newest.rs", "middle.rs", "old.rs"]
-        );
+        assert_eq!(paths_of(&suggestions), ["newest.rs", "middle.rs", "old.rs"]);
         // Recents carry no highlight offsets.
         assert!(suggestions.iter().all(|s| s.match_indices.is_empty()));
     }

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Wire routing and render chains with integration tests
 type: frontend
 complexity: medium
@@ -30,11 +30,11 @@ Make the feature live by slotting `@` activation into both the key-routing chain
 </requirements>
 
 ## Subtasks
-- [ ] 9.1 Add the activation branch to the key-routing chain after the skill branch.
-- [ ] 9.2 Add the render branch to the render chain in the same position.
-- [ ] 9.3 Dispatch the file-mention command variant in the executor.
-- [ ] 9.4 Remove staging `#[allow(dead_code)]` shims.
-- [ ] 9.5 Add end-to-end and parity integration tests.
+- [x] 9.1 Add the activation branch to the key-routing chain after the skill branch.
+- [x] 9.2 Add the render branch to the render chain in the same position.
+- [x] 9.3 Dispatch the file-mention command variant in the executor (arm added in task_07 for exhaustiveness; verified live here).
+- [x] 9.4 Remove staging `#[allow(dead_code)]` shims.
+- [x] 9.5 Add end-to-end and parity integration tests.
 
 ## Implementation Details
 Modify `src/tui/mod.rs`: the `key_event_to_tui_command_with_ui` precedence chain (after skill, before/around the command branch), the render `if-let` chain (same relative position), and the `TuiCommand` executor. See TechSpec "Component Overview" and "Impact Analysis" (the routing/render sync invariant).

@@ -194,16 +194,10 @@ struct TuiUiState {
     command_dropdown_dismissed: Option<String>,
     /// Latest file-index snapshot from the background worker walk (ADR-003);
     /// the `@` dropdown queries this in-memory list per keystroke.
-    // Staged: written by the snapshot consumer in task_05; first read by the
-    // task_06 dropdown activation. The `#[allow(dead_code)]` shims are removed
-    // in task_09.
-    #[allow(dead_code)]
     file_mention_entries: Vec<FileEntry>,
-    #[allow(dead_code)]
     file_mention_selection_index: usize,
     /// Input value the file-mention dropdown was last dismissed for (Escape),
     /// mirroring `command_dropdown_dismissed`.
-    #[allow(dead_code)]
     file_mention_dropdown_dismissed: Option<String>,
     clarification_option_index: usize,
     clarification_custom_answer: String,
@@ -309,10 +303,6 @@ struct CommandDropdown {
 /// dropdown (it carries a `PromptToken` and activates mid-prompt), plus a
 /// command-style `empty` no-match flag. Its suggestions are the ranked
 /// `FileSuggestion`s from `FileIndex::query` over the cached index.
-// Staged in task_06 (model + activation only); keys (task_07), render
-// (task_08), and routing (task_09) consume it. The `#[allow(dead_code)]` shims
-// are removed in task_09.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileMentionDropdown {
     token: PromptToken,
@@ -747,6 +737,9 @@ fn key_event_to_tui_command_with_ui(
         agent_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
     } else if skill_dropdown(&state.input, ui_state).is_some() {
         skill_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+    } else if let Some(dropdown) = file_mention_dropdown(state, ui_state) {
+        file_mention_dropdown_key_command(&dropdown, key)
+            .or_else(|| key_event_to_tui_command(state, key))
     } else if let Some(dropdown) = command_dropdown(state, ui_state) {
         command_dropdown_key_command(&dropdown, key)
             .or_else(|| key_event_to_tui_command(state, key))
@@ -908,7 +901,6 @@ fn command_dropdown_key_command(dropdown: &CommandDropdown, key: KeyEvent) -> Op
     }
 }
 
-#[allow(dead_code)] // wired into the key-routing chain in task_09.
 fn file_mention_dropdown_key_command(
     dropdown: &FileMentionDropdown,
     key: KeyEvent,
@@ -1763,7 +1755,6 @@ fn command_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<CommandDr
 /// the user has dismissed it for the current input (Escape). Returns `None`
 /// when there is nothing to show (e.g. a bare `@` before the index has loaded),
 /// so the dropdown never appears with a misleading empty body.
-#[allow(dead_code)] // wired into the routing/render chains in task_09.
 fn file_mention_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<FileMentionDropdown> {
     if state.pending_approval.is_some()
         || state.pending_clarification.is_some()
@@ -2009,13 +2000,16 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     render_input_status(frame, input_areas.status, ui_state, work_active);
     render_footer(frame, input_areas.footer, state, &theme);
     // Dropdown precedence mirrors key routing: agent, then skill, then the
-    // top-level command dropdown. Help takes over the screen, so suppress all
-    // dropdown rendering while it is open.
+    // `@` file mention, then the top-level command dropdown. Help takes over the
+    // screen, so suppress all dropdown rendering while it is open. This chain
+    // MUST stay in sync with `key_event_to_tui_command_with_ui`.
     if !ui_state.help_visible {
         if let Some(dropdown) = agent_dropdown(state, ui_state) {
             render_agent_dropdown(frame, input_areas.input, &dropdown, &theme, &state.agents);
         } else if let Some(dropdown) = skill_dropdown(&state.input, ui_state) {
             render_skill_dropdown(frame, input_areas.input, &dropdown, &theme);
+        } else if let Some(dropdown) = file_mention_dropdown(state, ui_state) {
+            render_file_mention_dropdown(frame, input_areas.input, &dropdown, &theme);
         } else if let Some(dropdown) = command_dropdown(state, ui_state) {
             render_command_dropdown(frame, input_areas.input, &dropdown, &theme);
         }
@@ -2581,7 +2575,6 @@ fn command_dropdown_item(
     }
 }
 
-#[allow(dead_code)] // wired into the render chain in task_09.
 fn render_file_mention_dropdown(
     frame: &mut Frame,
     input_area: Rect,
@@ -2659,7 +2652,6 @@ fn render_file_mention_dropdown(
     );
 }
 
-#[allow(dead_code)] // used by the render chain wired in task_09.
 fn file_mention_dropdown_block(theme: &Theme) -> Block<'static> {
     Block::default()
         .title(" Files ")
@@ -2669,7 +2661,6 @@ fn file_mention_dropdown_block(theme: &Theme) -> Block<'static> {
         .borders(Borders::ALL)
 }
 
-#[allow(dead_code)] // used by the render chain wired in task_09.
 fn file_mention_dropdown_item(
     theme: &Theme,
     suggestion: &FileSuggestion,
@@ -2710,7 +2701,6 @@ fn file_mention_dropdown_item(
 /// Build one styled span per character of `display`, emphasizing the matched
 /// offsets (bold accent) so the fuzzy match is confirmable at a glance
 /// (ADR-002 — highlighting is a V1 trust mechanism, not optional polish).
-#[allow(dead_code)] // used by the render chain wired in task_09.
 fn highlighted_path_spans(
     theme: &Theme,
     display: &str,
@@ -7255,7 +7245,10 @@ runtime = "fake"
         let dropdown = file_mention_dropdown(&state, &ui_state).expect("active for @");
         assert!(!dropdown.empty);
         assert_eq!(dropdown.selected, 0);
-        assert_eq!(dropdown.suggestions.first().unwrap().rel_path, "src/tui/mod.rs");
+        assert_eq!(
+            dropdown.suggestions.first().unwrap().rel_path,
+            "src/tui/mod.rs"
+        );
     }
 
     #[test]
@@ -7286,8 +7279,9 @@ runtime = "fake"
 
         // Pending clarification.
         let mut clarification = state_with_input("@run", false);
-        clarification.pending_clarification =
-            Some(clarification_view(vec![clarification_option("a", "Option A")]));
+        clarification.pending_clarification = Some(clarification_view(vec![clarification_option(
+            "a", "Option A",
+        )]));
         assert!(file_mention_dropdown(&clarification, &ui_state).is_none());
 
         // WaitingForUser run state on its own.
@@ -7420,7 +7414,10 @@ runtime = "fake"
         let mut ui_state = ui_state_with_file_entries("@mod", seeded_file_entries());
         // Exactly two matches (src/tui/mod.rs, src/runtime/mod.rs).
         assert_eq!(
-            file_mention_dropdown(&state, &ui_state).unwrap().suggestions.len(),
+            file_mention_dropdown(&state, &ui_state)
+                .unwrap()
+                .suggestions
+                .len(),
             2
         );
 
@@ -7495,7 +7492,10 @@ runtime = "fake"
         .await
         .unwrap();
 
-        assert_eq!(ui_state.file_mention_dropdown_dismissed, Some("@run".to_string()));
+        assert_eq!(
+            ui_state.file_mention_dropdown_dismissed,
+            Some("@run".to_string())
+        );
     }
 
     #[tokio::test]
@@ -7670,6 +7670,103 @@ runtime = "fake"
         assert!(joined.contains("src/tui/mod.rs"));
         // The selected second row carries the marker.
         assert!(joined.contains("> src/runtime/mod.rs"));
+    }
+
+    // ── task_09 routing/render wiring and parity ──
+
+    #[test]
+    fn routing_returns_file_mention_command_for_active_token() {
+        let state = state_with_input("@run", false);
+        let ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            command,
+            Some(TuiCommand::FileMentionDropdown(
+                FileMentionDropdownCommand::Next
+            ))
+        );
+    }
+
+    #[test]
+    fn routing_skips_file_mention_during_pending_approval() {
+        // pending_approval routes through normal input before the dropdowns.
+        let state = state_with_input("@run", true);
+        let ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            command,
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Down))
+        );
+    }
+
+    #[test]
+    fn render_chain_draws_file_dropdown_and_help_suppresses_it() {
+        let state = state_with_input("@run", false);
+        let mut ui_state = ui_state_with_file_entries("@run", seeded_file_entries());
+
+        let text = render_to_text_with_ui(&state, &ui_state, 80, 24);
+        assert!(text.contains("Files"));
+
+        // Help takes over the screen and suppresses all dropdown rendering.
+        ui_state.help_visible = true;
+        let text_help = render_to_text_with_ui(&state, &ui_state, 80, 24);
+        assert!(!text_help.contains("Files"));
+    }
+
+    #[tokio::test]
+    async fn end_to_end_down_then_enter_inserts_path_without_dispatching_a_run() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let mut state = state_with_input("look at @run", false);
+        let mut ui_state = ui_state_with_file_entries("look at @run", seeded_file_entries());
+
+        // Drive the real routing: Down selects the next match.
+        let down = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .expect("Down routes to the dropdown");
+        execute_tui_command(&mut state, &mut ui_state, &sender, down)
+            .await
+            .unwrap();
+
+        // Enter accepts (the dropdown is still active with matches).
+        let enter = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .expect("Enter routes to the dropdown");
+        execute_tui_command(&mut state, &mut ui_state, &sender, enter)
+            .await
+            .unwrap();
+
+        assert_eq!(state.input, "look at src/runtime/mod.rs ");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn routing_and_render_chains_agree_on_activation() {
+        // Whenever activation is `Some`, the render pass draws the overlay; when
+        // it is `None`, it does not (the two chains stay in sync).
+        for input in ["@run", "see @mod", "@zzzz", "hello world"] {
+            let state = state_with_input(input, false);
+            let ui_state = ui_state_with_file_entries(input, seeded_file_entries());
+            let active = file_mention_dropdown(&state, &ui_state).is_some();
+            let rendered = render_to_text_with_ui(&state, &ui_state, 80, 24).contains("Files");
+            assert_eq!(
+                active, rendered,
+                "routing/render parity mismatch for {input:?}"
+            );
+        }
     }
 
     // ── task_06 status footer ──
