@@ -22,6 +22,7 @@ pub(crate) const REQUIRED_HELP_FLAGS: &[&str] = &[
     "--include-partial-messages",
     "--no-session-persistence",
     "--tools",
+    "--strict-mcp-config",
     "--setting-sources",
     "--system-prompt",
     "--exclude-dynamic-system-prompt-sections",
@@ -47,6 +48,12 @@ const PROTECTED_DEFAULT_ARGS: &[&str] = &[
     "--no-session-persistence",
     "--tools",
     "",
+    // `--tools ""` drops the built-in/skill tools, but `--setting-sources user`
+    // still loads the user's MCP servers, leaving the model tools it can slip
+    // into mid-flow (a stray tool_use trips the harness-action boundary).
+    // `--strict-mcp-config` (with no --mcp-config) loads ZERO MCP servers, so
+    // the tool set is empty and a tool_use is physically impossible.
+    "--strict-mcp-config",
     "--setting-sources",
     "user",
     // Strip the bloated default system prompt down to the adapter brief and
@@ -384,6 +391,7 @@ fn validate_synthesized_args(args: &[String]) -> Result<()> {
     require_arg(args, "--include-partial-messages")?;
     require_arg(args, "--no-session-persistence")?;
     require_arg_value(args, "--tools", "")?;
+    require_arg(args, "--strict-mcp-config")?;
     require_arg_value(args, "--setting-sources", "user")?;
     require_arg_value(args, "--system-prompt", CLAUDE_ADAPTER_SYSTEM_PROMPT)?;
     require_arg(args, "--exclude-dynamic-system-prompt-sections")?;
@@ -615,7 +623,12 @@ impl ClaudeStreamState {
             ))
         })?;
         if frame_requests_local_action(&value) {
-            return Err(RuntimeProviderError::non_retryable(
+            // The model went off-protocol and emitted a tool_use instead of an
+            // action_request contract. Because tools are disabled (`--tools ""`)
+            // nothing actually executed, so this is a safe, transient off-script
+            // turn: retry (same model, then any fallback) rather than killing
+            // the run on the first stray tool_use.
+            return Err(RuntimeProviderError::retryable(
                 "Claude stream requested tool use or local action execution; harness-action boundary violated",
             )
             .into());
@@ -950,7 +963,8 @@ fn claude_prompt_text(request: &RuntimeRequest) -> Result<String> {
 Follow this protocol exactly:
 - Use the JSON envelope below as the only task input.
 - Do not solve the user's prompt directly in prose.
-- Do not edit files, run commands, inspect the repository, use Claude Code tools, use MCP tools, or call local tool surfaces directly.
+- Do not edit files, run commands, inspect the repository, use Claude Code tools, use MCP tools, use skills, or call local tool surfaces directly.
+- You have NO tools available. To perform ANY file read, file write, edit, or command, you MUST return one action_request JSON contract (for example kind "write_file" to create a file). Never emit a tool_use for Write, Edit, Bash, Read, Skill, or any other tool — the harness rejects every tool_use and fails the run.
 - If you need repository data or a file/command/edit operation, return one action_request JSON contract. The harness will execute it and call you again with action_results.
 - If you can complete your current step, return one {output_schema} JSON contract.
 - Return no Markdown, no commentary, and no text outside the contract delimiters.
@@ -1139,6 +1153,7 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--output-format", "stream-json"]));
         assert!(args.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--setting-sources", "user"]));
@@ -1275,6 +1290,7 @@ printf '%s\n' {}
         assert!(args.contains("--include-partial-messages\n"));
         assert!(args.contains("--no-session-persistence\n"));
         assert!(args.contains("--tools\n\n"));
+        assert!(args.contains("--strict-mcp-config\n"));
         assert!(args.contains("--setting-sources\nuser\n"));
         assert!(args.contains(&format!(
             "--system-prompt\n{CLAUDE_ADAPTER_SYSTEM_PROMPT}\n"
@@ -1545,6 +1561,9 @@ exec sleep 30
             emitted.push(event);
         }
         assert!(error.to_string().contains("harness-action boundary"));
+        // A stray tool_use is a transient off-protocol turn; nothing executed
+        // (tools are disabled), so the run retries instead of dying.
+        assert!(super::super::is_retryable_provider_error(&error));
         assert!(emitted.iter().any(|event| {
             event.is_transient()
                 && event.stream_name() == "message"
@@ -1642,7 +1661,10 @@ exec sleep 30
             .await
             .unwrap_err();
 
+        // Fails closed (the tool_use is rejected, never executed) but retryably,
+        // so a stray off-protocol turn does not kill the whole run.
         assert!(error.to_string().contains("harness-action boundary"));
+        assert!(super::super::is_retryable_provider_error(&error));
     }
 
     #[tokio::test]
