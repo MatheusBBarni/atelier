@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add ignore and nucleo-matcher dependencies
 type: chore
 complexity: low
@@ -27,9 +27,9 @@ Add the two crates the file index depends on — `ignore` (ripgrep's gitignore-a
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Add the `ignore` crate dependency.
-- [ ] 1.2 Add the `nucleo-matcher` crate dependency.
-- [ ] 1.3 Confirm the workspace builds and the lockfile resolves both crates.
+- [x] 1.1 Add the `ignore` crate dependency.
+- [x] 1.2 Add the `nucleo-matcher` crate dependency.
+- [x] 1.3 Confirm the workspace builds and the lockfile resolves both crates.
 
 ## Implementation Details
 Modify `Cargo.toml` `[dependencies]` only. See TechSpec "Technical Dependencies" — both crates are net-new and require no new tokio features. Pin to current stable versions consistent with the repo's existing version style.
