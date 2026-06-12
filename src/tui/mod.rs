@@ -153,6 +153,11 @@ struct TuiUiState {
     agent_selection_index: usize,
     skill_suggestions: Vec<SkillSuggestion>,
     skill_selection_index: usize,
+    command_selection_index: usize,
+    /// Input value the command dropdown was last dismissed for (Escape). The
+    /// dropdown stays suppressed only while the raw input matches, so editing
+    /// the text re-activates discovery without mutating the input.
+    command_dropdown_dismissed: Option<String>,
     clarification_option_index: usize,
     clarification_custom_answer: String,
     queue_selection_index: usize,
@@ -179,6 +184,8 @@ impl Default for TuiUiState {
             agent_selection_index: 0,
             skill_suggestions: Vec::new(),
             skill_selection_index: 0,
+            command_selection_index: 0,
+            command_dropdown_dismissed: None,
             clarification_option_index: 0,
             clarification_custom_answer: String::new(),
             queue_selection_index: 0,
@@ -235,6 +242,20 @@ struct SkillDropdown {
     token: PromptToken,
     suggestions: Vec<SkillSuggestion>,
     selected: usize,
+}
+
+/// The top-level slash-command discovery dropdown (ADR-004). Unlike the agent
+/// and skill dropdowns it is not token-based: it activates only while the whole
+/// input is a single `/`-prefixed word, and it carries a compact no-match state
+/// (`empty`) that still renders even though nothing is selectable.
+// task_04 builds the model; rendering (task_05) and key handling (task_06)
+// consume these fields. The allow is removed once those tasks land.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandDropdown {
+    suggestions: Vec<&'static crate::slash_commands::SlashCommandSpec>,
+    selected: Option<usize>,
+    empty: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1127,6 +1148,7 @@ fn collect_skill_file_fingerprints(
 fn reset_dropdown_selections(ui_state: &mut TuiUiState) {
     reset_agent_dropdown_selection(ui_state);
     reset_skill_dropdown_selection(ui_state);
+    reset_command_dropdown_selection(ui_state);
 }
 
 fn reset_agent_dropdown_selection(ui_state: &mut TuiUiState) {
@@ -1135,6 +1157,11 @@ fn reset_agent_dropdown_selection(ui_state: &mut TuiUiState) {
 
 fn reset_skill_dropdown_selection(ui_state: &mut TuiUiState) {
     ui_state.skill_selection_index = 0;
+}
+
+fn reset_command_dropdown_selection(ui_state: &mut TuiUiState) {
+    ui_state.command_selection_index = 0;
+    ui_state.command_dropdown_dismissed = None;
 }
 
 fn apply_agent_dropdown_command(
@@ -1338,6 +1365,51 @@ fn skill_dropdown(input: &str, ui_state: &TuiUiState) -> Option<SkillDropdown> {
         token,
         suggestions,
         selected,
+    })
+}
+
+/// Activation + filtering model for the command discovery dropdown (ADR-004).
+///
+/// Active only while the entire input is a single `/`-prefixed token (no
+/// whitespace yet). This keeps discovery off for paths and inline slashes
+/// (`please /tmp`, char 0 is not `/`), and — crucially — releases the dropdown
+/// the moment the user types a space, so argument-taking commands like
+/// `/goal <text>`, `/subtask <agent> <task>`, and `/queue <message>` stay
+/// normal input instead of getting trapped by the no-match state. Disabled
+/// during pending approval and `WaitingForUser`, and while the user has
+/// dismissed it for the current input (Escape). The `/agent:` and `/skill:`
+/// specialized dropdowns take precedence via the routing/render order, so this
+/// is only consulted once those are inactive.
+// Rendering (task_05) and key handling (task_06) call this; the allow keeps the
+// model-only task_04 build clean and is removed when those tasks consume it.
+#[allow(dead_code)]
+fn command_dropdown(state: &AppState, ui_state: &TuiUiState) -> Option<CommandDropdown> {
+    if state.pending_approval.is_some() || matches!(state.run_state, RunState::WaitingForUser) {
+        return None;
+    }
+    let input = state.input.as_str();
+    if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if ui_state.command_dropdown_dismissed.as_deref() == Some(input) {
+        return None;
+    }
+    let query = input.to_ascii_lowercase();
+    let suggestions: Vec<&'static crate::slash_commands::SlashCommandSpec> =
+        crate::slash_commands::catalog()
+            .iter()
+            .filter(|spec| spec.label.starts_with(query.as_str()))
+            .collect();
+    let (selected, empty) = if suggestions.is_empty() {
+        (None, true)
+    } else {
+        let index = ui_state.command_selection_index.min(suggestions.len() - 1);
+        (Some(index), false)
+    };
+    Some(CommandDropdown {
+        suggestions,
+        selected,
+        empty,
     })
 }
 
@@ -3824,6 +3896,118 @@ mod tests {
             input_char_count("test 123 /skill:personal-beta ")
         );
         assert!(receiver.try_recv().is_err());
+    }
+
+    // ── command dropdown model + activation (task_04) ──
+
+    fn command_state(input: &str) -> (AppState, TuiUiState) {
+        (state_with_input(input, false), ui_state_with_cursor_at_end(input))
+    }
+
+    #[test]
+    fn command_dropdown_lists_all_fixed_commands_for_slash() {
+        let (state, ui_state) = command_state("/");
+        let dropdown = command_dropdown(&state, &ui_state).expect("active for /");
+        assert!(!dropdown.empty);
+        assert_eq!(dropdown.selected, Some(0));
+        let labels: Vec<&str> = dropdown.suggestions.iter().map(|spec| spec.label).collect();
+        let catalog_labels: Vec<&str> = crate::slash_commands::catalog()
+            .iter()
+            .map(|spec| spec.label)
+            .collect();
+        assert_eq!(labels, catalog_labels);
+    }
+
+    #[test]
+    fn command_dropdown_filters_goal_commands_for_slash_g() {
+        let (state, ui_state) = command_state("/g");
+        let dropdown = command_dropdown(&state, &ui_state).expect("active for /g");
+        let labels: Vec<&str> = dropdown.suggestions.iter().map(|spec| spec.label).collect();
+        assert_eq!(labels, ["/goal", "/goal clear"]);
+    }
+
+    #[test]
+    fn command_dropdown_inactive_for_mid_prompt_slash() {
+        let (state, ui_state) = command_state("please /g");
+        assert!(command_dropdown(&state, &ui_state).is_none());
+    }
+
+    #[test]
+    fn command_dropdown_models_no_match_without_selection() {
+        let (state, ui_state) = command_state("/unknown");
+        let dropdown = command_dropdown(&state, &ui_state).expect("active for /unknown");
+        assert!(dropdown.empty);
+        assert!(dropdown.suggestions.is_empty());
+        assert_eq!(dropdown.selected, None);
+    }
+
+    #[test]
+    fn command_dropdown_releases_once_args_begin() {
+        // A space ends the command word, so argument-taking commands stay normal
+        // input instead of being trapped by the no-match state.
+        for input in [
+            "/goal ",
+            "/goal new objective",
+            "/subtask fixer do it",
+            "/queue ship it",
+        ] {
+            let (state, ui_state) = command_state(input);
+            assert!(
+                command_dropdown(&state, &ui_state).is_none(),
+                "dropdown should be inactive for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_dropdown_suppressed_during_pending_approval() {
+        let mut state = state_with_input("/", true);
+        // Isolate the pending-approval gate from the WaitingForUser gate.
+        state.run_state = RunState::Idle;
+        let ui_state = ui_state_with_cursor_at_end("/");
+        assert!(state.pending_approval.is_some());
+        assert!(command_dropdown(&state, &ui_state).is_none());
+    }
+
+    #[test]
+    fn command_dropdown_suppressed_while_waiting_for_user() {
+        let mut state = state_with_input("/", false);
+        state.run_state = RunState::WaitingForUser;
+        let ui_state = ui_state_with_cursor_at_end("/");
+        assert!(state.pending_approval.is_none());
+        assert!(command_dropdown(&state, &ui_state).is_none());
+    }
+
+    #[test]
+    fn command_dropdown_dismissed_only_for_matching_input() {
+        let (state, mut ui_state) = command_state("/g");
+        ui_state.command_dropdown_dismissed = Some("/g".to_string());
+        assert!(command_dropdown(&state, &ui_state).is_none());
+
+        // The same dismissal does not suppress a different input.
+        let (state2, mut ui2) = command_state("/go");
+        ui2.command_dropdown_dismissed = Some("/g".to_string());
+        assert!(command_dropdown(&state2, &ui2).is_some());
+    }
+
+    #[test]
+    fn agent_and_skill_dropdowns_take_precedence_over_command_dropdown() {
+        // /agent: with a roster resolves to the agent dropdown.
+        let agent_state = state_with_agent_roster("/agent:");
+        let agent_ui = ui_state_with_cursor_at_end("/agent:");
+        assert!(agent_dropdown(&agent_state, &agent_ui).is_some());
+
+        // /skill: with suggestions resolves to the skill dropdown.
+        let skill_state = state_with_input("/skill:", false);
+        let skill_ui = ui_state_with_skills_at_end("/skill:");
+        assert!(skill_dropdown(&skill_state.input, &skill_ui).is_some());
+
+        // /g resolves to neither specialized dropdown, so the command dropdown
+        // is the one that activates.
+        let (cmd_state, cmd_ui) = command_state("/g");
+        assert!(agent_dropdown(&cmd_state, &cmd_ui).is_none());
+        assert!(skill_dropdown(&cmd_state.input, &cmd_ui).is_none());
+        assert!(command_dropdown(&cmd_state, &cmd_ui).is_some());
     }
 
     #[test]
