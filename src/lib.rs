@@ -4,6 +4,7 @@ pub mod cli;
 pub mod codemap;
 pub mod config;
 pub mod diagnostics;
+pub mod docgen;
 pub mod doctor;
 pub mod file_index;
 pub mod history;

@@ -1,5 +1,6 @@
 use crate::codemap::{render_summary as render_codemap_summary, run_codemap, CodemapCommand};
 use crate::config::{init_config, load_effective_config, to_redacted_toml, ConfigLoadOptions};
+use crate::docgen::{emit_docs, render_summary as render_docgen_summary};
 use crate::doctor::{render_human, render_json, run_doctor};
 use crate::history::clean_sessions;
 use anyhow::{bail, Context, Result};
@@ -42,6 +43,9 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub codemap: Option<CodemapCommand>,
 
+    #[arg(long, value_name = "DIR")]
+    pub emit_docs: Option<PathBuf>,
+
     #[arg(long)]
     pub yes: bool,
 
@@ -70,16 +74,28 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
             || cli.init_config
             || cli.clean_sessions
             || cli.codemap.is_some()
+            || cli.emit_docs.is_some()
             || cli.yes
             || cli.debug)
     {
         bail!("--update cannot be combined with other flags");
     }
     if cli.codemap.is_some()
+        && (cli.doctor
+            || cli.print_config
+            || cli.init_config
+            || cli.clean_sessions
+            || cli.emit_docs.is_some())
+    {
+        bail!(
+            "--codemap cannot be combined with --doctor, --print-config, --init-config, --clean-sessions, or --emit-docs"
+        );
+    }
+    if cli.emit_docs.is_some()
         && (cli.doctor || cli.print_config || cli.init_config || cli.clean_sessions)
     {
         bail!(
-            "--codemap cannot be combined with --doctor, --print-config, --init-config, or --clean-sessions"
+            "--emit-docs cannot be combined with --doctor, --print-config, --init-config, or --clean-sessions"
         );
     }
 
@@ -127,6 +143,12 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
 
     if cli.print_config {
         print!("{}", to_redacted_toml(&config)?);
+        return Ok(());
+    }
+
+    if let Some(out_dir) = &cli.emit_docs {
+        let summary = emit_docs(&config, out_dir)?;
+        print!("{}", render_docgen_summary(&summary));
         return Ok(());
     }
 
@@ -197,6 +219,7 @@ mod tests {
             clean_sessions: false,
             update: false,
             codemap: None,
+            emit_docs: None,
             yes: false,
             debug: false,
         };
@@ -217,6 +240,7 @@ mod tests {
             clean_sessions: false,
             update: false,
             codemap: Some(CodemapCommand::Init),
+            emit_docs: None,
             yes: false,
             debug: false,
         };
@@ -225,5 +249,54 @@ mod tests {
 
         assert!(dir.path().join(".multiagent/codemap.json").exists());
         assert!(dir.path().join("codemap.md").exists());
+    }
+
+    fn cli_with_emit_docs(cwd: PathBuf, out_dir: PathBuf) -> Cli {
+        Cli {
+            cwd: Some(cwd),
+            config: None,
+            doctor: false,
+            json: false,
+            print_config: false,
+            init_config: false,
+            clean_sessions: false,
+            update: false,
+            codemap: None,
+            emit_docs: Some(out_dir),
+            yes: false,
+            debug: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_docs_writes_reference_fragments() {
+        let dir = tempdir().unwrap();
+        let out_dir = dir.path().join("_generated");
+        let cli = cli_with_emit_docs(dir.path().to_path_buf(), out_dir.clone());
+
+        run_cli_with(cli).await.unwrap();
+
+        assert!(out_dir.join("configuration.md").exists());
+        assert!(out_dir.join("cli.md").exists());
+    }
+
+    #[tokio::test]
+    async fn emit_docs_conflicts_with_print_config() {
+        let dir = tempdir().unwrap();
+        let mut cli = cli_with_emit_docs(dir.path().to_path_buf(), dir.path().join("_generated"));
+        cli.print_config = true;
+
+        let error = run_cli_with(cli).await.unwrap_err();
+        assert!(error.to_string().contains("--emit-docs cannot be combined"));
+    }
+
+    #[tokio::test]
+    async fn emit_docs_conflicts_with_update() {
+        let dir = tempdir().unwrap();
+        let mut cli = cli_with_emit_docs(dir.path().to_path_buf(), dir.path().join("_generated"));
+        cli.update = true;
+
+        let error = run_cli_with(cli).await.unwrap_err();
+        assert!(error.to_string().contains("--update cannot be combined"));
     }
 }
