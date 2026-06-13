@@ -24,6 +24,13 @@ Testing notes:
 - Live-runtime tests in `tests/runtime_integration.rs` are `#[ignore]`d behind env vars (`MULTIAGENT_RUN_CODEX_INTEGRATION=1`, `MULTIAGENT_TEST_CLAUDE=1`, `MULTIAGENT_CURSOR_LIVE=1`, `MULTIAGENT_RUN_ZAI_INTEGRATION=1`).
 - `runtime::codex` / `runtime::cursor` availability tests shell out to real CLIs and are environment-sensitive — they can fail/flake depending on what's installed locally. Treat those failures as environmental, not regressions.
 
+## Versioning
+
+**The package version must always be changed in `Cargo.toml` AND in every npm manifest together — they are required to match.** The npm manifests are `npm/package/package.json`, all `npm/platform/*/package.json`, and the `optionalDependencies` pins inside `npm/package/package.json`. Cargo's `[package].version` is the source of truth.
+
+- Don't hand-edit the npm manifests: bump `Cargo.toml`, then run `npm --prefix npm run sync:versions` to propagate the version to every npm manifest, and `npm --prefix npm run check:versions` to verify Cargo, all npm manifests, the optional-dependency pins, and `atelier --version` agree.
+- The release pipeline (`.github/workflows/release.yml`) enforces this via `check:versions`; a mismatch fails the run, so an unsynced bump will block the release. Commit the Cargo bump and the synced npm manifests in the same change.
+
 ## Architecture
 
 **Run lifecycle (the core loop).** `App::submit_prompt` (`src/app/mod.rs`) first dispatches built-in commands (`/goal`, `/config`, `/subtask`, `/workflow`, `/queue`), otherwise compiles the prompt (skill injection, prefix handling), then `drive_and_replay` runs the orchestrator loop. The orchestrator (`src/orchestrator/mod.rs`) emits `OrchestratorDecision`s that advance `RunState` (`Idle → Planning → Running → WaitingForUser → Completed/Failed/Interrupted/LimitReached`). Each step is executed against a runtime via `execute_runtime_step_streaming`.
