@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | HelpTab enum and roster row style types | pending | low | — |
+| 01 | HelpTab enum and roster row style types | completed | low | — |
 | 02 | Extract shared agent_roster_items builder | pending | low | task_01 |
 | 03 | Add help_active_tab state to TuiUiState | pending | low | task_01 |
 | 04 | Static reference tab builders (Keys, CLI, Approvals) | pending | low | task_01 |

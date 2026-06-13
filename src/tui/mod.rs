@@ -88,6 +88,69 @@ const QUEUE_SELECTED_MARKER: &str = "> ";
 const QUEUE_UNSELECTED_MARKER: &str = "  ";
 const QUEUE_HINT: &str = "↑/↓ select · Del cancel · Ctrl-R resume (clear input to focus)";
 
+/// Identifies the six tabs of the help modal and provides ordered iteration
+/// plus wrap-around navigation. Pure value type — carries no rendering or state.
+///
+/// Foundational type wired into `TuiUiState` and per-tab builders by the
+/// downstream tabbed-help-modal tasks (02–06); intentionally unused on its own.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelpTab {
+    GettingStarted,
+    Commands,
+    Keys,
+    Skills,
+    Approvals,
+    Cli,
+}
+
+impl HelpTab {
+    /// Tabs in declared left-to-right order (Getting Started first, CLI last).
+    const ALL: [HelpTab; 6] = [
+        HelpTab::GettingStarted,
+        HelpTab::Commands,
+        HelpTab::Keys,
+        HelpTab::Skills,
+        HelpTab::Approvals,
+        HelpTab::Cli,
+    ];
+
+    /// Human-readable tab title shown in the tab strip.
+    fn title(self) -> &'static str {
+        match self {
+            HelpTab::GettingStarted => "Getting Started",
+            HelpTab::Commands => "Commands",
+            HelpTab::Keys => "Keys",
+            HelpTab::Skills => "Skills",
+            HelpTab::Approvals => "Approvals",
+            HelpTab::Cli => "CLI",
+        }
+    }
+
+    /// Next tab in `ALL`, wrapping from the last back to the first.
+    fn next(self) -> HelpTab {
+        let index = HelpTab::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        HelpTab::ALL[(index + 1) % HelpTab::ALL.len()]
+    }
+
+    /// Previous tab in `ALL`, wrapping from the first back to the last.
+    fn prev(self) -> HelpTab {
+        let index = HelpTab::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        HelpTab::ALL[(index + HelpTab::ALL.len() - 1) % HelpTab::ALL.len()]
+    }
+}
+
+/// Row presentation style for the shared agent-roster builder: `Full` renders
+/// three lines per agent (Ctrl-L roster), `Compact` renders one (Getting Started).
+///
+/// Consumed by the `agent_roster_items` builder introduced in task 02.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RosterRowStyle {
+    Full,
+    Compact,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TuiCommand {
     Dispatch(AppEvent),
@@ -4110,6 +4173,61 @@ mod tests {
     use ratatui::backend::TestBackend;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn help_tab_all_is_ordered_and_complete() {
+        assert_eq!(HelpTab::ALL.len(), 6);
+        assert_eq!(HelpTab::ALL[0], HelpTab::GettingStarted);
+        assert_eq!(*HelpTab::ALL.last().unwrap(), HelpTab::Cli);
+        assert_eq!(
+            HelpTab::ALL,
+            [
+                HelpTab::GettingStarted,
+                HelpTab::Commands,
+                HelpTab::Keys,
+                HelpTab::Skills,
+                HelpTab::Approvals,
+                HelpTab::Cli,
+            ]
+        );
+    }
+
+    #[test]
+    fn help_tab_next_wraps_around() {
+        assert_eq!(HelpTab::GettingStarted.next(), HelpTab::Commands);
+        assert_eq!(HelpTab::Commands.next(), HelpTab::Keys);
+        assert_eq!(HelpTab::Cli.next(), HelpTab::GettingStarted);
+    }
+
+    #[test]
+    fn help_tab_prev_wraps_around() {
+        assert_eq!(HelpTab::GettingStarted.prev(), HelpTab::Cli);
+        assert_eq!(HelpTab::Commands.prev(), HelpTab::GettingStarted);
+        assert_eq!(HelpTab::Cli.prev(), HelpTab::Approvals);
+    }
+
+    #[test]
+    fn help_tab_next_prev_round_trip_for_every_tab() {
+        for tab in HelpTab::ALL {
+            assert_eq!(tab.next().prev(), tab);
+            assert_eq!(tab.prev().next(), tab);
+        }
+    }
+
+    #[test]
+    fn help_tab_titles_are_correct() {
+        assert_eq!(HelpTab::GettingStarted.title(), "Getting Started");
+        assert_eq!(HelpTab::Commands.title(), "Commands");
+        assert_eq!(HelpTab::Keys.title(), "Keys");
+        assert_eq!(HelpTab::Skills.title(), "Skills");
+        assert_eq!(HelpTab::Approvals.title(), "Approvals");
+        assert_eq!(HelpTab::Cli.title(), "CLI");
+    }
+
+    #[test]
+    fn roster_row_style_variants_are_distinct() {
+        assert_ne!(RosterRowStyle::Full, RosterRowStyle::Compact);
+    }
 
     #[test]
     fn renders_empty_tui_surfaces() {

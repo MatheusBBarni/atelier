@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: HelpTab enum and roster row style types
 type: frontend
 complexity: low
@@ -31,10 +31,10 @@ every other task and carry no rendering or state.
 </requirements>
 
 ## Subtasks
-- [ ] 01.1 Add the `HelpTab` enum with the six variants in tab order.
-- [ ] 01.2 Implement `ALL`, `title()`, `next()`, and `prev()` with wrap-around semantics.
-- [ ] 01.3 Add the `RosterRowStyle` enum.
-- [ ] 01.4 Add unit tests covering ordering, titles, and next/prev wrap-around.
+- [x] 01.1 Add the `HelpTab` enum with the six variants in tab order.
+- [x] 01.2 Implement `ALL`, `title()`, `next()`, and `prev()` with wrap-around semantics.
+- [x] 01.3 Add the `RosterRowStyle` enum.
+- [x] 01.4 Add unit tests covering ordering, titles, and next/prev wrap-around.
 
 ## Implementation Details
 Add both enums near the other UI types at the top of `src/tui/mod.rs` (the `TuiCommand` enum
@@ -57,12 +57,12 @@ sits at `:91`). Keep them as plain enums with an `impl HelpTab` block. See TechS
 
 ## Tests
 - Unit tests:
-  - [ ] `HelpTab::ALL` has 6 entries and starts with `GettingStarted`, ends with `Cli`.
-  - [ ] `HelpTab::GettingStarted.next() == Commands`; `HelpTab::Cli.next() == GettingStarted` (wrap).
-  - [ ] `HelpTab::GettingStarted.prev() == Cli` (wrap); `HelpTab::Commands.prev() == GettingStarted`.
-  - [ ] `HelpTab::Skills.title() == "Skills"` (spot-check one multi-word title, e.g. `GettingStarted.title() == "Getting Started"`).
+  - [x] `HelpTab::ALL` has 6 entries and starts with `GettingStarted`, ends with `Cli`.
+  - [x] `HelpTab::GettingStarted.next() == Commands`; `HelpTab::Cli.next() == GettingStarted` (wrap).
+  - [x] `HelpTab::GettingStarted.prev() == Cli` (wrap); `HelpTab::Commands.prev() == GettingStarted`.
+  - [x] `HelpTab::Skills.title() == "Skills"` (spot-check one multi-word title, e.g. `GettingStarted.title() == "Getting Started"`).
 - Integration tests:
-  - [ ] N/A — pure types with no render path; covered by unit tests (note in PR).
+  - [x] N/A — pure types with no render path; covered by unit tests (note in PR).
 - Test coverage target: >=80%
 - All tests must pass
 
