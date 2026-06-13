@@ -105,8 +105,7 @@ enum HelpTab {
 }
 
 // `ALL`/`title` are consumed by the tabbed render (task 06); `next`/`prev` are
-// consumed by tab navigation (task 07) and stay unused until then.
-#[allow(dead_code)]
+// consumed by tab navigation (task 07).
 impl HelpTab {
     /// Tabs in declared left-to-right order (Getting Started first, CLI last).
     const ALL: [HelpTab; 6] = [
@@ -168,6 +167,8 @@ enum TuiCommand {
     DispatchAndQuit(AppEvent),
     ToggleRoster,
     ToggleHelp,
+    HelpNextTab,
+    HelpPrevTab,
     ScrollEvents(EventScrollCommand),
     MoveInputCursor(InputCursorCommand),
     AgentDropdown(DropdownCommand),
@@ -583,6 +584,14 @@ async fn execute_tui_command_with_interrupt(
             clear_input(state, ui_state);
             Ok(true)
         }
+        TuiCommand::HelpNextTab => {
+            ui_state.help_active_tab = ui_state.help_active_tab.next();
+            Ok(true)
+        }
+        TuiCommand::HelpPrevTab => {
+            ui_state.help_active_tab = ui_state.help_active_tab.prev();
+            Ok(true)
+        }
         TuiCommand::ScrollEvents(command) => {
             scroll_events(ui_state, command);
             Ok(true)
@@ -886,6 +895,31 @@ fn key_event_to_tui_command_with_ui(
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
+            // Tab navigation is handled entirely within the help-visible branch so
+            // these keys never leak to the base handler. Right/Tab advance; Left/
+            // Shift-Tab retreat. Shift-Tab is distinguished by the SHIFT modifier.
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => Some(TuiCommand::HelpNextTab),
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::BackTab,
+                ..
+            } => Some(TuiCommand::HelpPrevTab),
             _ => None,
         }
     } else if state.pending_clarification.is_some() {
@@ -6842,6 +6876,121 @@ mod tests {
         );
     }
 
+    #[test]
+    fn help_visible_arrows_and_tab_navigate_tabs() {
+        let state = state_with_input("", false);
+        let visible = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+
+        // Right + Tab advance to the next tab.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpNextTab)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpNextTab)
+        );
+
+        // Left + Shift-Tab (and the terminal BackTab variant) retreat.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpPrevTab)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)
+            ),
+            Some(TuiCommand::HelpPrevTab)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+            ),
+            Some(TuiCommand::HelpPrevTab)
+        );
+
+        // Esc still closes; an unrelated key does not leak to the base handler.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::ToggleHelp)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            ),
+            None
+        );
+
+        // Navigation keys are inert when help is closed (no leakage the other way).
+        let hidden = TuiUiState::default();
+        assert_ne!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &hidden,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpNextTab)
+        );
+    }
+
+    #[tokio::test]
+    async fn help_next_prev_tab_commands_advance_active_tab() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::GettingStarted,
+            ..TuiUiState::default()
+        };
+
+        // Next from the first tab moves to Commands.
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::HelpNextTab)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_active_tab, HelpTab::Commands);
+
+        // Next from the last tab (Cli) wraps back to Getting Started.
+        ui_state.help_active_tab = HelpTab::Cli;
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::HelpNextTab)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
+
+        // Prev from the first tab wraps back to Cli.
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::HelpPrevTab)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_active_tab, HelpTab::Cli);
+
+        // Navigation is local UI state — no app event emitted.
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn ctrl_l_toggles_roster_visibility_without_app_event() {
         let state = state_with_input("", false);
@@ -10004,5 +10153,46 @@ runtime = "fake"
 
         assert!(text.contains("/help"));
         assert!(text.contains("toggle the help overlay"));
+    }
+
+    #[tokio::test]
+    async fn help_tabs_cycle_with_arrows_and_esc_closes_from_any_tab() {
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+
+        // Six Right presses cycle through all six tabs and return to Getting
+        // Started — proving a full wrap. Each press is routed through the real
+        // key handler, then executed.
+        for _ in 0..HelpTab::ALL.len() {
+            let command = key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            )
+            .expect("Right should navigate while help is visible");
+            execute_tui_command(&mut state, &mut ui_state, &sender, command)
+                .await
+                .unwrap();
+        }
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        assert!(text.contains("How Atelier works"));
+
+        // From the Skills tab, Esc closes the modal.
+        ui_state.help_active_tab = HelpTab::Skills;
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .expect("Esc should close help from any tab");
+        execute_tui_command(&mut state, &mut ui_state, &sender, command)
+            .await
+            .unwrap();
+        assert!(!ui_state.help_visible);
     }
 }
