@@ -40,8 +40,11 @@ pub struct SlashCommandSpec {
 /// scope change) to add `/workflow` and `/queue`, which shipped as real app
 /// commands after the freeze and were already visible in app guidance and the
 /// help overlay; keeping them out of the catalog would have dropped real
-/// commands from the surfaces this catalog is meant to align. Entries must
-/// still not be added or removed without a deliberate PRD scope change.
+/// commands from the surfaces this catalog is meant to align. Amended
+/// 2026-06-13 (Provider Usage Status PRD scope change) to add
+/// `/provider:status`, a runway-first provider readiness command routed as an
+/// app command. Entries must still not be added or removed without a
+/// deliberate PRD scope change.
 const CATALOG: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         label: "/help",
@@ -90,6 +93,13 @@ const CATALOG: &[SlashCommandSpec] = &[
         insert_text: "/queue",
         usage: "/queue <message>",
         description: "queue a follow-up prompt (alias /q)",
+        kind: SlashCommandKind::AppCommand,
+    },
+    SlashCommandSpec {
+        label: "/provider:status",
+        insert_text: "/provider:status",
+        usage: "/provider:status",
+        description: "show provider readiness and usage runway",
         kind: SlashCommandKind::AppCommand,
     },
     SlashCommandSpec {
@@ -144,7 +154,7 @@ pub fn help_command_lines() -> Vec<String> {
 mod tests {
     use super::*;
 
-    const FIXED_V1_LABELS: [&str; 10] = [
+    const FIXED_V1_LABELS: [&str; 11] = [
         "/help",
         "/goal",
         "/goal clear",
@@ -152,6 +162,7 @@ mod tests {
         "/subtask",
         "/workflow",
         "/queue",
+        "/provider:status",
         "/agent:",
         "/skill:",
         "/reload:skills",
@@ -240,7 +251,8 @@ mod tests {
                 "/config",
                 "/subtask",
                 "/workflow",
-                "/queue"
+                "/queue",
+                "/provider:status"
             ]
         );
     }
@@ -269,6 +281,44 @@ mod tests {
             assert!(line.starts_with(spec.usage), "line missing usage: {line}");
             let description: String = line.chars().skip(usage_width + 2).collect();
             assert_eq!(description, spec.description, "misaligned line: {line}");
+        }
+    }
+
+    #[test]
+    fn provider_status_is_a_single_app_command_entry() {
+        let provider_entries: Vec<&SlashCommandSpec> = catalog()
+            .iter()
+            .filter(|spec| spec.label == "/provider:status")
+            .collect();
+        assert_eq!(
+            provider_entries.len(),
+            1,
+            "expected exactly one /provider:status catalog entry"
+        );
+        let spec = provider_entries[0];
+        assert!(!spec.description.is_empty(), "empty description");
+        assert!(!spec.usage.is_empty(), "empty usage");
+        assert_eq!(spec.insert_text, "/provider:status");
+        // The colon is part of a namespaced command name, not a prompt-prefix
+        // handoff: the command stays an app command and must not end with ':'
+        // (which is what the `/agent:`/`/skill:` dropdowns key off of).
+        assert_eq!(spec.kind, SlashCommandKind::AppCommand);
+        assert!(
+            !spec.label.ends_with(':'),
+            "/provider:status must not look like a prompt prefix"
+        );
+    }
+
+    #[test]
+    fn catalog_lookup_for_unknown_commands_finds_nothing() {
+        // The catalog is a closed set, so unrelated commands have no entry and
+        // unknown-command guidance still treats them as unknown. Adding
+        // `/provider:status` must not register partial or sibling labels.
+        for unknown in ["/provider", "/status", "/doctor", "/provider:usage"] {
+            assert!(
+                catalog().iter().all(|spec| spec.label != unknown),
+                "{unknown} must not be a catalog entry"
+            );
         }
     }
 }

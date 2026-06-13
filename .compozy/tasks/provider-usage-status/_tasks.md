@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Add provider status command metadata | pending | low | — |
+| 01 | Add provider status command metadata | completed | low | — |
 | 02 | Define runtime provider status model | pending | medium | — |
 | 03 | Implement provider status service and adapter boundary | pending | high | task_02 |
 | 04 | Render compact share-safe provider status output | pending | medium | task_02 |

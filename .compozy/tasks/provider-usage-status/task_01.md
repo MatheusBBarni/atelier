@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add Provider Status Slash Command Metadata
 type: backend
 complexity: low
@@ -28,11 +28,11 @@ This task adds `/provider:status` to the visible slash command catalog so users 
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Add the provider status command metadata to the slash command catalog.
-- [ ] 1.2 Ensure the command description communicates compact provider runway/status intent.
-- [ ] 1.3 Update command catalog tests that assert fixed labels, search results, or ordering.
-- [ ] 1.4 Confirm no routing or provider-specific behavior is introduced in the metadata layer.
-- [ ] 1.5 Verify unknown slash commands still follow the existing rejection path.
+- [x] 1.1 Add the provider status command metadata to the slash command catalog.
+- [x] 1.2 Ensure the command description communicates compact provider runway/status intent.
+- [x] 1.3 Update command catalog tests that assert fixed labels, search results, or ordering.
+- [x] 1.4 Confirm no routing or provider-specific behavior is introduced in the metadata layer.
+- [x] 1.5 Verify unknown slash commands still follow the existing rejection path.
 
 ## Implementation Details
 Modify the existing slash command catalog and tests only. Reference the TechSpec sections "Proposed User-Facing Command" and "Command Routing" for command name, scope, and the metadata-only boundary.
@@ -59,12 +59,12 @@ Modify the existing slash command catalog and tests only. Reference the TechSpec
 
 ## Tests
 - Unit tests:
-  - [ ] Catalog includes exactly one `/provider:status` command entry.
-  - [ ] `/provider:status` has a non-empty description and usage string.
-  - [ ] Existing fixed-label command assertions are updated intentionally.
-  - [ ] Unknown slash command metadata lookups still return the existing unknown result.
+  - [x] Catalog includes exactly one `/provider:status` command entry. (`provider_status_is_a_single_app_command_entry`)
+  - [x] `/provider:status` has a non-empty description and usage string. (`provider_status_is_a_single_app_command_entry`)
+  - [x] Existing fixed-label command assertions are updated intentionally. (`FIXED_V1_LABELS` 10→11, AppCommand categorization list)
+  - [x] Unknown slash command metadata lookups still return the existing unknown result. (`catalog_lookup_for_unknown_commands_finds_nothing` + app-layer unknown-command tests)
 - Integration tests:
-  - [ ] Command discovery or prompt-prefix dropdown includes `/provider:status` without altering unrelated command entries.
+  - [x] Command discovery or prompt-prefix dropdown includes `/provider:status` without altering unrelated command entries. (`command_discovery_includes_provider_status_without_disturbing_others`)
 - Test coverage target: >=80%
 - All tests must pass
 

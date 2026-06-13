@@ -5,11 +5,46 @@ use multiagent::slash_commands::{
 #[test]
 fn catalog_accessor_is_usable_from_an_external_module() {
     let specs = catalog();
-    assert_eq!(specs.len(), 10);
+    assert_eq!(specs.len(), 11);
     assert_eq!(specs[0].label, "/help");
     assert!(specs
         .iter()
         .any(|spec| spec.label == "/reload:skills" && spec.kind == SlashCommandKind::TuiLocal));
+}
+
+#[test]
+fn command_discovery_includes_provider_status_without_disturbing_others() {
+    let specs = catalog();
+    // The new command is discoverable as a single app command...
+    let provider: Vec<&_> = specs
+        .iter()
+        .filter(|spec| spec.label == "/provider:status")
+        .collect();
+    assert_eq!(provider.len(), 1, "provider:status missing from discovery");
+    assert_eq!(provider[0].kind, SlashCommandKind::AppCommand);
+    assert!(available_commands_summary().contains("/provider:status"));
+    assert!(help_command_lines()
+        .iter()
+        .any(|line| line.contains("/provider:status")));
+
+    // ...and the pre-existing commands are untouched by its insertion.
+    for label in [
+        "/help",
+        "/goal",
+        "/goal clear",
+        "/config",
+        "/subtask",
+        "/workflow",
+        "/queue",
+        "/agent:",
+        "/skill:",
+        "/reload:skills",
+    ] {
+        assert!(
+            specs.iter().any(|spec| spec.label == label),
+            "discovery dropped unrelated command {label}"
+        );
+    }
 }
 
 #[test]
