@@ -91,9 +91,9 @@ const QUEUE_HINT: &str = "↑/↓ select · Del cancel · Ctrl-R resume (clear i
 /// Identifies the six tabs of the help modal and provides ordered iteration
 /// plus wrap-around navigation. Pure value type — carries no rendering or state.
 ///
-/// Foundational type wired into `TuiUiState` and per-tab builders by the
-/// downstream tabbed-help-modal tasks (02–06); intentionally unused on its own.
-#[allow(dead_code)]
+/// The active tab lives in `TuiUiState.help_active_tab`; `render_help_modal`
+/// dispatches on it to the per-tab builders. Wrap-around navigation
+/// (`next`/`prev`) is wired into key routing by task 07.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HelpTab {
     GettingStarted,
@@ -104,8 +104,8 @@ enum HelpTab {
     Cli,
 }
 
-// Associated items are consumed by the tabbed render + navigation (tasks 06/07);
-// unused on their own until then.
+// `ALL`/`title` are consumed by the tabbed render (task 06); `next`/`prev` are
+// consumed by tab navigation (task 07) and stay unused until then.
 #[allow(dead_code)]
 impl HelpTab {
     /// Tabs in declared left-to-right order (Getting Started first, CLI last).
@@ -2239,7 +2239,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         render_clarification_composer(frame, areas.input, clarification, ui_state);
         render_clarification_status(frame, areas.status, &theme, clarification.multi_select);
         if ui_state.help_visible {
-            render_help_modal(frame, &theme);
+            render_help_modal(frame, state, ui_state, &theme);
         } else {
             set_clarification_cursor(frame, areas.input, clarification, ui_state);
         }
@@ -2281,7 +2281,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         }
     }
     if ui_state.help_visible {
-        render_help_modal(frame, &theme);
+        render_help_modal(frame, state, ui_state, &theme);
     } else {
         set_input_cursor(frame, input_areas.input, input_layout);
     }
@@ -3302,51 +3302,44 @@ fn wrapped_event_line_count(lines: &[Line<'_>], width: u16) -> usize {
         .sum()
 }
 
-fn render_help_modal(frame: &mut Frame, theme: &Theme) {
+/// Tabbed help overlay. Pure function of `(AppState, TuiUiState, Theme)` — reads
+/// no `App` internals. Draws a theme-token tab strip (active tab highlighted) and
+/// dispatches on `ui_state.help_active_tab` to the matching per-tab builder. The
+/// default tab (`GettingStarted`) renders on open. Tab navigation is handled in the
+/// key-routing layer (task 07); this render just reflects `help_active_tab`.
+fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState, theme: &Theme) {
     let area = centered_rect(78, 100, frame.area());
-    let section_header = |label: &'static str, color| {
-        Line::from(vec![
-            Span::styled(
-                label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" commands", Style::default().fg(theme.text)),
-        ])
+    let active = ui_state.help_active_tab;
+
+    // Tab strip: every `HelpTab::ALL` title, the active one highlighted via theme
+    // tokens only (no inline color literals — ADR-003 rejects `ratatui::Tabs`).
+    let mut strip: Vec<Span<'static>> = Vec::new();
+    for (index, tab) in HelpTab::ALL.iter().enumerate() {
+        if index > 0 {
+            strip.push(Span::styled("  ", Style::default().fg(theme.text_dim)));
+        }
+        let style = if *tab == active {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.text_muted)
+        };
+        strip.push(Span::styled(tab.title(), style));
+    }
+    let mut lines = vec![Line::from(strip), Line::from("")];
+
+    // Render the active tab body by dispatching to its per-tab builder.
+    let body = match active {
+        HelpTab::GettingStarted => getting_started_lines(state, theme),
+        HelpTab::Commands => commands_tab_lines("", theme),
+        HelpTab::Keys => keys_tab_lines(theme),
+        HelpTab::Skills => skills_tab_lines(ui_state, theme),
+        HelpTab::Approvals => approvals_tab_lines(theme),
+        HelpTab::Cli => cli_tab_lines(theme),
     };
-    let mut lines = vec![section_header("TUI", theme.accent)];
-    // Slash-command rows come from the shared catalog so help stays aligned
-    // with the dropdown and unknown-command guidance (ADR-003). Non-command
-    // rows (keys, scrolling, CLI flags) stay literal below.
-    lines.extend(
-        crate::slash_commands::help_command_lines()
-            .into_iter()
-            .map(Line::from),
-    );
-    lines.extend([
-        Line::from("Enter                submit prompt or answer approval"),
-        Line::from("Ctrl-L               show or hide Agent Roster"),
-        Line::from("Arrow keys           move input cursor"),
-        Line::from("PageUp/PageDown     scroll Chat by page"),
-        Line::from("Mouse wheel         scroll Chat by line"),
-        Line::from("Home/End            jump Chat to top/latest"),
-        Line::from("Ctrl-C               interrupt active run and exit"),
-        Line::from("Backspace            delete input character"),
-        Line::from("Text                 edit the input composer"),
-        Line::from(""),
-    ]);
-    lines.push(section_header("CLI", theme.status_ok));
-    lines.extend([
-        Line::from("atelier                            open the TUI"),
-        Line::from("atelier --cwd <path>               run from a workspace"),
-        Line::from("atelier --config <path>            use a config file"),
-        Line::from("atelier --doctor [--json]          check runtimes and history"),
-        Line::from("atelier --print-config             print merged config"),
-        Line::from("atelier --init-config              create config files"),
-        Line::from("atelier --codemap init|changes|update manage repo maps"),
-        Line::from("atelier --clean-sessions [--yes]   delete local history"),
-        Line::from("atelier --debug                    write debug events"),
-        Line::from("atelier --help                     print CLI help"),
-    ]);
+    lines.extend(body);
+
     let help = Paragraph::new(lines)
         .style(Style::default().fg(theme.text).bg(theme.ink))
         .block(
@@ -3369,8 +3362,6 @@ fn render_help_modal(frame: &mut Frame, theme: &Theme) {
 /// Keybinding rows for the Keys help tab. Relocated verbatim from the pre-tab
 /// `render_help_modal` literals; pure builder consumed by the tabbed render
 /// (task 06). No `AppState`/`TuiUiState` reads.
-// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
-#[allow(dead_code)]
 fn keys_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
     vec![
         Line::from("Enter                submit prompt or answer approval"),
@@ -3388,8 +3379,6 @@ fn keys_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
 /// CLI flag rows for the CLI help tab. Relocated verbatim from the pre-tab
 /// `render_help_modal` literals; pure builder consumed by the tabbed render
 /// (task 06). No `AppState`/`TuiUiState` reads.
-// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
-#[allow(dead_code)]
 fn cli_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
     vec![
         Line::from("atelier                            open the TUI"),
@@ -3409,8 +3398,6 @@ fn cli_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
 /// Plain-language explanation of the two approval modes, agent capabilities,
 /// and the workspace read/write-roots concept. Net-new content; pure builder
 /// consumed by the tabbed render (task 06). No `AppState`/`TuiUiState` reads.
-// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
-#[allow(dead_code)]
 fn approvals_tab_lines(theme: &Theme) -> Vec<Line<'static>> {
     let header = |label: &'static str| {
         Line::from(Span::styled(
@@ -3445,8 +3432,6 @@ fn approvals_tab_lines(theme: &Theme) -> Vec<Line<'static>> {
 /// compact live agent summary (one row per configured agent via
 /// `agent_compact_line`, the shared `Compact` row definition). Pure builder
 /// consumed by the tabbed render (task 06).
-// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
-#[allow(dead_code)]
 fn getting_started_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
     let header = |label: &'static str| {
         Line::from(Span::styled(
@@ -3498,8 +3483,6 @@ fn getting_started_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> 
 /// unknown-command guidance. `filter` is a no-op in MVP (the substring filter
 /// lands in task 09); rows stay plain to match the pre-tab help render. Pure
 /// builder consumed by the tabbed render (task 06).
-// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
-#[allow(dead_code)]
 fn commands_tab_lines(_filter: &str, _theme: &Theme) -> Vec<Line<'static>> {
     crate::slash_commands::help_command_lines()
         .into_iter()
@@ -3512,8 +3495,6 @@ fn commands_tab_lines(_filter: &str, _theme: &Theme) -> Vec<Line<'static>> {
 /// an empty-state line when no skills are discovered, and always closes with the
 /// guidance disclaimer (skills do not bypass approvals/permissions). Pure builder
 /// consumed by the tabbed render (task 06).
-// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
-#[allow(dead_code)]
 fn skills_tab_lines(ui_state: &TuiUiState, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if ui_state.skill_suggestions.is_empty() {
@@ -5140,11 +5121,14 @@ mod tests {
     #[test]
     fn renders_help_modal_commands() {
         let state = state_with_input("", false);
-        let ui_state = TuiUiState {
+        // Tabbed help renders one tab at a time, so each assertion group is routed
+        // to its tab. The modal frame + Commands content render on the Commands tab.
+        let commands_ui = TuiUiState {
             help_visible: true,
+            help_active_tab: HelpTab::Commands,
             ..TuiUiState::default()
         };
-        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        let text = render_to_text_with_ui(&state, &commands_ui, 120, 32);
 
         assert!(text.contains("Help"));
         let header = text.lines().find(|line| line.contains("Help")).unwrap();
@@ -5163,21 +5147,37 @@ mod tests {
         assert!(text.contains("/workflow <prompt>"));
         assert!(text.contains("execute a broad prompt with workflow evidence"));
         assert!(text.contains("/config"));
-        assert!(text.contains("Mouse wheel"));
         assert!(!text.contains("close this help"));
-        assert!(text.contains("Ctrl-L"));
-        assert!(text.contains("Arrow keys"));
-        assert!(text.contains("PageUp/PageDown"));
-        assert!(text.contains("Home/End"));
-        assert!(text.contains("atelier --doctor"));
-        assert!(text.contains("atelier --clean-sessions"));
+
+        // Keybinding rows live on the Keys tab.
+        let keys_ui = TuiUiState {
+            help_active_tab: HelpTab::Keys,
+            ..commands_ui.clone()
+        };
+        let keys_text = render_to_text_with_ui(&state, &keys_ui, 120, 32);
+        assert!(keys_text.contains("Mouse wheel"));
+        assert!(keys_text.contains("Ctrl-L"));
+        assert!(keys_text.contains("Arrow keys"));
+        assert!(keys_text.contains("PageUp/PageDown"));
+        assert!(keys_text.contains("Home/End"));
+
+        // CLI flag rows live on the CLI tab.
+        let cli_ui = TuiUiState {
+            help_active_tab: HelpTab::Cli,
+            ..commands_ui
+        };
+        let cli_text = render_to_text_with_ui(&state, &cli_ui, 120, 32);
+        assert!(cli_text.contains("atelier --doctor"));
+        assert!(cli_text.contains("atelier --clean-sessions"));
     }
 
     #[test]
     fn help_modal_command_rows_are_catalog_derived() {
         let state = state_with_input("", false);
+        // Catalog-derived contract lives on the Commands tab.
         let ui_state = TuiUiState {
             help_visible: true,
+            help_active_tab: HelpTab::Commands,
             ..TuiUiState::default()
         };
         let text = render_to_text_with_ui(&state, &ui_state, 120, 40);
@@ -5201,17 +5201,26 @@ mod tests {
         assert!(text.contains("/reload:skills"));
         assert!(text.contains("/workflow <prompt>"));
         assert!(text.contains("/queue <message>"));
-        // Non-command rows survive the catalog routing.
-        assert!(text.contains("Ctrl-L"));
-        assert!(text.contains("Arrow keys"));
-        assert!(text.contains("Mouse wheel"));
+
+        // Non-command rows survive on the Keys tab (catalog routing did not drop
+        // the literal keybinding rows).
+        let keys_ui = TuiUiState {
+            help_active_tab: HelpTab::Keys,
+            ..ui_state
+        };
+        let keys_text = render_to_text_with_ui(&state, &keys_ui, 120, 40);
+        assert!(keys_text.contains("Ctrl-L"));
+        assert!(keys_text.contains("Arrow keys"));
+        assert!(keys_text.contains("Mouse wheel"));
     }
 
     #[test]
     fn readme_skill_command_wording_matches_help_language() {
         let state = state_with_input("", false);
+        // `/skill:` wording lives on the Commands tab.
         let ui_state = TuiUiState {
             help_visible: true,
+            help_active_tab: HelpTab::Commands,
             ..TuiUiState::default()
         };
         let help_text = render_to_text_with_ui(&state, &ui_state, 120, 32);
@@ -5228,8 +5237,10 @@ mod tests {
     #[test]
     fn readme_workflow_command_wording_matches_v1_limits() {
         let state = state_with_input("", false);
+        // `/workflow` wording lives on the Commands tab.
         let ui_state = TuiUiState {
             help_visible: true,
+            help_active_tab: HelpTab::Commands,
             ..TuiUiState::default()
         };
         let help_text = render_to_text_with_ui(&state, &ui_state, 120, 32);
@@ -5770,7 +5781,10 @@ mod tests {
         };
         let text = render_to_text_with_ui(&state, &ui_state, 80, 32);
         assert!(text.contains("Help"));
-        assert!(!text.contains("Commands"));
+        // The tabbed help strip legitimately renders the "Commands" tab title, so
+        // suppression is verified by the absence of the command dropdown's unique
+        // right-aligned navigation hint rather than the bare word "Commands".
+        assert!(!text.contains("Up/Down Tab/Enter"));
     }
 
     #[test]
@@ -9951,5 +9965,44 @@ runtime = "fake"
         let lines = approvals_tab_lines(&theme);
         let header = &lines[0];
         assert_eq!(header.spans[0].style.fg, Some(theme.accent));
+    }
+
+    #[test]
+    fn help_modal_opens_on_getting_started_with_tab_strip() {
+        // Opening help (default `help_active_tab`) renders the Getting Started body
+        // plus a tab strip listing every tab title.
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+
+        // Getting Started routing line is the default body.
+        assert!(text.contains("orchestrator"));
+        // The tab strip lists each tab title.
+        assert!(text.contains("Getting Started"));
+        assert!(text.contains("Commands"));
+        assert!(text.contains("Keys"));
+        assert!(text.contains("Skills"));
+        assert!(text.contains("Approvals"));
+        // The default body is Getting Started, not the Commands catalog.
+        assert!(!text.contains("toggle the help overlay"));
+    }
+
+    #[test]
+    fn help_modal_commands_tab_renders_catalog() {
+        // Selecting the Commands tab renders the catalog-derived command rows.
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+
+        assert!(text.contains("/help"));
+        assert!(text.contains("toggle the help overlay"));
     }
 }
