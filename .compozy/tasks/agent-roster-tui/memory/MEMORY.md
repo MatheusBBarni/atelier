@@ -8,7 +8,8 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
 - task_02 complete: `StepTiming` map + lifecycle stamping was already implemented; tests added this run (8 tests in `src/app/mod.rs`). `started_at`/`last_activity` are ready.
 - task_03 complete: `build_roster_rows` (+ `classify_step`, `step_display_label`, `format_coarse_elapsed`) and `STALL_THRESHOLD` const now exist in `src/app/mod.rs`. `rebuild_roster_rows` is wired into `publish_state`, which is now `&mut self` and rebuilds `roster_rows` on every publish (unconditionally — task_04 adds the change-gate).
 - task_04 complete: `refresh_roster_tick(&mut self) -> bool` (active-run gate + `roster_rows == rebuilt` change-gate via new `send_state()`), a 4th 1 Hz `select!` arm in the `tui` app-worker loop (`ROSTER_REFRESH_INTERVAL`, Skip missed ticks → `app.refresh_roster_tick()`), and a terminal-status `step_timings` clear added to `set_live_step_status`. Render-snapshot integration tests deferred to task_06 (renderer still reads `state.agents`).
-- task_05 complete: `activity_glyph(state, ascii)` and `activity_label(state)` pure helpers in `src/tui/mod.rs` beside `agent_status_label`. Set 1 glyphs `◐ ◔ ○ ·` / ASCII `> ? ! .`; labels `working/waiting/stalled?/idle`. Both `#[allow(dead_code)]` until task_06 consumes them. `ActivityState` added to the `tui` `use crate::app::{...}` import (it is not `Copy`).
+- task_05 complete: `activity_glyph(state, ascii)` and `activity_label(state)` pure helpers in `src/tui/mod.rs` beside `agent_status_label`. Set 1 glyphs `◐ ◔ ○ ·` / ASCII `> ? ! .`; labels `working/waiting/stalled?/idle`. `ActivityState` added to the `tui` `use crate::app::{...}` import (it is not `Copy`).
+- task_06 complete: roster render rewritten to consume `state.roster_rows` (`agent_roster_items` now takes `&[RosterRow]` + `spinner_frame`; new `roster_summary_header_item`/`roster_row_item`/`ROSTER_ACTIVE_SPINNER`). Names use `accent_for(row.accent_index)` (idle = accent + `DIM`, never `text_dim`). `build_roster_rows` + `StepTiming` are now `pub(crate)` (tui tests populate `roster_rows` via `populate_roster_rows`). Availability is no longer shown in the roster (not a `RosterRow` field). Per-field ellipsis truncation deferred (List clips gracefully).
 
 ## Shared Decisions
 
@@ -16,7 +17,8 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
 - `publish_state` is now `&mut self` (it rebuilds `roster_rows`). All callers were already `&mut self`, so no blast radius.
 - Activity classification (task_03): `WaitingForApproval`/`WaitingForAction` → `NeedsInput`; `Starting`/`Running`/`Streaming`/`Cancelling` → `Active` (or `Stalled` if `now - last_activity >= 30s`); `Completed`/`Failed`/`Interrupted`/no-step → `Idle`. `RosterRow.status` always carries `agent.status`; activity-driven label is via `activity`. `accent_index` is canonical-order, assigned before the NeedsInput pin-sort.
 - Sub-minute elapsed renders as `"8s"` (then `"1m 20s"`, `"1h 5m"`).
-- **Renderer still reads `state.agents` (tui/mod.rs:2473), NOT `roster_rows`** until task_06 rewrites the render block. Roster render-snapshot integration tests belong to task_06/07, not earlier.
+- **The roster renderer now reads `state.roster_rows`** (task_06). Full-frame render tests must populate it — use the `populate_roster_rows(&mut state)` test helper.
+- **Accent-by-identity:** chat (`item_agent_accent`) and the `/agent:` dropdown already resolve accent by canonical identity (look the agent up by `id`/`title` in `state.agents`). Only the roster needed repointing to `row.accent_index`. So a pin reorders the roster without recoloring; the dropdown/chat never reorder.
 
 ## Shared Learnings
 

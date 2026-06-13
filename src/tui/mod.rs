@@ -4,7 +4,7 @@ use crate::app::chat::{
 use crate::app::git::GitContext;
 use crate::app::{
     ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, InterruptHandle,
-    PendingClarificationView, QueuedFollowUpStatus, QueuedFollowUpView,
+    PendingClarificationView, QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
@@ -2302,7 +2302,8 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
             .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
             .split(main_area);
 
-        let roster_items = agent_roster_items(&state.agents, RosterRowStyle::Full, &theme);
+        let roster_items =
+            agent_roster_items(&state.roster_rows, ui_state.work_spinner_frame, &theme);
         let roster = List::new(roster_items).block(
             Block::default()
                 .title(" Agent Roster ")
@@ -3738,8 +3739,7 @@ fn agent_status_label(status: &str) -> &str {
 /// portable BMP circles so each state reads without color; `ascii` swaps to a
 /// 7-bit fallback for constrained terminals. Plain text only — no inline color
 /// literals — so legibility is carried by the glyph plus [`activity_label`]
-/// alone (NO_COLOR criterion). Consumed by the task_06 render rewrite; tested now.
-#[allow(dead_code)]
+/// alone (NO_COLOR criterion). Consumed by the roster render (`roster_row_item`).
 fn activity_glyph(state: ActivityState, ascii: bool) -> &'static str {
     match (state, ascii) {
         (ActivityState::Active, false) => "◐",
@@ -3755,8 +3755,7 @@ fn activity_glyph(state: ActivityState, ascii: bool) -> &'static str {
 
 /// Distinct, non-empty text label per activity state (ADR-002). Pairs with
 /// [`activity_glyph`] so the roster stays legible under `NO_COLOR`. Consumed by
-/// the roster render rewrite in task_06; exercised by tests now.
-#[allow(dead_code)]
+/// the roster render (`roster_row_item`).
 fn activity_label(state: ActivityState) -> &'static str {
     match state {
         ActivityState::Active => "working",
@@ -3826,62 +3825,148 @@ fn agent_compact_line(index: usize, agent: &AgentView, theme: &Theme) -> Line<'s
 /// Getting Started help tab. `Full` reproduces the three-line roster row
 /// (name + status / `runtime/model` + availability / effort + thinking state);
 /// `Compact` renders a single line (name · `runtime/model` · availability label).
-/// Agent colors cycle via `theme.accent_for(index)`; all other styling reuses the
-/// shared `status_style` / `availability_style` helpers so there is one data path.
+/// Quarter-circle frames cycled by `work_spinner_frame` so an `Active` agent's
+/// glyph visibly turns (ADR-002). Frame 0 is `◐` so a single static render
+/// matches [`activity_glyph`]`(Active, _)`. All BMP, no emoji presentation.
+const ROSTER_ACTIVE_SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+/// Build the roster list from the pre-computed [`RosterRow`] view-model (ADR-003):
+/// a summary-header line followed by one item per row. The renderer stays a pure
+/// function of `AppState` — every time-dependent value is read from the row, and
+/// agent colors come from `row.accent_index` (canonical identity, ADR-005), never
+/// the render-time position, so the `NeedsInput` pin cannot recolor an agent.
 fn agent_roster_items(
-    agents: &[AgentView],
-    style: RosterRowStyle,
+    rows: &[RosterRow],
+    spinner_frame: usize,
     theme: &Theme,
 ) -> Vec<ListItem<'static>> {
-    agents
-        .iter()
-        .enumerate()
-        .map(|(index, agent)| {
-            let name_style = Style::default()
-                .fg(theme.accent_for(index))
-                .add_modifier(Modifier::BOLD);
-            match style {
-                RosterRowStyle::Full => ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(format!("{} ", agent.name), name_style),
-                        Span::styled(
-                            agent_status_label(&agent.status).to_string(),
-                            status_style(theme, &agent.status),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{}/{} ", agent.runtime, agent.model),
-                            Style::default().fg(theme.text_muted),
-                        ),
-                        Span::styled(
-                            availability_label(&agent.availability),
-                            availability_style(theme, &agent.availability),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("effort:{} ", agent.effort),
-                            Style::default().fg(theme.text_muted),
-                        ),
-                        Span::styled(
-                            if agent.thinking {
-                                "thinking:on"
-                            } else {
-                                "thinking:off"
-                            },
-                            if agent.thinking {
-                                Style::default().fg(theme.accent)
-                            } else {
-                                Style::default().fg(theme.text_dim)
-                            },
-                        ),
-                    ]),
-                ]),
-                RosterRowStyle::Compact => ListItem::new(agent_compact_line(index, agent, theme)),
+    let mut items = vec![roster_summary_header_item(rows, theme)];
+    items.extend(
+        rows.iter()
+            .map(|row| roster_row_item(row, spinner_frame, theme)),
+    );
+    items
+}
+
+/// One-line activity census above the roster (ADR-001 item: summary header).
+/// At rest it shows a calm lineup count; during a run it shows working/waiting/
+/// stalled counts with portable glyphs. Theme tokens only — no inline colors.
+fn roster_summary_header_item(rows: &[RosterRow], theme: &Theme) -> ListItem<'static> {
+    let mut working = 0usize;
+    let mut waiting = 0usize;
+    let mut stalled = 0usize;
+    for row in rows {
+        match row.activity {
+            ActivityState::Active => working += 1,
+            ActivityState::NeedsInput => waiting += 1,
+            ActivityState::Stalled => stalled += 1,
+            ActivityState::Idle => {}
+        }
+    }
+    let line = if working == 0 && waiting == 0 && stalled == 0 {
+        Line::from(Span::styled(
+            format!("● {} agents idle", rows.len()),
+            Style::default().fg(theme.text_dim),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!("▶ {working} working · ◔ {waiting} waiting · ○ {stalled} stalled"),
+            Style::default()
+                .fg(theme.text_muted)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    ListItem::new(line)
+}
+
+/// Render one roster row: glyph + activity label + name on the lead line (weight
+/// driven by activity), then runtime/model + effort/thinking, and — for active
+/// states only — the pre-formatted current step and coarse elapsed. Terminal and
+/// plain-idle rows keep the existing status label instead of an activity glyph.
+fn roster_row_item(row: &RosterRow, spinner_frame: usize, theme: &Theme) -> ListItem<'static> {
+    let accent = theme.accent_for(row.accent_index);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let mut lead: Vec<Span<'static>> = Vec::new();
+    let active_states = !matches!(row.activity, ActivityState::Idle);
+    if active_states {
+        let glyph = if matches!(row.activity, ActivityState::Active) {
+            ROSTER_ACTIVE_SPINNER[spinner_frame % ROSTER_ACTIVE_SPINNER.len()]
+        } else {
+            activity_glyph(row.activity.clone(), false)
+        };
+        // Active rows are bold and brightly named; waiting/stalled stay normal
+        // weight but keep the prominent glyph + label (ADR-001).
+        let name_style = if matches!(row.activity, ActivityState::Active) {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(accent)
+        };
+        lead.push(Span::styled(
+            format!("{glyph} {} ", activity_label(row.activity.clone())),
+            Style::default().fg(theme.text),
+        ));
+        lead.push(Span::styled(row.name.clone(), name_style));
+    } else {
+        // Idle recedes via the DIM modifier, but the name keeps its identity
+        // accent (ADR-005) — never `text_dim`, or it loses the agent color that
+        // links the roster to the chat transcript. Terminal statuses keep their
+        // labelled badge.
+        lead.push(Span::styled(
+            format!("{} ", row.name),
+            Style::default().fg(accent).add_modifier(Modifier::DIM),
+        ));
+        if row.status != "idle" {
+            lead.push(Span::styled(
+                agent_status_label(&row.status).to_string(),
+                status_style(theme, &row.status),
+            ));
+        }
+    }
+    lines.push(Line::from(lead));
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{} ", row.runtime_model),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            format!("effort:{} ", row.effort),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            if row.thinking {
+                "thinking:on"
+            } else {
+                "thinking:off"
+            },
+            if row.thinking {
+                Style::default().fg(theme.accent)
+            } else {
+                Style::default().fg(theme.text_dim)
+            },
+        ),
+    ]));
+
+    // Step + elapsed are pre-formatted on the row (active states only).
+    if row.current_step.is_some() || row.elapsed.is_some() {
+        let mut detail = String::new();
+        if let Some(step) = &row.current_step {
+            detail.push_str(step);
+        }
+        if let Some(elapsed) = &row.elapsed {
+            if !detail.is_empty() {
+                detail.push_str(" | ");
             }
-        })
-        .collect()
+            detail.push_str(elapsed);
+        }
+        lines.push(Line::from(Span::styled(
+            detail,
+            Style::default().fg(theme.text_dim),
+        )));
+    }
+
+    ListItem::new(lines)
 }
 
 fn work_indicator_active(state: &AppState) -> bool {
@@ -4657,66 +4742,212 @@ mod tests {
         }
     }
 
-    #[test]
-    fn agent_roster_items_full_renders_three_lines_per_agent() {
-        let theme = TuiUiState::default().theme;
-        let agents = vec![
-            agent_view("fixer", "Fixer", "running", &["read"]),
-            agent_view("planner", "Planner", "idle", &[]),
-        ];
-        let items = agent_roster_items(&agents, RosterRowStyle::Full, &theme);
-        assert_eq!(items.len(), 2);
-        for item in &items {
-            assert_eq!(item.height(), 3);
+    fn roster_row(
+        agent_id: &str,
+        name: &str,
+        accent_index: usize,
+        activity: ActivityState,
+        current_step: Option<&str>,
+        elapsed: Option<&str>,
+    ) -> RosterRow {
+        RosterRow {
+            agent_id: agent_id.to_string(),
+            name: name.to_string(),
+            accent_index,
+            activity,
+            runtime_model: "fake/default".to_string(),
+            effort: "medium".to_string(),
+            thinking: false,
+            current_step: current_step.map(str::to_string),
+            elapsed: elapsed.map(str::to_string),
+            status: "idle".to_string(),
         }
     }
 
-    #[test]
-    fn agent_roster_items_compact_renders_one_line_per_agent() {
-        let theme = TuiUiState::default().theme;
-        let agents = vec![agent_view("fixer", "Fixer", "running", &["read"])];
-        let items = agent_roster_items(&agents, RosterRowStyle::Compact, &theme);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].height(), 1);
-        let text = roster_items_to_text(items, 80, 3);
-        assert!(text.contains("Fixer"), "compact row should show the name");
-        assert!(
-            text.contains("fake/default"),
-            "compact row should show runtime/model"
+    /// Populate `state.roster_rows` from `agents`/`live_steps` the way
+    /// `publish_state` does in production, so full-frame render tests see the
+    /// roster they expect (the renderer reads `roster_rows`, never `agents`).
+    fn populate_roster_rows(state: &mut AppState) {
+        state.roster_rows = crate::app::build_roster_rows(
+            &state.agents,
+            &state.live_steps,
+            &std::collections::BTreeMap::new(),
+            std::time::Instant::now(),
         );
     }
 
     #[test]
-    fn agent_roster_items_renders_down_availability_label() {
+    fn agent_roster_items_emits_header_then_one_item_per_row() {
         let theme = TuiUiState::default().theme;
-        let agents = vec![unavailable_agent_view()];
+        let rows = vec![
+            roster_row(
+                "fixer",
+                "Fixer",
+                0,
+                ActivityState::Active,
+                Some("patching"),
+                Some("12s"),
+            ),
+            roster_row("planner", "Planner", 1, ActivityState::Idle, None, None),
+        ];
+        let items = agent_roster_items(&rows, 0, &theme);
+        // One summary header item plus one item per row.
+        assert_eq!(items.len(), rows.len() + 1);
+    }
 
-        let compact = roster_items_to_text(
-            agent_roster_items(&agents, RosterRowStyle::Compact, &theme),
-            80,
-            3,
-        );
-        assert!(compact.contains("Fixer"));
-        assert!(compact.contains("codex/default"));
+    #[test]
+    fn roster_header_counts_active_states() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![
+            roster_row("a", "Anna", 0, ActivityState::Active, None, None),
+            roster_row("b", "Bret", 1, ActivityState::Active, None, None),
+            roster_row("c", "Cleo", 2, ActivityState::NeedsInput, None, None),
+            roster_row("d", "Dane", 3, ActivityState::Stalled, None, None),
+        ];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
         assert!(
-            compact.contains("down"),
-            "compact unavailable agent should show the `down` label"
+            text.contains("▶ 2 working · ◔ 1 waiting · ○ 1 stalled"),
+            "summary header counts: {text}"
         );
+    }
 
-        let full = roster_items_to_text(
-            agent_roster_items(&agents, RosterRowStyle::Full, &theme),
-            80,
-            6,
-        );
+    #[test]
+    fn roster_header_at_rest_shows_idle_lineup() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![
+            roster_row("a", "Anna", 0, ActivityState::Idle, None, None),
+            roster_row("b", "Bret", 1, ActivityState::Idle, None, None),
+            roster_row("c", "Cleo", 2, ActivityState::Idle, None, None),
+        ];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
+        assert!(text.contains("● 3 agents idle"), "at-rest header: {text}");
+    }
+
+    #[test]
+    fn roster_active_row_shows_glyph_label_step_and_elapsed() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![roster_row(
+            "explorer",
+            "Explorer",
+            0,
+            ActivityState::Active,
+            Some("exploring options"),
+            Some("45s"),
+        )];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
+        assert!(text.contains('◐'), "active glyph (frame 0): {text}");
+        assert!(text.contains("working"));
+        assert!(text.contains("Explorer"));
+        assert!(text.contains("exploring options"));
+        assert!(text.contains("45s"));
+    }
+
+    #[test]
+    fn roster_idle_row_has_no_activity_glyph_or_label() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![roster_row(
+            "planner",
+            "Planner",
+            0,
+            ActivityState::Idle,
+            None,
+            None,
+        )];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
+        assert!(text.contains("Planner"));
         assert!(
-            full.contains("down"),
-            "full unavailable agent should show the `down` label"
+            !text.contains("working"),
+            "idle row shows no activity label"
         );
+        assert!(!text.contains('◐'), "idle row shows no active glyph");
+    }
+
+    #[test]
+    fn roster_stalled_row_shows_frozen_glyph_and_elapsed() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![roster_row(
+            "explorer",
+            "Explorer",
+            0,
+            ActivityState::Stalled,
+            None,
+            Some("34s"),
+        )];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
+        assert!(text.contains('○'), "stalled glyph: {text}");
+        assert!(text.contains("stalled?"));
+        assert!(text.contains("34s"));
+    }
+
+    #[test]
+    fn roster_render_is_deterministic_when_idle() {
+        // Pure render of a clock-free row vec: repeated frames are byte-identical
+        // with no `now` advance (no spinner, no elapsed tick).
+        let mut state = state_with_input("", false);
+        state.agents = vec![agent_view("explorer", "Explorer", "idle", &[])];
+        state.roster_rows = vec![roster_row(
+            "explorer",
+            "Explorer",
+            0,
+            ActivityState::Idle,
+            None,
+            None,
+        )];
+        let a = render_to_text(&state, 100, 24);
+        let b = render_to_text(&state, 100, 24);
+        let c = render_to_text(&state, 100, 24);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn roster_renders_glyph_at_narrow_width_without_breakage() {
+        let mut state = state_with_input("", false);
+        state.run_state = RunState::Running;
+        state.agents = vec![agent_view("explorer", "Explorer", "running", &[])];
+        state.roster_rows = vec![roster_row(
+            "explorer",
+            "Explorer",
+            0,
+            ActivityState::Active,
+            Some("a-very-long-step-label-that-overflows-the-sidebar"),
+            Some("9s"),
+        )];
+        // The List clips overflow to the ~28% sidebar; the row stays legible and
+        // the frame renders without panicking or breaking layout.
+        let text = render_to_text(&state, 40, 24);
+        assert!(
+            text.contains('◐'),
+            "active glyph survives narrow width: {text}"
+        );
+    }
+
+    #[test]
+    fn roster_no_color_states_legible_by_glyph_and_label() {
+        // Under NO_COLOR every state must read from glyph + label alone.
+        let mut state = state_with_input("", false);
+        state.run_state = RunState::Running;
+        state.roster_rows = vec![
+            roster_row("a", "Aida", 0, ActivityState::Active, None, None),
+            roster_row("b", "Bram", 1, ActivityState::NeedsInput, None, None),
+            roster_row("c", "Cody", 2, ActivityState::Stalled, None, None),
+        ];
+        let no_color_ui = TuiUiState {
+            theme: Theme::resolve(TerminalCaps {
+                no_color: true,
+                truecolor: false,
+            }),
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &no_color_ui, 100, 24);
+        assert!(text.contains('◐') && text.contains("working"));
+        assert!(text.contains('◔') && text.contains("waiting"));
+        assert!(text.contains('○') && text.contains("stalled?"));
     }
 
     #[test]
     fn ctrl_l_roster_render_shows_each_agent_after_extraction() {
-        let state = AppState {
+        let mut state = AppState {
             session_id: "session".to_string(),
             run_state: RunState::Running,
             active_run_id: Some("run".to_string()),
@@ -4744,18 +4975,18 @@ mod tests {
             input: String::new(),
             git_context: None,
         };
+        populate_roster_rows(&mut state);
         let ui_state = TuiUiState {
             roster_visible: true,
             ..TuiUiState::default()
         };
         let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
         assert!(text.contains("Agent Roster"));
-        // First agent: name, runtime/model, availability label.
+        // The roster view-model carries name + runtime/model (availability is no
+        // longer a roster field — the rewrite shows activity instead, ADR-003).
         assert!(text.contains("Fixer"));
         assert!(text.contains("codex/default"));
-        // Second agent (unavailable): name, runtime/model, `down` label.
         assert!(text.contains("claude/default"));
-        assert!(text.contains("down"));
     }
 
     #[test]
@@ -4789,7 +5020,7 @@ mod tests {
 
     #[test]
     fn renders_agent_availability_events_and_input() {
-        let state = AppState {
+        let mut state = AppState {
             session_id: "session".to_string(),
             run_state: RunState::Running,
             active_run_id: Some("run".to_string()),
@@ -4826,11 +5057,12 @@ mod tests {
             input: "follow up".to_string(),
             git_context: None,
         };
+        populate_roster_rows(&mut state);
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Fixer"));
         assert!(text.contains("codex/default"));
         assert!(text.contains("effort:high"));
-        assert!(text.contains("down"));
+        // Availability ("down") is no longer a roster field (ADR-003 view-model).
         assert!(text.contains("Fixer step started."));
         assert!(text.contains("follow up"));
     }
@@ -4924,6 +5156,7 @@ mod tests {
             availability: None,
             status: "streaming".to_string(),
         }];
+        populate_roster_rows(&mut state);
 
         let text = render_to_text(&state, 100, 24);
 
@@ -8784,7 +9017,8 @@ runtime = "fake"
     /// resolves to truecolor or to the `NO_COLOR` (terminal-default) tier.
     #[test]
     fn no_color_render_matches_truecolor_text_content() {
-        let state = state_with_agent_roster("draft prompt");
+        let mut state = state_with_agent_roster("draft prompt");
+        populate_roster_rows(&mut state);
         let truecolor = render_to_text(&state, 80, 24);
 
         let no_color_ui = TuiUiState {
@@ -9893,11 +10127,21 @@ runtime = "fake"
 
     #[test]
     fn roster_names_carry_same_accents_as_chat() {
+        // ADR-005: accent follows canonical identity, not render position. Fixer
+        // is canonical index 1 but pinned to the top row (NeedsInput); its name
+        // must still render `accent_for(1)` — the same accent the chat transcript
+        // resolves for that agent (by its canonical position in `agents`).
         let theme = TuiUiState::default().theme;
         let mut state = state_with_input("", false);
         state.agents = vec![
             agent_view("explorer", "Explorer", "idle", &[]),
             agent_view("fixer", "Fixer", "idle", &[]),
+        ];
+        // Pinned-reorder roster: NeedsInput Fixer (canonical accent 1) at row 0,
+        // Explorer (canonical accent 0) below it.
+        state.roster_rows = vec![
+            roster_row("fixer", "Fixer", 1, ActivityState::NeedsInput, None, None),
+            roster_row("explorer", "Explorer", 0, ActivityState::Idle, None, None),
         ];
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -9907,11 +10151,12 @@ runtime = "fake"
             .unwrap();
         let buffer = terminal.backend().buffer();
 
+        // Pinned to row 0, Fixer keeps its canonical accent — not the row-0 accent.
+        assert_eq!(title_cell_fg(buffer, "Fixer").unwrap(), theme.accent_for(1));
         assert_eq!(
             title_cell_fg(buffer, "Explorer").unwrap(),
             theme.accent_for(0)
         );
-        assert_eq!(title_cell_fg(buffer, "Fixer").unwrap(), theme.accent_for(1));
     }
 
     #[test]

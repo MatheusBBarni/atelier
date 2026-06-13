@@ -273,7 +273,7 @@ pub enum AppEvent {
 /// `LiveStepView`, or the durable history record (ADR-004) so wall-clock
 /// `Instant`s stay out of the event stream.
 #[derive(Clone, Copy, Debug)]
-struct StepTiming {
+pub(crate) struct StepTiming {
     started_at: Instant,
     last_activity: Instant,
 }
@@ -5194,7 +5194,7 @@ fn format_coarse_elapsed(elapsed: Duration) -> String {
 /// that order *before* the pin so reordering never recolors an agent. `now` is
 /// injected for determinism — production passes `Instant::now()`, tests a fixed
 /// `Instant`.
-fn build_roster_rows(
+pub(crate) fn build_roster_rows(
     agents: &[AgentView],
     live_steps: &[LiveStepView],
     timing: &BTreeMap<String, StepTiming>,
