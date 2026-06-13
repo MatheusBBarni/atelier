@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
@@ -206,6 +207,25 @@ pub struct UiConfig {
 pub struct WorkspacePolicy {
     pub extra_read_roots: Vec<PathBuf>,
     pub extra_write_roots: Vec<PathBuf>,
+    /// Opt-in (`[workspace] allow_unrestricted_reads = true`): let the model
+    /// read any absolute path on the machine. Reads only — writes still require
+    /// `extra_write_roots`.
+    #[serde(default)]
+    pub allow_unrestricted_reads: bool,
+}
+
+impl WorkspacePolicy {
+    /// Read roots the model may target. When `allow_unrestricted_reads` is set,
+    /// the filesystem root is returned so every absolute path is a valid read
+    /// root; otherwise only the configured `extra_read_roots` apply. Writes are
+    /// unaffected — they always gate on `extra_write_roots`.
+    pub fn read_roots(&self) -> Cow<'_, [PathBuf]> {
+        if self.allow_unrestricted_reads {
+            Cow::Owned(vec![PathBuf::from(std::path::MAIN_SEPARATOR_STR)])
+        } else {
+            Cow::Borrowed(&self.extra_read_roots)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -403,6 +423,7 @@ struct RawPreset {
 struct RawWorkspacePolicy {
     extra_read_roots: Option<Vec<PathBuf>>,
     extra_write_roots: Option<Vec<PathBuf>>,
+    allow_unrestricted_reads: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -804,6 +825,9 @@ impl MergedConfig {
                     .into_iter()
                     .map(|path| resolve_config_path(source_dir, path))
                     .collect();
+            }
+            if let Some(allow_unrestricted_reads) = workspace.allow_unrestricted_reads {
+                self.workspace.allow_unrestricted_reads = allow_unrestricted_reads;
             }
         }
 
@@ -1511,7 +1535,6 @@ fn insert_builtin_agent(agents: &mut BTreeMap<String, MergedAgentProfile>, agent
 }
 
 pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConfig> {
-    let explicit_config_path = options.config_path.is_some();
     let working_directory = options.working_directory.canonicalize().with_context(|| {
         format!(
             "failed to resolve working directory {}",
@@ -1520,34 +1543,61 @@ pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConf
     })?;
     let mut merged = MergedConfig::builtin(working_directory.clone());
 
-    let env_config_path = env::var_os("MULTIAGENT_CONFIG").map(PathBuf::from);
-    let config_path = options.config_path.or(env_config_path.clone());
-    let home_config = config_path.unwrap_or_else(default_home_config_path);
-    let explicit_home_config = explicit_config_path || env_config_path.is_some();
+    let env_config_path = env::var_os("ATELIER_CONFIG")
+        .or_else(|| env::var_os("MULTIAGENT_CONFIG")) // back-compat
+        .map(PathBuf::from);
+    let config_path = options.config_path.or(env_config_path);
 
-    if home_config.exists() {
+    if let Some(home_config) = config_path {
+        // Explicit path (CLI flag or env var): it must exist.
+        if home_config.exists() {
+            apply_config_file(&mut merged, &home_config)?;
+        } else {
+            bail!(
+                "configured harness configuration file does not exist: {}",
+                home_config.display()
+            );
+        }
+    } else if let Some(home_config) =
+        first_existing([default_home_config_path(), legacy_home_config_path()])
+    {
+        // No explicit path: prefer ~/.config/.atelier/atelier.toml, but still
+        // load the legacy ~/.config/.multiagent/multiagent.toml if that's all
+        // that exists.
         apply_config_file(&mut merged, &home_config)?;
-    } else if explicit_home_config {
-        bail!(
-            "configured harness configuration file does not exist: {}",
-            home_config.display()
-        );
     }
 
-    let local_config = working_directory.join("multiagent.toml");
-    if local_config.exists() {
+    // Local override: prefer ./atelier.toml, fall back to legacy ./multiagent.toml.
+    if let Some(local_config) = first_existing([
+        working_directory.join("atelier.toml"),
+        working_directory.join("multiagent.toml"),
+    ]) {
         apply_config_file(&mut merged, &local_config)?;
     }
 
     merged.into_effective()
 }
 
-pub fn default_home_config_path() -> PathBuf {
+/// Legacy home config location, kept so configs written before the `.atelier`
+/// rename keep loading without a manual move.
+fn legacy_home_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join(".multiagent")
         .join("multiagent.toml")
+}
+
+fn first_existing<I: IntoIterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| path.exists())
+}
+
+pub fn default_home_config_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join(".atelier")
+        .join("atelier.toml")
 }
 
 fn apply_config_file(merged: &mut MergedConfig, path: &Path) -> Result<()> {
@@ -2272,7 +2322,7 @@ mod tests {
 
     fn load_from_temp(contents: &str) -> Result<EffectiveConfig> {
         let dir = tempdir()?;
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(&config_path, contents)?;
         load_effective_config(ConfigLoadOptions {
             working_directory: dir.path().to_path_buf(),
@@ -2335,7 +2385,7 @@ mod tests {
     #[test]
     fn default_home_config_path_uses_dot_config_multiagent() {
         let path = default_home_config_path();
-        assert!(path.ends_with(Path::new(".config/.multiagent/multiagent.toml")));
+        assert!(path.ends_with(Path::new(".config/.atelier/atelier.toml")));
     }
 
     #[test]
@@ -2470,7 +2520,7 @@ effort = "minimal"
         )
         .unwrap();
         fs::write(
-            dir.path().join("multiagent.toml"),
+            dir.path().join("atelier.toml"),
             r#"
 [agents.fixer]
 model = "local-model"
@@ -2489,6 +2539,69 @@ model = "local-model"
         assert_eq!(fixer.model, "local-model");
         assert_eq!(fixer.model_fallbacks, vec!["preset-fallback"]);
         assert_eq!(fixer.effort, AgentEffort::Minimal);
+    }
+
+    #[test]
+    fn workspace_allow_unrestricted_reads_parses_and_widens_read_roots() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("atelier.toml"),
+            r#"
+[workspace]
+allow_unrestricted_reads = true
+"#,
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        assert!(config.workspace.allow_unrestricted_reads);
+        // The flag turns the filesystem root into the read root; writes untouched.
+        assert_eq!(
+            config.workspace.read_roots().to_vec(),
+            vec![PathBuf::from(std::path::MAIN_SEPARATOR_STR)]
+        );
+        assert!(config.workspace.extra_write_roots.is_empty());
+    }
+
+    #[test]
+    fn legacy_local_multiagent_toml_is_still_loaded() {
+        // Configs written before the `.atelier` rename keep working without a
+        // manual move: ./multiagent.toml is still discovered as a local override.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("multiagent.toml"),
+            "[workspace]\nallow_unrestricted_reads = true\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        assert!(config.workspace.allow_unrestricted_reads);
+    }
+
+    #[test]
+    fn workspace_read_roots_default_to_configured_extra_roots() {
+        let default = WorkspacePolicy::default();
+        assert!(!default.allow_unrestricted_reads);
+        assert!(default.read_roots().is_empty());
+
+        let scoped = WorkspacePolicy {
+            extra_read_roots: vec![PathBuf::from("/tmp/refs")],
+            ..Default::default()
+        };
+        assert_eq!(
+            scoped.read_roots().to_vec(),
+            vec![PathBuf::from("/tmp/refs")]
+        );
     }
 
     #[test]
@@ -2511,7 +2624,7 @@ effort = "high"
         )
         .unwrap();
         fs::write(
-            dir.path().join("multiagent.toml"),
+            dir.path().join("atelier.toml"),
             r#"
 preset = "accurate"
 "#,

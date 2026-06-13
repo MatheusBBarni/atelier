@@ -91,7 +91,7 @@ pub struct HistoryStore {
 
 impl HistoryStore {
     pub fn create(working_directory: &Path) -> Result<Self> {
-        let root = working_directory.join(".multiagent");
+        let root = working_directory.join(".atelier");
         let session_id = new_id();
         let session_dir = root.join("sessions").join(&session_id);
         let artifacts_dir = session_dir.join("artifacts");
@@ -238,8 +238,13 @@ impl HistoryStore {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let relative_path = path
-            .strip_prefix(&self.root)
+        // Report the path relative to the workspace root (so it includes the
+        // `.atelier/` prefix) — that form is findable and copyable from the
+        // project root, unlike a path relative to the hidden data dir.
+        let relative_path = self
+            .root
+            .parent()
+            .and_then(|workspace| path.strip_prefix(workspace).ok())
             .unwrap_or(&path)
             .to_string_lossy()
             .to_string();
@@ -279,7 +284,7 @@ pub fn read_events_from_path(path: &Path) -> Result<Vec<HistoryEvent>> {
 }
 
 pub fn clean_sessions(working_directory: &Path) -> Result<Vec<PathBuf>> {
-    let root = working_directory.join(".multiagent");
+    let root = working_directory.join(".atelier");
     let targets = [root.join("sessions"), root.join("runs")];
     let mut deleted = Vec::new();
     for target in targets {
@@ -382,6 +387,11 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
         assert!(store.session_dir().join("artifacts").exists());
+        // The reported path is workspace-relative (keeps the `.atelier/` prefix)
+        // and resolves back to the file from the project root, so it is findable
+        // and copyable.
+        assert!(artifact.path.starts_with(".atelier/sessions/"));
+        assert!(dir.path().join(&artifact.path).is_file());
     }
 
     #[test]
@@ -431,7 +441,7 @@ mod tests {
     #[test]
     fn cleanup_deletes_only_sessions_and_runs() {
         let dir = tempdir().unwrap();
-        let root = dir.path().join(".multiagent");
+        let root = dir.path().join(".atelier");
         fs::create_dir_all(root.join("sessions/a")).unwrap();
         fs::create_dir_all(root.join("runs")).unwrap();
         fs::write(root.join("debug.log"), "keep").unwrap();

@@ -106,10 +106,11 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
     }
 
     if cli.init_config {
-        let path = cli
-            .config
-            .clone()
-            .or_else(|| env::var_os("MULTIAGENT_CONFIG").map(PathBuf::from));
+        let path = cli.config.clone().or_else(|| {
+            env::var_os("ATELIER_CONFIG")
+                .or_else(|| env::var_os("MULTIAGENT_CONFIG")) // back-compat
+                .map(PathBuf::from)
+        });
         let summary = init_config(path)?;
         for path in &summary.created {
             println!("created {}", path.display());
@@ -247,7 +248,7 @@ mod tests {
 
         run_cli_with(cli).await.unwrap();
 
-        assert!(dir.path().join(".multiagent/codemap.json").exists());
+        assert!(dir.path().join(".atelier/codemap.json").exists());
         assert!(dir.path().join("codemap.md").exists());
     }
 

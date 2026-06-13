@@ -149,7 +149,7 @@ impl ChatProjection {
                     "[{}:{marker}:#{}] {}",
                     stream.stream,
                     stream.sequence_end,
-                    concise(&stream.content, MAX_SUMMARY_CHARS)
+                    readable_stream_preview(&stream.content)
                 )));
             }
         }
@@ -2220,6 +2220,55 @@ fn human_json_summary(value: &Value) -> Option<String> {
     Some(format!("{} fields", object.len()))
 }
 
+/// Render a live runtime stream chunk as a readable one-liner. Runtime stderr is
+/// frequently raw JSON — structured-response chunks and coalesced event
+/// envelopes (e.g. `{"kind":"runtime_stream_delta","payload":{"content":{"preview":…}}}`).
+/// Surface the human-readable text buried inside rather than the escaped blob;
+/// fall back to a compact summary, then to the trimmed text for non-JSON output.
+fn readable_stream_preview(content: &str) -> String {
+    match json_value_from_text(content) {
+        Some(value) => readable_string_in(&value, 3)
+            .or_else(|| human_json_summary(&value))
+            .unwrap_or_else(|| concise(content, MAX_SUMMARY_CHARS)),
+        None => concise(content, MAX_SUMMARY_CHARS),
+    }
+}
+
+/// Find the first human-readable string in known content fields, recursing up to
+/// `depth` levels through wrapper keys (`payload`/`content`/…). Surfaces a
+/// streamed `preview`/`text` buried inside an event envelope without dumping the
+/// whole structure.
+fn readable_string_in(value: &Value, depth: usize) -> Option<String> {
+    let object = value.as_object()?;
+    for key in [
+        "summary",
+        "final_summary",
+        "message",
+        "preview",
+        "text",
+        "content",
+        "delta",
+    ] {
+        if let Some(text) = object.get(key).and_then(Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(concise(trimmed, MAX_SUMMARY_CHARS));
+            }
+        }
+    }
+    if depth > 0 {
+        for key in ["payload", "content", "data", "result"] {
+            if let Some(found) = object
+                .get(key)
+                .and_then(|nested| readable_string_in(nested, depth - 1))
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 fn human_json_body_lines(value: &Value) -> Vec<ChatLineView> {
     match value {
         Value::Object(object) => human_json_object_lines(object),
@@ -3148,6 +3197,30 @@ mod tests {
             .body
             .iter()
             .any(|line| line.text.contains("[stdout:final:#3-5]")));
+    }
+
+    #[test]
+    fn live_stream_preview_surfaces_buried_text_from_event_envelope() {
+        // A coalesced runtime_stream_delta event: the real streamed text lives at
+        // payload.content.preview, not the top-level envelope. The live "running"
+        // line should show that text, not the raw escaped JSON blob.
+        let raw = r#"{"event_id":"01ABC","group_id":null,"kind":"runtime_stream_delta","payload":{"agent":"explorer","coalesced":true,"content":{"chars":2044,"preview":"reading the orchestrator module"}}}"#;
+        let preview = readable_stream_preview(raw);
+        assert_eq!(preview, "reading the orchestrator module");
+        assert!(!preview.contains("event_id"));
+        assert!(!preview.contains("runtime_stream_delta"));
+    }
+
+    #[test]
+    fn live_stream_preview_passes_plain_text_through() {
+        assert_eq!(readable_stream_preview("checking files"), "checking files");
+    }
+
+    #[test]
+    fn live_stream_preview_uses_summary_for_structured_response() {
+        let raw =
+            r#"{"status":"completed","agent":"reviewer","summary":"no blocking issues found"}"#;
+        assert_eq!(readable_stream_preview(raw), "no blocking issues found");
     }
 
     #[test]

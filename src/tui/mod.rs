@@ -1529,7 +1529,7 @@ fn refresh_skill_suggestions(
 
 fn skill_cache_path(working_directory: &Path) -> PathBuf {
     working_directory
-        .join(".multiagent")
+        .join(".atelier")
         .join("skills-cache.json")
 }
 
@@ -4945,8 +4945,8 @@ mod tests {
         state.config_status = ConfigStatusView {
             summary: "Config: sources=2 preset=research warnings=1".to_string(),
             sources: vec![
-                "/home/user/.config/.multiagent/multiagent.toml".to_string(),
-                "multiagent.toml".to_string(),
+                "/home/user/.config/.atelier/atelier.toml".to_string(),
+                "atelier.toml".to_string(),
             ],
             preset: Some("research".to_string()),
             warnings: vec!["enabled agents without model_fallbacks: explorer".to_string()],

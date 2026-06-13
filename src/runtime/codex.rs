@@ -33,7 +33,7 @@ impl CodexRuntime {
                 runtime_id: self.config.id.clone(),
                 status: RuntimeAvailabilityStatus::Unavailable,
                 message: "codex command is not configured".to_string(),
-                remediation: Some("Set [runtimes.codex].command in multiagent.toml.".to_string()),
+                remediation: Some("Set [runtimes.codex].command in atelier.toml.".to_string()),
             };
         };
 

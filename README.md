@@ -25,7 +25,7 @@ an orchestrator and a sequence of specialized agent profiles.
 - Configurable agents with explicit capabilities and scopes.
 - Preset-based agent overrides, model fallback chains, and per-agent tool allowlists.
 - Serial council workflow for high-risk or user-requested decision review.
-- Durable per-session history and artifacts under `.multiagent/`.
+- Durable per-session history and artifacts under `.atelier/`.
 - Strict capability checks for file and command actions.
 - Deterministic local tests with optional integration paths.
 
@@ -115,11 +115,11 @@ Notes:
 
 Codemaps are visible repository docs for agents and users. `atelier --codemap
 init` writes folder-level `codemap.md` files and stores hashes in
-`.multiagent/codemap.json`. `atelier --codemap changes` compares current file
+`.atelier/codemap.json`. `atelier --codemap changes` compares current file
 hashes with that state and reports stale map paths. `atelier --codemap update`
 regenerates maps and refreshes the state.
 
-Codemap generation excludes `.git`, `.multiagent`, `target`, and common build or
+Codemap generation excludes `.git`, `.atelier`, `target`, and common build or
 dependency folders such as `node_modules`, `vendor`, `dist`, and `build`.
 Generated `codemap.md` files are excluded from hashes so editing a map does not
 make the workspace stale by itself.
@@ -162,8 +162,8 @@ clarification and approval prompts.
 Configuration is merged in this order:
 
 1. Built-in defaults
-2. Home config: `~/.config/.multiagent/multiagent.toml`
-3. Local override: `./multiagent.toml`
+2. Home config: `~/.config/.atelier/atelier.toml`
+3. Local override: `./atelier.toml`
 4. CLI flags (`--config` or `--cwd`)
 
 You can also set `MULTIAGENT_CONFIG` to choose the home config path.
@@ -213,15 +213,15 @@ Important values:
 
 Use `codex` when you want the installed Codex CLI and its login flow. ChatGPT
 subscription-backed Codex usage goes through Codex local auth, not an
-`OPENAI_API_KEY` in `multiagent.toml`.
+`OPENAI_API_KEY` in `atelier.toml`.
 
 ## Session history
 
 Session artifacts are stored in:
 
-- `.multiagent/sessions/<session-id>/events.jsonl`
-- `.multiagent/sessions/<session-id>/artifacts/*`
-- `.multiagent/runs/<run-id>.json`
+- `.atelier/sessions/<session-id>/events.jsonl`
+- `.atelier/sessions/<session-id>/artifacts/*`
+- `.atelier/runs/<run-id>.json`
 
 Use `--clean-sessions` to delete project-local history. Use `--yes` to skip confirmation.
 

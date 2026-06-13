@@ -275,14 +275,14 @@ fn working_directory_check(config: &EffectiveConfig) -> DoctorCheck {
 }
 
 fn history_writability_check(config: &EffectiveConfig) -> DoctorCheck {
-    let history_root = config.working_directory.join(".multiagent");
+    let history_root = config.working_directory.join(".atelier");
     match probe_history_writable(&history_root) {
         Ok(()) => DoctorCheck {
             id: "history.writable".to_string(),
             title: "Session History".to_string(),
             status: DoctorStatus::Ok,
             severity: DoctorSeverity::Info,
-            message: ".multiagent history directory can be created and written".to_string(),
+            message: ".atelier history directory can be created and written".to_string(),
             remediation: None,
             context: Some(serde_json::json!({ "path": history_root })),
         },
@@ -335,7 +335,7 @@ fn permission_checks(config: &EffectiveConfig) -> Vec<DoctorCheck> {
             path,
         ));
     }
-    let history_root = config.working_directory.join(".multiagent");
+    let history_root = config.working_directory.join(".atelier");
     if history_root.exists() {
         checks.push(permission_check(
             "history.permissions",
@@ -445,8 +445,8 @@ mod tests {
             .find(|check| check.id == "history.writable")
             .unwrap();
         assert_eq!(check.status, DoctorStatus::Ok);
-        assert!(dir.path().join(".multiagent").is_dir());
-        assert!(fs::read_dir(dir.path().join(".multiagent"))
+        assert!(dir.path().join(".atelier").is_dir());
+        assert!(fs::read_dir(dir.path().join(".atelier"))
             .unwrap()
             .all(|entry| !entry
                 .unwrap()
@@ -461,7 +461,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(&config_path, "schema_version = 1\n").unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644)).unwrap();
         let config = load_effective_config(ConfigLoadOptions {
@@ -486,7 +486,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("agents")).unwrap();
         fs::write(dir.path().join("agents/explorer.md"), "secret prompt").unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -556,7 +556,7 @@ exit 64
         .unwrap();
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             format!(
@@ -612,7 +612,7 @@ model = "default"
         .unwrap();
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             format!(
@@ -673,7 +673,7 @@ exit 64
         .unwrap();
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             format!(

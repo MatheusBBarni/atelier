@@ -20,11 +20,11 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Directory names pruned from the walk regardless of `.gitignore` — VCS
 /// metadata plus build/dependency noise. Mirrors `codemap`'s `EXCLUDED_DIRS`
-/// (the task requires at minimum `.multiagent`, `target`, and `node_modules`).
+/// (the task requires at minimum `.atelier`, `target`, and `node_modules`).
 const FORCE_EXCLUDED_DIRS: &[&str] = &[
     ".git",
     ".hg",
-    ".multiagent",
+    ".atelier",
     ".next",
     ".pytest_cache",
     ".ruff_cache",

@@ -1230,12 +1230,28 @@ h3 {
   margin-top: 0;
 }
 
+.doc-prose h1,
 .doc-prose h2,
 .doc-prose h3,
 .doc-prose h4 {
   margin-top: 2em;
   margin-bottom: 0.6em;
   scroll-margin-top: 24px;
+}
+
+/* DocsLayout already renders the page title from frontmatter (`.docs__title`),
+   so a leading `# Heading` in Markdown (e.g. the generated emit-docs config/CLI
+   pages) is a duplicate — and unstyled it would inherit the marketing hero h1
+   (up to 12rem) and overflow. Drop the redundant first heading; keep any later
+   h1 at a readable prose scale instead of the hero size. */
+.doc-prose > h1:first-child {
+  display: none;
+}
+
+.doc-prose h1 {
+  max-width: none;
+  font-size: 1.9rem;
+  line-height: 1.15;
 }
 
 .doc-prose h2 {

@@ -12,7 +12,7 @@ use tokio::time::timeout;
 
 const DEFAULT_SEARCH_EXCLUDED_DIRS: &[&str] = &[
     ".git",
-    ".multiagent",
+    ".atelier",
     "target",
     "node_modules",
     ".next",
@@ -172,7 +172,7 @@ pub fn validate_action_request_with_scope(
     let base_decision = match request.kind {
         ActionKind::ReadFile | ActionKind::ListFiles | ActionKind::SearchText => {
             if let Some(path) = path_param(&request.params) {
-                if let Err(error) = validate_model_path(path, &workspace.extra_read_roots) {
+                if let Err(error) = validate_model_path(path, &workspace.read_roots()) {
                     return ActionDecision::Denied(error.to_string());
                 }
             }
@@ -651,13 +651,13 @@ fn validate_parallel_read_path(
     path: &str,
     workspace: &WorkspacePolicy,
 ) -> Result<()> {
-    let path = validate_model_path(path, &workspace.extra_read_roots)?;
+    let path = validate_model_path(path, &workspace.read_roots())?;
     if scope_path_matches_any(
         &path,
         &scope.write_files,
         &workspace.extra_write_roots,
         true,
-    )? || scope_path_is_under_any(&path, &scope.read_roots, &workspace.extra_read_roots)?
+    )? || scope_path_is_under_any(&path, &scope.read_roots, &workspace.read_roots())?
     {
         return Ok(());
     }
@@ -672,8 +672,8 @@ fn validate_parallel_read_root(
     path: &str,
     workspace: &WorkspacePolicy,
 ) -> Result<()> {
-    let path = validate_model_path(path, &workspace.extra_read_roots)?;
-    if scope_path_is_under_any(&path, &scope.read_roots, &workspace.extra_read_roots)? {
+    let path = validate_model_path(path, &workspace.read_roots())?;
+    if scope_path_is_under_any(&path, &scope.read_roots, &workspace.read_roots())? {
         return Ok(());
     }
     bail!(
@@ -797,7 +797,7 @@ fn execute_read_file(
     let resolved = resolve_action_path(
         &context.working_directory,
         path,
-        &context.workspace.extra_read_roots,
+        &context.workspace.read_roots(),
         true,
     )?;
     let contents = fs::read_to_string(&resolved)
@@ -819,7 +819,7 @@ fn execute_list_files(
     let resolved = resolve_action_path(
         &context.working_directory,
         path,
-        &context.workspace.extra_read_roots,
+        &context.workspace.read_roots(),
         true,
     )?;
     let max_entries = optional_u64_param(&request.params, "max_entries")
@@ -852,7 +852,7 @@ fn execute_search_text(
     let resolved = resolve_action_path(
         &context.working_directory,
         path,
-        &context.workspace.extra_read_roots,
+        &context.workspace.read_roots(),
         true,
     )?;
     let max_matches = optional_u64_param(&request.params, "max_matches")
@@ -1478,6 +1478,95 @@ mod tests {
     }
 
     #[test]
+    fn unrestricted_reads_flag_allows_absolute_read_outside_workspace() {
+        let (mut config, explorer) = fixture_agent("explorer");
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::ReadFile,
+            params: json!({ "path": "/Users/nobody/.claude/reference.md" }),
+        };
+
+        // Default policy: absolute paths outside the workspace are denied.
+        let denied = validate_action_request(
+            &explorer,
+            &config.workspace,
+            &config.approval_mode,
+            &request,
+        );
+        assert!(
+            matches!(&denied, ActionDecision::Denied(reason) if reason.contains("absolute paths are not allowed")),
+            "expected absolute-path denial, got {denied:?}"
+        );
+
+        // Opting in lets the model read any absolute path.
+        config.workspace.allow_unrestricted_reads = true;
+        let allowed = validate_action_request(
+            &explorer,
+            &config.workspace,
+            &config.approval_mode,
+            &request,
+        );
+        assert!(
+            matches!(allowed, ActionDecision::Allowed),
+            "got {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn unrestricted_reads_flag_keeps_writes_restricted() {
+        // The flag is reads-only: writes outside the workspace stay denied even
+        // for a write-capable agent.
+        let (mut config, fixer) = fixture_agent("fixer");
+        config.workspace.allow_unrestricted_reads = true;
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::WriteFile,
+            params: json!({ "path": "/Users/nobody/.claude/reference.md" }),
+        };
+
+        let decision =
+            validate_action_request(&fixer, &config.workspace, &config.approval_mode, &request);
+        assert!(
+            matches!(&decision, ActionDecision::Denied(reason) if reason.contains("absolute paths are not allowed")),
+            "writes must stay restricted, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn unrestricted_reads_flag_executes_absolute_read_outside_workspace() {
+        let (mut config, _explorer) = fixture_agent("explorer");
+        let workspace_dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+        let outside_file = outside_dir.path().join("reference.md");
+        fs::write(&outside_file, "OUTSIDE_REFERENCE_BODY").unwrap();
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::ReadFile,
+            params: json!({ "path": outside_file.to_str().unwrap() }),
+        };
+
+        // Execution refuses the absolute path without the flag...
+        let denied_ctx = action_context(workspace_dir.path(), &config);
+        assert!(execute_read_file(&denied_ctx, &request).is_err());
+
+        // ...and reads it when the flag is set.
+        config.workspace.allow_unrestricted_reads = true;
+        let allowed_ctx = action_context(workspace_dir.path(), &config);
+        let result = execute_read_file(&allowed_ctx, &request).unwrap();
+        let body = result.content.unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(body, "OUTSIDE_REFERENCE_BODY");
+    }
+
+    #[test]
     fn path_scope_rejects_traversal() {
         let error = validate_model_path("../secret", &[]).unwrap_err();
         assert!(error.to_string().contains("traversal"));
@@ -1633,10 +1722,10 @@ mod tests {
     #[tokio::test]
     async fn search_text_skips_harness_runtime_history_by_default() {
         let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".multiagent/sessions/session")).unwrap();
+        fs::create_dir_all(dir.path().join(".atelier/sessions/session")).unwrap();
         fs::create_dir_all(dir.path().join("docs")).unwrap();
         fs::write(
-            dir.path().join(".multiagent/sessions/session/events.jsonl"),
+            dir.path().join(".atelier/sessions/session/events.jsonl"),
             "npm distribution plan\n".repeat(20),
         )
         .unwrap();

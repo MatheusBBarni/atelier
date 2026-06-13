@@ -77,7 +77,7 @@ fn frontmatter(title: &str, nav_order: u32) -> String {
 /// Renders the Configuration reference from the redacted [`build_printable_config`]
 /// projection. The full effective config is shown once as a canonical TOML block (identical
 /// to `--print-config`, so it cannot drift), followed by one section per top-level
-/// `multiagent.toml` table — each heading carries the literal `[section]` token so the
+/// `atelier.toml` table — each heading carries the literal `[section]` token so the
 /// coverage test can assert every section is documented.
 fn render_configuration(config: &EffectiveConfig) -> Result<String> {
     let printable = build_printable_config(config);

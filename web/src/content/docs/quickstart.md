@@ -51,7 +51,7 @@ Before touching any credential, see the orchestration loop run end to end. The
 step → complete loop the real runtimes drive, but it simulates the work instead
 of calling a provider. It needs no key and no login.
 
-In a scratch directory, create a local `multiagent.toml` that points every
+In a scratch directory, create a local `atelier.toml` that points every
 default agent at the `fake` runtime:
 
 ```toml
@@ -88,7 +88,7 @@ open a plan, route a step to an agent, stream progress, and finish the run — t
 shape of every real run, with nothing to configure. This is a preview, not a
 real result; the `fake` runtime never reads your files or calls a model.
 
-When you've seen the loop, delete the scratch `multiagent.toml` (or leave the
+When you've seen the loop, delete the scratch `atelier.toml` (or leave the
 directory) and move on to a real run.
 
 ## Connect a real runtime and make your first run
@@ -99,8 +99,8 @@ Generate a starter configuration and instruction files:
 atelier --init-config
 ```
 
-This writes `multiagent.toml` (and `agents/*.md` prompts) under
-`~/.config/.multiagent/`. Open that file once to see the stock defaults — the
+This writes `atelier.toml` (and `agents/*.md` prompts) under
+`~/.config/.atelier/`. Open that file once to see the stock defaults — the
 orchestrator on `zai`, the workers on `codex`.
 
 Provide the credentials the defaults expect:
@@ -135,8 +135,8 @@ flows without interruption. To *see* the control plane at the moment it acts,
 switch to `normal` mode, where every write or command action pauses for your
 explicit approval.
 
-Edit the `multiagent.toml` that `atelier --init-config` created (under
-`~/.config/.multiagent/`) and set:
+Edit the `atelier.toml` that `atelier --init-config` created (under
+`~/.config/.atelier/`) and set:
 
 ```toml
 approval_mode = "normal"

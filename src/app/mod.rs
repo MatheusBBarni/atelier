@@ -226,12 +226,27 @@ pub enum AppEvent {
     RunInterruptRequested,
 }
 
+/// Internal per-step lifecycle timing used to drive elapsed display and stall
+/// detection (Task 03). Held only on `App`; never serialized into `AppState`,
+/// `LiveStepView`, or the durable history record (ADR-004) so wall-clock
+/// `Instant`s stay out of the event stream.
+#[derive(Clone, Copy, Debug)]
+struct StepTiming {
+    started_at: Instant,
+    last_activity: Instant,
+}
+
 #[derive(Debug)]
 pub struct App {
     config: EffectiveConfig,
     history: HistoryStore,
     availability: BTreeMap<String, RuntimeAvailability>,
     state: AppState,
+    /// `step_id -> StepTiming`. Stamped on step registration, bumped on stream
+    /// arrival and active status transitions, cleared on step end. Private and
+    /// non-serialized (ADR-004); keyed by `step_id` so concurrent steps in a
+    /// parallel group track timing independently of one another.
+    step_timings: BTreeMap<String, StepTiming>,
     chat_projection: ChatProjection,
     pending_approval: Option<PendingApproval>,
     pending_clarification: Option<PendingClarification>,
@@ -778,6 +793,7 @@ impl App {
             history,
             availability,
             state,
+            step_timings: BTreeMap::new(),
             chat_projection: ChatProjection::new(),
             pending_approval: None,
             pending_clarification: None,
@@ -955,7 +971,10 @@ impl App {
                 .as_ref()
                 .map_or(prompt.as_str(), |start| start.command.prompt.as_str()),
         )?;
-        let mut visible_prompt = compiled_prompt.user_prompt.clone();
+        // Show the prompt as the user typed it so `/skill:` references stay
+        // visible in chat (mirrors the workflow branch below, which displays
+        // `original_command`). `run_prompt` stays stripped for the runtime.
+        let mut visible_prompt = compiled_prompt.submitted_prompt.clone();
         let mut run_prompt = compiled_prompt.user_prompt.clone();
         let mut submitted_prompt = compiled_prompt.submitted_prompt.clone();
         if let Some(start) = workflow_start.as_ref() {
@@ -1268,7 +1287,9 @@ impl App {
     /// run-creation path used by `submit_prompt` for ordinary prompts.
     fn build_follow_up_run(&mut self, prompt: String) -> Result<RunDriveContext> {
         let compiled_prompt = compile_app_prompt(&self.config.working_directory, &prompt)?;
-        let visible_prompt = compiled_prompt.user_prompt.clone();
+        // Keep `/skill:` references visible in the replayed prompt (matches
+        // `submit_prompt`); `run_prompt` stays stripped for the runtime.
+        let visible_prompt = compiled_prompt.submitted_prompt.clone();
         let run_prompt = compiled_prompt.user_prompt.clone();
         let submitted_prompt = compiled_prompt.submitted_prompt.clone();
 
@@ -3297,6 +3318,16 @@ impl App {
             .retain(|live_step| live_step.step_id != step_id || live_step.run_id != run_id);
         self.state.live_steps.push(view.clone());
         self.state.live_step = Some(view);
+        // Stamp lifecycle timing for this step (ADR-004). Both timestamps start
+        // equal; keyed by `step_id` so parallel-group peers stay independent.
+        let now = Instant::now();
+        self.step_timings.insert(
+            step_id.to_string(),
+            StepTiming {
+                started_at: now,
+                last_activity: now,
+            },
+        );
         self.sync_chat_items();
         self.set_agent_status(agent, "running");
     }
@@ -3339,6 +3370,10 @@ impl App {
                 self.active_step = self.active_steps.first().cloned();
             }
         }
+        // Drop the timing entry after the step is cleared from `active_steps`
+        // and `live_steps` to prevent unbounded growth (ADR-004). Done
+        // unconditionally so a missed agent lookup above cannot leak an entry.
+        self.step_timings.remove(step_id);
     }
 
     fn set_agent_status(&mut self, agent_id: &str, status: &str) {
@@ -4357,6 +4392,12 @@ impl App {
         sequence: u32,
         final_delta: bool,
     ) {
+        // Bump activity at the single stream chokepoint (ADR-004) before any
+        // other processing, so stall detection sees the freshest signal even if
+        // the step has no matching live view.
+        if let Some(timing) = self.step_timings.get_mut(step_id) {
+            timing.last_activity = Instant::now();
+        }
         let Some(live_step) = self
             .state
             .live_steps
@@ -4404,6 +4445,13 @@ impl App {
             status,
             LiveStepStatus::Completed | LiveStepStatus::Interrupted | LiveStepStatus::Failed
         );
+        // Bump activity on transitions into the active states where stall
+        // detection matters (ADR-004); terminal/waiting transitions do not.
+        if matches!(status, LiveStepStatus::Running | LiveStepStatus::Streaming) {
+            if let Some(timing) = self.step_timings.get_mut(step_id) {
+                timing.last_activity = Instant::now();
+            }
+        }
         live_step.status = status;
         if final_delta {
             for stream in &mut live_step.streams {
@@ -6087,7 +6135,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn fake_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -6411,6 +6459,41 @@ runtime = "fake"
             assert!(!prompt.contains("<Skill:"));
             assert!(!prompt.contains("SENTINEL_DERIVED_SKILL_BODY_PRIVATE"));
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_submitted_keeps_skill_reference_in_visible_prompt() {
+        // A `/skill:` prompt must render in chat as the user typed it — the
+        // reference stays visible. Only the runtime prompt is stripped.
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "SENTINEL_VISIBLE_SKILL_BODY_PRIVATE",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("/skill:reviewer inspect README")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let submitted = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .expect("prompt_submitted recorded");
+        // Display keeps the reference; the full skill body never leaks into it.
+        assert_eq!(
+            submitted.payload["prompt"], "/skill:reviewer inspect README",
+            "displayed prompt must keep the /skill: reference"
+        );
+        assert_eq!(
+            submitted.payload["submitted_prompt"],
+            "/skill:reviewer inspect README"
+        );
+        let displayed = submitted.payload["prompt"].as_str().unwrap();
+        assert!(!displayed.contains("SENTINEL_VISIBLE_SKILL_BODY_PRIVATE"));
     }
 
     #[tokio::test]
@@ -7127,7 +7210,7 @@ runtime = "fake"
     }
 
     fn fake_parallel_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -7183,7 +7266,7 @@ runtime = "fake"
     }
 
     fn fake_parallel_normal_approval_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -7226,7 +7309,7 @@ runtime = "fake"
     }
 
     fn fake_parallel_low_agent_step_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -7268,7 +7351,7 @@ runtime = "fake"
     }
 
     fn fake_parallel_reviewer_parse_error_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -7315,7 +7398,7 @@ runtime = "fake"
         security_prompt: &str,
         reviewer_prompt: &str,
     ) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             format!(
@@ -7423,7 +7506,7 @@ prompt = "{reviewer_prompt}"
         assert!(history_events
             .iter()
             .any(|event| event.kind == "runtime_stream_delta"));
-        assert!(dir.path().join(".multiagent/runs").exists());
+        assert!(dir.path().join(".atelier/runs").exists());
     }
 
     #[tokio::test]
@@ -8637,7 +8720,7 @@ prompt = "{reviewer_prompt}"
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("agents")).unwrap();
         fs::write(dir.path().join("agents/explorer.md"), "secret prompt body").unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -8867,7 +8950,7 @@ instructions_file = "agents/explorer.md"
     }
 
     fn approval_mode_config(dir: &Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -8898,7 +8981,7 @@ runtime = "fake"
     }
 
     fn single_agent_step_limit_config(dir: &Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -9359,7 +9442,7 @@ runtime = "fake"
         assert!(app.state.active_run_id.is_none());
         let events = app.history.read_events().unwrap();
         assert_no_workflow_run_start_events(&events);
-        let runs_dir = dir.path().join(".multiagent/runs");
+        let runs_dir = dir.path().join(".atelier/runs");
         assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
     }
 
@@ -9382,7 +9465,7 @@ runtime = "fake"
         assert!(app.state.active_run_id.is_none());
         let events = app.history.read_events().unwrap();
         assert_no_workflow_run_start_events(&events);
-        let runs_dir = dir.path().join(".multiagent/runs");
+        let runs_dir = dir.path().join(".atelier/runs");
         assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
     }
 
@@ -9467,7 +9550,7 @@ runtime = "fake"
             .any(|event| event.kind == "orchestrator_decision"));
 
         let run_record =
-            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+            fs::read_to_string(dir.path().join(format!(".atelier/runs/{run_id}.json"))).unwrap();
         assert!(
             run_record.contains("\"submitted_prompt\": \"/workflow parallel create a feature\"")
         );
@@ -9494,7 +9577,7 @@ runtime = "fake"
             .find(|event| event.kind == "run_started")
             .and_then(|event| event.payload["run_id"].as_str())
             .unwrap();
-        let record_path = dir.path().join(format!(".multiagent/runs/{run_id}.json"));
+        let record_path = dir.path().join(format!(".atelier/runs/{run_id}.json"));
         let record: Value =
             serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
         let ledger = record["workflow"]["target_ledger"].as_object().unwrap();
@@ -9746,7 +9829,7 @@ runtime = "fake"
             .find(|event| event.kind == "run_started")
             .and_then(|event| event.payload["run_id"].as_str())
             .unwrap();
-        let record_path = dir.path().join(format!(".multiagent/runs/{run_id}.json"));
+        let record_path = dir.path().join(format!(".atelier/runs/{run_id}.json"));
         let record: Value =
             serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
         let ledger = record["workflow"]["target_ledger"].as_object().unwrap();
@@ -9879,12 +9962,14 @@ runtime = "fake"
             .iter()
             .find(|event| event.kind == "prompt_submitted")
             .unwrap();
+        // The displayed prompt keeps the `/skill:` reference so chat shows what
+        // the user typed; only the runtime prompt is stripped.
         assert_eq!(
             prompt
                 .payload
                 .get("prompt")
                 .and_then(serde_json::Value::as_str),
-            Some("inspect README")
+            Some("/skill:reviewer inspect README")
         );
         assert_eq!(
             prompt
@@ -9928,7 +10013,7 @@ runtime = "fake"
                 && event.kind != "prompt_submitted"
                 && event.kind != "skills_loaded"
         }));
-        let runs_dir = dir.path().join(".multiagent/runs");
+        let runs_dir = dir.path().join(".atelier/runs");
         assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
     }
 
@@ -9975,7 +10060,9 @@ runtime = "fake"
             .iter()
             .find(|event| event.kind == "prompt_submitted")
             .unwrap();
-        assert_eq!(prompt.payload["prompt"], "please use here");
+        // Display keeps the mid-prompt reference as typed; the runtime prompt
+        // (normalized to "please use here") is stripped separately.
+        assert_eq!(prompt.payload["prompt"], "please use /skill:reviewer here");
         assert_eq!(
             events
                 .iter()
@@ -10002,13 +10089,15 @@ runtime = "fake"
         let skills = skills_loaded.payload["skills"].as_array().unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0]["requested_names"], json!(["a"]));
+        // Display shows the prompt as typed (both references kept); only the
+        // runtime prompt is normalized to "do x".
         assert_eq!(
             events
                 .iter()
                 .find(|event| event.kind == "prompt_submitted")
                 .unwrap()
                 .payload["prompt"],
-            "do x"
+            "/skill:a do x /skill:a"
         );
     }
 
@@ -10039,9 +10128,9 @@ runtime = "fake"
 
         let events_jsonl =
             fs::read_to_string(app.history.session_dir().join("events.jsonl")).unwrap();
-        let debug_log = fs::read_to_string(dir.path().join(".multiagent/debug.log")).unwrap();
+        let debug_log = fs::read_to_string(dir.path().join(".atelier/debug.log")).unwrap();
         let run_record =
-            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+            fs::read_to_string(dir.path().join(format!(".atelier/runs/{run_id}.json"))).unwrap();
         let chat_projection = serde_json::to_string(&app.state.chat_items).unwrap();
         let skill_item = app
             .state
@@ -10156,7 +10245,7 @@ runtime = "fake"
             .unwrap();
         let record_path = dir
             .path()
-            .join(".multiagent")
+            .join(".atelier")
             .join("runs")
             .join(format!("{run_id}.json"));
         let record: serde_json::Value =
@@ -10233,7 +10322,7 @@ runtime = "fake"
         );
         let run_id = subtask_started.run_id.as_ref().unwrap();
         let run_record =
-            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+            fs::read_to_string(dir.path().join(format!(".atelier/runs/{run_id}.json"))).unwrap();
         assert!(run_record.contains("\"request\": \"inspect README\""));
         assert!(run_record.contains("\"submitted_request\": \"/skill:reviewer inspect README\""));
         assert!(!run_record.contains("Review workflow guidance."));
@@ -10258,7 +10347,7 @@ runtime = "fake"
             .iter()
             .all(|event| event.kind != "subtask_started" && event.kind != "skills_loaded"));
         assert_eq!(
-            fs::read_dir(dir.path().join(".multiagent/runs"))
+            fs::read_dir(dir.path().join(".atelier/runs"))
                 .unwrap()
                 .count(),
             0
@@ -10331,7 +10420,7 @@ runtime = "fake"
             .unwrap();
         let record_path = dir
             .path()
-            .join(".multiagent")
+            .join(".atelier")
             .join("runs")
             .join(format!("{run_id}.json"));
         let record: serde_json::Value =
@@ -10350,7 +10439,7 @@ runtime = "fake"
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let _app = App::new_with_debug(config, true).await.unwrap();
-        let debug_log = dir.path().join(".multiagent/debug.log");
+        let debug_log = dir.path().join(".atelier/debug.log");
         let contents = fs::read_to_string(debug_log).unwrap();
         assert!(contents.contains("\"kind\":\"session_started\""));
     }
@@ -10392,7 +10481,7 @@ runtime = "fake"
     #[tokio::test]
     async fn fake_runtime_respects_agent_step_limit() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10440,7 +10529,7 @@ runtime = "fake"
     #[tokio::test]
     async fn run_driver_stops_when_wall_clock_limit_elapsed() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10490,7 +10579,7 @@ runtime = "fake"
     #[tokio::test]
     async fn step_time_limit_stops_resumed_step() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10624,7 +10713,7 @@ runtime = "fake"
     #[tokio::test]
     async fn review_fix_cycle_limit_stops_before_extra_fixer_pass() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10723,7 +10812,7 @@ runtime = "fake"
     #[tokio::test]
     async fn tool_policy_denials_are_recorded_as_durable_events() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10880,7 +10969,7 @@ runtime = "fake"
     async fn step_action_limit_allows_final_response_after_last_allowed_action() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("README.md"), "action context\n").unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10919,7 +11008,7 @@ runtime = "fake"
     #[tokio::test]
     async fn normal_approval_mode_pauses_run_with_pending_approval() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -11402,7 +11491,7 @@ runtime = "fake"
     #[tokio::test]
     async fn normal_prompt_cannot_answer_pending_approval() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -11447,7 +11536,7 @@ runtime = "fake"
     #[tokio::test]
     async fn interrupting_pending_approval_records_step_cancellation() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -11507,7 +11596,7 @@ runtime = "fake"
         assert!(events.iter().any(|event| event.kind == "run_interrupted"));
         let run_record_path = dir
             .path()
-            .join(".multiagent")
+            .join(".atelier")
             .join("runs")
             .join(format!("{run_id}.json"));
         let run_record: serde_json::Value =
@@ -11521,7 +11610,7 @@ runtime = "fake"
     #[tokio::test]
     async fn resolving_pending_approval_denial_resumes_and_completes_run() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -11610,7 +11699,7 @@ runtime = "fake"
             .and_then(|artifact| artifact.get("path"))
             .and_then(serde_json::Value::as_str)
             .unwrap();
-        assert!(dir.path().join(".multiagent").join(artifact_path).exists());
+        assert!(dir.path().join(artifact_path).exists());
     }
 
     #[tokio::test]
@@ -11676,7 +11765,7 @@ runtime = "fake"
             .and_then(|artifact| artifact.get("path"))
             .and_then(serde_json::Value::as_str)
             .unwrap();
-        assert!(dir.path().join(".multiagent").join(artifact_path).exists());
+        assert!(dir.path().join(artifact_path).exists());
     }
 
     #[tokio::test]

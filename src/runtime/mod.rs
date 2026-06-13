@@ -1007,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn execute_runtime_step_retries_retryable_provider_errors_with_fallback_model() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -1056,7 +1056,7 @@ model_fallbacks = ["fallback-succeeds"]
     #[tokio::test]
     async fn execute_runtime_step_retries_same_model_before_falling_back() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -1119,7 +1119,7 @@ model_fallbacks = ["fallback-succeeds"]
     #[tokio::test]
     async fn execute_runtime_step_surfaces_retryable_error_when_no_fallback_remains() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -1163,7 +1163,7 @@ model = "primary-fails"
     #[tokio::test]
     async fn execute_runtime_step_does_not_retry_parse_outputs_as_provider_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -1255,7 +1255,7 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -1316,7 +1316,7 @@ model_fallbacks = ["fallback-succeeds"]
     #[tokio::test]
     async fn execute_runtime_step_does_not_retry_non_retryable_provider_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -1411,7 +1411,7 @@ exit 0
         )
         .unwrap();
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -1506,7 +1506,7 @@ exit 64
         )
         .unwrap();
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             format!(
