@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Implement provider status service and adapter boundary
 type: backend
 complexity: high
@@ -31,12 +31,12 @@ This task adds the runtime-layer service that discovers configured providers and
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Add a runtime status service entry point that returns one `ProviderRunwayStatus` per relevant provider.
-- [ ] 3.2 Add provider adapter status hooks for the configured provider families covered by the existing runtime boundary.
-- [ ] 3.3 Add capability negotiation for auth, model availability, usage, rate limit, billing, incident, and local runtime health support.
-- [ ] 3.4 Add bounded timeout handling and partial-result behavior for slow or failing providers.
-- [ ] 3.5 Add redaction for provider diagnostics before status results leave the runtime layer.
-- [ ] 3.6 Map adapter outcomes into the runway states and usage availability values defined by the runtime model.
+- [x] 3.1 Add a runtime status service entry point that returns one `ProviderRunwayStatus` per relevant provider. (`ProviderStatusService::collect_status`)
+- [x] 3.2 Add provider adapter status hooks for the configured provider families covered by the existing runtime boundary. (`RuntimeAvailabilityProbe` reuses `check_runtime_availability` per-adapter dispatch)
+- [x] 3.3 Add capability negotiation for auth, model availability, usage, rate limit, billing, incident, and local runtime health support. (`ProviderStatusCapabilities` + `provider_capabilities`, exposed via separate `capabilities()` hook)
+- [x] 3.4 Add bounded timeout handling and partial-result behavior for slow or failing providers. (`with_timeout` + per-provider `tokio::time::timeout` over a `JoinSet`; `unresolved_status` row)
+- [x] 3.5 Add redaction for provider diagnostics before status results leave the runtime layer. (`redact_secrets` applied to reason + diagnostics in `normalize_status`)
+- [x] 3.6 Map adapter outcomes into the runway states and usage availability values defined by the runtime model. (`map_runtime_availability` + `classify_unavailable` + capability gate)
 
 ## Implementation Details
 Create or update the runtime/provider status abstraction described in the TechSpec "Runtime Integration" and "Capability Negotiation" sections. Keep discovery, timeout handling, state normalization, and diagnostic redaction inside `src/runtime`, while provider-specific checks remain close to the existing Claude, Codex, Cursor, fake, and Z.ai adapter code.
@@ -69,15 +69,15 @@ Create or update the runtime/provider status abstraction described in the TechSp
 
 ## Tests
 - Unit tests:
-  - [ ] Ready provider: valid auth/config/runtime signals produce `Ready` without exact usage unless supported usage data is returned.
-  - [ ] Unsupported usage: provider with no exact usage support produces `UnavailableUsage` or unsupported usage availability without invented remaining quota.
-  - [ ] Auth failure: invalid or missing credentials map to `Unauthenticated` with a user-actionable next action.
-  - [ ] Missing provider/model config maps to `Misconfigured` without attempting unsupported provider calls.
-  - [ ] Timeout maps only the affected provider to `ProviderError` or `UnavailableUsage` while other provider rows still return.
-  - [ ] Diagnostics containing secrets, emails, account identifiers, or raw provider payloads are redacted before rendering boundaries.
+  - [x] Ready provider: valid auth/config/runtime signals produce `Ready` without exact usage unless supported usage data is returned. (`ready_provider_yields_ready_without_exact_usage`, `available_maps_to_ready_and_unknown_maps_to_unavailable_usage`)
+  - [x] Unsupported usage: provider with no exact usage support produces `UnavailableUsage` or unsupported usage availability without invented remaining quota. (`exact_usage_without_capability_is_downgraded_to_unsupported`)
+  - [x] Auth failure: invalid or missing credentials map to `Unauthenticated` with a user-actionable next action. (`auth_failure_maps_to_unauthenticated_with_next_action`)
+  - [x] Missing provider/model config maps to `Misconfigured` without attempting unsupported provider calls. (`missing_config_maps_to_misconfigured`)
+  - [x] Timeout maps only the affected provider to `ProviderError` or `UnavailableUsage` while other provider rows still return. (`slow_provider_times_out_without_blocking_others`)
+  - [x] Diagnostics containing secrets, emails, account identifiers, or raw provider payloads are redacted before rendering boundaries. (`diagnostics_and_reasons_are_redacted_before_leaving_the_service`)
 - Integration tests:
-  - [ ] Fake provider adapter returns deterministic status capabilities and status rows through the runtime service.
-  - [ ] Multiple configured providers return independent rows when one provider succeeds and another fails.
+  - [x] Fake provider adapter returns deterministic status capabilities and status rows through the runtime service. (`tests/provider_status_service.rs::fake_adapter_returns_deterministic_rows_and_capabilities_through_service`)
+  - [x] Multiple configured providers return independent rows when one provider succeeds and another fails. (`tests/provider_status_service.rs::multiple_providers_return_independent_rows_when_one_fails`)
 - Test coverage target: >=80%
 - All tests must pass
 

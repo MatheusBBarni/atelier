@@ -1,0 +1,139 @@
+//! Integration coverage for the runtime provider status service: it must
+//! produce one typed row per provider through the real adapter boundary, keep
+//! providers independent when one fails, and discover providers from config —
+//! all deterministically (no live CLI/network, no env dependence).
+
+use std::sync::Arc;
+
+use multiagent::config::{
+    load_effective_config, ConfigLoadOptions, PromptMode, RuntimeConfig, RuntimeKind,
+};
+use multiagent::runtime::status::{
+    ProviderId, ProviderRunwayState, ProviderStatusProbe, ProviderStatusService,
+    RuntimeAvailabilityProbe,
+};
+
+fn runtime_config(id: &str, kind: RuntimeKind, api_key_env: Option<&str>) -> RuntimeConfig {
+    RuntimeConfig {
+        id: id.to_string(),
+        kind,
+        command: None,
+        args: Vec::new(),
+        prompt_mode: PromptMode::Stdin,
+        base_url: None,
+        api_key_env: api_key_env.map(|value| value.to_string()),
+    }
+}
+
+#[tokio::test]
+async fn fake_adapter_returns_deterministic_rows_and_capabilities_through_service() {
+    let probe = RuntimeAvailabilityProbe::new(runtime_config("fake", RuntimeKind::Fake, None));
+
+    // Capabilities are declared separately from the status result and are
+    // deterministic across calls; the fake provider exposes no exact usage.
+    let capabilities = probe.capabilities();
+    assert_eq!(capabilities, probe.capabilities());
+    assert!(!capabilities.supports_exact_usage());
+
+    let service = ProviderStatusService::new(vec![Arc::new(probe)]);
+    let rows = service.collect_status().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].provider_id, ProviderId::Fake);
+    // The fake runtime is always Available -> Ready, never with exact usage.
+    assert_eq!(rows[0].state, ProviderRunwayState::Ready);
+    assert!(!rows[0].usage.is_exact());
+
+    // Re-running yields the same provider and state (only freshness differs).
+    let rows_again = service.collect_status().await;
+    assert_eq!(rows_again.len(), 1);
+    assert_eq!(rows_again[0].provider_id, ProviderId::Fake);
+    assert_eq!(rows_again[0].state, ProviderRunwayState::Ready);
+}
+
+#[tokio::test]
+async fn multiple_providers_return_independent_rows_when_one_fails() {
+    let healthy = RuntimeAvailabilityProbe::new(runtime_config("fake", RuntimeKind::Fake, None));
+    // Z.ai with no api_key_env configured resolves to Misconfigured without
+    // reading any environment variable, so the failure is deterministic.
+    let failing = RuntimeAvailabilityProbe::new(runtime_config("zai", RuntimeKind::Zai, None));
+
+    let service = ProviderStatusService::new(vec![Arc::new(healthy), Arc::new(failing)]);
+    let rows = service.collect_status().await;
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].provider_id, ProviderId::Fake);
+    assert_eq!(rows[0].state, ProviderRunwayState::Ready);
+    assert_eq!(rows[1].provider_id, ProviderId::Zai);
+    assert_eq!(rows[1].state, ProviderRunwayState::Misconfigured);
+    // The failing provider did not suppress the healthy one.
+    assert_ne!(rows[0].state, rows[1].state);
+}
+
+#[tokio::test]
+async fn from_config_discovers_one_probe_per_provider_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("atelier.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[runtimes.fake]
+type = "fake"
+
+[runtimes.zai]
+type = "zai"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "fake"
+
+[agents.consul]
+runtime = "fake"
+
+[council.presets.default.architect]
+runtime = "fake"
+
+[council.presets.default.security]
+runtime = "fake"
+
+[council.presets.default.reviewer]
+runtime = "fake"
+"#,
+    )
+    .unwrap();
+
+    let config = load_effective_config(ConfigLoadOptions {
+        working_directory: dir.path().to_path_buf(),
+        config_path: Some(config_path),
+    })
+    .unwrap();
+
+    // The merged config layers built-in runtime defaults under the local
+    // overrides, so discovery covers every configured provider family. We
+    // assert discovery here rather than collecting status, because collecting
+    // would shell out to the real CLI providers (codex/cursor/claude).
+    let service = ProviderStatusService::from_config(&config);
+    let ids = service.provider_ids();
+    assert!(ids.contains(&ProviderId::Fake), "missing fake: {ids:?}");
+    assert!(ids.contains(&ProviderId::Zai), "missing zai: {ids:?}");
+    // One probe per distinct family — no duplicates.
+    let mut deduped = ids.clone();
+    deduped.sort_by_key(|id| format!("{id:?}"));
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        ids.len(),
+        "duplicate provider families: {ids:?}"
+    );
+    assert_eq!(service.provider_count(), ids.len());
+}

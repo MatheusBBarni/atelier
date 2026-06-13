@@ -23,9 +23,15 @@
 //!   field for secrets, tokens, account identifiers, emails, organization IDs,
 //!   or raw provider payloads (redaction itself lives in the service layer).
 
-use crate::config::RuntimeKind;
+use crate::config::{EffectiveConfig, RuntimeConfig, RuntimeKind};
+use crate::runtime::{check_runtime_availability, RuntimeAvailability, RuntimeAvailabilityStatus};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::{sleep, timeout};
 
 /// Stable identity for a provider whose runway status can be reported.
 ///
@@ -413,6 +419,576 @@ pub struct ProviderRunwayStatus {
     pub diagnostics: Vec<ProviderDiagnostic>,
 }
 
+// ---------------------------------------------------------------------------
+// Provider status service + adapter boundary
+// ---------------------------------------------------------------------------
+
+/// Default per-provider check timeout. Bounded so one slow provider cannot
+/// block the whole command and the PRD "median under 15s" metric holds even
+/// with several providers checked concurrently.
+pub const DEFAULT_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The raw result a provider adapter returns from a lightweight status check,
+/// before the service normalizes it into a [`ProviderRunwayStatus`] (stamps
+/// freshness, enforces the capability gate, and redacts diagnostics).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderProbeResult {
+    pub state: ProviderRunwayState,
+    pub reason: ProviderStatusReason,
+    pub next_action: ProviderNextAction,
+    pub usage: UsageAvailability,
+    pub reset: ResetAvailability,
+    pub selected_model: Option<String>,
+    pub source: StatusSource,
+    pub diagnostics: Vec<ProviderDiagnostic>,
+}
+
+/// A provider adapter's status hook. Implementations live close to the runtime
+/// adapters and expose capabilities *separately* from a status check so
+/// unsupported data classes are never mistaken for failed checks.
+#[async_trait]
+pub trait ProviderStatusProbe: Send + Sync {
+    fn provider_id(&self) -> ProviderId;
+    fn display_name(&self) -> String;
+    fn capabilities(&self) -> ProviderStatusCapabilities;
+    async fn probe(&self) -> ProviderProbeResult;
+}
+
+/// Declared status capabilities for a provider family.
+///
+/// Centralized here, mirroring how [`check_runtime_availability`] centralizes
+/// per-adapter readiness dispatch in the runtime layer. V1 exposes no exact
+/// usage for any provider, so `subscription_usage`/`api_billing_usage` are
+/// `Unsupported` everywhere and [`UsageAvailability::exact_if_supported`]
+/// always degrades to a truthful unsupported state.
+pub fn provider_capabilities(provider_id: ProviderId) -> ProviderStatusCapabilities {
+    let mut caps = ProviderStatusCapabilities::none();
+    match provider_id {
+        ProviderId::Claude | ProviderId::Codex | ProviderId::Cursor | ProviderId::Fake => {
+            caps.local_runtime_health = CapabilitySupport::Supported;
+        }
+        ProviderId::Zai => {
+            // Z.ai readiness is gated on a configured API key env var, so its
+            // auth state is checkable even though usage is not exposed.
+            caps.auth_state = CapabilitySupport::RequiresConfiguration;
+        }
+        ProviderId::Local => {
+            caps.local_runtime_health = CapabilitySupport::Supported;
+        }
+    }
+    caps
+}
+
+/// Official provider-native account/usage page to point users at when exact
+/// usage is unavailable. Best-effort V1 URLs; safe to surface (no secrets) and
+/// easy to refine as provider account surfaces are confirmed.
+pub fn provider_usage_url(provider_id: ProviderId) -> Option<String> {
+    let url = match provider_id {
+        ProviderId::Claude => "https://claude.ai/settings/usage",
+        ProviderId::Codex => "https://platform.openai.com/usage",
+        ProviderId::Cursor => "https://www.cursor.com/settings",
+        ProviderId::Zai => "https://z.ai",
+        ProviderId::Fake | ProviderId::Local => return None,
+    };
+    Some(url.to_string())
+}
+
+/// Map an existing [`RuntimeAvailability`] readiness result (produced by the
+/// per-adapter `check_availability`) into a typed [`ProviderProbeResult`].
+///
+/// This is the outcome→runway-state mapping: it never invents remaining quota
+/// and always represents unsupported exact usage as a first-class state.
+pub fn map_runtime_availability(
+    provider_id: ProviderId,
+    selected_model: Option<String>,
+    availability: &RuntimeAvailability,
+) -> ProviderProbeResult {
+    let url = provider_usage_url(provider_id);
+    match availability.status {
+        RuntimeAvailabilityStatus::Available => ProviderProbeResult {
+            state: ProviderRunwayState::Ready,
+            reason: ProviderStatusReason::new(
+                ReasonCode::UsageUnsupported,
+                "ready based on auth/config/runtime checks; exact remaining usage is unavailable \
+                 from this provider integration",
+            ),
+            next_action: ProviderNextAction::CheckProviderUsage {
+                provider_url: url.clone(),
+            },
+            usage: UsageAvailability::Unsupported { provider_url: url },
+            reset: ResetAvailability::Unknown,
+            selected_model,
+            source: StatusSource::LocalRuntimeCheck,
+            diagnostics: availability_diagnostics(availability),
+        },
+        RuntimeAvailabilityStatus::Unknown => ProviderProbeResult {
+            state: ProviderRunwayState::UnavailableUsage,
+            reason: ProviderStatusReason::new(
+                ReasonCode::UsageUnsupported,
+                "auth/config look ok; exact remaining usage is unsupported by this provider \
+                 integration",
+            ),
+            next_action: ProviderNextAction::CheckProviderUsage {
+                provider_url: url.clone(),
+            },
+            usage: UsageAvailability::Unsupported { provider_url: url },
+            reset: ResetAvailability::Unknown,
+            selected_model,
+            source: StatusSource::LocalRuntimeCheck,
+            diagnostics: availability_diagnostics(availability),
+        },
+        RuntimeAvailabilityStatus::Unavailable => {
+            let (state, code, next_action) = classify_unavailable(availability);
+            ProviderProbeResult {
+                state,
+                reason: ProviderStatusReason::new(code, availability.message.clone()),
+                next_action,
+                usage: UsageAvailability::Unavailable {
+                    reason: "provider is unavailable for this session".to_string(),
+                    provider_url: url,
+                },
+                reset: ResetAvailability::NotApplicable,
+                selected_model,
+                source: StatusSource::LocalRuntimeCheck,
+                diagnostics: availability_diagnostics(availability),
+            }
+        }
+    }
+}
+
+/// Classify an `Unavailable` readiness result into a typed runway state using
+/// the adapter's own message/remediation text (the only signal the existing
+/// availability contract carries). Missing/invalid configuration maps to
+/// `Misconfigured`; missing credentials map to `Unauthenticated`; anything
+/// else is a `ProviderError`.
+fn classify_unavailable(
+    availability: &RuntimeAvailability,
+) -> (ProviderRunwayState, ReasonCode, ProviderNextAction) {
+    let text = format!(
+        "{} {}",
+        availability.message,
+        availability.remediation.as_deref().unwrap_or("")
+    )
+    .to_lowercase();
+    let mentions = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+
+    if mentions(&[
+        "not configured",
+        "not found",
+        "install",
+        "path",
+        "base_url",
+        "command",
+    ]) {
+        (
+            ProviderRunwayState::Misconfigured,
+            ReasonCode::Misconfigured,
+            ProviderNextAction::FixConfiguration,
+        )
+    } else if mentions(&[
+        "not set",
+        "api key",
+        "login",
+        "auth",
+        "token",
+        "credential",
+        "export",
+    ]) {
+        (
+            ProviderRunwayState::Unauthenticated,
+            ReasonCode::AuthRequired,
+            ProviderNextAction::Authenticate,
+        )
+    } else {
+        (
+            ProviderRunwayState::ProviderError,
+            ReasonCode::ProviderError,
+            ProviderNextAction::RetryLater,
+        )
+    }
+}
+
+/// Build share-safe diagnostics from a readiness result. The message and
+/// remediation are run through redaction at the service boundary, so this just
+/// captures them at the appropriate severity.
+fn availability_diagnostics(availability: &RuntimeAvailability) -> Vec<ProviderDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if !availability.message.trim().is_empty() {
+        let severity = match availability.status {
+            RuntimeAvailabilityStatus::Unavailable => DiagnosticSeverity::Error,
+            RuntimeAvailabilityStatus::Unknown | RuntimeAvailabilityStatus::Available => {
+                DiagnosticSeverity::Info
+            }
+        };
+        diagnostics.push(ProviderDiagnostic::new(
+            severity,
+            "runtime",
+            availability.message.clone(),
+        ));
+    }
+    if let Some(remediation) = &availability.remediation {
+        diagnostics.push(ProviderDiagnostic::info("remediation", remediation.clone()));
+    }
+    diagnostics
+}
+
+/// Real provider adapter probe: reuses the existing per-adapter
+/// `check_availability` dispatch and maps its result into the typed model.
+pub struct RuntimeAvailabilityProbe {
+    provider_id: ProviderId,
+    display_name: String,
+    config: RuntimeConfig,
+    selected_model: Option<String>,
+}
+
+impl RuntimeAvailabilityProbe {
+    pub fn new(config: RuntimeConfig) -> Self {
+        let provider_id = ProviderId::from(config.kind.clone());
+        Self {
+            provider_id,
+            display_name: provider_id.default_display_name().to_string(),
+            config,
+            selected_model: None,
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderStatusProbe for RuntimeAvailabilityProbe {
+    fn provider_id(&self) -> ProviderId {
+        self.provider_id
+    }
+
+    fn display_name(&self) -> String {
+        self.display_name.clone()
+    }
+
+    fn capabilities(&self) -> ProviderStatusCapabilities {
+        provider_capabilities(self.provider_id)
+    }
+
+    async fn probe(&self) -> ProviderProbeResult {
+        let availability = check_runtime_availability(&self.config).await;
+        map_runtime_availability(self.provider_id, self.selected_model.clone(), &availability)
+    }
+}
+
+/// Deterministic probe that returns a fixed result, optionally after a delay.
+/// Used for fake-adapter routing/rendering tests and timeout exercises.
+pub struct StaticStatusProbe {
+    provider_id: ProviderId,
+    display_name: String,
+    capabilities: ProviderStatusCapabilities,
+    result: ProviderProbeResult,
+    delay: Option<Duration>,
+}
+
+impl StaticStatusProbe {
+    pub fn new(
+        provider_id: ProviderId,
+        display_name: impl Into<String>,
+        capabilities: ProviderStatusCapabilities,
+        result: ProviderProbeResult,
+    ) -> Self {
+        Self {
+            provider_id,
+            display_name: display_name.into(),
+            capabilities,
+            result,
+            delay: None,
+        }
+    }
+
+    /// Make the probe sleep before returning, to exercise per-provider
+    /// timeout handling deterministically.
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
+        self
+    }
+}
+
+#[async_trait]
+impl ProviderStatusProbe for StaticStatusProbe {
+    fn provider_id(&self) -> ProviderId {
+        self.provider_id
+    }
+
+    fn display_name(&self) -> String {
+        self.display_name.clone()
+    }
+
+    fn capabilities(&self) -> ProviderStatusCapabilities {
+        self.capabilities
+    }
+
+    async fn probe(&self) -> ProviderProbeResult {
+        if let Some(delay) = self.delay {
+            sleep(delay).await;
+        }
+        self.result.clone()
+    }
+}
+
+/// Discovers configured providers and collects one typed runway status per
+/// provider, concurrently and behind bounded per-provider timeouts.
+pub struct ProviderStatusService {
+    probes: Vec<Arc<dyn ProviderStatusProbe>>,
+    per_provider_timeout: Duration,
+}
+
+impl ProviderStatusService {
+    /// Build a service from an explicit set of probes (the injection point for
+    /// deterministic tests and later command routing).
+    pub fn new(probes: Vec<Arc<dyn ProviderStatusProbe>>) -> Self {
+        Self {
+            probes,
+            per_provider_timeout: DEFAULT_PROVIDER_STATUS_TIMEOUT,
+        }
+    }
+
+    /// Override the per-provider timeout.
+    pub fn with_timeout(mut self, per_provider_timeout: Duration) -> Self {
+        self.per_provider_timeout = per_provider_timeout;
+        self
+    }
+
+    /// Discover relevant providers from configured runtimes — one probe per
+    /// distinct provider family, in stable runtime-id order.
+    pub fn from_config(config: &EffectiveConfig) -> Self {
+        let mut seen: HashSet<ProviderId> = HashSet::new();
+        let mut probes: Vec<Arc<dyn ProviderStatusProbe>> = Vec::new();
+        for runtime in config.runtimes.values() {
+            let provider_id = ProviderId::from(runtime.kind.clone());
+            if seen.insert(provider_id) {
+                probes.push(Arc::new(RuntimeAvailabilityProbe::new(runtime.clone())));
+            }
+        }
+        Self::new(probes)
+    }
+
+    /// Number of providers this service will report on.
+    pub fn provider_count(&self) -> usize {
+        self.probes.len()
+    }
+
+    /// The provider families this service will report on, in row order.
+    pub fn provider_ids(&self) -> Vec<ProviderId> {
+        self.probes
+            .iter()
+            .map(|probe| probe.provider_id())
+            .collect()
+    }
+
+    /// Collect one [`ProviderRunwayStatus`] per provider. Probes run
+    /// concurrently; a probe that exceeds the timeout (or otherwise fails to
+    /// complete) yields a `ProviderError` row for that provider only, so a
+    /// single slow/failing provider never blocks the others.
+    pub async fn collect_status(&self) -> Vec<ProviderRunwayStatus> {
+        let observed_at = Utc::now();
+        let mut results: Vec<Option<ProviderProbeResult>> =
+            (0..self.probes.len()).map(|_| None).collect();
+
+        let mut set = tokio::task::JoinSet::new();
+        for (index, probe) in self.probes.iter().enumerate() {
+            let probe = Arc::clone(probe);
+            let per_provider_timeout = self.per_provider_timeout;
+            set.spawn(async move {
+                let outcome = timeout(per_provider_timeout, probe.probe()).await.ok();
+                (index, outcome)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok((index, outcome)) = joined {
+                results[index] = outcome;
+            }
+        }
+
+        self.probes
+            .iter()
+            .enumerate()
+            .map(|(index, probe)| match std::mem::take(&mut results[index]) {
+                Some(result) => normalize_status(probe.as_ref(), result, observed_at),
+                None => unresolved_status(probe.as_ref(), observed_at),
+            })
+            .collect()
+    }
+}
+
+/// Normalize a probe result into the typed status: enforce the capability gate
+/// on exact usage, stamp live freshness, and redact diagnostics + reason text.
+fn normalize_status(
+    probe: &dyn ProviderStatusProbe,
+    result: ProviderProbeResult,
+    observed_at: DateTime<Utc>,
+) -> ProviderRunwayStatus {
+    let provider_id = probe.provider_id();
+    let capabilities = probe.capabilities();
+
+    let mut state = result.state;
+    let mut usage = result.usage;
+    let mut reason = result.reason;
+    // Truthfulness guard at the service boundary: exact usage cannot survive
+    // without a supporting capability, regardless of what the adapter returned.
+    if usage.is_exact() && !capabilities.supports_exact_usage() {
+        usage = UsageAvailability::Unsupported {
+            provider_url: provider_usage_url(provider_id),
+        };
+        if matches!(state, ProviderRunwayState::Ready) {
+            state = ProviderRunwayState::UnavailableUsage;
+        }
+        reason = ProviderStatusReason::new(
+            ReasonCode::UsageUnsupported,
+            "exact remaining usage is unavailable from this provider integration",
+        );
+    }
+
+    let reason = ProviderStatusReason {
+        code: reason.code,
+        summary: redact_secrets(&reason.summary),
+    };
+    let diagnostics = result
+        .diagnostics
+        .into_iter()
+        .map(redact_diagnostic)
+        .collect();
+
+    ProviderRunwayStatus {
+        provider_id,
+        display_name: probe.display_name(),
+        selected_model: result.selected_model,
+        state,
+        reason,
+        next_action: result.next_action,
+        usage,
+        reset: result.reset,
+        freshness: StatusFreshness::Live { observed_at },
+        source: result.source,
+        diagnostics,
+    }
+}
+
+/// Status row for a provider whose check did not complete (timed out or
+/// panicked). Reported as a `ProviderError` for that provider only.
+fn unresolved_status(
+    probe: &dyn ProviderStatusProbe,
+    observed_at: DateTime<Utc>,
+) -> ProviderRunwayStatus {
+    let provider_id = probe.provider_id();
+    ProviderRunwayStatus {
+        provider_id,
+        display_name: probe.display_name(),
+        selected_model: None,
+        state: ProviderRunwayState::ProviderError,
+        reason: ProviderStatusReason::new(
+            ReasonCode::ProviderError,
+            "provider status check did not complete in time",
+        ),
+        next_action: ProviderNextAction::RetryLater,
+        usage: UsageAvailability::Unavailable {
+            reason: "status check did not complete".to_string(),
+            provider_url: provider_usage_url(provider_id),
+        },
+        reset: ResetAvailability::Unknown,
+        freshness: StatusFreshness::Live { observed_at },
+        source: StatusSource::Unknown,
+        diagnostics: Vec::new(),
+    }
+}
+
+/// Redact a diagnostic's label and detail before it leaves the runtime layer.
+fn redact_diagnostic(diagnostic: ProviderDiagnostic) -> ProviderDiagnostic {
+    ProviderDiagnostic {
+        severity: diagnostic.severity,
+        label: redact_secrets(&diagnostic.label),
+        detail: redact_secrets(&diagnostic.detail),
+    }
+}
+
+/// Replace secret-like substrings (emails, API keys/tokens, org/account ids,
+/// raw high-entropy payload tokens) with placeholders so default output is
+/// safe to paste into logs or support requests. Conservative and token-based:
+/// it preserves ordinary words and official URLs.
+pub fn redact_secrets(text: &str) -> String {
+    text.split_whitespace()
+        .map(redact_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_token(token: &str) -> String {
+    if looks_like_email(token) {
+        return "[redacted-email]".to_string();
+    }
+    // Handle `key=value` / `key: value` shapes, redacting only the value when
+    // the key is sensitive or the value itself looks secret.
+    for separator in ['=', ':'] {
+        if let Some((key, value)) = token.split_once(separator) {
+            if !value.is_empty()
+                && (key_is_sensitive(key) || looks_like_secret(value) || looks_like_email(value))
+            {
+                return format!("{key}{separator}[redacted]");
+            }
+        }
+    }
+    if looks_like_secret(token) {
+        return "[redacted]".to_string();
+    }
+    token.to_string()
+}
+
+fn looks_like_email(token: &str) -> bool {
+    match token.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty() && domain.contains('.') && !domain.ends_with('.')
+        }
+        None => false,
+    }
+}
+
+fn key_is_sensitive(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "apikey",
+        "api_key",
+        "bearer",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn looks_like_secret(token: &str) -> bool {
+    const SECRET_PREFIXES: [&str; 9] = [
+        "sk-", "sk_", "pk-", "ghp_", "gho_", "xoxb-", "xoxp-", "zai-", "org-",
+    ];
+    let lowered = token.to_ascii_lowercase();
+    if SECRET_PREFIXES
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+    {
+        return true;
+    }
+    // High-entropy-looking token: long, restricted alphabet, mixes letters and
+    // digits. Catches raw API keys and opaque payload ids without flagging
+    // normal prose or URLs (which lack the letter+digit mix in one token).
+    if token.len() >= 20
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '/' | '='))
+        && token.chars().any(|c| c.is_ascii_digit())
+        && token.chars().any(|c| c.is_ascii_alphabetic())
+    {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +1173,205 @@ mod tests {
         assert_eq!(status.state, ProviderRunwayState::LocalOnlyStatus);
         assert_eq!(status.usage, UsageAvailability::NotApplicable);
         assert_eq!(status.reason.code, ReasonCode::LocalOnly);
+    }
+
+    fn ready_probe_result() -> ProviderProbeResult {
+        ProviderProbeResult {
+            state: ProviderRunwayState::Ready,
+            reason: ProviderStatusReason::new(
+                ReasonCode::UsageUnsupported,
+                "ready; exact usage unavailable",
+            ),
+            next_action: ProviderNextAction::CheckProviderUsage {
+                provider_url: Some("https://example.test".to_string()),
+            },
+            usage: UsageAvailability::Unsupported {
+                provider_url: Some("https://example.test".to_string()),
+            },
+            reset: ResetAvailability::Unknown,
+            selected_model: Some("model-x".to_string()),
+            source: StatusSource::LocalRuntimeCheck,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_provider_yields_ready_without_exact_usage() {
+        let probe = StaticStatusProbe::new(
+            ProviderId::Claude,
+            "Claude",
+            provider_capabilities(ProviderId::Claude),
+            ready_probe_result(),
+        );
+        let service = ProviderStatusService::new(vec![Arc::new(probe)]);
+        let rows = service.collect_status().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, ProviderRunwayState::Ready);
+        assert!(!rows[0].usage.is_exact());
+        assert!(matches!(rows[0].freshness, StatusFreshness::Live { .. }));
+    }
+
+    #[tokio::test]
+    async fn exact_usage_without_capability_is_downgraded_to_unsupported() {
+        // Adapter wrongly returns Exact; the service has no supporting
+        // capability, so it must degrade to a truthful unsupported state and
+        // never surface invented remaining quota.
+        let mut result = ready_probe_result();
+        result.usage = UsageAvailability::Exact(sample_exact_usage());
+        let probe = StaticStatusProbe::new(
+            ProviderId::Codex,
+            "Codex",
+            provider_capabilities(ProviderId::Codex),
+            result,
+        );
+        let service = ProviderStatusService::new(vec![Arc::new(probe)]);
+        let rows = service.collect_status().await;
+        assert!(!rows[0].usage.is_exact());
+        assert!(matches!(
+            rows[0].usage,
+            UsageAvailability::Unsupported { .. }
+        ));
+        assert_eq!(rows[0].state, ProviderRunwayState::UnavailableUsage);
+        assert_eq!(rows[0].reason.code, ReasonCode::UsageUnsupported);
+    }
+
+    #[tokio::test]
+    async fn exact_usage_with_supporting_capability_is_preserved() {
+        let mut result = ready_probe_result();
+        result.usage = UsageAvailability::Exact(sample_exact_usage());
+        let mut caps = provider_capabilities(ProviderId::Zai);
+        caps.subscription_usage = CapabilitySupport::Supported;
+        let probe = StaticStatusProbe::new(ProviderId::Zai, "Z.ai", caps, result);
+        let service = ProviderStatusService::new(vec![Arc::new(probe)]);
+        let rows = service.collect_status().await;
+        assert!(rows[0].usage.is_exact());
+    }
+
+    #[test]
+    fn auth_failure_maps_to_unauthenticated_with_next_action() {
+        let availability = RuntimeAvailability {
+            runtime_id: "zai".to_string(),
+            status: RuntimeAvailabilityStatus::Unavailable,
+            message: "environment variable MULTIAGENT_TEST_ZAI_KEY is not set".to_string(),
+            remediation: Some(
+                "Export MULTIAGENT_TEST_ZAI_KEY with a valid Z.ai API key.".to_string(),
+            ),
+        };
+        let result = map_runtime_availability(ProviderId::Zai, None, &availability);
+        assert_eq!(result.state, ProviderRunwayState::Unauthenticated);
+        assert_eq!(result.reason.code, ReasonCode::AuthRequired);
+        assert_eq!(result.next_action, ProviderNextAction::Authenticate);
+    }
+
+    #[test]
+    fn missing_config_maps_to_misconfigured() {
+        let availability = RuntimeAvailability {
+            runtime_id: "zai".to_string(),
+            status: RuntimeAvailabilityStatus::Unavailable,
+            message: "Z.ai api_key_env is not configured".to_string(),
+            remediation: Some("Set [runtimes.zai].api_key_env in atelier.toml.".to_string()),
+        };
+        let result = map_runtime_availability(ProviderId::Zai, None, &availability);
+        assert_eq!(result.state, ProviderRunwayState::Misconfigured);
+        assert_eq!(result.reason.code, ReasonCode::Misconfigured);
+        assert_eq!(result.next_action, ProviderNextAction::FixConfiguration);
+    }
+
+    #[test]
+    fn available_maps_to_ready_and_unknown_maps_to_unavailable_usage() {
+        let available = RuntimeAvailability {
+            runtime_id: "codex".to_string(),
+            status: RuntimeAvailabilityStatus::Available,
+            message: "codex CLI found".to_string(),
+            remediation: None,
+        };
+        let ready = map_runtime_availability(ProviderId::Codex, None, &available);
+        assert_eq!(ready.state, ProviderRunwayState::Ready);
+        assert!(matches!(ready.usage, UsageAvailability::Unsupported { .. }));
+        assert!(!ready.usage.is_exact());
+
+        let unknown = RuntimeAvailability {
+            runtime_id: "zai".to_string(),
+            status: RuntimeAvailabilityStatus::Unknown,
+            message: "key is set; network check deferred".to_string(),
+            remediation: None,
+        };
+        let row = map_runtime_availability(ProviderId::Zai, None, &unknown);
+        assert_eq!(row.state, ProviderRunwayState::UnavailableUsage);
+        assert!(!row.usage.is_exact());
+    }
+
+    #[tokio::test]
+    async fn slow_provider_times_out_without_blocking_others() {
+        let fast = StaticStatusProbe::new(
+            ProviderId::Codex,
+            "Codex",
+            provider_capabilities(ProviderId::Codex),
+            ready_probe_result(),
+        );
+        let slow = StaticStatusProbe::new(
+            ProviderId::Claude,
+            "Claude",
+            provider_capabilities(ProviderId::Claude),
+            ready_probe_result(),
+        )
+        .with_delay(Duration::from_secs(30));
+        let service = ProviderStatusService::new(vec![Arc::new(fast), Arc::new(slow)])
+            .with_timeout(Duration::from_millis(50));
+        let rows = service.collect_status().await;
+        assert_eq!(rows.len(), 2);
+        // Order is preserved and only the slow provider degrades.
+        assert_eq!(rows[0].provider_id, ProviderId::Codex);
+        assert_eq!(rows[0].state, ProviderRunwayState::Ready);
+        assert_eq!(rows[1].provider_id, ProviderId::Claude);
+        assert_eq!(rows[1].state, ProviderRunwayState::ProviderError);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_and_reasons_are_redacted_before_leaving_the_service() {
+        let mut result = ready_probe_result();
+        result.reason = ProviderStatusReason::new(
+            ReasonCode::ProviderError,
+            "login failed for alice@example.com using sk-ABCD1234efgh5678ijkl",
+        );
+        result.diagnostics = vec![
+            ProviderDiagnostic::error("auth", "token=sk-SECRET1234567890abcd org-9988776655AABBCC"),
+            ProviderDiagnostic::info(
+                "account",
+                "email bob@corp.example.org payload 0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+            ),
+        ];
+        let probe = StaticStatusProbe::new(
+            ProviderId::Codex,
+            "Codex",
+            provider_capabilities(ProviderId::Codex),
+            result,
+        );
+        let service = ProviderStatusService::new(vec![Arc::new(probe)]);
+        let rows = service.collect_status().await;
+        let row = &rows[0];
+        let blob = format!("{} {:?}", row.reason.summary, row.diagnostics);
+        for secret in [
+            "alice@example.com",
+            "sk-ABCD1234efgh5678ijkl",
+            "sk-SECRET1234567890abcd",
+            "org-9988776655AABBCC",
+            "bob@corp.example.org",
+            "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        ] {
+            assert!(!blob.contains(secret), "secret leaked: {secret} in {blob}");
+        }
+        assert!(
+            blob.contains("[redacted"),
+            "expected redaction marker in {blob}"
+        );
+        // Ordinary words survive redaction.
+        assert!(row.reason.summary.contains("login"));
+    }
+
+    #[test]
+    fn redaction_preserves_official_urls_and_plain_text() {
+        let text = "ready; check https://claude.ai/settings/usage before a long run";
+        assert_eq!(redact_secrets(text), text);
     }
 }
