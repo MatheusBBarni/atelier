@@ -1147,3 +1147,259 @@ h3 {
     transition: none;
   }
 }
+
+/* ---- Docs section --------------------------------------------------------
+   The `/docs` pages reuse the brand tokens but need a readable doc-body scale:
+   the marketing h1/h2 (clamp up to 12rem) is far too large for prose. These
+   styles theme the shared DocsLayout (section nav + content + in-page TOC),
+   the `/docs` index, and Markdown elements (headings, tables, code). */
+
+.docs {
+  display: grid;
+  grid-template-columns: minmax(180px, 220px) minmax(0, 1fr) minmax(160px, 200px);
+  gap: clamp(24px, 4vw, 56px);
+  align-items: start;
+  width: min(var(--max), calc(100% - 40px));
+  margin: 0 auto;
+  padding: clamp(40px, 6vw, 72px) 0;
+}
+
+.docs__nav,
+.docs__toc {
+  position: sticky;
+  top: 24px;
+  min-width: 0;
+  font-size: 0.86rem;
+}
+
+.docs__nav ul,
+.docs__toc ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.docs__nav-link,
+.docs__toc a {
+  display: block;
+  padding: 6px 10px;
+  color: var(--muted);
+  border-radius: 6px;
+  border-left: 2px solid transparent;
+}
+
+.docs__nav-link:hover,
+.docs__nav-link:focus-visible,
+.docs__toc a:hover,
+.docs__toc a:focus-visible {
+  color: var(--accent);
+}
+
+.docs__nav-link.is-current {
+  color: var(--text);
+  border-left-color: var(--accent);
+  background: var(--panel-2);
+}
+
+.docs__toc-item.is-depth-3 a {
+  padding-left: 22px;
+  font-size: 0.8rem;
+}
+
+.docs__body {
+  min-width: 0;
+  max-width: 760px;
+}
+
+.docs__title {
+  max-width: none;
+  margin-bottom: 28px;
+  font-size: clamp(2.2rem, 4vw, 3rem);
+  line-height: 1.1;
+}
+
+/* Doc-body Markdown -------------------------------------------------------- */
+
+.doc-prose {
+  color: var(--text);
+}
+
+.doc-prose > :first-child {
+  margin-top: 0;
+}
+
+.doc-prose h2,
+.doc-prose h3,
+.doc-prose h4 {
+  margin-top: 2em;
+  margin-bottom: 0.6em;
+  scroll-margin-top: 24px;
+}
+
+.doc-prose h2 {
+  max-width: none;
+  font-size: 1.6rem;
+  line-height: 1.2;
+}
+
+.doc-prose h3 {
+  font-size: 1.2rem;
+  line-height: 1.3;
+}
+
+.doc-prose h4 {
+  font-family: "Newsreader", Georgia, serif;
+  font-size: 1.02rem;
+}
+
+.doc-prose p,
+.doc-prose li {
+  color: var(--muted);
+}
+
+.doc-prose p {
+  margin-bottom: 1.1em;
+}
+
+.doc-prose ul,
+.doc-prose ol {
+  margin: 0 0 1.1em;
+  padding-left: 1.4em;
+}
+
+.doc-prose li {
+  margin-bottom: 0.4em;
+}
+
+.doc-prose a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.doc-prose a:hover,
+.doc-prose a:focus-visible {
+  color: var(--gold-bright);
+}
+
+.doc-prose strong {
+  color: var(--text);
+}
+
+.doc-prose blockquote {
+  margin: 0 0 1.1em;
+  padding: 4px 0 4px 16px;
+  color: var(--dim);
+  border-left: 2px solid var(--line-strong);
+}
+
+/* Inline code + fenced code blocks. */
+.doc-prose :not(pre) > code {
+  padding: 2px 6px;
+  color: var(--accent);
+  font-size: 0.86em;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.doc-prose pre {
+  margin: 0 0 1.3em;
+  padding: 16px 18px;
+  overflow-x: auto;
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.doc-prose pre code {
+  padding: 0;
+  color: var(--text);
+  background: none;
+  border: 0;
+  font-size: 0.86rem;
+}
+
+/* Themed Markdown tables — the generated reference (task_11) renders here, so
+   they must read on-brand without the bespoke `.command-table` markup. */
+.doc-prose table {
+  width: 100%;
+  margin: 0 0 1.3em;
+  border-collapse: collapse;
+  overflow: hidden;
+  font-size: 0.86rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.doc-prose th,
+.doc-prose td {
+  padding: 10px 14px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--line);
+}
+
+.doc-prose thead th {
+  color: var(--gold);
+  background: var(--panel-2);
+}
+
+.doc-prose tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.doc-prose tbody td {
+  color: var(--muted);
+}
+
+.doc-prose tbody code {
+  color: var(--accent);
+}
+
+/* Docs index --------------------------------------------------------------- */
+
+.docs-index__list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.docs-index__item a {
+  display: block;
+  padding: 16px 18px;
+  color: var(--text);
+  font-weight: 700;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.docs-index__item a:hover,
+.docs-index__item a:focus-visible {
+  color: var(--accent);
+  border-color: var(--line-strong);
+}
+
+.docs-index__empty {
+  color: var(--muted);
+}
+
+@media (max-width: 980px) {
+  .docs {
+    grid-template-columns: 1fr;
+  }
+
+  .docs__nav,
+  .docs__toc {
+    position: static;
+  }
+
+  .docs__toc {
+    order: 3;
+  }
+}
