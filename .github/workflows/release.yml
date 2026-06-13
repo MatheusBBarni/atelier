@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       version:
@@ -25,8 +27,88 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  detect-version-bump:
+    name: Detect version bump
+    # Only the branch-push path needs auto-detection. Tag pushes and
+    # workflow_dispatch resolve their version directly in validate-release,
+    # so this job is skipped for those events.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      should_release: ${{ steps.detect.outputs.should_release }}
+      version: ${{ steps.detect.outputs.version }}
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so we can read Cargo.toml at the push's previous commit.
+          fetch-depth: 0
+      - name: Detect Cargo version change
+        id: detect
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          read_package_version() {
+            # Print the [package] version from Cargo.toml at the given revision.
+            git show "$1:Cargo.toml" 2>/dev/null | awk '
+              /^\[/ { in_pkg = ($0 == "[package]") }
+              in_pkg && /^[[:space:]]*version[[:space:]]*=/ {
+                if (match($0, /"[^"]+"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+              }'
+          }
+
+          CURRENT="$(read_package_version "${AFTER_SHA}")"
+          if [[ ! "${CURRENT}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::Cargo [package] version '${CURRENT}' is not a stable semver; skipping auto-release."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          TAG="v${CURRENT}"
+          echo "version=${CURRENT}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+          PREVIOUS=""
+          if [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]] \
+            && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            PREVIOUS="$(read_package_version "${BEFORE_SHA}")"
+          fi
+
+          if [[ -z "${PREVIOUS}" ]]; then
+            echo "::notice::Could not determine the previous version (before=${BEFORE_SHA:-none}); skipping to avoid an unintended deploy."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${CURRENT}" == "${PREVIOUS}" ]]; then
+            echo "Version unchanged at ${CURRENT}; nothing to release."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::warning::Version changed to ${CURRENT} but tag ${TAG} already exists; skipping release."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Version changed ${PREVIOUS} -> ${CURRENT}; will tag and release ${TAG}."
+          echo "should_release=true" >> "${GITHUB_OUTPUT}"
+
   validate-release:
     name: Validate release inputs
+    needs: detect-version-bump
+    # Run for manual dispatch, for tag pushes, or for a main push that bumped
+    # the version. !cancelled() lets this run even though detect-version-bump
+    # is skipped on the dispatch/tag paths.
+    if: >-
+      !cancelled()
+      && (github.event_name == 'workflow_dispatch'
+          || startsWith(github.ref, 'refs/tags/')
+          || needs.detect-version-bump.outputs.should_release == 'true')
     runs-on: ubuntu-24.04
     outputs:
       publish: ${{ steps.release.outputs.publish }}
@@ -54,9 +136,14 @@ jobs:
             VERSION="${VERSION#v}"
             TAG="v${VERSION}"
             PUBLISH=false
-          else
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             TAG="${GITHUB_REF_NAME}"
             VERSION="${TAG#v}"
+            PUBLISH=true
+          else
+            # Auto-release triggered by a version bump on main.
+            VERSION="${{ needs.detect-version-bump.outputs.version }}"
+            TAG="${{ needs.detect-version-bump.outputs.tag }}"
             PUBLISH=true
           fi
 
@@ -80,6 +167,7 @@ jobs:
 
   rust-tests:
     name: Rust tests
+    needs: validate-release
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -384,10 +472,17 @@ jobs:
           if gh release view "${TAG}" >/dev/null 2>&1; then
             gh release upload "${TAG}" target/npm-dist/archives/* target/npm-dist/*.tgz target/npm-dist/SHA256SUMS --clobber
           else
+            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+              # Manual tag push: the release tag already exists in the repo.
+              TAG_ARGS=(--verify-tag)
+            else
+              # Auto-release from a version bump on main: create the tag at this commit.
+              TAG_ARGS=(--target "${GITHUB_SHA}")
+            fi
             gh release create "${TAG}" \
               target/npm-dist/archives/* \
               target/npm-dist/*.tgz \
               target/npm-dist/SHA256SUMS \
-              --verify-tag \
+              "${TAG_ARGS[@]}" \
               --generate-notes
           fi
