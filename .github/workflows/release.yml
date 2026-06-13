@@ -29,10 +29,11 @@ concurrency:
 jobs:
   detect-version-bump:
     name: Detect version bump
-    # Only the branch-push path needs auto-detection. Tag pushes and
-    # workflow_dispatch resolve their version directly in validate-release,
-    # so this job is skipped for those events.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Always runs so it never becomes a *skipped* dependency. A skipped job
+    # poisons success() for every downstream job transitively, which would
+    # wrongly skip the entire pipeline on tag pushes / workflow_dispatch.
+    # For non-main-branch events the detect step short-circuits to
+    # should_release=false (those paths resolve their version in validate-release).
     runs-on: ubuntu-24.04
     outputs:
       should_release: ${{ steps.detect.outputs.should_release }}
@@ -51,6 +52,12 @@ jobs:
           AFTER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+
+          if [[ "${{ github.event_name }}" != "push" || "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "Event is not a push to main; auto-release detection does not apply."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
 
           read_package_version() {
             # Print the [package] version from Cargo.toml at the given revision.
