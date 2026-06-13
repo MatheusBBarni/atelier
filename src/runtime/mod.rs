@@ -2,6 +2,7 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod fake;
+pub mod status;
 pub mod zai;
 
 use crate::actions::{ActionRequest, ActionResult};

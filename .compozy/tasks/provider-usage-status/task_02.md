@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Define Runtime Provider Status Model
 type: backend
 complexity: medium
@@ -29,11 +29,11 @@ Define the typed provider runway status model under the runtime boundary so prov
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add a runtime status module for provider runway status types.
-- [ ] 2.2 Define fixed enums and structs for runway state, usage availability, reset availability, freshness, source, reason, next action, capabilities, and diagnostics.
-- [ ] 2.3 Connect the new module through the existing runtime module exports so later tasks can consume it.
-- [ ] 2.4 Add deterministic unit tests for state, capability, and usage modeling behavior.
-- [ ] 2.5 Confirm exact usage cannot be represented without the explicit exact usage variant and supporting provider capability context.
+- [x] 2.1 Add a runtime status module for provider runway status types.
+- [x] 2.2 Define fixed enums and structs for runway state, usage availability, reset availability, freshness, source, reason, next action, capabilities, and diagnostics.
+- [x] 2.3 Connect the new module through the existing runtime module exports so later tasks can consume it.
+- [x] 2.4 Add deterministic unit tests for state, capability, and usage modeling behavior.
+- [x] 2.5 Confirm exact usage cannot be represented without the explicit exact usage variant and supporting provider capability context.
 
 ## Implementation Details
 Create or update runtime-owned files only. Reference the TechSpec Status Model and Capability Negotiation sections for required fields and semantics instead of duplicating every interface detail here. The result should be a small, reusable model surface that later tasks can use for provider service implementation, command formatting, and app routing.
@@ -61,13 +61,13 @@ Create or update runtime-owned files only. Reference the TechSpec Status Model a
 
 ## Tests
 - Unit tests:
-  - [ ] Exact usage can only be represented through the explicit exact usage variant with observed timestamp data.
-  - [ ] Unsupported, unavailable, and not-applicable usage states remain distinct in equality or matching assertions.
-  - [ ] Every required runway state can be constructed and matched without string parsing.
-  - [ ] Capability support variants cover supported, unsupported, requires-account-link, and requires-configuration cases.
-  - [ ] Provider diagnostics can be represented without storing raw secret-like values in the default data path.
+  - [x] Exact usage can only be represented through the explicit exact usage variant with observed timestamp data. (`exact_usage_is_only_reachable_through_the_exact_variant_with_a_timestamp`)
+  - [x] Unsupported, unavailable, and not-applicable usage states remain distinct in equality or matching assertions. (`unsupported_unavailable_and_not_applicable_usage_are_distinct`)
+  - [x] Every required runway state can be constructed and matched without string parsing. (`every_required_runway_state_can_be_constructed_and_matched`)
+  - [x] Capability support variants cover supported, unsupported, requires-account-link, and requires-configuration cases. (`capability_support_covers_all_four_cases`)
+  - [x] Provider diagnostics can be represented without storing raw secret-like values in the default data path. (`diagnostics_carry_only_share_safe_label_and_detail`)
 - Integration tests:
-  - [ ] A fake runtime status result can be built from the exported runtime model and consumed outside the status module.
+  - [x] A fake runtime status result can be built from the exported runtime model and consumed outside the status module. (`tests/provider_status_model.rs::fake_runtime_status_can_be_built_from_the_exported_model`)
 - Test coverage target: >=80%
 - All tests must pass
 
