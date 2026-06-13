@@ -4055,13 +4055,20 @@ fn sync_clarification_state(state: &AppState, ui_state: &mut TuiUiState) {
                 ui_state.clarification_selected.clear();
                 ui_state.clarification_custom_answer.clear();
                 ui_state.clarification_submitting = false;
-                let focus = clarification_default_focus(view);
-                ui_state.clarification_option_index = focus;
+                ui_state.clarification_option_index = clarification_default_focus(view);
                 // In multi-select, pre-check the recommended option so the
                 // highlighted "★ recommended" row honestly shows [x] and Enter
-                // confirms it rather than silently doing nothing.
-                if view.multi_select && view.recommended_option_id.is_some() {
-                    ui_state.clarification_selected.insert(focus);
+                // confirms it. Only do so when the recommended id resolves to a
+                // real option — otherwise the default-focus fallback would
+                // silently pre-check the first option for a stale/missing id.
+                if view.multi_select {
+                    if let Some(index) = view
+                        .recommended_option_id
+                        .as_deref()
+                        .and_then(|id| view.options.iter().position(|option| option.id == id))
+                    {
+                        ui_state.clarification_selected.insert(index);
+                    }
                 }
             } else {
                 let row_count = view.options.len() + 1;
