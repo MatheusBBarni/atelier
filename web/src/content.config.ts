@@ -6,8 +6,18 @@ import { glob } from "astro/loaders";
 // git-ignored generated reference under `_generated/` (Configuration, CLI —
 // task_11). The `**/*.md` pattern intentionally includes `_`-prefixed paths so
 // the generated fragments are picked up; do not switch to `[^_]` excluding.
+//
+// `generateId` strips the `_generated/` build-time directory from the entry id
+// so the generated pages live at clean slugs (`configuration`, `cli`) and the
+// prose cross-links (`../configuration/`, `../cli/`) resolve — the on-disk
+// location is an implementation detail, not part of the URL.
 const docs = defineCollection({
-  loader: glob({ pattern: "**/*.md", base: "./src/content/docs" }),
+  loader: glob({
+    pattern: "**/*.md",
+    base: "./src/content/docs",
+    generateId: ({ entry }) =>
+      entry.replace(/^_generated\//, "").replace(/\.md$/, ""),
+  }),
   schema: z.object({
     /** Page `<title>` and the section-nav / index label. */
     title: z.string(),
