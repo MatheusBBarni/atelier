@@ -1,13 +1,17 @@
 name: web checks
 
-# PR gate for the docs site. Node-only at this stage: builds web/ with the
-# GitHub Pages base path (/atelier) and link-checks the output so broken
-# internal links and base-path 404s fail before merge (ADR-005, PRD F9).
-# The Rust generate step is added later (task_12).
+# PR gate for the docs site. Builds the `atelier` binary, runs `--emit-docs` to
+# generate the reference fragments, then builds web/ with the GitHub Pages base
+# path (/atelier) and link-checks the output so broken internal links and
+# base-path 404s — including on generated pages — fail before merge
+# (ADR-005, PRD F9). Generator-source changes also trip the gate.
 on:
   pull_request:
     paths:
       - "web/**"
+      - "src/cli.rs"
+      - "src/config/**"
+      - "src/slash_commands.rs"
       - ".github/workflows/web-checks.yml"
   workflow_dispatch:
 
@@ -26,6 +30,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build atelier (release)
+        run: cargo build --locked --release --bin atelier
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -37,9 +50,20 @@ jobs:
         working-directory: web
         run: npm ci
 
+      # Run the prebuilt binary's --emit-docs into the content collection so the
+      # link-check below covers the generated reference pages. ATELIER_BIN reuses
+      # the release build above instead of `cargo run`.
+      - name: Generate reference docs
+        working-directory: web
+        run: npm run generate
+        env:
+          ATELIER_BIN: ${{ github.workspace }}/target/release/atelier
+
+      # `npx astro build` (not `npm run build`) so the `prebuild` hook does not
+      # re-run generate — the step above already produced the fragments.
       - name: Build site (GitHub Pages base path)
         working-directory: web
-        run: npm run build
+        run: npx astro build
         env:
           GITHUB_PAGES: "true"
 
