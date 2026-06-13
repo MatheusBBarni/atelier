@@ -9,6 +9,10 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
   (just before `work_indicator_active`) backs the Ctrl-L roster in `Full`. `RosterRowStyle::Full`
   is live; `Compact` (1 line) is ready but unconstructed in prod until task_05, so `RosterRowStyle`
   keeps its `#[allow(dead_code)]`.
+- task_03 complete: `TuiUiState.help_active_tab: HelpTab` (default `GettingStarted`, reset on
+  `ToggleHelp` close) is live (`src/tui/mod.rs` struct `:257`, Default `:303`, arm `:562`).
+  Ephemeral UI state, never in `AppState`. `HelpTab` keeps `#[allow(dead_code)]` (variants/
+  `next`/`prev`/`title`/`ALL` still unused until task_06/07).
 
 ## Shared Decisions
 - New foundational TUI types are staged with `#[allow(dead_code)]` + a doc-comment naming the
@@ -24,5 +28,9 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
   text — `ListItem` content is not publicly readable in ratatui 0.29.
 
 ## Open Risks
+- `cargo fmt --check` currently fails on committed task_01 code (`HelpTab::next`/`prev` in
+  `src/tui/mod.rs`, commit c00d737) — long single-line `.position()` call rustfmt wants wrapped.
+  Not caused by later tasks. Fix opportunistically in a task that already touches that region, or
+  as a standalone fmt commit; don't bundle it into unrelated task commits.
 
 ## Handoffs

@@ -257,6 +257,10 @@ enum AppWorkerCommand {
 struct TuiUiState {
     roster_visible: bool,
     help_visible: bool,
+    /// Active tab in the help modal. Ephemeral UI state only — never enters the
+    /// event-sourced `AppState` snapshot. Reset to `GettingStarted` on close so
+    /// reopening always lands on the front-door tab.
+    help_active_tab: HelpTab,
     event_scroll: usize,
     event_follow: bool,
     event_content_lines: usize,
@@ -304,6 +308,7 @@ impl Default for TuiUiState {
         Self {
             roster_visible: true,
             help_visible: false,
+            help_active_tab: HelpTab::GettingStarted,
             event_scroll: 0,
             event_follow: true,
             event_content_lines: 0,
@@ -561,6 +566,11 @@ async fn execute_tui_command_with_interrupt(
         }
         TuiCommand::ToggleHelp => {
             ui_state.help_visible = !ui_state.help_visible;
+            if !ui_state.help_visible {
+                // Reset to the front-door tab so reopening always starts on
+                // Getting Started. Ephemeral UI state, never in the snapshot.
+                ui_state.help_active_tab = HelpTab::GettingStarted;
+            }
             clear_input(state, ui_state);
             Ok(true)
         }
@@ -4819,6 +4829,48 @@ mod tests {
         assert_eq!(ui_state.input_cursor, 0);
         assert!(ui_state.help_visible);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn help_active_tab_defaults_to_getting_started() {
+        assert_eq!(
+            TuiUiState::default().help_active_tab,
+            HelpTab::GettingStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_help_close_resets_active_tab() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Cli,
+            ..TuiUiState::default()
+        };
+
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::ToggleHelp)
+            .await
+            .unwrap();
+
+        assert!(!ui_state.help_visible);
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
+    }
+
+    #[tokio::test]
+    async fn toggle_help_open_preserves_default_active_tab() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState::default();
+        assert!(!ui_state.help_visible);
+
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::ToggleHelp)
+            .await
+            .unwrap();
+
+        // Opening flips visibility and leaves the active tab at the default.
+        assert!(ui_state.help_visible);
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
     }
 
     #[test]
