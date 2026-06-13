@@ -342,6 +342,13 @@ fn facts_lines(theme: &Theme, facts: &WelcomeFacts) -> Vec<Line<'static>> {
             ),
         ]));
     }
+    // Empty-state onboarding hint (task_08): the welcome only renders on an
+    // empty chat, so this routing mental-model line is self-gating — no state or
+    // events. Sits beside the existing `/help` cue.
+    lines.push(Line::from(Span::styled(
+        "describe a task — it routes through an orchestrator to named agents",
+        Style::default().fg(theme.text_muted),
+    )));
     lines.push(Line::from(Span::styled(
         "type /help for commands",
         Style::default().fg(theme.text_muted),
@@ -516,6 +523,44 @@ mod tests {
         assert!(text.contains('3')); // agent count
         assert!(text.contains("explorer"));
         assert!(text.contains("default")); // preset
+    }
+
+    #[test]
+    fn facts_box_includes_routing_hint_and_help_cue() {
+        // The empty-state onboarding hint (task_08) must teach the routing
+        // mental model and keep the existing `/help` cue beside it.
+        let agents = [agent("explorer")];
+        let lines = facts_lines(&truecolor(), &facts_with(&agents, None));
+        let text: String = lines
+            .iter()
+            .map(|line| format!("{}\n", line_text(line)))
+            .collect();
+
+        assert!(
+            text.contains("orchestrator"),
+            "routing hint names the orchestrator"
+        );
+        assert!(
+            text.contains("named agents"),
+            "routing hint names the agents"
+        );
+        assert!(
+            text.contains("type /help for commands"),
+            "existing /help cue retained"
+        );
+
+        // The hint carries no inline color — it is styled with a theme token, so
+        // every span's foreground is the shared muted token.
+        let hint = lines
+            .iter()
+            .find(|line| line_text(line).contains("orchestrator"))
+            .expect("hint line present");
+        assert!(
+            hint.spans
+                .iter()
+                .all(|span| span.style.fg == Some(truecolor().text_muted)),
+            "hint styled with theme.text_muted token"
+        );
     }
 
     #[test]

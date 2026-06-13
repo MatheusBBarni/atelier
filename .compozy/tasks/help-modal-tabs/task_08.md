@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Empty-state onboarding hint in welcome facts
 type: frontend
 complexity: low
@@ -31,9 +31,9 @@ self-gating (the welcome only renders on an empty chat) and needs no state or ev
 </requirements>
 
 ## Subtasks
-- [ ] 08.1 Draft the one-line routing hint copy.
-- [ ] 08.2 Add the hint line to `facts_lines`, preserving the `/help` cue.
-- [ ] 08.3 Add a unit test in `welcome.rs` tests asserting both lines are present.
+- [x] 08.1 Draft the one-line routing hint copy.
+- [x] 08.2 Add the hint line to `facts_lines`, preserving the `/help` cue.
+- [x] 08.3 Add a unit test in `welcome.rs` tests asserting both lines are present.
 
 ## Implementation Details
 `facts_lines` (`src/tui/welcome.rs:312`) builds the welcome facts `Vec<Line>` and already ends
@@ -57,11 +57,11 @@ with the muted `/help` cue. Append the routing hint there. `welcome.rs` has its 
 
 ## Tests
 - Unit tests:
-  - [ ] `facts_lines` output contains the new routing-hint substring (e.g., "orchestrator").
-  - [ ] `facts_lines` still contains "type /help for commands".
-  - [ ] The hint line carries no inline color (the `colors_live_only_in_theme_module` scan over `src/tui/*.rs` still passes).
+  - [x] `facts_lines` output contains the new routing-hint substring (e.g., "orchestrator").
+  - [x] `facts_lines` still contains "type /help for commands".
+  - [x] The hint line carries no inline color (the `colors_live_only_in_theme_module` scan over `src/tui/*.rs` still passes).
 - Integration tests:
-  - [ ] With an empty chat (no events, no chat items), `render_to_text_with_ui` shows the routing hint in the welcome area.
+  - [x] With an empty chat (no events, no chat items), `render_to_text` shows the routing hint in the welcome area.
 - Test coverage target: >=80%
 - All tests must pass
 

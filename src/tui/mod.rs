@@ -8573,6 +8573,25 @@ runtime = "fake"
     }
 
     #[test]
+    fn welcome_shows_routing_onboarding_hint_on_empty_chat() {
+        // task_08: a newcomer on an empty chat (only the synthetic Welcome item)
+        // sees the routing hint pointing through the orchestrator to /help.
+        let mut state = state_with_agent_roster("");
+        state.chat_items = vec![ChatItemView::welcome()];
+
+        let text = render_to_text(&state, 80, 24);
+
+        assert!(
+            text.contains("orchestrator"),
+            "routing onboarding hint visible in welcome area"
+        );
+        assert!(
+            text.contains("type /help for commands"),
+            "existing /help cue retained beside the hint"
+        );
+    }
+
+    #[test]
     fn welcome_persists_above_later_chat_items() {
         let mut state = state_with_agent_roster("");
         state.chat_items = vec![
