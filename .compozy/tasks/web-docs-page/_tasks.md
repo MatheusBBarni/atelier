@@ -10,7 +10,7 @@
 | 04 | Write the Quickstart page | completed | medium | task_03 |
 | 05 | Write the Concepts page | completed | low | task_03 |
 | 06 | Write the Governance and Safety page | pending | medium | task_03 |
-| 07 | Emit machine-readable surfaces (llms.txt, twins, sitemap) | pending | medium | task_03, task_04, task_05, task_06 |
+| 07 | Emit machine-readable surfaces (llms.txt, twins, sitemap) | completed | medium | task_03, task_04, task_05, task_06 |
 | 08 | Add the web-checks PR workflow with link checking | pending | medium | task_07 |
 | 09 | Refactor the redacted-config builder for reuse | pending | medium | — |
 | 10 | Build the emit-docs reference generator | pending | high | task_03, task_09 |

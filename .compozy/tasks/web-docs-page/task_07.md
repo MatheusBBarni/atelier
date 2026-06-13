@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Emit machine-readable surfaces (llms.txt, twins, sitemap)"
 type: frontend
 complexity: medium
@@ -37,11 +37,20 @@ endpoints that read the docs collection, so they reflect whatever pages exist
 </requirements>
 
 ## Subtasks
-- [ ] 7.1 Build the `llms.txt` endpoint (H1 + summary + grouped links + `## Optional`).
-- [ ] 7.2 Build the `llms-full.txt` endpoint (concatenated non-Optional bodies).
-- [ ] 7.3 Build the per-page `.md` twin endpoint.
-- [ ] 7.4 Build the sitemap endpoint.
-- [ ] 7.5 Verify all four outputs reflect the current collection and use base-correct absolute URLs.
+- [x] 7.1 Build the `llms.txt` endpoint (H1 + summary + grouped links + `## Optional`).
+- [x] 7.2 Build the `llms-full.txt` endpoint (concatenated non-Optional bodies).
+- [x] 7.3 Build the per-page `.md` twin endpoint.
+- [x] 7.4 Build the sitemap endpoint.
+- [x] 7.5 Verify all four outputs reflect the current collection and use base-correct absolute URLs.
+
+## Follow-ups
+- The `docs` schema has no `area` field, so `llms.txt` collapses all non-optional entries
+  into one `## Docs` section. Add an `area`/`group` frontmatter field if richer link
+  grouping is later wanted.
+- Governance page (task_06) was not yet present in the branch when this task ran; the
+  endpoints are collection-generic and pick it up automatically once it lands. Bucketing /
+  exclusion behaviour is proven by the `node --test` unit suite rather than Governance
+  content.
 
 ## Implementation Details
 
