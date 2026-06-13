@@ -1789,82 +1789,91 @@ fn title_case_id(id: &str) -> String {
     }
 }
 
+/// Redacted, serializable projection of [`EffectiveConfig`] used by `--print-config`
+/// (via [`to_redacted_toml`]) and the docs generator (`src/docgen`). Field visibility is
+/// `pub(crate)` so `docgen` can read the same redacted view it renders to Markdown.
 #[derive(Clone, Debug, Serialize)]
-struct PrintableConfig {
-    schema_version: u32,
+pub(crate) struct PrintableConfig {
+    pub(crate) schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    preset: Option<String>,
-    approval_mode: ApprovalMode,
-    workspace: WorkspacePolicy,
-    features: Features,
-    ui: UiConfig,
-    limits: Limits,
-    council: PrintableCouncilConfig,
-    runtimes: BTreeMap<String, PrintableRuntime>,
-    agents: BTreeMap<String, PrintableAgent>,
+    pub(crate) preset: Option<String>,
+    pub(crate) approval_mode: ApprovalMode,
+    pub(crate) workspace: WorkspacePolicy,
+    pub(crate) features: Features,
+    pub(crate) ui: UiConfig,
+    pub(crate) limits: Limits,
+    pub(crate) council: PrintableCouncilConfig,
+    pub(crate) runtimes: BTreeMap<String, PrintableRuntime>,
+    pub(crate) agents: BTreeMap<String, PrintableAgent>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PrintableRuntime {
+pub(crate) struct PrintableRuntime {
     #[serde(rename = "type")]
-    kind: RuntimeKind,
+    pub(crate) kind: RuntimeKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    command: Option<String>,
+    pub(crate) command: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    args: Vec<String>,
+    pub(crate) args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_mode: Option<PromptMode>,
+    pub(crate) prompt_mode: Option<PromptMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    base_url: Option<String>,
+    pub(crate) base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    api_key_env: Option<String>,
+    pub(crate) api_key_env: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PrintableAgent {
-    display_name: String,
-    runtime: String,
-    model: String,
+pub(crate) struct PrintableAgent {
+    pub(crate) display_name: String,
+    pub(crate) runtime: String,
+    pub(crate) model: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    model_fallbacks: Vec<String>,
-    effort: AgentEffort,
-    thinking: bool,
-    capabilities: Vec<Capability>,
+    pub(crate) model_fallbacks: Vec<String>,
+    pub(crate) effort: AgentEffort,
+    pub(crate) thinking: bool,
+    pub(crate) capabilities: Vec<Capability>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ToolName>>,
-    prompt_source: String,
+    pub(crate) tools: Option<Vec<ToolName>>,
+    pub(crate) prompt_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    instructions_file: Option<PathBuf>,
+    pub(crate) instructions_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    instructions_append_file: Option<PathBuf>,
+    pub(crate) instructions_append_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    orchestrator_description_file: Option<PathBuf>,
-    enabled: bool,
+    pub(crate) orchestrator_description_file: Option<PathBuf>,
+    pub(crate) enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PrintableCouncilConfig {
-    default_preset: String,
-    timeout_seconds: u64,
-    execution_mode: CouncilExecutionMode,
-    presets: BTreeMap<String, BTreeMap<String, PrintableCouncilMember>>,
+pub(crate) struct PrintableCouncilConfig {
+    pub(crate) default_preset: String,
+    pub(crate) timeout_seconds: u64,
+    pub(crate) execution_mode: CouncilExecutionMode,
+    pub(crate) presets: BTreeMap<String, BTreeMap<String, PrintableCouncilMember>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PrintableCouncilMember {
-    runtime: String,
-    model: String,
+pub(crate) struct PrintableCouncilMember {
+    pub(crate) runtime: String,
+    pub(crate) model: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    model_fallbacks: Vec<String>,
-    effort: AgentEffort,
-    thinking: bool,
-    prompt_source: String,
+    pub(crate) model_fallbacks: Vec<String>,
+    pub(crate) effort: AgentEffort,
+    pub(crate) thinking: bool,
+    pub(crate) prompt_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_file: Option<PathBuf>,
+    pub(crate) prompt_file: Option<PathBuf>,
 }
 
-pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
-    let printable = PrintableConfig {
+/// Builds the redacted [`PrintableConfig`] projection of `config`. This is the single
+/// place the `EffectiveConfig → PrintableConfig` mapping lives; both [`to_redacted_toml`]
+/// (for `--print-config`) and the docs generator reuse it so the redacted view stays
+/// identical across surfaces. Preserves every redaction invariant: env-var names (not
+/// secrets), `prompt_source` labels, authored-args-only runtimes, and prompt-file paths
+/// without bodies.
+pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfig {
+    PrintableConfig {
         schema_version: config.schema_version,
         preset: config.active_preset.clone(),
         approval_mode: config.approval_mode.clone(),
@@ -1964,8 +1973,14 @@ pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
                 )
             })
             .collect(),
-    };
+    }
+}
 
+/// Renders the redacted effective configuration as TOML for `--print-config`. Thin
+/// serialize-only wrapper over [`build_printable_config`]; output is byte-identical to the
+/// previous inlined implementation.
+pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
+    let printable = build_printable_config(config);
     toml::to_string_pretty(&printable).context("failed to render effective configuration")
 }
 
@@ -2846,6 +2861,47 @@ api_key_env = "sk-secret"
         assert!(rendered.contains("prompt_source = \"inline_redacted\""));
         assert!(!rendered.contains("Own the run plan"));
         assert!(!rendered.contains("Bearer"));
+    }
+
+    #[test]
+    fn build_printable_config_matches_to_redacted_toml() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("empty-home.toml");
+        fs::write(&config_path, "schema_version = 1\n").unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let via_builder = toml::to_string_pretty(&build_printable_config(&config)).unwrap();
+        let via_wrapper = to_redacted_toml(&config).unwrap();
+
+        assert_eq!(via_builder, via_wrapper);
+    }
+
+    #[test]
+    fn build_printable_config_exposes_all_sections() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("empty-home.toml");
+        fs::write(&config_path, "schema_version = 1\n").unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let printable = build_printable_config(&config);
+
+        // Agents, runtimes, and council presets are all reachable from the reusable
+        // builder for the docs generator (task_10).
+        assert!(!printable.agents.is_empty());
+        assert!(!printable.runtimes.is_empty());
+        assert!(!printable.council.presets.is_empty());
+        // The scalar limits/ui/workspace sections are reachable by construction.
+        assert!(printable.limits.max_parallel_agent_steps > 0);
+        let _ = printable.workspace.extra_read_roots.len();
+        let _ = printable.ui.hide_banner;
     }
 
     #[test]
