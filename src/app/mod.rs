@@ -68,6 +68,44 @@ pub struct AgentView {
     pub status: String,
 }
 
+/// Activity classification for a roster row (ADR-001/ADR-002). Computed in the
+/// app layer by the roster builder and pre-baked into [`RosterRow`] so the
+/// renderer never reads a clock. `snake_case` on the wire mirrors
+/// [`LiveStepStatus`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityState {
+    Active,
+    NeedsInput,
+    Stalled,
+    Idle,
+}
+
+/// Live-activity-first view-model for one agent in the roster (ADR-003). Joins
+/// identity ([`AgentView`]) with liveness ([`LiveStepView`]) and carries
+/// pre-formatted, clock-free values for the pure renderer. Built by the roster
+/// builder and stored on [`AppState::roster_rows`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterRow {
+    /// Stable identity key (`AgentView.id`).
+    pub agent_id: String,
+    pub name: String,
+    /// Canonical-order index into the theme accent palette (ADR-005); decoupled
+    /// from render-time position so the `NeedsInput` pin cannot recolor an agent.
+    pub accent_index: usize,
+    pub activity: ActivityState,
+    /// `"runtime/model"`.
+    pub runtime_model: String,
+    pub effort: String,
+    pub thinking: bool,
+    /// Step label, active rows only.
+    pub current_step: Option<String>,
+    /// Coarse pre-formatted elapsed (e.g. `"1m 20s"`), active rows only.
+    pub elapsed: Option<String>,
+    /// Existing terminal status labels, preserved.
+    pub status: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppState {
     pub session_id: String,
@@ -85,6 +123,10 @@ pub struct AppState {
     pub show_first_approval_explainer: bool,
     pub pending_clarification: Option<PendingClarificationView>,
     pub agents: Vec<AgentView>,
+    /// Live-activity-first roster view-model, rebuilt on every publish (ADR-003).
+    /// Empty until the roster builder (task 03) populates it.
+    #[serde(default)]
+    pub roster_rows: Vec<RosterRow>,
     pub chat_items: Vec<ChatItemView>,
     pub queued_follow_ups: Vec<QueuedFollowUpView>,
     pub events: Vec<String>,
@@ -780,6 +822,7 @@ impl App {
             show_first_approval_explainer: false,
             pending_clarification: None,
             agents: build_agent_views(&config, &availability),
+            roster_rows: Vec::new(),
             // Branded welcome item present from the first frame (ADR-005);
             // `sync_chat_items` keeps it prepended across projection updates.
             chat_items: vec![ChatItemView::welcome()],
@@ -12001,5 +12044,100 @@ runtime = "fake"
             .contains("waiting for clarification"));
         assert!(app.pending_clarification.is_some());
         assert_eq!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    fn sample_roster_row() -> RosterRow {
+        RosterRow {
+            agent_id: "explorer".to_string(),
+            name: "Explorer".to_string(),
+            accent_index: 2,
+            activity: ActivityState::Active,
+            runtime_model: "fake/default".to_string(),
+            effort: "medium".to_string(),
+            thinking: true,
+            current_step: Some("scan the workspace".to_string()),
+            elapsed: Some("1m 20s".to_string()),
+            status: "running".to_string(),
+        }
+    }
+
+    #[test]
+    fn activity_state_serializes_active() {
+        let json = serde_json::to_string(&ActivityState::Active).unwrap();
+        assert_eq!(json, "\"active\"");
+        let parsed: ActivityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ActivityState::Active);
+    }
+
+    #[test]
+    fn activity_state_serializes_needs_input() {
+        let json = serde_json::to_string(&ActivityState::NeedsInput).unwrap();
+        assert_eq!(json, "\"needs_input\"");
+        let parsed: ActivityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ActivityState::NeedsInput);
+    }
+
+    #[test]
+    fn activity_state_serializes_stalled() {
+        let json = serde_json::to_string(&ActivityState::Stalled).unwrap();
+        assert_eq!(json, "\"stalled\"");
+        let parsed: ActivityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ActivityState::Stalled);
+    }
+
+    #[test]
+    fn activity_state_serializes_idle() {
+        let json = serde_json::to_string(&ActivityState::Idle).unwrap();
+        assert_eq!(json, "\"idle\"");
+        let parsed: ActivityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ActivityState::Idle);
+    }
+
+    #[test]
+    fn roster_row_serializes_with_all_fields() {
+        let row = sample_roster_row();
+        let json = serde_json::to_string(&row).unwrap();
+        let parsed: RosterRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, row);
+    }
+
+    #[test]
+    fn roster_row_serializes_with_optional_nones() {
+        let row = RosterRow {
+            current_step: None,
+            elapsed: None,
+            activity: ActivityState::Idle,
+            ..sample_roster_row()
+        };
+        let value: Value = serde_json::to_value(&row).unwrap();
+        assert!(value["current_step"].is_null());
+        assert!(value["elapsed"].is_null());
+        let parsed: RosterRow = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, row);
+    }
+
+    #[tokio::test]
+    async fn app_state_default_has_empty_roster_rows() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+        assert!(app.state().roster_rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_state_carries_roster_rows_through_watch() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        app.state_mut().roster_rows = vec![sample_roster_row()];
+        app.publish_state();
+
+        let state = receiver.borrow_and_update();
+        assert_eq!(state.roster_rows.len(), 1);
+        assert_eq!(state.roster_rows[0].agent_id, "explorer");
+        assert_eq!(state.roster_rows[0].activity, ActivityState::Active);
     }
 }

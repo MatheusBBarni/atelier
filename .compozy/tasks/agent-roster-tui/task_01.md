@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "View-model types: ActivityState + RosterRow + AppState field"
 type: backend
 complexity: low
@@ -36,13 +36,13 @@ Define the new view-model types (`ActivityState` enum and `RosterRow` struct) th
 
 ## Subtasks
 
-- [ ] 1.1 Define `ActivityState` enum with four variants and serde conventions
-- [ ] 1.2 Define `RosterRow` struct with all required fields and trait derives
-- [ ] 1.3 Add `roster_rows` field to `AppState` struct
-- [ ] 1.4 Update the primary `AppState` constructor (`App::new_with_debug`) to initialize `roster_rows`
-- [ ] 1.5 Identify and update all test `AppState` fixtures in `src/tui/mod.rs`
-- [ ] 1.6 Write serde round-trip unit tests for `ActivityState` and `RosterRow`
-- [ ] 1.7 Write integration test for `publish_state`→`watch` round-trip with `roster_rows`
+- [x] 1.1 Define `ActivityState` enum with four variants and serde conventions
+- [x] 1.2 Define `RosterRow` struct with all required fields and trait derives
+- [x] 1.3 Add `roster_rows` field to `AppState` struct
+- [x] 1.4 Update the primary `AppState` constructor (`App::new_with_debug`) to initialize `roster_rows`
+- [x] 1.5 Identify and update all test `AppState` fixtures in `src/tui/mod.rs`
+- [x] 1.6 Write serde round-trip unit tests for `ActivityState` and `RosterRow`
+- [x] 1.7 Write integration test for `publish_state`→`watch` round-trip with `roster_rows`
 
 ## Implementation Details
 

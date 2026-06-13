@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | View-model types: ActivityState + RosterRow + AppState field | pending | low | — |
+| 01 | View-model types: ActivityState + RosterRow + AppState field | completed | low | — |
 | 02 | StepTiming map + lifecycle stamping | pending | medium | — |
 | 03 | build_roster_rows builder (join, classify, elapsed, accent_index, NeedsInput pin) | pending | medium | task_01, task_02 |
 | 04 | Wire rebuild into publish_state + 1Hz gated refresh tick | pending | medium | task_03 |
