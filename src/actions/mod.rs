@@ -1480,6 +1480,10 @@ mod tests {
     #[test]
     fn unrestricted_reads_flag_allows_absolute_read_outside_workspace() {
         let (mut config, explorer) = fixture_agent("explorer");
+        // Hermetic baseline: `fixture_agent` loads the user's home config, which
+        // may opt into unrestricted reads — pin it off so the "without flag"
+        // path is exercised regardless of the ambient environment.
+        config.workspace.allow_unrestricted_reads = false;
         let request = ActionRequest {
             schema_version: 1,
             action_id: "a".to_string(),
@@ -1539,6 +1543,9 @@ mod tests {
     #[test]
     fn unrestricted_reads_flag_executes_absolute_read_outside_workspace() {
         let (mut config, _explorer) = fixture_agent("explorer");
+        // Hermetic baseline: ignore any ambient home-config opt-in (see sibling
+        // test) so the "without flag" denial path is exercised deterministically.
+        config.workspace.allow_unrestricted_reads = false;
         let workspace_dir = tempdir().unwrap();
         let outside_dir = tempdir().unwrap();
         let outside_file = outside_dir.path().join("reference.md");
