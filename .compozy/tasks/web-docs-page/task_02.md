@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Extract a shared Base.astro layout"
 type: refactor
 complexity: medium
@@ -33,11 +33,11 @@ page to use it, so the landing page and every docs page share one source (PRD F4
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Create `Base.astro` with the shared head, nav, footer, and a default slot.
-- [ ] 2.2 Parameterize `title`/`description` (and optional OG/canonical) via props.
-- [ ] 2.3 Move the `assetPath()`/`BASE_URL` helper into the layout (or a shared import) so every page reuses it.
-- [ ] 2.4 Migrate `index.astro` to wrap its sections in `Base.astro`.
-- [ ] 2.5 Verify the landing page renders identically (visual diff against the reference screenshots).
+- [x] 2.1 Create `Base.astro` with the shared head, nav, footer, and a default slot.
+- [x] 2.2 Parameterize `title`/`description` (and optional OG/canonical) via props.
+- [x] 2.3 Move the `assetPath()`/`BASE_URL` helper into the layout (or a shared import) so every page reuses it.
+- [x] 2.4 Migrate `index.astro` to wrap its sections in `Base.astro`.
+- [x] 2.5 Verify the landing page renders identically (visual diff against the reference screenshots).
 
 ## Implementation Details
 
