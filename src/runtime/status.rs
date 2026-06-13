@@ -989,6 +989,168 @@ fn looks_like_secret(token: &str) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Compact share-safe rendering
+// ---------------------------------------------------------------------------
+
+/// Render a list of provider statuses into the compact, share-safe default
+/// output: a `Provider status` header followed by exactly one column-aligned
+/// row per provider (display name, status label, then a short reason + one
+/// next action). This is the small API command routing calls; it needs no
+/// provider-specific knowledge.
+///
+/// Share-safety is structural: diagnostics are omitted entirely from the
+/// default view, exact usage is rendered only from `UsageAvailability::Exact`,
+/// and the free-text fields (display name, reason) are defensively run through
+/// [`redact_secrets`] so a status built outside the service still cannot leak.
+pub fn render_provider_status(statuses: &[ProviderRunwayStatus]) -> String {
+    if statuses.is_empty() {
+        return "Provider status\n\nNo configured providers to report.".to_string();
+    }
+
+    let name_width = statuses
+        .iter()
+        .map(|status| redact_secrets(&status.display_name).chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_width = statuses
+        .iter()
+        .map(|status| state_label(status.state).chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let mut out = String::from("Provider status\n\n");
+    for status in statuses {
+        let name = redact_secrets(&status.display_name);
+        let label = state_label(status.state);
+        let detail = render_detail(status);
+        out.push_str(&format!(
+            "{name:name_width$}  {label:label_width$}  {detail}\n"
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// Stable user-facing label for each runway state.
+pub fn state_label(state: ProviderRunwayState) -> &'static str {
+    match state {
+        ProviderRunwayState::Ready => "ready",
+        ProviderRunwayState::LimitedRunway => "limited runway",
+        ProviderRunwayState::Blocked => "blocked",
+        ProviderRunwayState::UnavailableUsage => "unavailable usage",
+        ProviderRunwayState::Unauthenticated => "unauthenticated",
+        ProviderRunwayState::Misconfigured => "misconfigured",
+        ProviderRunwayState::ProviderError => "provider error",
+        ProviderRunwayState::LocalOnlyStatus => "local-only status",
+    }
+}
+
+/// The detail column for one row: a capitalized reason sentence, the exact
+/// usage figures when (and only when) the typed usage is `Exact`, then one
+/// next-action sentence.
+fn render_detail(status: &ProviderRunwayStatus) -> String {
+    let mut segments: Vec<String> = vec![ensure_trailing_period(&capitalize_first(
+        &redact_secrets(&status.reason.summary),
+    ))];
+
+    if let UsageAvailability::Exact(exact) = &status.usage {
+        segments.push(render_exact_usage(exact, &status.reset));
+    }
+
+    segments.push(next_action_phrase(status));
+    segments.join(" ")
+}
+
+/// Render documented exact usage. Only ever called for
+/// `UsageAvailability::Exact`, so it never invents numbers.
+fn render_exact_usage(exact: &ExactUsage, reset: &ResetAvailability) -> String {
+    let remaining = format_amount(&exact.remaining);
+    let metric = metric_label(&exact.metric);
+    let mut sentence = match &exact.limit {
+        Some(limit) => format!("{remaining} of {} {metric} remaining", format_amount(limit)),
+        None => format!("{remaining} {metric} remaining"),
+    };
+    let reset = render_reset(exact, reset);
+    if !reset.is_empty() {
+        sentence.push_str("; ");
+        sentence.push_str(&reset);
+    }
+    sentence.push('.');
+    sentence
+}
+
+/// Reset timing for exact usage. Prefers the usage window's own `reset_at`,
+/// falls back to the status-level reset, and says `unknown` rather than
+/// inferring a time when the provider does not return one.
+fn render_reset(exact: &ExactUsage, reset: &ResetAvailability) -> String {
+    if let Some(reset_at) = exact.reset_at {
+        return format!("resets {}", reset_at.format("%Y-%m-%d %H:%M UTC"));
+    }
+    match reset {
+        ResetAvailability::Known { reset_at } => {
+            format!("resets {}", reset_at.format("%Y-%m-%d %H:%M UTC"))
+        }
+        ResetAvailability::Unknown => "reset unknown".to_string(),
+        ResetAvailability::NotApplicable => String::new(),
+    }
+}
+
+/// Provider-native metric noun. `Other` is provider-supplied text, so it is
+/// redacted defensively.
+fn metric_label(metric: &UsageMetric) -> String {
+    match metric {
+        UsageMetric::Messages => "messages".to_string(),
+        UsageMetric::Requests => "requests".to_string(),
+        UsageMetric::Tokens => "tokens".to_string(),
+        UsageMetric::Credits => "credits".to_string(),
+        UsageMetric::Other(name) => redact_secrets(name),
+    }
+}
+
+/// Format a usage amount. `f64`'s `Display` already renders whole numbers
+/// without a trailing `.0` and fractional amounts compactly.
+fn format_amount(amount: &UsageAmount) -> String {
+    format!("{}", amount.value)
+}
+
+/// One actionable next-step sentence per typed next action. The provider URL is
+/// intentionally not printed in the compact view (kept share-safe and short);
+/// a detailed view can surface it later.
+fn next_action_phrase(status: &ProviderRunwayStatus) -> String {
+    match &status.next_action {
+        ProviderNextAction::Proceed => "Safe to proceed.".to_string(),
+        ProviderNextAction::CheckProviderUsage { .. } => {
+            format!(
+                "Check {} account usage.",
+                redact_secrets(&status.display_name)
+            )
+        }
+        ProviderNextAction::Authenticate => "Authenticate or re-link the account.".to_string(),
+        ProviderNextAction::FixConfiguration => "Update provider configuration.".to_string(),
+        ProviderNextAction::SwitchProvider => "Switch providers for this session.".to_string(),
+        ProviderNextAction::ReduceScope => "Reduce session scope.".to_string(),
+        ProviderNextAction::RetryLater => "Retry later.".to_string(),
+        ProviderNextAction::VerifyRuntime => "Verify the local runtime is installed.".to_string(),
+    }
+}
+
+fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+fn ensure_trailing_period(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.ends_with(['.', '!', '?']) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,5 +1535,168 @@ mod tests {
     fn redaction_preserves_official_urls_and_plain_text() {
         let text = "ready; check https://claude.ai/settings/usage before a long run";
         assert_eq!(redact_secrets(text), text);
+    }
+
+    fn status(
+        provider_id: ProviderId,
+        state: ProviderRunwayState,
+        reason: &str,
+        next_action: ProviderNextAction,
+        usage: UsageAvailability,
+    ) -> ProviderRunwayStatus {
+        ProviderRunwayStatus {
+            provider_id,
+            display_name: provider_id.default_display_name().to_string(),
+            selected_model: None,
+            state,
+            reason: ProviderStatusReason::new(ReasonCode::UsageUnsupported, reason),
+            next_action,
+            usage,
+            reset: ResetAvailability::Unknown,
+            freshness: StatusFreshness::Unknown,
+            source: StatusSource::LocalRuntimeCheck,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ready_with_unsupported_usage_renders_ready_wording() {
+        let row = status(
+            ProviderId::Claude,
+            ProviderRunwayState::Ready,
+            "ready based on auth/config/runtime checks; exact remaining usage is unavailable",
+            ProviderNextAction::CheckProviderUsage {
+                provider_url: Some("https://claude.ai/settings/usage".to_string()),
+            },
+            UsageAvailability::Unsupported {
+                provider_url: Some("https://claude.ai/settings/usage".to_string()),
+            },
+        );
+        let out = render_provider_status(&[row]);
+        assert!(out.contains("Claude"));
+        assert!(out.contains("ready"));
+        assert!(out.contains("exact remaining usage is unavailable"));
+        assert!(out.contains("Check Claude account usage."));
+        // No exact figures fabricated.
+        assert!(!out.contains("remaining of"));
+    }
+
+    #[test]
+    fn unavailable_usage_renders_unsupported_message_and_verification_action() {
+        let row = status(
+            ProviderId::Codex,
+            ProviderRunwayState::UnavailableUsage,
+            "auth/config look ok; exact remaining usage is unsupported by this provider integration",
+            ProviderNextAction::CheckProviderUsage { provider_url: None },
+            UsageAvailability::Unsupported { provider_url: None },
+        );
+        let out = render_provider_status(&[row]);
+        assert!(out.contains("unavailable usage"));
+        assert!(out.contains("unsupported"));
+        assert!(out.contains("Check Codex account usage."));
+    }
+
+    #[test]
+    fn exact_usage_renders_only_when_usage_is_exact() {
+        let exact_row = status(
+            ProviderId::Zai,
+            ProviderRunwayState::Ready,
+            "ready",
+            ProviderNextAction::Proceed,
+            UsageAvailability::Exact(ExactUsage {
+                metric: UsageMetric::Messages,
+                remaining: UsageAmount::new(42.0),
+                limit: Some(UsageAmount::new(100.0)),
+                window: None,
+                reset_at: Some(fixed_time()),
+                observed_at: fixed_time(),
+            }),
+        );
+        let exact_out = render_provider_status(&[exact_row]);
+        assert!(exact_out.contains("42 of 100 messages remaining"));
+        assert!(exact_out.contains("resets 2023-11-14"));
+
+        let unsupported_row = status(
+            ProviderId::Zai,
+            ProviderRunwayState::UnavailableUsage,
+            "exact remaining usage is unavailable",
+            ProviderNextAction::CheckProviderUsage { provider_url: None },
+            UsageAvailability::Unsupported { provider_url: None },
+        );
+        let unsupported_out = render_provider_status(&[unsupported_row]);
+        // No exact-usage figure is rendered (the word "remaining" may still
+        // appear inside the truthful "exact remaining usage is unavailable").
+        assert!(!unsupported_out.contains("messages remaining"));
+        assert!(!unsupported_out.contains(" of "));
+    }
+
+    #[test]
+    fn local_only_renders_without_account_usage_wording() {
+        let row = status(
+            ProviderId::Local,
+            ProviderRunwayState::LocalOnlyStatus,
+            "runtime reachable; account readiness does not require a provider account",
+            ProviderNextAction::Proceed,
+            UsageAvailability::NotApplicable,
+        );
+        let out = render_provider_status(&[row]);
+        assert!(out.contains("local-only status"));
+        assert!(out.contains("Safe to proceed."));
+        // Local readiness is never framed as account usage to check.
+        assert!(!out.contains("account usage"));
+    }
+
+    #[test]
+    fn diagnostics_with_sensitive_strings_are_omitted_from_default_output() {
+        let mut row = status(
+            ProviderId::Codex,
+            ProviderRunwayState::ProviderError,
+            "a live check failed",
+            ProviderNextAction::RetryLater,
+            UsageAvailability::Unavailable {
+                reason: "transient failure".to_string(),
+                provider_url: None,
+            },
+        );
+        row.diagnostics = vec![
+            ProviderDiagnostic::error("auth", "token sk-LEAK1234567890abcdef"),
+            ProviderDiagnostic::info("account", "user carol@example.com org-AABBCCDDEEFF"),
+        ];
+        let out = render_provider_status(&[row]);
+        for sensitive in [
+            "sk-LEAK1234567890abcdef",
+            "carol@example.com",
+            "org-AABBCCDDEEFF",
+        ] {
+            assert!(!out.contains(sensitive), "leaked {sensitive} in: {out}");
+        }
+    }
+
+    #[test]
+    fn unknown_reset_renders_as_unknown_not_inferred_text() {
+        let row = status(
+            ProviderId::Zai,
+            ProviderRunwayState::Ready,
+            "ready",
+            ProviderNextAction::Proceed,
+            UsageAvailability::Exact(ExactUsage {
+                metric: UsageMetric::Credits,
+                remaining: UsageAmount::new(12.5),
+                limit: None,
+                window: None,
+                reset_at: None,
+                observed_at: fixed_time(),
+            }),
+        );
+        let out = render_provider_status(&[row]);
+        assert!(out.contains("12.5 credits remaining"));
+        assert!(out.contains("reset unknown"));
+    }
+
+    #[test]
+    fn empty_status_list_renders_a_friendly_placeholder() {
+        let out = render_provider_status(&[]);
+        assert!(out.contains("Provider status"));
+        assert!(out.contains("No configured providers"));
     }
 }
