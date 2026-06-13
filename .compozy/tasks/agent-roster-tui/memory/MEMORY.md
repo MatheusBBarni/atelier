@@ -8,6 +8,7 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
 - task_02 complete: `StepTiming` map + lifecycle stamping was already implemented; tests added this run (8 tests in `src/app/mod.rs`). `started_at`/`last_activity` are ready.
 - task_03 complete: `build_roster_rows` (+ `classify_step`, `step_display_label`, `format_coarse_elapsed`) and `STALL_THRESHOLD` const now exist in `src/app/mod.rs`. `rebuild_roster_rows` is wired into `publish_state`, which is now `&mut self` and rebuilds `roster_rows` on every publish (unconditionally — task_04 adds the change-gate).
 - task_04 complete: `refresh_roster_tick(&mut self) -> bool` (active-run gate + `roster_rows == rebuilt` change-gate via new `send_state()`), a 4th 1 Hz `select!` arm in the `tui` app-worker loop (`ROSTER_REFRESH_INTERVAL`, Skip missed ticks → `app.refresh_roster_tick()`), and a terminal-status `step_timings` clear added to `set_live_step_status`. Render-snapshot integration tests deferred to task_06 (renderer still reads `state.agents`).
+- task_05 complete: `activity_glyph(state, ascii)` and `activity_label(state)` pure helpers in `src/tui/mod.rs` beside `agent_status_label`. Set 1 glyphs `◐ ◔ ○ ·` / ASCII `> ? ! .`; labels `working/waiting/stalled?/idle`. Both `#[allow(dead_code)]` until task_06 consumes them. `ActivityState` added to the `tui` `use crate::app::{...}` import (it is not `Copy`).
 
 ## Shared Decisions
 
@@ -23,6 +24,7 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
 - `src/tui/mod.rs` already has an unrelated `RosterRowStyle` enum — distinct from the new `RosterRow` view-model.
 - FIXED in task_04 run: the 2 `actions::tests::unrestricted_reads_*` failures were NOT a sandbox quirk — `fixture_agent` loads the user's home config, which now has `[workspace] allow_unrestricted_reads = true`, so the "without flag" denial assertions failed. Made hermetic by pinning `config.workspace.allow_unrestricted_reads = false` in both tests. `cargo test --lib` is now fully green (771 passed). (Committed separately from task_04 — out of task scope.)
 - `src/tui/mod.rs` carries unrelated uncommitted formatting WIP, so crate-wide `cargo fmt --check` fails on it. Scope fmt to your own file with `rustfmt --edition 2021 --check <file>`.
+- **`colors_live_only_in_theme_module` is a naive substring scan for the color-literal token in `src/tui/mod.rs`** — even a *doc comment* mentioning it fails the test. In tui code/comments, never write that literal; say "color literals" instead. (task_06 will add real color usages in the render path — they must route through `theme.*` tokens, never inline literals.)
 
 ## Open Risks
 

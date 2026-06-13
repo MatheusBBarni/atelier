@@ -3,8 +3,8 @@ use crate::app::chat::{
 };
 use crate::app::git::GitContext;
 use crate::app::{
-    AgentView, App, AppEvent, AppState, ApprovalHandle, InterruptHandle, PendingClarificationView,
-    QueuedFollowUpStatus, QueuedFollowUpView,
+    ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, InterruptHandle,
+    PendingClarificationView, QueuedFollowUpStatus, QueuedFollowUpView,
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
@@ -3731,6 +3731,38 @@ fn agent_status_label(status: &str) -> &str {
         "streaming" => "running",
         "running_parallel" => "running parallel",
         _ => status,
+    }
+}
+
+/// Glyph vocabulary for the four-state activity model (ADR-002). Set 1 uses
+/// portable BMP circles so each state reads without color; `ascii` swaps to a
+/// 7-bit fallback for constrained terminals. Plain text only — no inline color
+/// literals — so legibility is carried by the glyph plus [`activity_label`]
+/// alone (NO_COLOR criterion). Consumed by the task_06 render rewrite; tested now.
+#[allow(dead_code)]
+fn activity_glyph(state: ActivityState, ascii: bool) -> &'static str {
+    match (state, ascii) {
+        (ActivityState::Active, false) => "◐",
+        (ActivityState::NeedsInput, false) => "◔",
+        (ActivityState::Stalled, false) => "○",
+        (ActivityState::Idle, false) => "·",
+        (ActivityState::Active, true) => ">",
+        (ActivityState::NeedsInput, true) => "?",
+        (ActivityState::Stalled, true) => "!",
+        (ActivityState::Idle, true) => ".",
+    }
+}
+
+/// Distinct, non-empty text label per activity state (ADR-002). Pairs with
+/// [`activity_glyph`] so the roster stays legible under `NO_COLOR`. Consumed by
+/// the roster render rewrite in task_06; exercised by tests now.
+#[allow(dead_code)]
+fn activity_label(state: ActivityState) -> &'static str {
+    match state {
+        ActivityState::Active => "working",
+        ActivityState::NeedsInput => "waiting",
+        ActivityState::Stalled => "stalled?",
+        ActivityState::Idle => "idle",
     }
 }
 
@@ -8677,6 +8709,68 @@ runtime = "fake"
 
         let disabled = status_style(&theme, "disabled");
         assert_eq!(disabled.fg, Some(theme.text_dim));
+    }
+
+    // --- task_05: activity_glyph / activity_label vocabulary (ADR-002) --------
+
+    #[test]
+    fn activity_glyph_uses_set_1_unicode() {
+        assert_eq!(activity_glyph(ActivityState::Active, false), "◐");
+        assert_eq!(activity_glyph(ActivityState::NeedsInput, false), "◔");
+        assert_eq!(activity_glyph(ActivityState::Stalled, false), "○");
+        assert_eq!(activity_glyph(ActivityState::Idle, false), "·");
+    }
+
+    #[test]
+    fn activity_glyph_ascii_fallback() {
+        assert_eq!(activity_glyph(ActivityState::Active, true), ">");
+        assert_eq!(activity_glyph(ActivityState::NeedsInput, true), "?");
+        assert_eq!(activity_glyph(ActivityState::Stalled, true), "!");
+        assert_eq!(activity_glyph(ActivityState::Idle, true), ".");
+    }
+
+    #[test]
+    fn activity_label_vocabulary() {
+        assert_eq!(activity_label(ActivityState::Active), "working");
+        assert_eq!(activity_label(ActivityState::NeedsInput), "waiting");
+        assert_eq!(activity_label(ActivityState::Stalled), "stalled?");
+        assert_eq!(activity_label(ActivityState::Idle), "idle");
+    }
+
+    #[test]
+    fn activity_labels_are_distinct_and_non_empty() {
+        let labels = [
+            activity_label(ActivityState::Active),
+            activity_label(ActivityState::NeedsInput),
+            activity_label(ActivityState::Stalled),
+            activity_label(ActivityState::Idle),
+        ];
+        assert!(labels.iter().all(|label| !label.is_empty()));
+        let unique: std::collections::BTreeSet<_> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "labels must be pairwise distinct"
+        );
+    }
+
+    #[test]
+    fn activity_glyphs_are_single_portable_bmp_chars() {
+        // ADR-002: portable BMP glyphs only — no emoji-presentation or
+        // double-width characters, so each state reads on a constrained terminal.
+        for state in [
+            ActivityState::Active,
+            ActivityState::NeedsInput,
+            ActivityState::Stalled,
+            ActivityState::Idle,
+        ] {
+            for ascii in [false, true] {
+                let glyph = activity_glyph(state.clone(), ascii);
+                assert_eq!(glyph.chars().count(), 1, "single char: {glyph:?}");
+                let ch = glyph.chars().next().unwrap();
+                assert!((ch as u32) <= 0xFFFF, "BMP only: {glyph:?}");
+            }
+        }
     }
 
     #[test]
