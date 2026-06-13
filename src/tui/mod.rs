@@ -2631,12 +2631,14 @@ fn render_agent_dropdown(
         .skip(first_visible)
         .take(visible_count)
         .map(|(index, suggestion)| {
-            // Resolve the agent's accent by its roster position so the dropdown
-            // matches the roster/chat coloring for the same agent.
+            // Single-source accent rule (ADR-005, task_07; see `item_agent_accent`):
+            // resolve the accent by the agent's canonical identity index — its
+            // position in the canonical `agents` slice, found by `id` — so the
+            // dropdown matches the roster/chat color regardless of dropdown rank.
             let accent = agents
                 .iter()
                 .position(|agent| agent.id == suggestion.id)
-                .map(|roster_index| theme.accent_for(roster_index))
+                .map(|canonical_index| theme.accent_for(canonical_index))
                 .unwrap_or(theme.accent);
             agent_dropdown_item(theme, suggestion, index == selected, accent)
         })
@@ -3255,9 +3257,23 @@ fn agent_index_for_title(agents: &[AgentView], title: &str) -> Option<usize> {
 }
 
 /// Accent for an agent-attributed item's title: the owning agent's round-robin
-/// color (ADR-006). `None` for non-attributed kinds or unmatched agents, so the
-/// caller falls back to severity styling. Consistent with the roster/dropdown
-/// because all three resolve through `theme.accent_for(roster_index)`.
+/// color. `None` for non-attributed kinds or unmatched agents, so the caller
+/// falls back to severity styling.
+///
+/// Single-source accent rule (ADR-005, task_07): an agent's color is anchored to
+/// its **canonical identity index**, never its render-time position. All three
+/// surfaces resolve the same index for a given agent:
+///
+/// 1. roster — `RosterRow.accent_index` (canonical, fixed before the
+///    `NeedsInput` pin reorders rows), read in `roster_row_item`;
+/// 2. chat — `agent_index_for_title` looks the agent up in the canonical
+///    `agents` slice (this function);
+/// 3. `/agent:` dropdown — `agents.position(|a| a.id == suggestion.id)`.
+///
+/// So the pin can never recolor an agent or break its link to the transcript.
+/// RISK: a future fourth surface that derives accent from a display position
+/// would silently break this contract — route any new accent through one of the
+/// canonical-index lookups above.
 fn item_agent_accent(theme: &Theme, agents: &[AgentView], item: &ChatItemView) -> Option<Color> {
     if !matches!(
         item.kind,
@@ -3884,6 +3900,9 @@ fn roster_summary_header_item(rows: &[RosterRow], theme: &Theme) -> ListItem<'st
 /// states only — the pre-formatted current step and coarse elapsed. Terminal and
 /// plain-idle rows keep the existing status label instead of an activity glyph.
 fn roster_row_item(row: &RosterRow, spinner_frame: usize, theme: &Theme) -> ListItem<'static> {
+    // Single-source accent rule (ADR-005, task_07; see `item_agent_accent`):
+    // canonical identity index, never the render-time row position — so the
+    // `NeedsInput` pin reorders rows without recoloring any agent.
     let accent = theme.accent_for(row.accent_index);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -10180,11 +10199,19 @@ runtime = "fake"
 
     #[test]
     fn agent_dropdown_ids_carry_same_accents_as_roster() {
+        // Cross-surface consistency under the pin (ADR-005, task_07): with the
+        // roster pinned so fixer (canonical 1) sits at row 0, both the roster
+        // name and the `/agent:` dropdown id must still show `accent_for(1)` —
+        // the dropdown resolves by canonical `id`, never by dropdown rank.
         let theme = TuiUiState::default().theme;
-        // Roster order: explorer (0), fixer (1), archived/disabled (2, filtered).
-        let state = state_with_agent_roster("/agent:");
+        // Canonical order: explorer (0), fixer (1).
+        let mut state = state_with_agent_roster("/agent:");
+        state.roster_rows = vec![
+            roster_row("fixer", "Fixer", 1, ActivityState::NeedsInput, None, None),
+            roster_row("explorer", "Explorer", 0, ActivityState::Idle, None, None),
+        ];
         let mut ui_state = TuiUiState {
-            roster_visible: false,
+            roster_visible: true,
             input_cursor: input_char_count("/agent:"),
             ..TuiUiState::default()
         };
@@ -10195,11 +10222,18 @@ runtime = "fake"
             .unwrap();
         let buffer = terminal.backend().buffer();
 
+        // Dropdown ids (lowercase) — canonical accent regardless of dropdown rank.
         assert_eq!(
             title_cell_fg(buffer, "explorer").unwrap(),
             theme.accent_for(0)
         );
         assert_eq!(title_cell_fg(buffer, "fixer").unwrap(), theme.accent_for(1));
+        // Roster names (capitalized) — fixer keeps accent_for(1) at pinned row 0.
+        assert_eq!(title_cell_fg(buffer, "Fixer").unwrap(), theme.accent_for(1));
+        assert_eq!(
+            title_cell_fg(buffer, "Explorer").unwrap(),
+            theme.accent_for(0)
+        );
     }
 
     // ── task_08 surface polish ──

@@ -10,4 +10,4 @@
 | 04 | Wire rebuild into publish_state + 1Hz gated refresh tick | completed | medium | task_03 |
 | 05 | activity_glyph / activity_label helpers (Set 1 glyphs + ASCII/NO_COLOR) | completed | low | task_01 |
 | 06 | Roster render rewrite: weight, glyph+label, elapsed, current-step, animated indicator, summary header | completed | high | task_04, task_05 |
-| 07 | Accent-by-identity consistency (roster/chat/dropdown) + strengthened contract tests | pending | medium | task_06 |
+| 07 | Accent-by-identity consistency (roster/chat/dropdown) + strengthened contract tests | completed | medium | task_06 |
