@@ -12140,4 +12140,226 @@ runtime = "fake"
         assert_eq!(state.roster_rows[0].agent_id, "explorer");
         assert_eq!(state.roster_rows[0].activity, ActivityState::Active);
     }
+
+    // --- StepTiming lifecycle (task_02, ADR-004) ------------------------------
+
+    #[tokio::test]
+    async fn step_timing_stamped_on_registration() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+
+        let timing = app
+            .step_timings
+            .get("step-1")
+            .expect("registering an active step stamps a timing entry");
+        // Both timestamps start equal at registration time.
+        assert_eq!(timing.started_at, timing.last_activity);
+    }
+
+    #[tokio::test]
+    async fn step_timing_bumped_on_stream_keeps_started_at() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        // Backdate the entry so the bump is observably later than `started_at`.
+        let backdated = Instant::now() - Duration::from_secs(10);
+        {
+            let timing = app.step_timings.get_mut("step-1").unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        app.push_live_stream_content("step-1", "stdout".to_string(), "hi".to_string(), 1, false);
+
+        let timing = app.step_timings.get("step-1").unwrap();
+        assert_eq!(
+            timing.started_at, backdated,
+            "stream arrival must not move started_at"
+        );
+        assert!(
+            timing.last_activity > timing.started_at,
+            "stream arrival must advance last_activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_bumped_on_active_status_transition() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        let backdated = Instant::now() - Duration::from_secs(10);
+        {
+            let timing = app.step_timings.get_mut("step-1").unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        app.set_live_step_status("step-1", LiveStepStatus::Running);
+
+        let timing = app.step_timings.get("step-1").unwrap();
+        assert_eq!(timing.started_at, backdated);
+        assert!(
+            timing.last_activity > timing.started_at,
+            "Running transition must advance last_activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_not_bumped_on_terminal_status_transition() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        let backdated = Instant::now() - Duration::from_secs(10);
+        {
+            let timing = app.step_timings.get_mut("step-1").unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        // Terminal/waiting transitions are not active states, so they must not
+        // refresh the stall signal (the entry persists until clear_active_step).
+        app.set_live_step_status("step-1", LiveStepStatus::WaitingForApproval);
+
+        let timing = app.step_timings.get("step-1").unwrap();
+        assert_eq!(
+            timing.last_activity, backdated,
+            "non-active status transition must leave last_activity untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_cleared_on_step_end() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        assert!(app.step_timings.contains_key("step-1"));
+
+        app.clear_active_step("step-1");
+
+        assert!(
+            !app.step_timings.contains_key("step-1"),
+            "clearing a step must remove its timing entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_parallel_steps_tracked_independently() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        // Two concurrent steps in a parallel group, keyed by distinct step_ids.
+        app.set_active_step_with_metadata(
+            "run-1",
+            Some("group-1".to_string()),
+            "step-a",
+            None,
+            None,
+            "explorer",
+        );
+        app.set_active_step_with_metadata(
+            "run-1",
+            Some("group-1".to_string()),
+            "step-b",
+            None,
+            None,
+            "fixer",
+        );
+
+        // Backdate both to a common baseline, then bump only step-a.
+        let backdated = Instant::now() - Duration::from_secs(10);
+        for step_id in ["step-a", "step-b"] {
+            let timing = app.step_timings.get_mut(step_id).unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        app.push_live_stream_content("step-a", "stdout".to_string(), "tick".to_string(), 1, false);
+
+        let a = *app.step_timings.get("step-a").unwrap();
+        let b = *app.step_timings.get("step-b").unwrap();
+        assert!(
+            a.last_activity > b.last_activity,
+            "streaming step-a must not touch step-b's timing"
+        );
+        assert_eq!(
+            b.last_activity, backdated,
+            "the quiet peer keeps its original last_activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_multi_step_lifecycle_through_app_layer() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step_with_metadata(
+            "run-1",
+            Some("group-1".to_string()),
+            "step-a",
+            None,
+            None,
+            "explorer",
+        );
+        app.set_active_step_with_metadata(
+            "run-1",
+            Some("group-1".to_string()),
+            "step-b",
+            None,
+            None,
+            "fixer",
+        );
+
+        let backdated = Instant::now() - Duration::from_secs(10);
+        for step_id in ["step-a", "step-b"] {
+            let timing = app.step_timings.get_mut(step_id).unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        // Stream to the first, status-transition the second: both advance, each
+        // independently from its own baseline.
+        app.push_live_stream_content("step-a", "stdout".to_string(), "a".to_string(), 1, false);
+        app.set_live_step_status("step-b", LiveStepStatus::Running);
+
+        assert!(app.step_timings.get("step-a").unwrap().last_activity > backdated);
+        assert!(app.step_timings.get("step-b").unwrap().last_activity > backdated);
+
+        // Clearing one leaves the other intact.
+        app.clear_active_step("step-a");
+        assert!(!app.step_timings.contains_key("step-a"));
+        assert!(app.step_timings.contains_key("step-b"));
+    }
+
+    #[tokio::test]
+    async fn step_timing_never_leaks_into_serialized_state() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        app.push_live_stream_content("step-1", "stdout".to_string(), "hi".to_string(), 1, false);
+
+        let json = serde_json::to_string(app.state()).unwrap();
+        assert!(
+            !json.contains("step_timings"),
+            "the timing map must not be serialized onto AppState"
+        );
+        assert!(
+            !json.contains("last_activity") && !json.contains("started_at"),
+            "internal timing fields must not leak into serialized state (ADR-004)"
+        );
+    }
 }

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "StepTiming map + lifecycle stamping"
 type: backend
 complexity: medium
@@ -33,13 +33,13 @@ This task introduces an internal timing map to the `App` struct that tracks per-
 
 ## Subtasks
 
-- [ ] 2.1 — Define the `StepTiming` struct and add it as a private, non-serialized field to `App`.
-- [ ] 2.2 — Stamp `started_at` and `last_activity` when `set_active_step_with_metadata` registers a new active step.
-- [ ] 2.3 — Bump `last_activity` in `push_live_stream_content` immediately upon stream arrival.
-- [ ] 2.4 — Bump `last_activity` in `set_live_step_status` for `Running`/`Streaming` status transitions.
-- [ ] 2.5 — Clear the timing entry in `clear_active_step` when a step terminates.
-- [ ] 2.6 — Write unit tests validating timing lifecycle (stamp, bump, clear) using the `Instant::now() - Duration` offset pattern.
-- [ ] 2.7 — Verify no timing data leaks into serialized history or public views; pass all existing tests without regression.
+- [x] 2.1 — Define the `StepTiming` struct and add it as a private, non-serialized field to `App`.
+- [x] 2.2 — Stamp `started_at` and `last_activity` when `set_active_step_with_metadata` registers a new active step.
+- [x] 2.3 — Bump `last_activity` in `push_live_stream_content` immediately upon stream arrival.
+- [x] 2.4 — Bump `last_activity` in `set_live_step_status` for `Running`/`Streaming` status transitions.
+- [x] 2.5 — Clear the timing entry in `clear_active_step` when a step terminates.
+- [x] 2.6 — Write unit tests validating timing lifecycle (stamp, bump, clear) using the `Instant::now() - Duration` offset pattern.
+- [x] 2.7 — Verify no timing data leaks into serialized history or public views; pass all existing tests without regression.
 
 ## Implementation Details
 
