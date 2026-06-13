@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add focused provider status verification coverage
 type: test
 complexity: high
@@ -35,12 +35,14 @@ This task verifies the complete `/provider:status` flow after the command metada
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Add catalog-level tests for `/provider:status` metadata and fixed command-label expectations.
-- [ ] 6.2 Add submitted-command routing tests that exercise `/provider:status` from `App::submit_prompt`.
-- [ ] 6.3 Add runtime status mapping tests using deterministic fake provider responses for all runway states.
-- [ ] 6.4 Add formatter tests for exact usage gating, unsupported usage wording, freshness/reset display, and next-action output.
-- [ ] 6.5 Add redaction tests proving sensitive diagnostics and account data are omitted from default output.
-- [ ] 6.6 Add timeout and partial-result tests proving one slow or failed provider does not suppress other provider rows.
+- [x] 6.1 Add catalog-level tests for `/provider:status` metadata and fixed command-label expectations. (`slash_commands` unit tests, `tests/slash_command_catalog.rs`, `tests/provider_status_verification.rs::catalog_exposes_provider_status_exactly_once_and_rejects_unknown_siblings`)
+- [x] 6.2 Add submitted-command routing tests that exercise `/provider:status` from `App::submit_prompt`. (app routing tests in `src/app/mod.rs`)
+- [x] 6.3 Add runtime status mapping tests using deterministic fake provider responses for all runway states. (`every_runway_state_survives_service_normalization`, `exact_usage_downgrade_rewrites_only_the_ready_state`, `every_state_label_is_nonempty_and_distinct`)
+- [x] 6.4 Add formatter tests for exact usage gating, unsupported usage wording, freshness/reset display, and next-action output. (`exact_usage_renders_only_with_supporting_capability`, `unknown_reset_renders_as_unknown_not_inferred_text`, `every_next_action_renders_a_distinct_nonempty_phrase`)
+- [x] 6.5 Add redaction tests proving sensitive diagnostics and account data are omitted from default output. (`default_output_redacts_every_sensitive_category`)
+- [x] 6.6 Add timeout and partial-result tests proving one slow or failed provider does not suppress other provider rows. (`one_slow_provider_times_out_without_suppressing_others`)
+
+> Coverage note: tasks 01–05 already produced focused tests at each boundary; this task adds the explicit, exhaustive verification layer — all 8 `ProviderRunwayState`s, every `ProviderNextAction` phrase, and every sensitive-redaction category — consolidated in `tests/provider_status_verification.rs` plus gap-filling unit tests in `src/runtime/status.rs`.
 
 ## Implementation Details
 Add focused tests at the command, app-routing, runtime-status, and formatting boundaries created by the preceding tasks. Reference the TechSpec "Testing Plan", "Output Rules", "Errors and Diagnostics", and "Freshness and Timeouts" sections for the expected behavior; do not duplicate provider interface definitions from the TechSpec in test fixtures.
@@ -73,17 +75,17 @@ Add focused tests at the command, app-routing, runtime-status, and formatting bo
 
 ## Tests
 - Unit tests:
-  - [ ] Slash command catalog includes exactly one `/provider:status` entry with the expected description and usage metadata.
-  - [ ] Unknown slash command input such as `/provider:not-real` still follows the existing rejection path.
-  - [ ] Runtime status mapping returns the expected `ProviderRunwayState` for fake ready, limited, blocked, unauthenticated, misconfigured, provider-error, unavailable-usage, and local-only provider responses.
-  - [ ] Formatter renders exact remaining usage only for `UsageAvailability::Exact` returned through supported capability data.
-  - [ ] Formatter renders explicit unsupported exact-usage wording and a provider-native verification action for unsupported usage.
-  - [ ] Redaction removes fake tokens, account IDs, organization IDs, email addresses, and raw provider payload fields from default output.
-  - [ ] Timeout handling marks the affected provider as provider error or unavailable usage while preserving other provider rows.
+  - [x] Slash command catalog includes exactly one `/provider:status` entry with the expected description and usage metadata. (`provider_status_is_a_single_app_command_entry`, verification catalog test)
+  - [x] Unknown slash command input such as `/provider:not-real` still follows the existing rejection path. (`catalog_lookup_for_unknown_commands_finds_nothing`, `provider_unknown_command_keeps_existing_unknown_behavior`)
+  - [x] Runtime status mapping returns the expected `ProviderRunwayState` for fake ready, limited, blocked, unauthenticated, misconfigured, provider-error, unavailable-usage, and local-only provider responses. (`every_runway_state_survives_service_normalization` + `map_runtime_availability` mapping tests)
+  - [x] Formatter renders exact remaining usage only for `UsageAvailability::Exact` returned through supported capability data. (`exact_usage_renders_only_with_supporting_capability`)
+  - [x] Formatter renders explicit unsupported exact-usage wording and a provider-native verification action for unsupported usage. (`unsupported_usage_renders_truthful_wording_and_verification_action`)
+  - [x] Redaction removes fake tokens, account IDs, organization IDs, email addresses, and raw provider payload fields from default output. (`default_output_redacts_every_sensitive_category`)
+  - [x] Timeout handling marks the affected provider as provider error or unavailable usage while preserving other provider rows. (`one_slow_provider_times_out_without_suppressing_others`)
 - Integration tests:
-  - [ ] Submitted `/provider:status` produces one compact status row per configured fake provider through `App::submit_prompt`.
-  - [ ] Submitted `/provider:status` with mixed fake provider outcomes returns partial output without failing the entire command.
-  - [ ] Submitted non-status slash commands continue to use the existing routing behavior.
+  - [x] Submitted `/provider:status` produces one compact status row per configured fake provider through `App::submit_prompt`. (`provider_status_command_renders_one_row_for_each_used_provider`)
+  - [x] Submitted `/provider:status` with mixed fake provider outcomes returns partial output without failing the entire command. (`provider_status_command_renders_failing_provider_share_safely`)
+  - [x] Submitted non-status slash commands continue to use the existing routing behavior. (`provider_status_handler_only_claims_the_exact_command`, `provider_unknown_command_keeps_existing_unknown_behavior`)
 - Test coverage target: >=80%
 - All tests must pass
 

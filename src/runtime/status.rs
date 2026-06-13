@@ -1709,4 +1709,117 @@ mod tests {
         assert!(out.contains("Provider status"));
         assert!(out.contains("No configured providers"));
     }
+
+    const ALL_RUNWAY_STATES: [ProviderRunwayState; 8] = [
+        ProviderRunwayState::Ready,
+        ProviderRunwayState::LimitedRunway,
+        ProviderRunwayState::Blocked,
+        ProviderRunwayState::UnavailableUsage,
+        ProviderRunwayState::Unauthenticated,
+        ProviderRunwayState::Misconfigured,
+        ProviderRunwayState::ProviderError,
+        ProviderRunwayState::LocalOnlyStatus,
+    ];
+
+    #[tokio::test]
+    async fn every_runway_state_survives_service_normalization() {
+        // With non-exact usage, the capability gate never rewrites the state,
+        // so each state must round-trip through the service unchanged.
+        for state in ALL_RUNWAY_STATES {
+            let mut result = ready_probe_result();
+            result.state = state;
+            result.usage = UsageAvailability::NotApplicable;
+            let probe = StaticStatusProbe::new(
+                ProviderId::Fake,
+                "Fake",
+                provider_capabilities(ProviderId::Fake),
+                result,
+            );
+            let rows = ProviderStatusService::new(vec![Arc::new(probe)])
+                .collect_status()
+                .await;
+            assert_eq!(rows[0].state, state, "state {state:?} must survive");
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_usage_downgrade_rewrites_only_the_ready_state() {
+        // A non-Ready state keeps its label even when its (uncapable) exact
+        // usage is downgraded — only Ready becomes UnavailableUsage.
+        let mut result = ready_probe_result();
+        result.state = ProviderRunwayState::LimitedRunway;
+        result.usage = UsageAvailability::Exact(sample_exact_usage());
+        let probe = StaticStatusProbe::new(
+            ProviderId::Codex,
+            "Codex",
+            provider_capabilities(ProviderId::Codex),
+            result,
+        );
+        let rows = ProviderStatusService::new(vec![Arc::new(probe)])
+            .collect_status()
+            .await;
+        assert!(!rows[0].usage.is_exact(), "uncapable exact must downgrade");
+        assert_eq!(
+            rows[0].state,
+            ProviderRunwayState::LimitedRunway,
+            "non-Ready state must be preserved"
+        );
+    }
+
+    #[test]
+    fn every_state_label_is_nonempty_and_distinct() {
+        let labels: Vec<&str> = ALL_RUNWAY_STATES.iter().map(|s| state_label(*s)).collect();
+        for label in &labels {
+            assert!(!label.is_empty());
+        }
+        let mut deduped = labels.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), labels.len(), "labels must be distinct");
+    }
+
+    #[test]
+    fn every_next_action_renders_a_distinct_nonempty_phrase() {
+        let actions = [
+            ProviderNextAction::Proceed,
+            ProviderNextAction::CheckProviderUsage { provider_url: None },
+            ProviderNextAction::Authenticate,
+            ProviderNextAction::FixConfiguration,
+            ProviderNextAction::SwitchProvider,
+            ProviderNextAction::ReduceScope,
+            ProviderNextAction::RetryLater,
+            ProviderNextAction::VerifyRuntime,
+        ];
+        let mut phrases = Vec::new();
+        for action in actions {
+            let row = status(
+                ProviderId::Claude,
+                ProviderRunwayState::Ready,
+                "reason",
+                action,
+                UsageAvailability::NotApplicable,
+            );
+            let phrase = next_action_phrase(&row);
+            assert!(!phrase.trim().is_empty());
+            assert!(phrase.ends_with('.'), "phrase must be a sentence: {phrase}");
+            phrases.push(phrase);
+        }
+        let mut deduped = phrases.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            phrases.len(),
+            "each next action must render a distinct phrase"
+        );
+        // The provider-usage action names the provider for the user.
+        let row = status(
+            ProviderId::Claude,
+            ProviderRunwayState::Ready,
+            "reason",
+            ProviderNextAction::CheckProviderUsage { provider_url: None },
+            UsageAvailability::NotApplicable,
+        );
+        assert!(next_action_phrase(&row).contains("Claude"));
+    }
 }
