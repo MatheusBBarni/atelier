@@ -60,6 +60,37 @@ pub fn build_diff_preview(diff: &str) -> DiffPreviewView {
     }
 }
 
+/// A short, read-only preview of a newly-written file's contents (a created
+/// file is not a diff, so its lines are shown as neutral context).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentPreviewView {
+    pub preview_lines: Vec<ChatLineView>,
+    pub truncated: bool,
+}
+
+pub fn build_content_preview(content: &str) -> ContentPreviewView {
+    let mut preview_lines = Vec::new();
+    let mut scanned_bytes = 0usize;
+    let mut truncated = false;
+
+    for line in content.lines() {
+        scanned_bytes = scanned_bytes.saturating_add(line.len()).saturating_add(1);
+        if scanned_bytes > MAX_PREVIEW_BYTES || preview_lines.len() >= MAX_PREVIEW_LINES {
+            truncated = true;
+            break;
+        }
+        preview_lines.push(ChatLineView {
+            style: ChatLineStyle::DiffContext,
+            text: concise(line, 220),
+        });
+    }
+
+    ContentPreviewView {
+        preview_lines,
+        truncated,
+    }
+}
+
 fn push_unique(files: &mut Vec<String>, path: &str) {
     if path == "/dev/null" || files.iter().any(|file| file == path) {
         return;

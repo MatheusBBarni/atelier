@@ -1,5 +1,5 @@
 use super::command_summary::{summarize_command, CommandSummaryInput};
-use super::diff_preview::build_diff_preview;
+use super::diff_preview::{build_content_preview, build_diff_preview};
 use super::{
     ChatDetailRef, ChatItemKind, ChatItemStatus, ChatItemView, ChatLifecycleKey, ChatLineStyle,
     ChatLineView, ChatSeverity, ChatSourceRef,
@@ -32,6 +32,9 @@ struct ActionContext {
     diff: Option<String>,
     path: Option<String>,
     content_bytes: Option<u64>,
+    /// Capped slice of a `write_file` action's content, so a created file can
+    /// show a preview of what was written (not just its byte count).
+    content_preview: Option<String>,
 }
 
 impl ChatProjection {
@@ -442,6 +445,11 @@ impl ChatProjection {
                 .get("params")
                 .and_then(|params| string_field(params, "content"))
                 .map(|content| content.len() as u64),
+            content_preview: event
+                .payload
+                .get("params")
+                .and_then(|params| string_field(params, "content"))
+                .map(|content| capped_content_preview(&content)),
         };
         if context.kind.as_deref() == Some("write_file") && context.content_bytes.is_none() {
             context.content_bytes = event
@@ -1528,7 +1536,7 @@ fn action_requested_view(
                 ChatItemKind::FileEdit,
                 format!("File write requested: {path}"),
                 Some(summary),
-                Vec::new(),
+                write_file_preview_body(context),
             )
         }
         Some(kind) => (
@@ -1544,6 +1552,38 @@ fn action_requested_view(
             Vec::new(),
         ),
     }
+}
+
+/// Upper bound on the raw `write_file` content retained for previewing, so the
+/// projection never holds a whole large file in memory per action.
+const CONTENT_PREVIEW_CAP_BYTES: usize = 8 * 1024;
+
+fn capped_content_preview(content: &str) -> String {
+    if content.len() <= CONTENT_PREVIEW_CAP_BYTES {
+        return content.to_string();
+    }
+    let mut end = CONTENT_PREVIEW_CAP_BYTES;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    content[..end].to_string()
+}
+
+/// Body lines previewing a created file's contents, with a truncation note when
+/// the file is longer than the preview window. Empty when no content was kept.
+fn write_file_preview_body(context: &ActionContext) -> Vec<ChatLineView> {
+    let Some(content) = context.content_preview.as_deref() else {
+        return Vec::new();
+    };
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+    let preview = build_content_preview(content);
+    let mut body = preview.preview_lines;
+    if preview.truncated {
+        body.push(ChatLineView::muted("… (preview truncated)"));
+    }
+    body
 }
 
 fn file_edit_view(
@@ -1562,7 +1602,11 @@ fn file_edit_view(
             let summary = bytes
                 .map(|bytes| format!("{bytes} bytes"))
                 .unwrap_or_else(|| "created".to_string());
-            (format!("File created: {path}"), Some(summary), Vec::new())
+            (
+                format!("File created: {path}"),
+                Some(summary),
+                write_file_preview_body(context),
+            )
         }
         Some("apply_patch") => {
             let files = payload
@@ -1619,7 +1663,7 @@ fn action_file_edit_result_view(
             (
                 format!("File created: {path}"),
                 bytes.map(|bytes| format!("{bytes} bytes")),
-                Vec::new(),
+                write_file_preview_body(context),
             )
         }
         Some("apply_patch") => {
@@ -3195,6 +3239,71 @@ mod tests {
         let projection = ChatProjection::rebuild(&events);
 
         assert_eq!(projection.items()[0].summary.as_deref(), Some("+1 -1"));
+    }
+
+    #[test]
+    fn created_file_shows_content_preview_in_chat() {
+        let events = vec![
+            event(
+                "action_requested",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "action",
+                    "step_id": "step",
+                    "kind": "write_file",
+                    "params": {
+                        "path": ".compozy/tasks/demo/_prd.md",
+                        "content": "# PRD draft\n\nThis is the generated draft.\nSecond line of content.\n"
+                    }
+                }),
+            ),
+            event(
+                "file_edit_applied",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "action_id": "action",
+                    "operation": "write_file",
+                    "path": ".compozy/tasks/demo/_prd.md",
+                    "bytes": 64
+                }),
+            ),
+            event(
+                "action_completed",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "action",
+                    "status": "completed",
+                    "content": { "path": ".compozy/tasks/demo/_prd.md", "bytes": 64 },
+                    "artifact": null
+                }),
+            ),
+        ];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = projection
+            .items()
+            .iter()
+            .find(|item| item.title.contains("File created"))
+            .expect("a 'File created' chat item");
+        let body = item
+            .body
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("# PRD draft"),
+            "preview missing header: {body}"
+        );
+        assert!(
+            body.contains("This is the generated draft."),
+            "preview missing content: {body}"
+        );
     }
 
     #[test]

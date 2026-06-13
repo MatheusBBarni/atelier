@@ -1666,7 +1666,7 @@ fn build_clarification_answer(
 
     let (answer, selected_option_id, selected_option_label, answer_source) =
         if clarification.multi_select {
-            let mut labels = Vec::new();
+            let mut checked_labels = Vec::new();
             let mut first_id = None;
             let mut first_label = None;
             for (index, option) in options.iter().enumerate() {
@@ -1675,21 +1675,43 @@ fn build_clarification_answer(
                         first_id = Some(option.id.clone());
                         first_label = Some(option.label.clone());
                     }
-                    labels.push(option.label.clone());
+                    checked_labels.push(option.label.clone());
                 }
             }
-            if !custom.is_empty() {
-                labels.push(custom);
+            let has_custom = !custom.is_empty();
+            let checked_count = checked_labels.len();
+            if checked_count == 0 && !has_custom {
+                // Nothing checked and no custom text: fall back to the focused
+                // option so Enter is never a silent dead-end (e.g. on the
+                // pre-focused recommended row). The empty custom row submits
+                // nothing.
+                if focused < options.len() {
+                    let option = &options[focused];
+                    (
+                        option.label.clone(),
+                        Some(option.id.clone()),
+                        Some(option.label.clone()),
+                        "recommended".to_string(),
+                    )
+                } else {
+                    return None;
+                }
+            } else {
+                let mut parts = checked_labels;
+                if has_custom {
+                    parts.push(custom);
+                }
+                // Report the true selection shape so the transcript reads
+                // naturally instead of always claiming "multiple".
+                let (source, id, label) = if checked_count == 0 {
+                    ("custom".to_string(), None, None)
+                } else if checked_count == 1 && !has_custom {
+                    ("recommended".to_string(), first_id, first_label)
+                } else {
+                    ("multi".to_string(), first_id, first_label)
+                };
+                (parts.join("; "), id, label, source)
             }
-            if labels.is_empty() {
-                return None;
-            }
-            (
-                labels.join("; "),
-                first_id,
-                first_label,
-                "multi".to_string(),
-            )
         } else if focused < options.len() {
             // A real option is focused: submit it (focus-driven). Any stale
             // custom text is ignored until the user focuses the custom row.
@@ -3734,10 +3756,12 @@ fn clarification_input_areas(composer_area: Rect) -> InputAreas {
     }
 }
 
-/// The fully-built clarification composer body plus, when the custom row is
-/// focused, the cursor's display-column offset within the last line.
+/// The fully-built clarification composer body, the line index of the focused
+/// row (so the composer can scroll to keep it visible), and — when the custom
+/// row is focused — the cursor's display-column offset within the last line.
 struct ClarificationLayout {
     lines: Vec<Line<'static>>,
+    focused_line: usize,
     custom_cursor_col: Option<usize>,
 }
 
@@ -3756,6 +3780,7 @@ fn clarification_layout(
     let span_width = |s: &str| Span::raw(s.to_string()).width();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut focused_line = 0;
     lines.push(Line::from(Span::styled(
         clarification.question.clone(),
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
@@ -3764,6 +3789,9 @@ fn clarification_layout(
 
     for (index, option) in clarification.options.iter().enumerate() {
         let is_focused = index == focused;
+        if is_focused {
+            focused_line = lines.len();
+        }
         let checked = ui_state.clarification_selected.contains(&index);
         let recommended = clarification
             .recommended_option_id
@@ -3824,6 +3852,9 @@ fn clarification_layout(
 
     // Synthetic custom row (always last so the cursor math stays simple).
     let custom_focused = focused == custom_row;
+    if custom_focused {
+        focused_line = lines.len();
+    }
     let marker = if custom_focused {
         CLARIFICATION_FOCUS_MARKER
     } else {
@@ -3876,8 +3907,27 @@ fn clarification_layout(
 
     ClarificationLayout {
         lines,
+        focused_line,
         custom_cursor_col,
     }
+}
+
+/// Vertical scroll offset (in wrapped rows) that keeps the focused row's last
+/// wrapped row inside an `inner_height`-tall viewport. Zero whenever everything
+/// fits, so normal-sized terminals are unaffected.
+fn clarification_scroll_offset(
+    lines: &[Line<'_>],
+    focused_line: usize,
+    inner_width: u16,
+    inner_height: usize,
+) -> usize {
+    if inner_height == 0 || focused_line >= lines.len() {
+        return 0;
+    }
+    let width = usize::from(inner_width.max(1));
+    let rows_above = wrapped_event_line_count(&lines[..focused_line], inner_width);
+    let focused_rows = lines[focused_line].width().max(1).div_ceil(width);
+    (rows_above + focused_rows).saturating_sub(inner_height)
 }
 
 fn render_clarification_composer(
@@ -3893,8 +3943,18 @@ fn render_clarification_composer(
     } else {
         " Clarifying question "
     };
+    // Scroll so the focused row stays visible when the body is taller than the
+    // (capped) composer on short terminals; zero on roomy terminals.
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let scroll = clarification_scroll_offset(
+        &layout.lines,
+        layout.focused_line,
+        clarification_inner_width(area),
+        inner_height,
+    );
     let composer = Paragraph::new(layout.lines)
         .wrap(Wrap { trim: false })
+        .scroll((scroll.min(usize::from(u16::MAX)) as u16, 0))
         .block(
             Block::default()
                 .title(title)
@@ -3948,19 +4008,26 @@ fn set_clarification_cursor(
     let Some(cursor_col) = layout.custom_cursor_col else {
         return;
     };
-    let inner_width = usize::from(clarification_inner_width(area));
+    let inner_width_u16 = clarification_inner_width(area);
+    let inner_width = usize::from(inner_width_u16);
+    let inner_height = usize::from(area.height.saturating_sub(2));
     // The custom row is the last line; rows above it consume the wrapped height
     // of everything before, and the cursor wraps within the custom line itself.
+    // Subtract the same scroll offset the composer renders with so the caret
+    // tracks the visible custom input rather than clamping onto a clipped row.
     let last = layout.lines.len().saturating_sub(1);
-    let rows_above =
-        wrapped_event_line_count(&layout.lines[..last], clarification_inner_width(area));
-    let row = rows_above + cursor_col / inner_width;
+    let rows_above = wrapped_event_line_count(&layout.lines[..last], inner_width_u16);
+    let scroll = clarification_scroll_offset(
+        &layout.lines,
+        layout.focused_line,
+        inner_width_u16,
+        inner_height,
+    );
+    let row = (rows_above + cursor_col / inner_width).saturating_sub(scroll);
     let col = cursor_col % inner_width;
-    let max_col = usize::from(area.width.saturating_sub(2));
-    let max_row = usize::from(area.height.saturating_sub(2));
     frame.set_cursor_position(Position::new(
-        area.x + 1 + col.min(max_col) as u16,
-        area.y + 1 + row.min(max_row) as u16,
+        area.x + 1 + col.min(inner_width.saturating_sub(1)) as u16,
+        area.y + 1 + row.min(inner_height.saturating_sub(1)) as u16,
     ));
 }
 
@@ -3974,7 +4041,14 @@ fn sync_clarification_state(state: &AppState, ui_state: &mut TuiUiState) {
                 ui_state.clarification_question_id = Some(view.question_id.clone());
                 ui_state.clarification_selected.clear();
                 ui_state.clarification_custom_answer.clear();
-                ui_state.clarification_option_index = clarification_default_focus(view);
+                let focus = clarification_default_focus(view);
+                ui_state.clarification_option_index = focus;
+                // In multi-select, pre-check the recommended option so the
+                // highlighted "★ recommended" row honestly shows [x] and Enter
+                // confirms it rather than silently doing nothing.
+                if view.multi_select && view.recommended_option_id.is_some() {
+                    ui_state.clarification_selected.insert(focus);
+                }
             } else {
                 let row_count = view.options.len() + 1;
                 ui_state.clarification_option_index =
@@ -7005,8 +7079,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_multi_select_submit_does_not_emit() {
-        let mut ui_state = TuiUiState::default();
+    async fn empty_multi_select_submit_falls_back_to_focused_option() {
+        // With nothing checked and no custom text, Enter is never a dead-end:
+        // it submits the focused option (as a single "recommended" choice).
+        let mut ui_state = TuiUiState {
+            clarification_option_index: 1,
+            ..Default::default()
+        };
+        let mut app_state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+        ]);
+        view.multi_select = true;
+        app_state.pending_clarification = Some(view);
+
+        let (sender, mut receiver) = mpsc::channel(4);
+        execute_tui_command(
+            &mut app_state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::Clarification(ClarificationCommand::Submit),
+        )
+        .await
+        .unwrap();
+        match receiver.try_recv().unwrap() {
+            AppWorkerCommand::Event(AppEvent::ClarificationAnswered(answer)) => {
+                assert_eq!(answer.answer, "Beta");
+                assert_eq!(answer.answer_source, "recommended");
+                assert_eq!(answer.selected_option_id.as_deref(), Some("b"));
+            }
+            other => panic!("unexpected worker command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_multi_select_submit_on_custom_row_does_not_emit() {
+        // Focused on the (empty) custom row with nothing checked → no answer.
+        let mut ui_state = TuiUiState {
+            clarification_option_index: 2,
+            ..Default::default()
+        };
         let mut app_state = state_with_input("", false);
         let mut view = clarification_view(vec![
             clarification_option("a", "Alpha"),
@@ -7025,6 +7138,63 @@ mod tests {
         .await
         .unwrap();
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn single_checked_multi_select_reports_recommended_source() {
+        let mut ui_state = TuiUiState {
+            clarification_selected: BTreeSet::from([1]),
+            ..Default::default()
+        };
+        let mut app_state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+        ]);
+        view.multi_select = true;
+        app_state.pending_clarification = Some(view);
+
+        let (sender, mut receiver) = mpsc::channel(4);
+        execute_tui_command(
+            &mut app_state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::Clarification(ClarificationCommand::Submit),
+        )
+        .await
+        .unwrap();
+        match receiver.try_recv().unwrap() {
+            AppWorkerCommand::Event(AppEvent::ClarificationAnswered(answer)) => {
+                // Exactly one box checked, no custom text → not "multi".
+                assert_eq!(answer.answer, "Beta");
+                assert_eq!(answer.answer_source, "recommended");
+                assert_eq!(answer.selected_option_label.as_deref(), Some("Beta"));
+            }
+            other => panic!("unexpected worker command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_select_pre_checks_recommended_option_on_arrival() {
+        let mut state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+        ]);
+        view.multi_select = true;
+        view.recommended_option_id = Some("b".to_string());
+        state.pending_clarification = Some(view);
+        // Fresh ui_state (question_id None) → sync treats this as a new question.
+        let mut ui_state = TuiUiState::default();
+
+        let lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 80, 24);
+        let joined = lines.join("\n");
+        // The recommended option is pre-checked and focused, so Enter confirms it.
+        assert!(
+            joined.contains("[x] Beta"),
+            "recommended pre-checked: {joined}"
+        );
+        assert!(ui_state.clarification_selected.contains(&1));
     }
 
     #[tokio::test]
