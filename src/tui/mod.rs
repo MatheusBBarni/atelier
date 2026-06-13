@@ -80,9 +80,9 @@ const CLARIFICATION_CUSTOM_PROMPT: &str = "Custom: ";
 const CLARIFICATION_CUSTOM_PLACEHOLDER: &str = "Custom…";
 const CLARIFICATION_RECOMMENDED_SUFFIX: &str = "  ★ recommended";
 const CLARIFICATION_HINT_SINGLE: &str =
-    "↑/↓ move · type for a custom answer · Enter confirm · Ctrl-C interrupt";
+    "↑/↓ or 1-9 move · type for custom · Enter confirm · Ctrl-C interrupt";
 const CLARIFICATION_HINT_MULTI: &str =
-    "↑/↓ move · Space toggle · type for a custom answer · Enter confirm · Ctrl-C interrupt";
+    "↑/↓ or 1-9 move · Space toggle · type for custom · Enter confirm · Ctrl-C interrupt";
 const QUEUE_VISIBLE_MAX: usize = 6;
 const QUEUE_SELECTED_MARKER: &str = "> ";
 const QUEUE_UNSELECTED_MARKER: &str = "  ";
@@ -7217,6 +7217,32 @@ mod tests {
             "recommended pre-checked: {joined}"
         );
         assert!(ui_state.clarification_selected.contains(&1));
+    }
+
+    #[test]
+    fn multi_select_does_not_pre_check_unknown_recommended_option() {
+        let mut state = state_with_input("", false);
+        let mut view = clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+        ]);
+        view.multi_select = true;
+        // A recommended id that matches no option must not pre-check anything.
+        view.recommended_option_id = Some("unknown".to_string());
+        state.pending_clarification = Some(view);
+        let mut ui_state = TuiUiState::default();
+
+        let lines = render_to_lines_with_ui_mut(&state, &mut ui_state, 80, 24);
+        let joined = lines.join("\n");
+
+        // Nothing is pre-checked when the recommended id resolves to no option,
+        // and focus still falls back to the first row.
+        assert!(
+            !joined.contains("[x]"),
+            "no option should be pre-checked: {joined}"
+        );
+        assert!(ui_state.clarification_selected.is_empty());
+        assert_eq!(ui_state.clarification_option_index, 0);
     }
 
     #[tokio::test]
