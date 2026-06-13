@@ -104,6 +104,9 @@ enum HelpTab {
     Cli,
 }
 
+// Associated items are consumed by the tabbed render + navigation (tasks 06/07);
+// unused on their own until then.
+#[allow(dead_code)]
 impl HelpTab {
     /// Tabs in declared left-to-right order (Getting Started first, CLI last).
     const ALL: [HelpTab; 6] = [
@@ -129,13 +132,19 @@ impl HelpTab {
 
     /// Next tab in `ALL`, wrapping from the last back to the first.
     fn next(self) -> HelpTab {
-        let index = HelpTab::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        let index = HelpTab::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .unwrap_or(0);
         HelpTab::ALL[(index + 1) % HelpTab::ALL.len()]
     }
 
     /// Previous tab in `ALL`, wrapping from the first back to the last.
     fn prev(self) -> HelpTab {
-        let index = HelpTab::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        let index = HelpTab::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .unwrap_or(0);
         HelpTab::ALL[(index + HelpTab::ALL.len() - 1) % HelpTab::ALL.len()]
     }
 }
@@ -3431,6 +3440,109 @@ fn approvals_tab_lines(theme: &Theme) -> Vec<Line<'static>> {
     ]
 }
 
+/// Getting Started tab body — the default help front door. Renders, in order:
+/// a one-line routing mental model, two copy-pasteable example prompts, then a
+/// compact live agent summary (one row per configured agent via
+/// `agent_compact_line`, the shared `Compact` row definition). Pure builder
+/// consumed by the tabbed render (task 06).
+// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
+#[allow(dead_code)]
+fn getting_started_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let header = |label: &'static str| {
+        Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let body = |text: &'static str| Line::from(Span::styled(text, Style::default().fg(theme.text)));
+    // Copy-pasteable example prompts (PRD Open Question): real, runnable, and
+    // read-first so a newcomer can try them safely. Marked with `> `.
+    let example = |text: &'static str| {
+        Line::from(Span::styled(
+            format!("> {text}"),
+            Style::default().fg(theme.text_muted),
+        ))
+    };
+    let mut lines = vec![
+        header("How Atelier works"),
+        body("Your prompt -> orchestrator -> named agents do the work."),
+        body("In normal mode, approvals gate every file write and command."),
+        Line::from(""),
+        header("Try a prompt"),
+        example("Summarize what this project does and how the run loop works."),
+        example("Find where approval mode is enforced and add a test for it."),
+        Line::from(""),
+        header("Your agents"),
+    ];
+    if state.agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No agents configured.",
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        lines.extend(
+            state
+                .agents
+                .iter()
+                .enumerate()
+                .map(|(index, agent)| agent_compact_line(index, agent, theme)),
+        );
+    }
+    lines
+}
+
+/// Commands tab body — derived from `slash_commands::catalog()` via
+/// `help_command_lines()` so the tab never drifts from the dropdown or
+/// unknown-command guidance. `filter` is a no-op in MVP (the substring filter
+/// lands in task 09); rows stay plain to match the pre-tab help render. Pure
+/// builder consumed by the tabbed render (task 06).
+// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
+#[allow(dead_code)]
+fn commands_tab_lines(_filter: &str, _theme: &Theme) -> Vec<Line<'static>> {
+    crate::slash_commands::help_command_lines()
+        .into_iter()
+        .map(Line::from)
+        .collect()
+}
+
+/// Skills tab body — live from `ui_state.skill_suggestions` (project + personal
+/// discovery). Lists each skill's `/skill:` alias with its source tag, renders
+/// an empty-state line when no skills are discovered, and always closes with the
+/// guidance disclaimer (skills do not bypass approvals/permissions). Pure builder
+/// consumed by the tabbed render (task 06).
+// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
+#[allow(dead_code)]
+fn skills_tab_lines(ui_state: &TuiUiState, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if ui_state.skill_suggestions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No skills discovered in .agents/skills or .claude/skills.",
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        for suggestion in &ui_state.skill_suggestions {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("/skill:{} ", suggestion.alias),
+                    Style::default().fg(theme.accent),
+                ),
+                Span::styled(
+                    format!("[{}]", suggestion.source_tag.label()),
+                    Style::default().fg(theme.text_muted),
+                ),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Skills are guidance and do not bypass approvals or permissions.",
+        Style::default().fg(theme.text_dim),
+    )));
+    lines
+}
+
 fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -3529,6 +3641,31 @@ fn availability_label(availability: &Option<crate::runtime::RuntimeAvailability>
     }
 }
 
+/// Single compact agent row (`name · runtime/model · availability`) shared by
+/// the `Compact` roster style and the Getting Started help tab. Extracted so
+/// both surfaces render a compact row from one definition: the Getting Started
+/// builder returns `Vec<Line>` and cannot consume `agent_roster_items`' opaque
+/// `ListItem`s, so the shared core is the line, not the list item. Agent colors
+/// cycle via `theme.accent_for(index)`.
+fn agent_compact_line(index: usize, agent: &AgentView, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{} ", agent.name),
+            Style::default()
+                .fg(theme.accent_for(index))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{}/{} ", agent.runtime, agent.model),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            availability_label(&agent.availability),
+            availability_style(theme, &agent.availability),
+        ),
+    ])
+}
+
 /// Builds the per-agent roster rows shared by the Ctrl-L Agent Roster and the
 /// Getting Started help tab. `Full` reproduces the three-line roster row
 /// (name + status / `runtime/model` + availability / effort + thinking state);
@@ -3585,17 +3722,7 @@ fn agent_roster_items(
                         ),
                     ]),
                 ]),
-                RosterRowStyle::Compact => ListItem::new(Line::from(vec![
-                    Span::styled(format!("{} ", agent.name), name_style),
-                    Span::styled(
-                        format!("{}/{} ", agent.runtime, agent.model),
-                        Style::default().fg(theme.text_muted),
-                    ),
-                    Span::styled(
-                        availability_label(&agent.availability),
-                        availability_style(theme, &agent.availability),
-                    ),
-                ])),
+                RosterRowStyle::Compact => ListItem::new(agent_compact_line(index, agent, theme)),
             }
         })
         .collect()
@@ -9682,6 +9809,93 @@ runtime = "fake"
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn commands_tab_lines_cover_every_catalog_command_once() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("", &theme));
+        // Mirrors `help_modal_command_rows_are_catalog_derived`: every catalog
+        // command's usage renders, and each description renders exactly once,
+        // proving the rows are catalog-derived and not duplicated.
+        for spec in crate::slash_commands::catalog() {
+            assert!(text.contains(spec.usage), "missing usage {}", spec.usage);
+            let occurrences = text.matches(spec.description).count();
+            assert_eq!(
+                occurrences, 1,
+                "description {:?} rendered {occurrences} times",
+                spec.description
+            );
+        }
+        assert!(text.contains("/workflow <prompt>"));
+        assert!(text.contains("/queue <message>"));
+        assert!(text.contains("/reload:skills"));
+    }
+
+    #[test]
+    fn skills_tab_lines_list_aliases_and_disclaimer() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let ui_state = TuiUiState {
+            skill_suggestions: test_skill_suggestions(),
+            ..TuiUiState::default()
+        };
+        let text = help_tab_text(&skills_tab_lines(&ui_state, &theme));
+        assert!(text.contains("project-alpha"), "missing project alias");
+        assert!(text.contains("personal-beta"), "missing personal alias");
+        // Source tags are surfaced.
+        assert!(text.contains("Project") && text.contains("Personal"));
+        // The guidance disclaimer is always present.
+        assert!(text.to_lowercase().contains("guidance"));
+        assert!(text.to_lowercase().contains("approvals"));
+    }
+
+    #[test]
+    fn skills_tab_lines_render_empty_state_without_panic() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let ui_state = TuiUiState {
+            skill_suggestions: Vec::new(),
+            ..TuiUiState::default()
+        };
+        let text = help_tab_text(&skills_tab_lines(&ui_state, &theme));
+        assert!(text.to_lowercase().contains("no skills"));
+        // The disclaimer survives the empty state.
+        assert!(text.to_lowercase().contains("guidance"));
+    }
+
+    #[test]
+    fn getting_started_lines_render_model_examples_and_compact_agents() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let mut state = state_with_input("", false);
+        state.agents = vec![
+            agent_view("explorer", "Explorer", "idle", &["read"]),
+            agent_view("fixer", "Fixer", "idle", &["read", "edit"]),
+        ];
+        let lines = getting_started_lines(&state, &theme);
+        let text = help_tab_text(&lines);
+        // Routing mental model: prompt -> orchestrator -> named agents.
+        assert!(text.contains("orchestrator"));
+        assert!(text.contains("agents"));
+        // At least two copy-pasteable example prompts (marked with "> ").
+        let example_count = lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .first()
+                    .is_some_and(|span| span.content.starts_with("> "))
+            })
+            .count();
+        assert!(example_count >= 2, "expected >=2 example prompts");
+        // Exactly one compact agent row per configured agent.
+        assert!(text.contains("Explorer"));
+        assert!(text.contains("Fixer"));
+        let agent_rows = lines
+            .iter()
+            .filter(|line| {
+                let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                joined.contains("Explorer") || joined.contains("Fixer")
+            })
+            .count();
+        assert_eq!(agent_rows, 2, "expected one compact row per agent");
     }
 
     fn help_tab_text(lines: &[Line<'static>]) -> String {
