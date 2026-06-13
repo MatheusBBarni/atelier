@@ -995,6 +995,9 @@ impl App {
         if self.handle_queue_command(&prompt).await? {
             return Ok(());
         }
+        if self.handle_provider_status_command(&prompt).await? {
+            return Ok(());
+        }
         if matches!(self.state.run_state, RunState::WaitingForUser) {
             if self.state.pending_approval.is_some() {
                 bail!("a run is waiting for action approval");
@@ -1165,6 +1168,40 @@ impl App {
             config_status_display(&self.state.config_status),
         )?;
         Ok(true)
+    }
+
+    async fn handle_provider_status_command(&mut self, prompt: &str) -> Result<bool> {
+        let trimmed = prompt.trim();
+        if trimmed != "/provider:status" {
+            // Only the exact (optionally whitespace-trimmed) command is handled
+            // here. `/provider:statusFOO` is a malformed provider-status call;
+            // unrelated commands like `/provider:unknown` fall through to the
+            // existing unknown-command guard untouched.
+            if trimmed.starts_with("/provider:status") {
+                bail!("usage: /provider:status");
+            }
+            return Ok(false);
+        }
+
+        let report = self.provider_status_report().await;
+        self.record_event(
+            None,
+            None,
+            "provider_status_viewed",
+            json!({ "report": report.clone() }),
+            report,
+        )?;
+        Ok(true)
+    }
+
+    /// Collect provider runway status via the runtime status service and render
+    /// it with the compact share-safe formatter. Provider discovery, probing,
+    /// timeouts, normalization, and redaction all stay behind `runtime::status`;
+    /// the app layer only triggers the bounded service and delivers the result.
+    async fn provider_status_report(&self) -> String {
+        let service = crate::runtime::status::ProviderStatusService::from_config(&self.config);
+        let statuses = service.collect_status().await;
+        crate::runtime::status::render_provider_status(&statuses)
     }
 
     async fn handle_queue_command(&mut self, prompt: &str) -> Result<bool> {
@@ -9021,6 +9058,173 @@ instructions_file = "agents/explorer.md"
         assert!(!events
             .iter()
             .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+    }
+
+    fn fake_with_zai_config(dir: &std::path::Path) -> EffectiveConfig {
+        // Most agents use the deterministic fake runtime; one agent uses a Z.ai
+        // runtime whose api_key_env points at a guaranteed-unset, uniquely
+        // named variable. That resolves to a deterministic Unauthenticated
+        // status in any environment (the var is never set), exercising the
+        // partial-failure / share-safe path of `/provider:status`.
+        let config_path = dir.join("atelier.toml");
+        fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[runtimes.zai]
+type = "zai"
+api_key_env = "MULTIAGENT_TEST_PROVIDER_STATUS_NO_KEY"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "zai"
+
+[agents.consul]
+runtime = "fake"
+
+[council.presets.default.architect]
+runtime = "fake"
+
+[council.presets.default.security]
+runtime = "fake"
+
+[council.presets.default.reviewer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn provider_status_command_renders_one_row_for_each_used_provider() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/provider:status").await.unwrap();
+
+        let display = app.state.events.join("\n");
+        assert!(display.contains("Provider status"), "{display}");
+        assert!(display.contains("Fake"), "{display}");
+        assert!(display.contains("ready"), "{display}");
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "provider_status_viewed"));
+        // No agent run was started — this is a read-only command.
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+    }
+
+    #[tokio::test]
+    async fn provider_status_command_tolerates_surrounding_whitespace() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("   /provider:status   ").await.unwrap();
+
+        assert!(app.state.events.join("\n").contains("Provider status"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn provider_status_handler_only_claims_the_exact_command() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        // The exact command is handled.
+        assert!(app
+            .handle_provider_status_command("/provider:status")
+            .await
+            .unwrap());
+        // An ordinary prompt is not intercepted.
+        assert!(!app
+            .handle_provider_status_command("just a normal prompt")
+            .await
+            .unwrap());
+        // A different namespaced command is not intercepted (falls through to
+        // the existing unknown-command guard).
+        assert!(!app
+            .handle_provider_status_command("/provider:unknown")
+            .await
+            .unwrap());
+        // A malformed provider-status call with trailing args is rejected.
+        assert!(app
+            .handle_provider_status_command("/provider:status extra")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_unknown_command_keeps_existing_unknown_behavior() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app.submit_prompt("/provider:unknown").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown command /provider:unknown"),
+            "{error}"
+        );
+        assert_eq!(app.state.run_state, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn provider_status_command_renders_failing_provider_share_safely() {
+        let dir = tempdir().unwrap();
+        let config = fake_with_zai_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/provider:status").await.unwrap();
+
+        let display = app.state.events.join("\n");
+        // Healthy and failing providers both appear, independently.
+        assert!(display.contains("Fake"), "{display}");
+        assert!(display.contains("ready"), "{display}");
+        assert!(display.contains("Z.ai"), "{display}");
+        assert!(display.contains("unauthenticated"), "{display}");
+        assert_eq!(app.state.run_state, RunState::Idle);
+
+        // The full recorded payload is share-safe: no env var values or
+        // credential material, only the share-safe config message.
+        let events = app.history.read_events().unwrap();
+        let payload = events
+            .iter()
+            .find(|event| event.kind == "provider_status_viewed")
+            .unwrap()
+            .payload
+            .to_string();
+        assert!(!payload.contains("sk-"), "{payload}");
+        assert!(
+            !payload.contains('@'),
+            "leaked an email/account id: {payload}"
+        );
     }
 
     #[test]

@@ -70,7 +70,7 @@ async fn multiple_providers_return_independent_rows_when_one_fails() {
 }
 
 #[tokio::test]
-async fn from_config_discovers_one_probe_per_provider_family() {
+async fn from_config_discovers_only_provider_families_used_by_enabled_agents() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("atelier.toml");
     std::fs::write(
@@ -95,7 +95,7 @@ runtime = "fake"
 runtime = "fake"
 
 [agents.oracle]
-runtime = "fake"
+runtime = "zai"
 
 [agents.consul]
 runtime = "fake"
@@ -118,22 +118,29 @@ runtime = "fake"
     })
     .unwrap();
 
-    // The merged config layers built-in runtime defaults under the local
-    // overrides, so discovery covers every configured provider family. We
-    // assert discovery here rather than collecting status, because collecting
-    // would shell out to the real CLI providers (codex/cursor/claude).
+    // Discovery is driven by the runtimes enabled agents actually reference
+    // (fake + zai here), NOT by every runtime the merged built-in defaults
+    // define. So codex/cursor/claude — defined by defaults but unused — are
+    // not probed, which also keeps this test free of live CLI shell-outs.
     let service = ProviderStatusService::from_config(&config);
     let ids = service.provider_ids();
     assert!(ids.contains(&ProviderId::Fake), "missing fake: {ids:?}");
     assert!(ids.contains(&ProviderId::Zai), "missing zai: {ids:?}");
-    // One probe per distinct family — no duplicates.
-    let mut deduped = ids.clone();
-    deduped.sort_by_key(|id| format!("{id:?}"));
-    deduped.dedup();
-    assert_eq!(
-        deduped.len(),
-        ids.len(),
-        "duplicate provider families: {ids:?}"
+    assert!(
+        !ids.contains(&ProviderId::Codex),
+        "unused codex probed: {ids:?}"
     );
-    assert_eq!(service.provider_count(), ids.len());
+    assert!(
+        !ids.contains(&ProviderId::Cursor),
+        "unused cursor probed: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&ProviderId::Claude),
+        "unused claude probed: {ids:?}"
+    );
+    assert_eq!(
+        service.provider_count(),
+        2,
+        "expected exactly fake + zai: {ids:?}"
+    );
 }

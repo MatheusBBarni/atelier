@@ -752,12 +752,22 @@ impl ProviderStatusService {
         self
     }
 
-    /// Discover relevant providers from configured runtimes — one probe per
-    /// distinct provider family, in stable runtime-id order.
+    /// Discover the *relevant* providers from config: the distinct provider
+    /// families actually referenced by enabled agents, one probe each, in
+    /// stable agent-id order. This deliberately excludes runtimes that are
+    /// merely defined (e.g. built-in defaults the user never references) so the
+    /// command reports only the providers a session can actually use and does
+    /// not pay to probe unused CLIs.
     pub fn from_config(config: &EffectiveConfig) -> Self {
         let mut seen: HashSet<ProviderId> = HashSet::new();
         let mut probes: Vec<Arc<dyn ProviderStatusProbe>> = Vec::new();
-        for runtime in config.runtimes.values() {
+        for agent in config.agents.values() {
+            if !agent.enabled {
+                continue;
+            }
+            let Some(runtime) = config.runtimes.get(&agent.runtime) else {
+                continue;
+            };
             let provider_id = ProviderId::from(runtime.kind.clone());
             if seen.insert(provider_id) {
                 probes.push(Arc::new(RuntimeAvailabilityProbe::new(runtime.clone())));

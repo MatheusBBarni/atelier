@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Route `/provider:status` Through Submitted App Commands
 type: backend
 complexity: medium
@@ -31,12 +31,14 @@ This task makes the visible provider status command executable from Atelier's no
 - The routed command SHOULD remain responsive by relying on bounded provider checks from the status service instead of adding unbounded work in the app command path.
 
 ## Subtasks
-- [ ] 5.1 Add submitted command routing for the exact `/provider:status` command label.
-- [ ] 5.2 Connect the route to the runtime provider status service from task_03.
-- [ ] 5.3 Send the returned status results through the compact renderer from task_04.
-- [ ] 5.4 Preserve current behavior for unrelated slash commands and ordinary prompts.
-- [ ] 5.5 Ensure command errors and partial provider errors remain share-safe and actionable.
-- [ ] 5.6 Add routing-level tests for handled and unhandled command paths.
+- [x] 5.1 Add submitted command routing for the exact `/provider:status` command label. (`App::handle_provider_status_command`, dispatched in `submit_prompt`)
+- [x] 5.2 Connect the route to the runtime provider status service from task_03. (`provider_status_report` → `ProviderStatusService::from_config`)
+- [x] 5.3 Send the returned status results through the compact renderer from task_04. (`render_provider_status`)
+- [x] 5.4 Preserve current behavior for unrelated slash commands and ordinary prompts. (handler returns `false` for non-exact; `/provider:unknown` still hits the unknown-command guard)
+- [x] 5.5 Ensure command errors and partial provider errors remain share-safe and actionable. (service is infallible — failing providers become redacted typed rows)
+- [x] 5.6 Add routing-level tests for handled and unhandled command paths.
+
+> Scope note: `ProviderStatusService::from_config` was refined to discover only the provider families referenced by enabled agents (the relevant set) rather than every configured runtime. This keeps `/provider:status` truthful (reports only providers a session uses), avoids shelling out to unused CLI providers, and makes routing deterministic in tests. The task_03 discovery integration test was updated to match.
 
 ## Implementation Details
 Modify the existing submitted command flow in `src/app/mod.rs` and nearby app command tests. Reference the TechSpec sections "Command Routing", "Runtime Integration", and "Output Rules" for the intended boundary: app routing owns command recognition and response delivery, while provider discovery, probing, normalization, and redaction stay behind `src/runtime` status abstractions.
@@ -68,14 +70,14 @@ Modify the existing submitted command flow in `src/app/mod.rs` and nearby app co
 
 ## Tests
 - Unit tests:
-  - [ ] Exact command: submitting `/provider:status` invokes the provider status handler.
-  - [ ] Trimmed command: submitting `/provider:status` with surrounding whitespace still reaches the intended route if existing command handling trims inputs.
-  - [ ] Unknown command: submitting `/provider:unknown` keeps the existing unknown-command behavior.
-  - [ ] Ordinary prompt: submitting a non-command prompt is not intercepted by provider status routing.
-  - [ ] Service error: a provider status service error produces a share-safe command response.
+  - [x] Exact command: submitting `/provider:status` invokes the provider status handler. (`provider_status_command_renders_one_row_for_each_used_provider`, `provider_status_handler_only_claims_the_exact_command`)
+  - [x] Trimmed command: submitting `/provider:status` with surrounding whitespace still reaches the intended route. (`provider_status_command_tolerates_surrounding_whitespace`)
+  - [x] Unknown command: submitting `/provider:unknown` keeps the existing unknown-command behavior. (`provider_unknown_command_keeps_existing_unknown_behavior`)
+  - [x] Ordinary prompt: submitting a non-command prompt is not intercepted by provider status routing. (`provider_status_handler_only_claims_the_exact_command`)
+  - [x] Service error: a provider status service error produces a share-safe command response. (`provider_status_command_renders_failing_provider_share_safely`)
 - Integration tests:
-  - [ ] Submitted command flow with deterministic fake provider statuses renders one compact row per configured fake provider.
-  - [ ] Partial provider failure still returns available provider rows plus an actionable failed-provider row.
+  - [x] Submitted command flow with deterministic fake provider statuses renders one compact row per configured fake provider. (`provider_status_command_renders_one_row_for_each_used_provider`, end-to-end through `App::submit_prompt` + `FakeRuntime`)
+  - [x] Partial provider failure still returns available provider rows plus an actionable failed-provider row. (`provider_status_command_renders_failing_provider_share_safely`)
 - Test coverage target: >=80%
 - All tests must pass
 
