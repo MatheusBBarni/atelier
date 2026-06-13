@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "build_roster_rows builder (join, classify, elapsed, accent_index, NeedsInput pin)"
 type: backend
 complexity: medium
@@ -50,12 +50,14 @@ Implement the pure builder function that produces `Vec<RosterRow>` from canonica
 
 ## Subtasks
 
-- [ ] 3.1 Define `ActivityState` enum (`Active | NeedsInput | Stalled | Idle`) and `RosterRow` struct with `agent_id, name, accent_index, activity, runtime_model, effort, thinking, current_step, elapsed, status` in `src/app/mod.rs`; add `roster_rows: Vec<RosterRow>` to `AppState`.
-- [ ] 3.2 Add the internal `StepTiming` struct (`started_at, last_activity` both `Instant`) to `App` as a `BTreeMap<String /*step_id*/, StepTiming>`; do not serialize. Stamp on `set_active_step_with_metadata` and bump on `push_live_stream_content` and `set_live_step_status`.
-- [ ] 3.3 Implement `build_roster_rows(agents, live_steps, timing, now)`: join by agent, classify activity, assign `accent_index` from canonical order before pin-sort, format coarse elapsed on active rows, apply NeedsInput pin-sort, return `Vec<RosterRow>`.
-- [ ] 3.4 Implement coarse elapsed formatter as a helper: takes `Duration` (from `now - started_at`) and returns `Option<String>` (None on idle, coarse format on active).
-- [ ] 3.5 Unit tests for `build_roster_rows`: each classification branch (Active within threshold, Stalled at/after 30s, NeedsInput for both waiting statuses, Idle when no step), elapsed formatter edge cases (8s, 80s, whole-minute, singular/plural), NeedsInput pin preserves `accent_index` as canonical value, parallel-group multiple-Active rows each with correct elapsed.
-- [ ] 3.6 Add `rebuild_roster_rows(&mut self)` on `App`; call it inside `publish_state` after agent/live-step changes so rows update atomically with state.
+- [x] 3.1 Define `ActivityState` enum (`Active | NeedsInput | Stalled | Idle`) and `RosterRow` struct with `agent_id, name, accent_index, activity, runtime_model, effort, thinking, current_step, elapsed, status` in `src/app/mod.rs`; add `roster_rows: Vec<RosterRow>` to `AppState`.
+- [x] 3.2 Add the internal `StepTiming` struct (`started_at, last_activity` both `Instant`) to `App` as a `BTreeMap<String /*step_id*/, StepTiming>`; do not serialize. Stamp on `set_active_step_with_metadata` and bump on `push_live_stream_content` and `set_live_step_status`.
+- [x] 3.3 Implement `build_roster_rows(agents, live_steps, timing, now)`: join by agent, classify activity, assign `accent_index` from canonical order before pin-sort, format coarse elapsed on active rows, apply NeedsInput pin-sort, return `Vec<RosterRow>`.
+- [x] 3.4 Implement coarse elapsed formatter as a helper: takes `Duration` (from `now - started_at`) and returns `Option<String>` (None on idle, coarse format on active).
+- [x] 3.5 Unit tests for `build_roster_rows`: each classification branch (Active within threshold, Stalled at/after 30s, NeedsInput for both waiting statuses, Idle when no step), elapsed formatter edge cases (8s, 80s, whole-minute, singular/plural), NeedsInput pin preserves `accent_index` as canonical value, parallel-group multiple-Active rows each with correct elapsed.
+- [x] 3.6 Add `rebuild_roster_rows(&mut self)` on `App`; call it inside `publish_state` after agent/live-step changes so rows update atomically with state.
+
+> **Scope note (deferral):** The integration **render-snapshot** tests listed under Deliverables/Tests (idle/active/needs-input/stalled/narrow/NO_COLOR) are deferred to task_06/07. The renderer still reads `state.agents` directly (`src/tui/mod.rs:2473`) and does not consume `roster_rows` until the task_06 render rewrite, so meaningful roster snapshots cannot be authored here. The builder itself is fully covered by 13 unit tests (all four activity states, terminal preservation, elapsed edge cases, NeedsInput pin preserving canonical `accent_index`, parallel-group multi-Active).
 
 ## Implementation Details
 

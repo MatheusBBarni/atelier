@@ -278,6 +278,11 @@ struct StepTiming {
     last_activity: Instant,
 }
 
+/// A `Running`/`Streaming` step whose last activity is at least this old is
+/// classified `Stalled` rather than `Active` (ADR-004). Fixed in V1;
+/// configurability is a documented Non-Goal.
+const STALL_THRESHOLD: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 pub struct App {
     config: EffectiveConfig,
@@ -4157,10 +4162,27 @@ impl App {
             .collect();
     }
 
-    fn publish_state(&self) {
+    fn publish_state(&mut self) {
+        // Rebuild the roster view-model centrally so rows never drift from
+        // `agents`/`live_steps` and the renderer stays a pure, clock-free
+        // function of `AppState` (ADR-003).
+        self.rebuild_roster_rows();
         if let Some(sender) = &self.state_sender {
             let _ = sender.send(self.state.clone());
         }
+    }
+
+    /// Rebuild `AppState.roster_rows` from the current agents, live steps, and
+    /// step timing using a fresh wall-clock (ADR-003). Called inside
+    /// `publish_state`; the injected `now` keeps the builder itself testable.
+    fn rebuild_roster_rows(&mut self) {
+        let rows = build_roster_rows(
+            &self.state.agents,
+            &self.state.live_steps,
+            &self.step_timings,
+            Instant::now(),
+        );
+        self.state.roster_rows = rows;
     }
 
     /// Apply a freshly fetched git context, publishing a state update only when
@@ -5093,6 +5115,139 @@ fn build_agent_views(
             .cmp(&(agent_roster_rank(&right.id), right.id.as_str()))
     });
     views
+}
+
+/// Format a coarse, whole-second elapsed duration for an active roster row
+/// (ADR-002/ADR-004). Sub-minute renders as `"8s"`, minutes as `"1m 20s"`
+/// (the seconds remainder is dropped when zero, e.g. `"1m"`), and hours as
+/// `"1h 5m"`. The returned string is pre-formatted into [`RosterRow::elapsed`]
+/// so the renderer never touches a clock.
+fn format_coarse_elapsed(elapsed: Duration) -> String {
+    let total = elapsed.as_secs();
+    if total < 60 {
+        return format!("{total}s");
+    }
+    if total < 3600 {
+        let minutes = total / 60;
+        let seconds = total % 60;
+        if seconds == 0 {
+            return format!("{minutes}m");
+        }
+        return format!("{minutes}m {seconds}s");
+    }
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    if minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {minutes}m")
+    }
+}
+
+/// Pure roster builder (ADR-003): joins canonical agents with their live steps,
+/// classifies each row's [`ActivityState`], assigns a canonical-order
+/// `accent_index` immune to the pin-sort (ADR-005), pre-formats elapsed on
+/// active rows, and floats `NeedsInput` rows to the top via a stable pin-sort.
+///
+/// `agents` must already be in canonical order (orchestrator-first then
+/// alphabetical, as [`build_agent_views`] yields); `accent_index` is taken from
+/// that order *before* the pin so reordering never recolors an agent. `now` is
+/// injected for determinism — production passes `Instant::now()`, tests a fixed
+/// `Instant`.
+fn build_roster_rows(
+    agents: &[AgentView],
+    live_steps: &[LiveStepView],
+    timing: &BTreeMap<String, StepTiming>,
+    now: Instant,
+) -> Vec<RosterRow> {
+    let mut rows: Vec<(usize, RosterRow)> = agents
+        .iter()
+        .enumerate()
+        .map(|(accent_index, agent)| {
+            // Join: an agent's live step is the one whose `agent` matches its id.
+            let live_step = live_steps.iter().find(|step| step.agent == agent.id);
+
+            let (activity, current_step, elapsed) = match live_step {
+                Some(step) => classify_step(step, timing, now),
+                None => (ActivityState::Idle, None, None),
+            };
+
+            let row = RosterRow {
+                agent_id: agent.id.clone(),
+                name: agent.name.clone(),
+                accent_index,
+                activity,
+                runtime_model: format!("{}/{}", agent.runtime, agent.model),
+                effort: agent.effort.clone(),
+                thinking: agent.thinking,
+                current_step,
+                elapsed,
+                // Terminal/idle rows keep their existing status label; only the
+                // activity-driven states carry their own meaning via `activity`.
+                status: agent.status.clone(),
+            };
+            (accent_index, row)
+        })
+        .collect();
+
+    // The single permitted reorder: stable pin-sort floating `NeedsInput` rows
+    // to the top (pin_rank 0) while every other row keeps its canonical order
+    // (pin_rank 1). `accent_index` was assigned above, so the pin never moves a
+    // color. The secondary key preserves canonical order within each rank.
+    rows.sort_by_key(|(canonical_order, row)| {
+        let pin_rank = if row.activity == ActivityState::NeedsInput {
+            0
+        } else {
+            1
+        };
+        (pin_rank, *canonical_order)
+    });
+
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// Classify a joined live step into an [`ActivityState`] plus the pre-formatted
+/// `current_step`/`elapsed` shown on active rows. Terminal statuses collapse to
+/// `Idle` with no step/elapsed; their label survives on `RosterRow::status`.
+fn classify_step(
+    step: &LiveStepView,
+    timing: &BTreeMap<String, StepTiming>,
+    now: Instant,
+) -> (ActivityState, Option<String>, Option<String>) {
+    match step.status {
+        LiveStepStatus::WaitingForApproval | LiveStepStatus::WaitingForAction => {
+            (ActivityState::NeedsInput, None, None)
+        }
+        LiveStepStatus::Starting
+        | LiveStepStatus::Running
+        | LiveStepStatus::Streaming
+        | LiveStepStatus::Cancelling => {
+            let entry = timing.get(&step.step_id);
+            let stalled = entry
+                .is_some_and(|t| now.saturating_duration_since(t.last_activity) >= STALL_THRESHOLD);
+            let activity = if stalled {
+                ActivityState::Stalled
+            } else {
+                ActivityState::Active
+            };
+            let elapsed =
+                entry.map(|t| format_coarse_elapsed(now.saturating_duration_since(t.started_at)));
+            let current_step = Some(step_display_label(step));
+            (activity, current_step, elapsed)
+        }
+        // Terminal statuses: Idle, label preserved from `agent.status`.
+        LiveStepStatus::Completed | LiveStepStatus::Failed | LiveStepStatus::Interrupted => {
+            (ActivityState::Idle, None, None)
+        }
+    }
+}
+
+/// Resolve the step label shown on an active row, falling back to the step id
+/// when the label is absent.
+fn step_display_label(step: &LiveStepView) -> String {
+    step.step_label
+        .clone()
+        .unwrap_or_else(|| step.step_id.clone())
 }
 
 fn build_config_status(
@@ -12117,11 +12272,18 @@ runtime = "fake"
     }
 
     #[tokio::test]
-    async fn app_state_default_has_empty_roster_rows() {
+    async fn app_state_after_construction_has_roster_row_per_agent() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let app = App::new(config).await.unwrap();
-        assert!(app.state().roster_rows.is_empty());
+        // Construction publishes once, so `roster_rows` is rebuilt to one row per
+        // canonical agent (ADR-003); with no live steps every row is Idle.
+        assert_eq!(app.state().roster_rows.len(), app.state().agents.len());
+        assert!(app
+            .state()
+            .roster_rows
+            .iter()
+            .all(|row| row.activity == ActivityState::Idle));
     }
 
     #[tokio::test]
@@ -12132,13 +12294,283 @@ runtime = "fake"
         let (sender, mut receiver) = watch::channel(app.state().clone());
         app.attach_state_sender(sender);
 
+        // `publish_state` rebuilds `roster_rows` from agents/live_steps (ADR-003),
+        // so any manually-set rows are replaced by the freshly built canonical set.
         app.state_mut().roster_rows = vec![sample_roster_row()];
         app.publish_state();
 
         let state = receiver.borrow_and_update();
-        assert_eq!(state.roster_rows.len(), 1);
-        assert_eq!(state.roster_rows[0].agent_id, "explorer");
-        assert_eq!(state.roster_rows[0].activity, ActivityState::Active);
+        // With no live steps every row is Idle and the orchestrator sorts first
+        // (canonical order); the row count tracks the agent count.
+        assert_eq!(state.roster_rows.len(), state.agents.len());
+        assert_eq!(state.roster_rows[0].agent_id, "orchestrator");
+        assert!(state
+            .roster_rows
+            .iter()
+            .all(|row| row.activity == ActivityState::Idle));
+    }
+
+    // --- build_roster_rows builder (task_03, ADR-003/004/005) -----------------
+
+    fn roster_agent(id: &str, name: &str) -> AgentView {
+        AgentView {
+            id: id.to_string(),
+            name: name.to_string(),
+            runtime: "fake".to_string(),
+            model: "default".to_string(),
+            effort: "medium".to_string(),
+            thinking: false,
+            capabilities: Vec::new(),
+            availability: None,
+            status: "idle".to_string(),
+        }
+    }
+
+    fn roster_live_step(agent: &str, step_id: &str, status: LiveStepStatus) -> LiveStepView {
+        LiveStepView {
+            run_id: "run-1".to_string(),
+            group_id: None,
+            step_id: step_id.to_string(),
+            step_label: Some(format!("{agent} step")),
+            file_scope: None,
+            agent: agent.to_string(),
+            status,
+            streams: Vec::new(),
+        }
+    }
+
+    /// A timing entry stamped `started_secs` ago, last active `idle_secs` ago,
+    /// relative to the `now` the test will pass to `build_roster_rows`.
+    fn timing_entry(now: Instant, started_secs: u64, idle_secs: u64) -> StepTiming {
+        StepTiming {
+            started_at: now - Duration::from_secs(started_secs),
+            last_activity: now - Duration::from_secs(idle_secs),
+        }
+    }
+
+    #[test]
+    fn classify_active_within_threshold() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Streaming,
+        )];
+        let mut timing = BTreeMap::new();
+        timing.insert("step-1".to_string(), timing_entry(now, 5, 0));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::Active);
+        assert_eq!(rows[0].elapsed.as_deref(), Some("5s"));
+        assert_eq!(rows[0].current_step.as_deref(), Some("explorer step"));
+    }
+
+    #[test]
+    fn classify_stalled_at_exactly_threshold() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Running,
+        )];
+        let mut timing = BTreeMap::new();
+        // started 30s ago, last activity exactly 30s ago -> stalled, not active.
+        timing.insert("step-1".to_string(), timing_entry(now, 30, 30));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::Stalled);
+        // Elapsed still shown on stalled rows.
+        assert_eq!(rows[0].elapsed.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn classify_stalled_after_threshold() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Streaming,
+        )];
+        let mut timing = BTreeMap::new();
+        timing.insert("step-1".to_string(), timing_entry(now, 35, 35));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::Stalled);
+        assert_eq!(rows[0].elapsed.as_deref(), Some("35s"));
+    }
+
+    #[test]
+    fn classify_needs_input_from_waiting_for_approval() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::WaitingForApproval,
+        )];
+        let timing = BTreeMap::new();
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::NeedsInput);
+        assert_eq!(rows[0].elapsed, None);
+        assert_eq!(rows[0].current_step, None);
+    }
+
+    #[test]
+    fn classify_needs_input_from_waiting_for_action() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::WaitingForAction,
+        )];
+        let timing = BTreeMap::new();
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::NeedsInput);
+    }
+
+    #[test]
+    fn classify_idle_when_no_step() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let rows = build_roster_rows(&agents, &[], &BTreeMap::new(), now);
+
+        assert_eq!(rows[0].activity, ActivityState::Idle);
+        assert_eq!(rows[0].elapsed, None);
+        assert_eq!(rows[0].current_step, None);
+    }
+
+    #[test]
+    fn classify_terminal_status_preserves_label() {
+        let now = Instant::now();
+        let mut agent = roster_agent("explorer", "Explorer");
+        agent.status = "completed".to_string();
+        let agents = vec![agent];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Completed,
+        )];
+        let timing = BTreeMap::new();
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::Idle);
+        assert_eq!(rows[0].status, "completed");
+        assert_eq!(rows[0].elapsed, None);
+        assert_eq!(rows[0].current_step, None);
+    }
+
+    #[test]
+    fn elapsed_formatter_edge_cases() {
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(8)), "8s");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(60)), "1m");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(80)), "1m 20s");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(120)), "2m");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(3900)), "1h 5m");
+        // Sub-minute remainder under an hour boundary collapses cleanly.
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(3661)), "1h 1m");
+    }
+
+    #[test]
+    fn needs_input_pin_preserves_canonical_accent_index() {
+        let now = Instant::now();
+        // Canonical order: [explorer, fixer] (alphabetical, no orchestrator here).
+        let agents = vec![
+            roster_agent("explorer", "Explorer"),
+            roster_agent("fixer", "Fixer"),
+        ];
+        let steps = vec![
+            roster_live_step("explorer", "step-e", LiveStepStatus::Streaming),
+            roster_live_step("fixer", "step-f", LiveStepStatus::WaitingForApproval),
+        ];
+        let mut timing = BTreeMap::new();
+        timing.insert("step-e".to_string(), timing_entry(now, 5, 0));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        // fixer (NeedsInput) pins to the top...
+        assert_eq!(rows[0].agent_id, "fixer");
+        assert_eq!(rows[1].agent_id, "explorer");
+        // ...but keeps its canonical accent_index of 1 (not 0).
+        assert_eq!(rows[0].accent_index, 1);
+        assert_eq!(rows[1].accent_index, 0);
+    }
+
+    #[test]
+    fn parallel_group_multiple_active_rows_each_correct() {
+        let now = Instant::now();
+        let agents = vec![
+            roster_agent("explorer", "Explorer"),
+            roster_agent("fixer", "Fixer"),
+        ];
+        let mut explorer_step = roster_live_step("explorer", "step-e", LiveStepStatus::Running);
+        explorer_step.group_id = Some("group-1".to_string());
+        let mut fixer_step = roster_live_step("fixer", "step-f", LiveStepStatus::Streaming);
+        fixer_step.group_id = Some("group-1".to_string());
+        let steps = vec![explorer_step, fixer_step];
+
+        let mut timing = BTreeMap::new();
+        timing.insert("step-e".to_string(), timing_entry(now, 10, 0));
+        timing.insert("step-f".to_string(), timing_entry(now, 80, 0));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        // No NeedsInput, so canonical order is preserved with stable accents.
+        assert_eq!(rows[0].agent_id, "explorer");
+        assert_eq!(rows[0].accent_index, 0);
+        assert_eq!(rows[0].activity, ActivityState::Active);
+        assert_eq!(rows[0].elapsed.as_deref(), Some("10s"));
+
+        assert_eq!(rows[1].agent_id, "fixer");
+        assert_eq!(rows[1].accent_index, 1);
+        assert_eq!(rows[1].activity, ActivityState::Active);
+        assert_eq!(rows[1].elapsed.as_deref(), Some("1m 20s"));
+    }
+
+    #[test]
+    fn missing_step_label_falls_back_to_step_id() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let mut step = roster_live_step("explorer", "step-1", LiveStepStatus::Streaming);
+        step.step_label = None;
+        let steps = vec![step];
+        let mut timing = BTreeMap::new();
+        timing.insert("step-1".to_string(), timing_entry(now, 5, 0));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].current_step.as_deref(), Some("step-1"));
+    }
+
+    #[test]
+    fn build_roster_rows_preserves_canonical_order_without_pin() {
+        let now = Instant::now();
+        let agents = vec![
+            roster_agent("orchestrator", "Orchestrator"),
+            roster_agent("explorer", "Explorer"),
+            roster_agent("fixer", "Fixer"),
+        ];
+        let rows = build_roster_rows(&agents, &[], &BTreeMap::new(), now);
+
+        let order: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
+        assert_eq!(order, vec!["orchestrator", "explorer", "fixer"]);
+        for (idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.accent_index, idx);
+        }
     }
 
     // --- StepTiming lifecycle (task_02, ADR-004) ------------------------------

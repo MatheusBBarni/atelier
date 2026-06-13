@@ -5,11 +5,16 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
 ## Current State
 
 - task_01 complete: `ActivityState`, `RosterRow`, and `AppState.roster_rows` exist in `src/app/mod.rs`.
-- task_02 complete: `StepTiming` map + lifecycle stamping was already implemented; tests added this run (8 tests in `src/app/mod.rs`). `started_at`/`last_activity` + `STALL_THRESHOLD` are ready for task_03 to consume.
+- task_02 complete: `StepTiming` map + lifecycle stamping was already implemented; tests added this run (8 tests in `src/app/mod.rs`). `started_at`/`last_activity` are ready.
+- task_03 complete: `build_roster_rows` (+ `classify_step`, `step_display_label`, `format_coarse_elapsed`) and `STALL_THRESHOLD` const now exist in `src/app/mod.rs`. `rebuild_roster_rows` is wired into `publish_state`, which is now `&mut self` and rebuilds `roster_rows` on every publish (unconditionally — task_04 adds the change-gate).
 
 ## Shared Decisions
 
 - `RosterRow.roster_rows` uses `#[serde(default)]` so older durable history records deserialize with an empty roster (no migration needed).
+- `publish_state` is now `&mut self` (it rebuilds `roster_rows`). All callers were already `&mut self`, so no blast radius.
+- Activity classification (task_03): `WaitingForApproval`/`WaitingForAction` → `NeedsInput`; `Starting`/`Running`/`Streaming`/`Cancelling` → `Active` (or `Stalled` if `now - last_activity >= 30s`); `Completed`/`Failed`/`Interrupted`/no-step → `Idle`. `RosterRow.status` always carries `agent.status`; activity-driven label is via `activity`. `accent_index` is canonical-order, assigned before the NeedsInput pin-sort.
+- Sub-minute elapsed renders as `"8s"` (then `"1m 20s"`, `"1h 5m"`).
+- **Renderer still reads `state.agents` (tui/mod.rs:2473), NOT `roster_rows`** until task_06 rewrites the render block. Roster render-snapshot integration tests belong to task_06/07, not earlier.
 
 ## Shared Learnings
 
