@@ -767,6 +767,11 @@ const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// only exists to surface files created mid-session.
 const FILE_INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Cadence of the roster refresh tick (ADR-004). 1 Hz keeps coarse elapsed and
+/// stall detection current during a quiet step; cheap and change-gated, so it
+/// only publishes when a row actually moves.
+const ROSTER_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Walk the working directory off the worker's async thread and publish the
 /// snapshot to the TUI. Extracted from the worker `select!` so it is
 /// unit-testable in isolation (ADR-003). The `ignore`-crate walk is
@@ -847,6 +852,14 @@ async fn run_app_worker(
     file_index_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     file_index_poll.tick().await; // consume the immediate first tick (startup covered it)
 
+    // Bounded 1 Hz roster refresh (ADR-004). Stream deltas already refresh the
+    // roster under load, so this only needs to fire while a step is quiet;
+    // `refresh_roster_tick` self-gates to active runs and change-gates before
+    // publishing. Skip missed ticks so heavy streaming can't queue a burst.
+    let mut roster_poll = tokio::time::interval(ROSTER_REFRESH_INTERVAL);
+    roster_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    roster_poll.tick().await; // consume the immediate first tick
+
     loop {
         tokio::select! {
             command = command_receiver.recv() => match command {
@@ -871,6 +884,9 @@ async fn run_app_worker(
                     file_index_sender.clone(),
                     walk_cancel.clone(),
                 );
+            }
+            _ = roster_poll.tick() => {
+                app.refresh_roster_tick();
             }
         }
     }

@@ -4167,9 +4167,44 @@ impl App {
         // `agents`/`live_steps` and the renderer stays a pure, clock-free
         // function of `AppState` (ADR-003).
         self.rebuild_roster_rows();
+        self.send_state();
+    }
+
+    /// Send the current `AppState` snapshot over the watch channel **without**
+    /// rebuilding the roster. Used by change-gated publishers (e.g.
+    /// `refresh_roster_tick`) that have already prepared `roster_rows`.
+    fn send_state(&self) {
         if let Some(sender) = &self.state_sender {
             let _ = sender.send(self.state.clone());
         }
+    }
+
+    /// Bounded 1 Hz roster refresh (ADR-004). Rebuilds the roster view-model
+    /// with a fresh clock so coarse elapsed advances and a quiet step surfaces
+    /// as `Stalled` even when no stream events arrive, then publishes **only**
+    /// when the rebuilt rows differ — the change gate mirrors `set_git_context`.
+    /// A no-op unless a run is actively working. Returns whether it published.
+    pub(crate) fn refresh_roster_tick(&mut self) -> bool {
+        // Gate to active runs (keep in sync with `tui::work_indicator_active`):
+        // an idle roster never changes, so ticking it would only churn the watch.
+        if !matches!(self.state.run_state, RunState::Planning | RunState::Running) {
+            return false;
+        }
+        let rows = build_roster_rows(
+            &self.state.agents,
+            &self.state.live_steps,
+            &self.step_timings,
+            Instant::now(),
+        );
+        // Rows pre-format elapsed into coarse buckets and carry activity state,
+        // so an unchanged vec means neither the bucket nor the activity moved
+        // (ADR-004 change gate) — suppress the publish.
+        if self.state.roster_rows == rows {
+            return false;
+        }
+        self.state.roster_rows = rows;
+        self.send_state();
+        true
     }
 
     /// Rebuild `AppState.roster_rows` from the current agents, live steps, and
@@ -4522,6 +4557,11 @@ impl App {
             for stream in &mut live_step.streams {
                 stream.final_delta = true;
             }
+        }
+        if final_delta {
+            // A finished step no longer needs timing: drop it so the agent
+            // classifies as `Idle` and the map doesn't leak entries (ADR-004).
+            self.step_timings.remove(step_id);
         }
         self.state.live_step = self.state.live_steps.first().cloned();
         self.sync_chat_items();
@@ -12308,6 +12348,128 @@ runtime = "fake"
             .roster_rows
             .iter()
             .all(|row| row.activity == ActivityState::Idle));
+    }
+
+    // --- task_04: publish_state hook + refresh_roster_tick (ADR-003/004) ------
+
+    #[tokio::test]
+    async fn publish_state_marks_active_agent_from_live_step() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.state_mut().live_steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Streaming,
+        )];
+        app.step_timings
+            .insert("step-1".to_string(), timing_entry(Instant::now(), 5, 0));
+
+        app.publish_state();
+
+        let row = app
+            .state()
+            .roster_rows
+            .iter()
+            .find(|row| row.agent_id == "explorer")
+            .expect("explorer row");
+        assert_eq!(row.activity, ActivityState::Active);
+    }
+
+    #[tokio::test]
+    async fn refresh_roster_tick_is_noop_when_idle() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        assert_eq!(app.state().run_state, RunState::Idle);
+        // Idle runs never change the roster, so the tick gate short-circuits.
+        assert!(!app.refresh_roster_tick());
+    }
+
+    #[tokio::test]
+    async fn refresh_roster_tick_publishes_on_elapsed_bucket_change() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.state_mut().run_state = RunState::Running;
+        app.state_mut().live_steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Running,
+        )];
+        app.step_timings.insert(
+            "step-1".to_string(),
+            StepTiming {
+                started_at: Instant::now() - Duration::from_secs(15),
+                last_activity: Instant::now(),
+            },
+        );
+        app.publish_state();
+        let before = app
+            .state()
+            .roster_rows
+            .iter()
+            .find(|row| row.agent_id == "explorer")
+            .and_then(|row| row.elapsed.clone());
+        assert_eq!(before.as_deref(), Some("15s"));
+
+        // Simulate elapsed advancing across a coarse bucket by aging started_at.
+        app.step_timings.get_mut("step-1").unwrap().started_at =
+            Instant::now() - Duration::from_secs(35);
+        assert!(app.refresh_roster_tick(), "bucket moved -> should publish");
+
+        let after = app
+            .state()
+            .roster_rows
+            .iter()
+            .find(|row| row.agent_id == "explorer")
+            .and_then(|row| row.elapsed.clone());
+        assert_eq!(after.as_deref(), Some("35s"));
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn refresh_roster_tick_suppresses_identical_rebuild() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.state_mut().run_state = RunState::Running;
+        app.state_mut().live_steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Running,
+        )];
+        // Sit mid-bucket so two back-to-back ticks render the same coarse elapsed.
+        app.step_timings.insert(
+            "step-1".to_string(),
+            StepTiming {
+                started_at: Instant::now() - Duration::from_millis(8_200),
+                last_activity: Instant::now(),
+            },
+        );
+
+        assert!(app.refresh_roster_tick(), "first tick publishes the change");
+        assert!(
+            !app.refresh_roster_tick(),
+            "identical rebuild must be change-gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_cleared_on_terminal_status() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.state_mut().live_steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Running,
+        )];
+        app.step_timings
+            .insert("step-1".to_string(), timing_entry(Instant::now(), 5, 0));
+        assert!(app.step_timings.contains_key("step-1"));
+
+        app.set_live_step_status("step-1", LiveStepStatus::Completed);
+
+        assert!(
+            !app.step_timings.contains_key("step-1"),
+            "a finished step must drop its timing entry"
+        );
     }
 
     // --- build_roster_rows builder (task_03, ADR-003/004/005) -----------------

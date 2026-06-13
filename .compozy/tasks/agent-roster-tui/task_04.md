@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Wire rebuild into publish_state + 1Hz gated refresh tick"
 type: backend
 complexity: medium
@@ -34,13 +34,13 @@ This task integrates roster rebuild calls into the publish_state pathway and add
 
 ## Subtasks
 
-- [ ] 4.1 — Write `rebuild_roster_rows(&mut self)` in `App`, calling `build_roster_rows(...)` with `Instant::now()` and storing into `state.roster_rows`.
-- [ ] 4.2 — Add the call to `rebuild_roster_rows()` inside `publish_state` (after state is mutated but before the watch sender sends).
-- [ ] 4.3 — Implement `refresh_roster_tick(&mut self)` with early-return on idle, rebuild with fresh `now`, and a change-gate before publishing (compare activity + elapsed-bucket).
-- [ ] 4.4 — Add the 4th `tokio::select!` arm (1 Hz interval with `Skip` missed-tick behavior) in the app-worker loop (`tui/mod.rs:731-756`).
-- [ ] 4.5 — Verify that the `StepTiming` map is initialized, stamped in `set_active_step_with_metadata` (task 02 step 1), and cleared in `clear_active_step` and on terminal status.
-- [ ] 4.6 — Write unit tests: `publish_state` populates `roster_rows`; idle run with `refresh_roster_tick` performs no publish; active run with advanced `now` publishes on elapsed-bucket change; change-gate suppresses identical rebuild; step quiet ≥30s flips to `Stalled` on next tick.
-- [ ] 4.7 — Add integration snapshot test: idle roster, single-active with elapsed, needs-input pinned, stalled in-place, summary header, and `NO_COLOR` determinism.
+- [x] 4.1 — `rebuild_roster_rows(&mut self)` exists (delivered by task_03), calling `build_roster_rows(...)` with `Instant::now()` into `state.roster_rows`. Verified.
+- [x] 4.2 — `rebuild_roster_rows()` is invoked inside `publish_state` (task_03). Verified.
+- [x] 4.3 — `refresh_roster_tick(&mut self) -> bool`: active-run gate, rebuild with fresh `now`, change-gate via `roster_rows == rebuilt` (RosterRow `PartialEq` compares activity + coarse-elapsed bucket); publishes through new `send_state()`.
+- [x] 4.4 — 4th `select!` arm (`ROSTER_REFRESH_INTERVAL` 1 Hz, `Skip` missed ticks → `app.refresh_roster_tick()`) in the app-worker loop in `src/tui/mod.rs`.
+- [x] 4.5 — `step_timings` init (empty) + stamp (`set_active_step_with_metadata`/`push_live_stream_content`/`set_live_step_status`) verified; **added** the missing terminal-status clear to `set_live_step_status`.
+- [x] 4.6 — Unit tests added: `publish_state` populates active rows; idle tick is a no-op; elapsed-bucket change publishes; change-gate suppresses identical rebuild; terminal status clears timing. (Stall-≥30s is already covered by `classify_stalled_after_threshold`.)
+- [ ] 4.7 — **Deferred to task_06.** Roster render-snapshot tests require the renderer to consume `roster_rows`; it still reads `state.agents` until the task_06 render rewrite (per shared MEMORY.md + techspec sequencing).
 
 ## Implementation Details
 
