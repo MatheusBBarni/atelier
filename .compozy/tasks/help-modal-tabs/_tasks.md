@@ -7,7 +7,7 @@
 | 01 | HelpTab enum and roster row style types | completed | low | — |
 | 02 | Extract shared agent_roster_items builder | completed | low | task_01 |
 | 03 | Add help_active_tab state to TuiUiState | completed | low | task_01 |
-| 04 | Static reference tab builders (Keys, CLI, Approvals) | pending | low | task_01 |
+| 04 | Static reference tab builders (Keys, CLI, Approvals) | completed | low | task_01 |
 | 05 | Live and Getting Started tab builders | pending | medium | task_01, task_02 |
 | 06 | Tabbed render_help_modal with active-tab dispatch | pending | medium | task_03, task_04, task_05 |
 | 07 | Help tab navigation keys and commands | pending | medium | task_06 |

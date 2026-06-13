@@ -3357,6 +3357,80 @@ fn render_help_modal(frame: &mut Frame, theme: &Theme) {
     frame.render_widget(help, area);
 }
 
+/// Keybinding rows for the Keys help tab. Relocated verbatim from the pre-tab
+/// `render_help_modal` literals; pure builder consumed by the tabbed render
+/// (task 06). No `AppState`/`TuiUiState` reads.
+// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
+#[allow(dead_code)]
+fn keys_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from("Enter                submit prompt or answer approval"),
+        Line::from("Ctrl-L               show or hide Agent Roster"),
+        Line::from("Arrow keys           move input cursor"),
+        Line::from("PageUp/PageDown     scroll Chat by page"),
+        Line::from("Mouse wheel         scroll Chat by line"),
+        Line::from("Home/End            jump Chat to top/latest"),
+        Line::from("Ctrl-C               interrupt active run and exit"),
+        Line::from("Backspace            delete input character"),
+        Line::from("Text                 edit the input composer"),
+    ]
+}
+
+/// CLI flag rows for the CLI help tab. Relocated verbatim from the pre-tab
+/// `render_help_modal` literals; pure builder consumed by the tabbed render
+/// (task 06). No `AppState`/`TuiUiState` reads.
+// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
+#[allow(dead_code)]
+fn cli_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from("atelier                            open the TUI"),
+        Line::from("atelier --cwd <path>               run from a workspace"),
+        Line::from("atelier --config <path>            use a config file"),
+        Line::from("atelier --doctor [--json]          check runtimes and history"),
+        Line::from("atelier --print-config             print merged config"),
+        Line::from("atelier --init-config              create config files"),
+        Line::from("atelier --codemap init|changes|update manage repo maps"),
+        Line::from("atelier --clean-sessions [--yes]   delete local history"),
+        Line::from("atelier --debug                    write debug events"),
+        Line::from("atelier --help                     print CLI help"),
+    ]
+}
+
+/// Static Approvals & Modes prose for the help tab (ADR-001: static in V1).
+/// Plain-language explanation of the two approval modes, agent capabilities,
+/// and the workspace read/write-roots concept. Net-new content; pure builder
+/// consumed by the tabbed render (task 06). No `AppState`/`TuiUiState` reads.
+// Consumed by the tabbed `render_help_modal` (task 06); unused in prod until then.
+#[allow(dead_code)]
+fn approvals_tab_lines(theme: &Theme) -> Vec<Line<'static>> {
+    let header = |label: &'static str| {
+        Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let body = |text: &'static str| Line::from(Span::styled(text, Style::default().fg(theme.text)));
+    vec![
+        header("Approval modes"),
+        body("yolo (default): agents act without asking — file writes and"),
+        body("commands run automatically. Best for trusted, fast iteration."),
+        body("normal: every write or command pauses for your approval before"),
+        body("it runs. Read-only actions still proceed without a prompt."),
+        Line::from(""),
+        header("Capabilities"),
+        body("Each agent is granted only the capabilities it needs (read,"),
+        body("edit, command, plan, review …). An agent cannot take an action"),
+        body("its profile does not allow, regardless of approval mode."),
+        Line::from(""),
+        header("Read / write roots"),
+        body("The workspace sets which paths agents may touch. Writes are"),
+        body("confined to the write roots; reads to the read roots. Anything"),
+        body("outside those roots is off-limits even in yolo mode."),
+    ]
+}
+
 fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -9608,5 +9682,60 @@ runtime = "fake"
                 .count(),
             1
         );
+    }
+
+    fn help_tab_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn keys_tab_lines_contains_expected_keybindings() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&keys_tab_lines(&theme));
+        assert!(text.contains("Ctrl-L"));
+        assert!(text.contains("PageUp/PageDown"));
+        assert!(text.contains("Home/End"));
+        // Verbatim relocation: the full keybinding set is present.
+        assert!(text.contains("Enter"));
+        assert!(text.contains("Backspace"));
+    }
+
+    #[test]
+    fn cli_tab_lines_contains_expected_flags() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&cli_tab_lines(&theme));
+        assert!(text.contains("atelier --doctor"));
+        assert!(text.contains("atelier --init-config"));
+        assert!(text.contains("atelier --help"));
+    }
+
+    #[test]
+    fn approvals_tab_lines_explains_modes_and_roots() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&approvals_tab_lines(&theme));
+        assert!(text.contains("yolo"));
+        assert!(text.contains("normal"));
+        // Mentions the read/write-roots concept and capabilities.
+        assert!(text.contains("read roots") && text.contains("write roots"));
+        assert!(text.to_lowercase().contains("capabilities"));
+    }
+
+    #[test]
+    fn approvals_tab_lines_style_uses_theme_tokens() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        // Every styled span draws from theme tokens (no inline Color literals);
+        // the header line uses the accent token.
+        let lines = approvals_tab_lines(&theme);
+        let header = &lines[0];
+        assert_eq!(header.spans[0].style.fg, Some(theme.accent));
     }
 }

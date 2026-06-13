@@ -13,6 +13,11 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
   `ToggleHelp` close) is live (`src/tui/mod.rs` struct `:257`, Default `:303`, arm `:562`).
   Ephemeral UI state, never in `AppState`. `HelpTab` keeps `#[allow(dead_code)]` (variants/
   `next`/`prev`/`title`/`ALL` still unused until task_06/07).
+- task_04 complete: static-content builders `keys_tab_lines`/`cli_tab_lines`/`approvals_tab_lines`
+  (`fn(&Theme) -> Vec<Line<'static>>`) live just after `render_help_modal` (~`:3360+`). Keys/CLI
+  relocated verbatim from the old `render_help_modal` literals (still present there until task_06
+  swaps them in); Approvals is net-new static prose (theme-token headers/body). All three carry
+  `#[allow(dead_code)]` until task_06 consumes them.
 
 ## Shared Decisions
 - New foundational TUI types are staged with `#[allow(dead_code)]` + a doc-comment naming the
