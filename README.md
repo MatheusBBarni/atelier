@@ -33,10 +33,15 @@ an orchestrator and a sequence of specialized agent profiles.
 
 - Node.js 20+ and npm 10+ for the recommended npm install path.
 - Rust toolchain only if you build from source.
-- Optional: `codex` CLI with `codex login` completed if you plan to use the Codex runtime.
-- Optional: `claude` CLI if you plan to opt agents into the Claude runtime.
-- Optional: `cursor-agent` CLI with `cursor-agent login` completed if you plan to use the Cursor runtime.
-- Optional: `ZAI_API_KEY` (or another env var configured as `api_key_env`) for Z.ai runtime.
+- `ZAI_API_KEY` (or another env var configured as `api_key_env`): required for a real run
+  with stock defaults — the default orchestrator runs on the `zai` runtime (`glm-5.1`), which
+  fails without it. Only the `fake` runtime needs no credentials, and it simulates rather than
+  doing real work.
+- `codex` CLI with `codex login` completed: required for the default worker agents (explorer,
+  fixer, reviewer), which run on the `codex` runtime out of the box.
+- Optional: `claude` CLI — only if you opt agents into the Claude runtime through config.
+- Optional: `cursor-agent` CLI with `cursor-agent login` completed — only if you opt agents
+  into the Cursor runtime through config.
 
 ## Install
 
@@ -185,6 +190,7 @@ Important values:
 ## Runtimes
 
 - `codex`
+  - Default runtime for the built-in worker agents (explorer, fixer, reviewer), so `codex login` is needed for real runs out of the box.
   - Invokes the installed `codex` CLI as a child process.
   - Reuses Codex-owned login state, including ChatGPT subscription login when the CLI is signed in that way.
   - Defaults: `codex exec --skip-git-repo-check --color never`
@@ -200,6 +206,7 @@ Important values:
   - Keeps Cursor-native tool calls behind Harness Actions.
   - Built-in agents do not use Cursor unless you opt in through config.
 - `zai`
+  - Default runtime for the orchestrator (`glm-5.1`), so `ZAI_API_KEY` is effectively required for any real run.
   - Uses an API key from an env var (example: `ZAI_API_KEY`) and posts to `https://api.z.ai/api/paas/v4`.
 - `fake`
   - Local test/runtime simulation mode.

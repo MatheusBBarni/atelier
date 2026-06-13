@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Fix README runtime-requirements accuracy | pending | low | — |
+| 01 | Fix README runtime-requirements accuracy | completed | low | — |
 | 02 | Extract a shared Base.astro layout | pending | medium | — |
 | 03 | Scaffold the docs content collection, layout, nav, and styles | pending | medium | task_02 |
 | 04 | Write the Quickstart page | pending | medium | task_03 |
