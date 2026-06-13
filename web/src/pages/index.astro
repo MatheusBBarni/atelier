@@ -155,6 +155,61 @@ const visualFrames = [
     alt: "Atelier TUI showing the help overlay with TUI and CLI commands.",
   },
 ];
+
+const orchestratorAgent = {
+  name: "The Orchestrator",
+  role: "Supreme Executor & Delegator",
+  src: "/images/agents/orchestrator.png",
+  alt: "Orchestrator agent: a wizard conjuring a glowing magic circle to direct the run.",
+};
+
+const supportingAgents = [
+  {
+    name: "Explorer",
+    role: "Codebase Recon",
+    src: "/images/agents/explorer.png",
+    alt: "Explorer agent: an adventurer surveying terrain through a spyglass.",
+  },
+  {
+    name: "Librarian",
+    role: "Knowledge Retrieval",
+    src: "/images/agents/librarian.png",
+    alt: "Librarian agent: a figure retrieving documents among towering archives.",
+  },
+  {
+    name: "Designer",
+    role: "Visual Excellence",
+    src: "/images/agents/designer.png",
+    alt: "Designer agent: a maker arranging interface panels and design surfaces.",
+  },
+  {
+    name: "Reviewer",
+    role: "Critical Review",
+    src: "/images/agents/reviewer.png",
+    alt: "Reviewer agent: an inspector scrutinizing layered evidence for regressions.",
+  },
+  {
+    name: "Oracle",
+    role: "Strategic Advisor",
+    src: "/images/agents/oracle.png",
+    alt: "Oracle agent: a robed seer reading a glowing tome of runes.",
+  },
+  {
+    name: "Consul",
+    role: "Planning & Reflection",
+    src: "/images/agents/consul.png",
+    alt: "Consul agent: a counselor weighing orbiting plans in a vaulted hall.",
+  },
+  {
+    name: "Fixer",
+    role: "Implementation Specialist",
+    src: "/images/agents/fixer.png",
+    alt: "Fixer agent: an armored engineer applying precise, scoped changes.",
+  },
+];
+
+const leftAgents = supportingAgents.slice(0, 4);
+const rightAgents = supportingAgents.slice(4);
 ---
 
 <!doctype html>
@@ -290,6 +345,69 @@ const visualFrames = [
               <dd>active run</dd>
             </div>
           </dl>
+        </div>
+      </section>
+
+      <section class="section--agents" aria-labelledby="agents-title">
+        <div class="agents__sky" aria-hidden="true"></div>
+        <div class="agents__inner">
+          <div class="section__heading section__heading--narrow">
+            <p class="eyebrow">Agent Roster</p>
+            <h2 id="agents-title">One run, the right specialists.</h2>
+            <p>
+              The Orchestrator owns the run and delegates to focused agents —
+              recon, knowledge, design, review, advice, planning, and
+              implementation — each with its own capabilities and runtime.
+            </p>
+          </div>
+
+          <div class="constellation">
+            <div class="constellation__column">
+              {
+                leftAgents.map((agent) => (
+                  <article class="agent-card">
+                    <figure>
+                      <img src={assetPath(agent.src)} alt={agent.alt} loading="lazy" />
+                    </figure>
+                    <div class="agent-card__caption">
+                      <h3>{agent.name}</h3>
+                      <p>{agent.role}</p>
+                    </div>
+                  </article>
+                ))
+              }
+            </div>
+
+            <article class="agent-hero">
+              <figure>
+                <img
+                  src={assetPath(orchestratorAgent.src)}
+                  alt={orchestratorAgent.alt}
+                  loading="lazy"
+                />
+              </figure>
+              <div class="agent-hero__caption">
+                <h3>{orchestratorAgent.name}</h3>
+                <p>{orchestratorAgent.role}</p>
+              </div>
+            </article>
+
+            <div class="constellation__column">
+              {
+                rightAgents.map((agent) => (
+                  <article class="agent-card">
+                    <figure>
+                      <img src={assetPath(agent.src)} alt={agent.alt} loading="lazy" />
+                    </figure>
+                    <div class="agent-card__caption">
+                      <h3>{agent.name}</h3>
+                      <p>{agent.role}</p>
+                    </div>
+                  </article>
+                ))
+              }
+            </div>
+          </div>
         </div>
       </section>
 

@@ -167,6 +167,10 @@ pub struct PendingClarificationView {
     pub question: String,
     pub options: Vec<ClarificationOption>,
     pub recommended_option_id: Option<String>,
+    /// When true the user may select several options at once; the composer
+    /// renders checkboxes instead of a single-choice list.
+    #[serde(default)]
+    pub multi_select: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -918,7 +922,7 @@ impl App {
         if self.handle_subtask_command(&prompt).await? {
             return Ok(());
         }
-        if self.handle_queue_command(&prompt)? {
+        if self.handle_queue_command(&prompt).await? {
             return Ok(());
         }
         if matches!(self.state.run_state, RunState::WaitingForUser) {
@@ -1090,7 +1094,7 @@ impl App {
         Ok(true)
     }
 
-    fn handle_queue_command(&mut self, prompt: &str) -> Result<bool> {
+    async fn handle_queue_command(&mut self, prompt: &str) -> Result<bool> {
         let Some(message) = parse_queue_command(prompt)? else {
             return Ok(false);
         };
@@ -1110,6 +1114,18 @@ impl App {
             }),
             format!("Queued follow-up: {}", single_line_event_text(&view.prompt)),
         )?;
+        // The worker drives a run to completion before it can service the next
+        // command, so a `/queue` submitted *during* a run is only processed once
+        // that run has already ended — after its run-end drain has passed. When
+        // no run is in flight, run the run-end handling now so the new item is
+        // drained on a clean completion or paused (with the right reason) after
+        // a non-clean ending, instead of sitting Pending with nothing to trigger
+        // it. A run that is `WaitingForUser` still owns `active_run_id`, so it is
+        // excluded here — its queued items stay Pending and replay once the user
+        // resolves the wait, rather than being wrongly paused.
+        if self.state.active_run_id.is_none() {
+            self.react_to_run_end_for_queue().await?;
+        }
         Ok(true)
     }
 
@@ -1726,6 +1742,7 @@ impl App {
                     question,
                     options: decision.clarifying_options.clone(),
                     recommended_option_id: decision.recommended_option_id.clone(),
+                    multi_select: decision.multi_select,
                 };
                 self.state.pending_clarification = Some(view.clone());
                 self.set_agent_status("orchestrator", "waiting_for_user");
@@ -1738,6 +1755,7 @@ impl App {
                         "question": view.question,
                         "options": view.options,
                         "recommended_option_id": view.recommended_option_id,
+                        "multi_select": view.multi_select,
                     }),
                     "Orchestrator asked a clarifying question.",
                 )?;
@@ -6235,6 +6253,7 @@ runtime = "fake"
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
         let council_member = app
@@ -6356,6 +6375,7 @@ runtime = "fake"
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
 
@@ -8343,6 +8363,7 @@ prompt = "{reviewer_prompt}"
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
 
@@ -9116,6 +9137,36 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn queue_command_processed_after_run_finishes_starts_immediately() {
+        // In the TUI the worker drives a run to completion before it can service
+        // the next command, so a `/queue` typed during a run is only processed
+        // after the run already ended. The queued item must still start rather
+        // than sit forever with no run-end to trigger its drain.
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        // The run has already finished when the queued follow-up arrives.
+        queue_via_event(&mut app, "deferred work").await;
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert!(
+            app.state.queued_follow_ups.is_empty(),
+            "queued follow-up should have started instead of staying queued"
+        );
+        assert!(replay_started_prompts(&app).contains(&"deferred work".to_string()));
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "prompt_submitted" && event.payload["prompt"] == "deferred work"
+        }));
+    }
+
+    #[tokio::test]
     async fn clarification_waiting_pauses_queue_with_reason() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
@@ -9205,6 +9256,31 @@ runtime = "fake"
             app.state.queued_follow_ups[0].status,
             QueuedFollowUpStatus::Paused
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_queue_after_failed_run_is_paused_with_reason() {
+        // The run has already ended in Failed by the time the worker processes
+        // the `/queue` (it was blocked driving the run). The new item must be
+        // paused with the failure reason rather than left Pending forever.
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.handle_event(AppEvent::PromptSubmitted(
+            "always parse error create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(app.state.run_state, RunState::Failed);
+
+        queue_via_event(&mut app, "post-failure work").await;
+
+        assert!(replay_started_prompts(&app).is_empty());
+        assert_eq!(app.state.queued_follow_ups.len(), 1);
+        let item = &app.state.queued_follow_ups[0];
+        assert_eq!(item.status, QueuedFollowUpStatus::Paused);
+        assert_eq!(item.pause_reason.as_deref(), Some("previous run failed"));
     }
 
     #[tokio::test]

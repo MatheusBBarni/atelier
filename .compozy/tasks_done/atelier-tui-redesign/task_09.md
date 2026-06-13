@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: README assets and 3-terminal release verification
 type: docs
 complexity: low

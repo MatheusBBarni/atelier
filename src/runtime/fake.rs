@@ -280,6 +280,7 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             clarifying_question: None,
             clarifying_options: Vec::new(),
             recommended_option_id: None,
+            multi_select: false,
             final_summary: None,
         };
     }
@@ -406,6 +407,10 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
         } else {
             (None, Vec::new(), None)
         };
+    // A clarification turns multi-select when the prompt opts in, so end-to-end
+    // tests and manual runs can exercise the multi-select composer path.
+    let multi_select =
+        matches!(status, DecisionStatus::WaitingForUser) && prompt.contains("multi-select");
 
     OrchestratorDecision {
         schema_version: 1,
@@ -425,6 +430,7 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
         clarifying_question,
         clarifying_options,
         recommended_option_id,
+        multi_select,
         final_summary,
     }
 }
