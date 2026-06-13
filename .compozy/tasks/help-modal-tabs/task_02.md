@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Extract shared agent_roster_items builder
 type: refactor
 complexity: low
@@ -32,10 +32,10 @@ the roster's rendering logic.
 </requirements>
 
 ## Subtasks
-- [ ] 02.1 Add the `agent_roster_items` builder with `Full` and `Compact` arms.
-- [ ] 02.2 Replace the inline roster loop at `:2120` with a `Full`-style call.
-- [ ] 02.3 Add a regression test proving the Ctrl-L roster render is unchanged.
-- [ ] 02.4 Add unit tests for `Full` (3 lines/agent) and `Compact` (1 line/agent), including availability styling.
+- [x] 02.1 Add the `agent_roster_items` builder with `Full` and `Compact` arms.
+- [x] 02.2 Replace the inline roster loop at `:2120` with a `Full`-style call.
+- [x] 02.3 Add a regression test proving the Ctrl-L roster render is unchanged.
+- [x] 02.4 Add unit tests for `Full` (3 lines/agent) and `Compact` (1 line/agent), including availability styling.
 
 ## Implementation Details
 The current roster builds a `Vec<ListItem>` inline in `render` (`src/tui/mod.rs:2120`). Move
@@ -62,11 +62,11 @@ signature.
 
 ## Tests
 - Unit tests:
-  - [ ] `agent_roster_items(&[a,b], Full, &theme)` returns items whose flattened text has 3 lines per agent.
-  - [ ] `agent_roster_items(&[a], Compact, &theme)` returns one line containing the name, `runtime/model`, and availability label.
-  - [ ] An agent with `availability: Some(RuntimeAvailabilityStatus::Unavailable)` renders the `"down"` label (build via the `agent_view(...)` helper or an `AgentView` literal as at `:4131`).
+  - [x] `agent_roster_items(&[a,b], Full, &theme)` returns items whose flattened text has 3 lines per agent.
+  - [x] `agent_roster_items(&[a], Compact, &theme)` returns one line containing the name, `runtime/model`, and availability label.
+  - [x] An agent with `availability: Some(RuntimeAvailabilityStatus::Unavailable)` renders the `"down"` label (build via the `agent_view(...)` helper or an `AgentView` literal as at `:4131`).
 - Integration tests:
-  - [ ] With `roster_visible == true` and two agents, `render_to_text_with_ui` still shows each agent's name, `runtime/model`, and availability after extraction (Ctrl-L roster regression).
+  - [x] With `roster_visible == true` and two agents, `render_to_text_with_ui` still shows each agent's name, `runtime/model`, and availability after extraction (Ctrl-L roster regression).
 - Test coverage target: >=80%
 - All tests must pass
 

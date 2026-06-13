@@ -143,7 +143,9 @@ impl HelpTab {
 /// Row presentation style for the shared agent-roster builder: `Full` renders
 /// three lines per agent (Ctrl-L roster), `Compact` renders one (Getting Started).
 ///
-/// Consumed by the `agent_roster_items` builder introduced in task 02.
+/// Consumed by the `agent_roster_items` builder (task 02). `Full` is live in the
+/// Ctrl-L roster; `Compact` lands with the Getting Started tab (task 05), so the
+/// `allow(dead_code)` stays until that variant is constructed in production.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RosterRowStyle {
@@ -2193,56 +2195,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
             .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
             .split(main_area);
 
-        let roster_items = state
-            .agents
-            .iter()
-            .enumerate()
-            .map(|(index, agent)| {
-                let availability = availability_label(&agent.availability);
-                ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{} ", agent.name),
-                            Style::default()
-                                .fg(theme.accent_for(index))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            agent_status_label(&agent.status),
-                            status_style(&theme, &agent.status),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{}/{} ", agent.runtime, agent.model),
-                            Style::default().fg(theme.text_muted),
-                        ),
-                        Span::styled(
-                            availability,
-                            availability_style(&theme, &agent.availability),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("effort:{} ", agent.effort),
-                            Style::default().fg(theme.text_muted),
-                        ),
-                        Span::styled(
-                            if agent.thinking {
-                                "thinking:on"
-                            } else {
-                                "thinking:off"
-                            },
-                            if agent.thinking {
-                                Style::default().fg(theme.accent)
-                            } else {
-                                Style::default().fg(theme.text_dim)
-                            },
-                        ),
-                    ]),
-                ])
-            })
-            .collect::<Vec<_>>();
+        let roster_items = agent_roster_items(&state.agents, RosterRowStyle::Full, &theme);
         let roster = List::new(roster_items).block(
             Block::default()
                 .title(" Agent Roster ")
@@ -3492,6 +3445,78 @@ fn availability_label(availability: &Option<crate::runtime::RuntimeAvailability>
     }
 }
 
+/// Builds the per-agent roster rows shared by the Ctrl-L Agent Roster and the
+/// Getting Started help tab. `Full` reproduces the three-line roster row
+/// (name + status / `runtime/model` + availability / effort + thinking state);
+/// `Compact` renders a single line (name · `runtime/model` · availability label).
+/// Agent colors cycle via `theme.accent_for(index)`; all other styling reuses the
+/// shared `status_style` / `availability_style` helpers so there is one data path.
+fn agent_roster_items(
+    agents: &[AgentView],
+    style: RosterRowStyle,
+    theme: &Theme,
+) -> Vec<ListItem<'static>> {
+    agents
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| {
+            let name_style = Style::default()
+                .fg(theme.accent_for(index))
+                .add_modifier(Modifier::BOLD);
+            match style {
+                RosterRowStyle::Full => ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(format!("{} ", agent.name), name_style),
+                        Span::styled(
+                            agent_status_label(&agent.status).to_string(),
+                            status_style(theme, &agent.status),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{}/{} ", agent.runtime, agent.model),
+                            Style::default().fg(theme.text_muted),
+                        ),
+                        Span::styled(
+                            availability_label(&agent.availability),
+                            availability_style(theme, &agent.availability),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("effort:{} ", agent.effort),
+                            Style::default().fg(theme.text_muted),
+                        ),
+                        Span::styled(
+                            if agent.thinking {
+                                "thinking:on"
+                            } else {
+                                "thinking:off"
+                            },
+                            if agent.thinking {
+                                Style::default().fg(theme.accent)
+                            } else {
+                                Style::default().fg(theme.text_dim)
+                            },
+                        ),
+                    ]),
+                ]),
+                RosterRowStyle::Compact => ListItem::new(Line::from(vec![
+                    Span::styled(format!("{} ", agent.name), name_style),
+                    Span::styled(
+                        format!("{}/{} ", agent.runtime, agent.model),
+                        Style::default().fg(theme.text_muted),
+                    ),
+                    Span::styled(
+                        availability_label(&agent.availability),
+                        availability_style(theme, &agent.availability),
+                    ),
+                ])),
+            }
+        })
+        .collect()
+}
+
 fn work_indicator_active(state: &AppState) -> bool {
     matches!(state.run_state, RunState::Planning | RunState::Running)
 }
@@ -4227,6 +4252,141 @@ mod tests {
     #[test]
     fn roster_row_style_variants_are_distinct() {
         assert_ne!(RosterRowStyle::Full, RosterRowStyle::Compact);
+    }
+
+    /// Renders a built list of roster items to flattened buffer text so tests can
+    /// assert on the visible content without reaching into `ListItem` internals.
+    fn roster_items_to_text(items: Vec<ListItem<'static>>, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(List::new(items), frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn unavailable_agent_view() -> AgentView {
+        AgentView {
+            id: "fixer".to_string(),
+            name: "Fixer".to_string(),
+            runtime: "codex".to_string(),
+            model: "default".to_string(),
+            effort: "high".to_string(),
+            thinking: false,
+            capabilities: vec!["read".to_string()],
+            availability: Some(RuntimeAvailability {
+                runtime_id: "codex".to_string(),
+                status: RuntimeAvailabilityStatus::Unavailable,
+                message: "missing command".to_string(),
+                remediation: None,
+            }),
+            status: "running".to_string(),
+        }
+    }
+
+    #[test]
+    fn agent_roster_items_full_renders_three_lines_per_agent() {
+        let theme = TuiUiState::default().theme;
+        let agents = vec![
+            agent_view("fixer", "Fixer", "running", &["read"]),
+            agent_view("planner", "Planner", "idle", &[]),
+        ];
+        let items = agent_roster_items(&agents, RosterRowStyle::Full, &theme);
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(item.height(), 3);
+        }
+    }
+
+    #[test]
+    fn agent_roster_items_compact_renders_one_line_per_agent() {
+        let theme = TuiUiState::default().theme;
+        let agents = vec![agent_view("fixer", "Fixer", "running", &["read"])];
+        let items = agent_roster_items(&agents, RosterRowStyle::Compact, &theme);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].height(), 1);
+        let text = roster_items_to_text(items, 80, 3);
+        assert!(text.contains("Fixer"), "compact row should show the name");
+        assert!(
+            text.contains("fake/default"),
+            "compact row should show runtime/model"
+        );
+    }
+
+    #[test]
+    fn agent_roster_items_renders_down_availability_label() {
+        let theme = TuiUiState::default().theme;
+        let agents = vec![unavailable_agent_view()];
+
+        let compact = roster_items_to_text(
+            agent_roster_items(&agents, RosterRowStyle::Compact, &theme),
+            80,
+            3,
+        );
+        assert!(compact.contains("Fixer"));
+        assert!(compact.contains("codex/default"));
+        assert!(
+            compact.contains("down"),
+            "compact unavailable agent should show the `down` label"
+        );
+
+        let full = roster_items_to_text(
+            agent_roster_items(&agents, RosterRowStyle::Full, &theme),
+            80,
+            6,
+        );
+        assert!(
+            full.contains("down"),
+            "full unavailable agent should show the `down` label"
+        );
+    }
+
+    #[test]
+    fn ctrl_l_roster_render_shows_each_agent_after_extraction() {
+        let state = AppState {
+            session_id: "session".to_string(),
+            run_state: RunState::Running,
+            active_run_id: Some("run".to_string()),
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
+            live_steps: Vec::new(),
+            pending_approval: None,
+            pending_clarification: None,
+            agents: vec![
+                AgentView {
+                    runtime: "codex".to_string(),
+                    ..agent_view("fixer", "Fixer", "running", &["read"])
+                },
+                AgentView {
+                    runtime: "claude".to_string(),
+                    ..unavailable_agent_view()
+                },
+            ],
+            chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
+            events: Vec::new(),
+            input: String::new(),
+            git_context: None,
+        };
+        let ui_state = TuiUiState {
+            roster_visible: true,
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(text.contains("Agent Roster"));
+        // First agent: name, runtime/model, availability label.
+        assert!(text.contains("Fixer"));
+        assert!(text.contains("codex/default"));
+        // Second agent (unavailable): name, runtime/model, `down` label.
+        assert!(text.contains("claude/default"));
+        assert!(text.contains("down"));
     }
 
     #[test]
