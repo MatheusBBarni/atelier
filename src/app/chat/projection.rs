@@ -9,6 +9,11 @@ use crate::history::HistoryEvent;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// One-line explainer shown beside the first approval a user ever hits (ADR-004,
+/// Phase 2). Kept to a single line and shown at most once per user.
+pub(crate) const FIRST_APPROVAL_EXPLAINER: &str =
+    "First approval: an agent wants to run a gated action — reply y to approve or n to deny.";
+
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_SUMMARY_CHARS: usize = 240;
 const MAX_BODY_LINES: usize = 12;
@@ -184,7 +189,11 @@ impl ChatProjection {
         });
     }
 
-    pub fn apply_pending_approval(&mut self, approval: Option<&PendingApprovalView>) {
+    pub fn apply_pending_approval(
+        &mut self,
+        approval: Option<&PendingApprovalView>,
+        show_first_approval_explainer: bool,
+    ) {
         let Some(approval) = approval else {
             let previous_key = self.pending_key.take();
             self.remove_waiting_approval_key(previous_key);
@@ -196,7 +205,14 @@ impl ChatProjection {
             action_id: approval.action_id.clone(),
         };
         self.pending_key = Some(key.clone());
-        let mut body = vec![ChatLineView::warning(&approval.summary)];
+        let mut body = Vec::new();
+        // First-approval explainer: a single muted line shown at most once per
+        // user (ADR-004), gated by the caller's persisted latch. Additive — it
+        // never changes the approve/deny prompt below it.
+        if show_first_approval_explainer {
+            body.push(ChatLineView::muted(FIRST_APPROVAL_EXPLAINER));
+        }
+        body.push(ChatLineView::warning(&approval.summary));
         if let Some(diagnostic) = approval.diagnostic.as_deref() {
             body.push(ChatLineView::warning(concise(
                 diagnostic,
@@ -3640,6 +3656,71 @@ mod tests {
 
         assert_eq!(item.kind, ChatItemKind::Approval);
         assert_eq!(item.status, ChatItemStatus::WaitingApproval);
+    }
+
+    fn pending_approval_view() -> PendingApprovalView {
+        PendingApprovalView {
+            run_id: "run-1".to_string(),
+            group_id: None,
+            step_id: "step-1".to_string(),
+            action_id: "action-1".to_string(),
+            agent: "fixer".to_string(),
+            summary: "Execute dangerous command".to_string(),
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn first_approval_explainer_renders_when_flag_set() {
+        let mut projection = ChatProjection::rebuild(&[]);
+        let approval = pending_approval_view();
+        projection.apply_pending_approval(Some(&approval), true);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::Approval);
+        // The explainer is the first body line, muted, and additive — the
+        // original approval summary still follows it.
+        assert_eq!(item.body[0].style, ChatLineStyle::Muted);
+        assert_eq!(item.body[0].text, FIRST_APPROVAL_EXPLAINER);
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == approval.summary && line.style == ChatLineStyle::Warning));
+    }
+
+    #[test]
+    fn approval_omits_explainer_when_flag_unset() {
+        let mut projection = ChatProjection::rebuild(&[]);
+        let approval = pending_approval_view();
+        projection.apply_pending_approval(Some(&approval), false);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::Approval);
+        assert!(item
+            .body
+            .iter()
+            .all(|line| line.text != FIRST_APPROVAL_EXPLAINER));
+        // The approval summary remains the first body line (unchanged semantics).
+        assert_eq!(item.body[0].text, approval.summary);
+    }
+
+    #[test]
+    fn re_applying_first_approval_is_idempotent_on_body() {
+        // Repeated syncs within the same pending approval must not stack the
+        // explainer line (render is called every frame).
+        let mut projection = ChatProjection::rebuild(&[]);
+        let approval = pending_approval_view();
+        projection.apply_pending_approval(Some(&approval), true);
+        projection.apply_pending_approval(Some(&approval), true);
+
+        let item = &projection.items()[0];
+        let explainer_lines = item
+            .body
+            .iter()
+            .filter(|line| line.text == FIRST_APPROVAL_EXPLAINER)
+            .count();
+        assert_eq!(explainer_lines, 1);
+        assert_eq!(projection.items().len(), 1);
     }
 
     #[test]

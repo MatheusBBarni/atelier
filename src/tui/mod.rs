@@ -2490,18 +2490,27 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
             &welcome_facts,
         )
     } else if let Some(pending) = &state.pending_approval {
-        vec![
-            Line::from(format!(
-                "Approval required for {} action {}.",
-                pending.agent, pending.action_id
-            )),
-            Line::from(
-                pending
-                    .diagnostic
-                    .as_deref()
-                    .unwrap_or("Approve or deny the pending action."),
-            ),
-        ]
+        let mut lines = Vec::new();
+        // First-approval explainer: a single muted line shown at most once per
+        // user (ADR-004), gated by the persisted latch via `AppState`. Additive —
+        // the approval prompt below is unchanged.
+        if state.show_first_approval_explainer {
+            lines.push(Line::styled(
+                crate::app::chat::FIRST_APPROVAL_EXPLAINER,
+                Style::default().fg(theme.text_muted),
+            ));
+        }
+        lines.push(Line::from(format!(
+            "Approval required for {} action {}.",
+            pending.agent, pending.action_id
+        )));
+        lines.push(Line::from(
+            pending
+                .diagnostic
+                .as_deref()
+                .unwrap_or("Approve or deny the pending action."),
+        ));
+        lines
     } else if state.events.is_empty() {
         vec![Line::from("No chat yet.")]
     } else {
@@ -4670,6 +4679,7 @@ mod tests {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: vec![
                 AgentView {
@@ -4712,6 +4722,7 @@ mod tests {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: Vec::new(),
             chat_items: Vec::new(),
@@ -4739,6 +4750,7 @@ mod tests {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
@@ -4960,6 +4972,7 @@ mod tests {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: Vec::new(),
             chat_items: Vec::new(),
@@ -5061,6 +5074,7 @@ mod tests {
                 summary: "Action requires action approval.".to_string(),
                 diagnostic: Some("command requires action approval: cargo install x".to_string()),
             }),
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: Vec::new(),
             chat_items: Vec::new(),
@@ -5072,6 +5086,57 @@ mod tests {
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Approval required for fixer action action."));
         assert!(text.contains("command requires action approval"));
+        // No explainer when the show-once latch is already set.
+        assert!(!text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
+    }
+
+    fn fallback_approval_state(show_first_approval_explainer: bool) -> AppState {
+        AppState {
+            session_id: "session".to_string(),
+            run_state: RunState::WaitingForUser,
+            active_run_id: Some("run".to_string()),
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
+            live_steps: Vec::new(),
+            pending_approval: Some(crate::app::PendingApprovalView {
+                run_id: "run".to_string(),
+                group_id: None,
+                step_id: "step".to_string(),
+                action_id: "action".to_string(),
+                agent: "fixer".to_string(),
+                summary: "Action requires action approval.".to_string(),
+                diagnostic: Some("command requires action approval: cargo install x".to_string()),
+            }),
+            show_first_approval_explainer,
+            pending_clarification: None,
+            agents: Vec::new(),
+            // Empty so the pending-approval fallback render path is exercised.
+            chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
+            events: vec!["Action approval required.".to_string()],
+            input: String::new(),
+            git_context: None,
+        }
+    }
+
+    #[test]
+    fn renders_first_approval_explainer_when_flag_set() {
+        let state = fallback_approval_state(true);
+        // Wide enough that the single explainer line is not wrapped by the
+        // paragraph renderer, so the full text is contiguous in the output.
+        let text = render_to_text(&state, 200, 24);
+        // The explainer line shows alongside the (unchanged) approval prompt.
+        assert!(text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
+        assert!(text.contains("Approval required for fixer action action."));
+    }
+
+    #[test]
+    fn suppresses_first_approval_explainer_when_flag_unset() {
+        let state = fallback_approval_state(false);
+        let text = render_to_text(&state, 100, 24);
+        assert!(!text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
+        assert!(text.contains("Approval required for fixer action action."));
     }
 
     #[test]
@@ -7117,6 +7182,7 @@ mod tests {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
@@ -7235,6 +7301,7 @@ mod tests {
                 summary: "Action requires approval.".to_string(),
                 diagnostic: None,
             }),
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: Vec::new(),
             chat_items: Vec::new(),

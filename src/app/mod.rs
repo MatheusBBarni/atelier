@@ -78,6 +78,11 @@ pub struct AppState {
     pub live_step: Option<LiveStepView>,
     pub live_steps: Vec<LiveStepView>,
     pub pending_approval: Option<PendingApprovalView>,
+    /// True only while the *first* approval a user ever hits is pending, so the
+    /// render path can show a one-line first-approval explainer at most once
+    /// per user (ADR-004). Gated by a persisted latch in `HistoryStore`.
+    #[serde(default)]
+    pub show_first_approval_explainer: bool,
     pub pending_clarification: Option<PendingClarificationView>,
     pub agents: Vec<AgentView>,
     pub chat_items: Vec<ChatItemView>,
@@ -757,6 +762,7 @@ impl App {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: build_agent_views(&config, &availability),
             // Branded welcome item present from the first frame (ADR-005);
@@ -3819,6 +3825,18 @@ impl App {
                             request: request.clone(),
                         });
                         self.state.pending_approval = Some(view);
+                        // Show the one-line first-approval explainer at most once
+                        // per user (ADR-004): consult the persisted latch exactly
+                        // when an approval becomes pending, and latch it on first
+                        // sight. Subsequent approvals see the latch set and never
+                        // re-show. A latch write failure must not block the run, so
+                        // we only flag the explainer once the latch is persisted.
+                        if !self.history.first_approval_explainer_shown() {
+                            self.history.mark_first_approval_explainer_shown()?;
+                            self.state.show_first_approval_explainer = true;
+                        } else {
+                            self.state.show_first_approval_explainer = false;
+                        }
                         self.state.run_state = RunState::WaitingForUser;
                         self.record_event(
                             Some(run_id.to_string()),
@@ -4041,8 +4059,10 @@ impl App {
     fn sync_chat_items(&mut self) {
         self.chat_projection
             .apply_live_steps(&self.state.live_steps);
-        self.chat_projection
-            .apply_pending_approval(self.state.pending_approval.as_ref());
+        self.chat_projection.apply_pending_approval(
+            self.state.pending_approval.as_ref(),
+            self.state.show_first_approval_explainer,
+        );
         // The welcome item is prepended (not part of the projection) so it stays
         // first and stable across re-syncs (ADR-005).
         let mut items = Vec::with_capacity(self.chat_projection.items().len() + 1);
@@ -9216,6 +9236,44 @@ runtime = "fake"
             .as_deref()
             .is_some_and(|reason| reason.contains("approval")));
         assert!(replay_started_prompts(&app).is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_approval_shows_explainer_and_latches_then_suppresses() {
+        let dir = tempdir().unwrap();
+
+        // Fresh install, first approval: the explainer flag is set and the
+        // projected approval body carries the one-line explainer.
+        let mut first = App::new(approval_mode_config(dir.path())).await.unwrap();
+        first
+            .handle_event(AppEvent::PromptSubmitted(
+                "approval action create a feature".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(first.state.pending_approval.is_some());
+        assert!(first.state.show_first_approval_explainer);
+        assert!(first.state.chat_items.iter().any(|item| item
+            .body
+            .iter()
+            .any(|line| line.text == crate::app::chat::FIRST_APPROVAL_EXPLAINER)));
+        // The latch is persisted at the workspace root.
+        assert!(first.history.first_approval_explainer_shown());
+
+        // A later session (latch persisted on disk) suppresses the explainer.
+        let mut later = App::new(approval_mode_config(dir.path())).await.unwrap();
+        later
+            .handle_event(AppEvent::PromptSubmitted(
+                "approval action create a feature".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(later.state.pending_approval.is_some());
+        assert!(!later.state.show_first_approval_explainer);
+        assert!(later.state.chat_items.iter().all(|item| item
+            .body
+            .iter()
+            .all(|line| line.text != crate::app::chat::FIRST_APPROVAL_EXPLAINER)));
     }
 
     #[tokio::test]

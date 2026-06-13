@@ -59,6 +59,19 @@ impl HistoryEvent {
     }
 }
 
+/// Cross-session UI flags persisted at the `.atelier/` data root (ADR-004).
+/// Lives outside `sessions/`, so it survives `clean_sessions` and a fresh launch.
+/// New show-once flags are added here with `#[serde(default)]` for forward
+/// compatibility — never a new file per flag.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistentUiState {
+    #[serde(default)]
+    first_approval_explainer_shown: bool,
+}
+
+/// Root-level filename for [`PersistentUiState`].
+const UI_STATE_FILE: &str = "ui_state.json";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMetadata {
     pub schema_version: u32,
@@ -166,6 +179,40 @@ impl HistoryStore {
 
     pub fn read_events(&self) -> Result<Vec<HistoryEvent>> {
         read_events_from_path(&self.events_path)
+    }
+
+    fn ui_state_path(&self) -> PathBuf {
+        self.root.join(UI_STATE_FILE)
+    }
+
+    fn read_ui_state(&self) -> PersistentUiState {
+        // A missing or unparseable file degrades to defaults rather than failing
+        // the run — at worst the show-once explainer shows one extra time.
+        fs::read_to_string(self.ui_state_path())
+            .ok()
+            .and_then(|raw| serde_json::from_str::<PersistentUiState>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Whether the first-approval explainer has already been shown once for this
+    /// user (cross-session show-once latch, ADR-004).
+    pub fn first_approval_explainer_shown(&self) -> bool {
+        self.read_ui_state().first_approval_explainer_shown
+    }
+
+    /// Idempotently latch the first-approval explainer as shown. A no-op (no
+    /// write) when the flag is already set.
+    pub fn mark_first_approval_explainer_shown(&self) -> Result<()> {
+        let mut state = self.read_ui_state();
+        if state.first_approval_explainer_shown {
+            return Ok(());
+        }
+        state.first_approval_explainer_shown = true;
+        write_private_file(
+            &self.ui_state_path(),
+            serde_json::to_string_pretty(&state)?.as_bytes(),
+        )?;
+        Ok(())
     }
 
     pub fn write_run_record<T: Serialize>(&self, run_id: &str, record: &T) -> Result<PathBuf> {
@@ -335,6 +382,50 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
         assert!(store.session_dir().join("artifacts").exists());
+    }
+
+    #[test]
+    fn first_approval_explainer_latch_defaults_unset_then_persists() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+
+        // Fresh install: latch unset.
+        assert!(!store.first_approval_explainer_shown());
+
+        store.mark_first_approval_explainer_shown().unwrap();
+        assert!(store.first_approval_explainer_shown());
+
+        // Persists across sessions: a new store on the same workspace root (a
+        // fresh session dir) still sees the latch — the flag lives at the root.
+        let next_session = HistoryStore::create(dir.path()).unwrap();
+        assert!(next_session.first_approval_explainer_shown());
+        // And it survives session cleanup (the flag is not under sessions/).
+        clean_sessions(dir.path()).unwrap();
+        let after_clean = HistoryStore::create(dir.path()).unwrap();
+        assert!(after_clean.first_approval_explainer_shown());
+    }
+
+    #[test]
+    fn marking_first_approval_explainer_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        store.mark_first_approval_explainer_shown().unwrap();
+        // Repeat calls are a no-op and keep the latch set.
+        store.mark_first_approval_explainer_shown().unwrap();
+        assert!(store.first_approval_explainer_shown());
+    }
+
+    #[test]
+    fn first_approval_latch_degrades_to_unset_on_corrupt_file() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        // Latch once so the flag file exists at its real (root-agnostic) path,
+        // then corrupt it in place.
+        store.mark_first_approval_explainer_shown().unwrap();
+        let flag_path = store.ui_state_path();
+        fs::write(&flag_path, "not json").unwrap();
+        // A corrupt flag file must not panic or error — it reads as not-yet-shown.
+        assert!(!store.first_approval_explainer_shown());
     }
 
     #[test]
