@@ -1,0 +1,2 @@
+{"schema_version":1,"event_id":"01KV0R0H1GXR6J0N757A4G011B","session_id":"01KV0R0GM1G880BNFY1MTXANEA","run_id":null,"group_id":null,"step_id":null,"timestamp":"2026-06-13T15:01:09.296Z","kind":"session_started","payload":{},"payload_truncated":false}
+{"schema_version":1,"event_id":"01KV0R0N811ENHB8BGPRZP03YC","session_id":"01KV0R0GM1G880BNFY1MTXANEA","run_id":null,"group_id":null,"step_id":null,"timestamp":"2026-06-13T15:01:13.601Z","kind":"session_ended","payload":{"active_run_id":null,"run_state":"idle"},"payload_truncated":false}

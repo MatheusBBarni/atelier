@@ -48,7 +48,18 @@ Keep only durable, cross-task context here. Do not duplicate facts that are obvi
   usage+label, renders a leading "Filter: …" line and a "No commands match …" empty indicator.
   Never touches `state.input`. First Phase-2 item done; only the first-approval explainer remains.
 
+- task_10 complete (Phase 2): first-approval explainer. New cross-session persistence primitive
+  (ADR-004): `HistoryStore` reads/writes `.atelier/ui_state.json` (root-level JSON, `#[serde(default)]`
+  fields, survives `clean_sessions`) via `first_approval_explainer_shown()` /
+  `mark_first_approval_explainer_shown()`. `AppState.show_first_approval_explainer: bool`
+  (`#[serde(default)]`) is the render channel; App latches once when a pending approval is created
+  (~`set pending_approval` in run loop). Explainer = `chat::FIRST_APPROVAL_EXPLAINER` (pub(crate),
+  muted token) rendered in BOTH `apply_pending_approval` body (live) and the tui `:2492` fallback.
+  This is the FULL feature complete — no deferred items remain.
+
 ## Shared Decisions
+- `.atelier/ui_state.json` (root, not per-session) is the home for any future cross-session
+  show-once / first-run UI flags — add fields there with `#[serde(default)]`, don't add new files.
 - New foundational TUI types are staged with `#[allow(dead_code)]` + a doc-comment naming the
   consuming task, since the crate has no `deny(warnings)` and the lib build would warn otherwise.
   Remove the allow when the consumer lands.

@@ -1528,9 +1528,7 @@ fn refresh_skill_suggestions(
 }
 
 fn skill_cache_path(working_directory: &Path) -> PathBuf {
-    working_directory
-        .join(".atelier")
-        .join("skills-cache.json")
+    working_directory.join(".atelier").join("skills-cache.json")
 }
 
 fn read_cached_skill_suggestions(

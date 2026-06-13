@@ -1,0 +1,1569 @@
+{
+  "schema_version": 1,
+  "fingerprint": [
+    {
+      "path": "/Users/matheusbbarni/.agents/skills/context7-mcp/SKILL.md",
+      "byte_len": 2124,
+      "modified_secs": 1781320323,
+      "modified_nanos": 786250677
+    },
+    {
+      "path": "/Users/matheusbbarni/.agents/skills/create-skill/SKILL.md",
+      "byte_len": 3074,
+      "modified_secs": 1781310715,
+      "modified_nanos": 707803657
+    },
+    {
+      "path": "/Users/matheusbbarni/.agents/skills/cy-batch-tasks/SKILL.md",
+      "byte_len": 6575,
+      "modified_secs": 1781311664,
+      "modified_nanos": 754475766
+    },
+    {
+      "path": "/Users/matheusbbarni/.agents/skills/improve/SKILL.md",
+      "byte_len": 14990,
+      "modified_secs": 1781297454,
+      "modified_nanos": 297544945
+    },
+    {
+      "path": "/Users/matheusbbarni/.agents/skills/pptx/SKILL.md",
+      "byte_len": 9182,
+      "modified_secs": 1781295375,
+      "modified_nanos": 545568105
+    },
+    {
+      "path": "/Users/matheusbbarni/.agents/skills/xp/SKILL.md",
+      "byte_len": 7053,
+      "modified_secs": 1781320628,
+      "modified_nanos": 396888613
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/.system/imagegen/SKILL.md",
+      "byte_len": 24003,
+      "modified_secs": 1778256764,
+      "modified_nanos": 657548021
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/.system/openai-docs/SKILL.md",
+      "byte_len": 7315,
+      "modified_secs": 1778256764,
+      "modified_nanos": 658659850
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/.system/plugin-creator/SKILL.md",
+      "byte_len": 6382,
+      "modified_secs": 1778256764,
+      "modified_nanos": 659368764
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/.system/skill-creator/SKILL.md",
+      "byte_len": 22047,
+      "modified_secs": 1778256764,
+      "modified_nanos": 659865970
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/.system/skill-installer/SKILL.md",
+      "byte_len": 3366,
+      "modified_secs": 1778256764,
+      "modified_nanos": 660633509
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/agent-browser/SKILL.md",
+      "byte_len": 3263,
+      "modified_secs": 1779823203,
+      "modified_nanos": 260036366
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/caveman/SKILL.md",
+      "byte_len": 3653,
+      "modified_secs": 1777992547,
+      "modified_nanos": 17892661
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/compozy-worktree/SKILL.md",
+      "byte_len": 1360,
+      "modified_secs": 1778264451,
+      "modified_nanos": 309953942
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/compozy/SKILL.md",
+      "byte_len": 14191,
+      "modified_secs": 1778199969,
+      "modified_nanos": 685552503
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/computer-use/SKILL.md",
+      "byte_len": 8514,
+      "modified_secs": 1779367644,
+      "modified_nanos": 691256198
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/context7-mcp/SKILL.md",
+      "byte_len": 2124,
+      "modified_secs": 1781320321,
+      "modified_nanos": 168548661
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cover-letter-generator/SKILL.md",
+      "byte_len": 9183,
+      "modified_secs": 1779329140,
+      "modified_nanos": 800109496
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/create-skill/SKILL.md",
+      "byte_len": 3074,
+      "modified_secs": 1781310715,
+      "modified_nanos": 707803657
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/create-specification/SKILL.md",
+      "byte_len": 5518,
+      "modified_secs": 1778036949,
+      "modified_nanos": 753516958
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-batch-tasks/SKILL.md",
+      "byte_len": 6575,
+      "modified_secs": 1781311664,
+      "modified_nanos": 754475766
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-create-prd/SKILL.md",
+      "byte_len": 12754,
+      "modified_secs": 1778199969,
+      "modified_nanos": 689841962
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-create-tasks/SKILL.md",
+      "byte_len": 8034,
+      "modified_secs": 1778199969,
+      "modified_nanos": 692968296
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-create-techspec/SKILL.md",
+      "byte_len": 9939,
+      "modified_secs": 1778199969,
+      "modified_nanos": 696088547
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-execute-task/SKILL.md",
+      "byte_len": 3969,
+      "modified_secs": 1778199969,
+      "modified_nanos": 698284839
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-final-verify/SKILL.md",
+      "byte_len": 7549,
+      "modified_secs": 1778199969,
+      "modified_nanos": 699991381
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-fix-reviews/SKILL.md",
+      "byte_len": 3923,
+      "modified_secs": 1778199969,
+      "modified_nanos": 701419089
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-idea-factory/SKILL.md",
+      "byte_len": 14461,
+      "modified_secs": 1778199969,
+      "modified_nanos": 707826424
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-review-round/SKILL.md",
+      "byte_len": 9458,
+      "modified_secs": 1778199969,
+      "modified_nanos": 711338424
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/cy-workflow-memory/SKILL.md",
+      "byte_len": 4996,
+      "modified_secs": 1778199969,
+      "modified_nanos": 714405633
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/dev-workflow/SKILL.md",
+      "byte_len": 2387,
+      "modified_secs": 1777992547,
+      "modified_nanos": 18038412
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/electron-dev/SKILL.md",
+      "byte_len": 5427,
+      "modified_secs": 1778188647,
+      "modified_nanos": 210072372
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/elysia/SKILL.md",
+      "byte_len": 7043,
+      "modified_secs": 1778188647,
+      "modified_nanos": 200547670
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/find-skills/SKILL.md",
+      "byte_len": 5446,
+      "modified_secs": 1778036955,
+      "modified_nanos": 627906652
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/frontend-design/SKILL.md",
+      "byte_len": 4278,
+      "modified_secs": 1778188647,
+      "modified_nanos": 191832052
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/git-ckp/SKILL.md",
+      "byte_len": 2007,
+      "modified_secs": 1777992547,
+      "modified_nanos": 18177870
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/git-commit/SKILL.md",
+      "byte_len": 3091,
+      "modified_secs": 1777992547,
+      "modified_nanos": 18615078
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/git-workflow/SKILL.md",
+      "byte_len": 3707,
+      "modified_secs": 1777992547,
+      "modified_nanos": 18765328
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/git-worktree/SKILL.md",
+      "byte_len": 1934,
+      "modified_secs": 1778207587,
+      "modified_nanos": 457627727
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/gpt-image-2/SKILL.md",
+      "byte_len": 7250,
+      "modified_secs": 1779400445,
+      "modified_nanos": 810525645
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/grill-and-create-tasks/SKILL.md",
+      "byte_len": 2202,
+      "modified_secs": 1778683055,
+      "modified_nanos": 882486653
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/grill-me/SKILL.md",
+      "byte_len": 635,
+      "modified_secs": 1777992547,
+      "modified_nanos": 19442745
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/grill-techspec/SKILL.md",
+      "byte_len": 4358,
+      "modified_secs": 1780625560,
+      "modified_nanos": 973512124
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/grill-with-docs/SKILL.md",
+      "byte_len": 3552,
+      "modified_secs": 1777992547,
+      "modified_nanos": 19864203
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/handoff/SKILL.md",
+      "byte_len": 719,
+      "modified_secs": 1778614022,
+      "modified_nanos": 877249684
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/heroui-native/SKILL.md",
+      "byte_len": 6955,
+      "modified_secs": 1778676012,
+      "modified_nanos": 932847015
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/heroui-react/SKILL.md",
+      "byte_len": 6525,
+      "modified_secs": 1778676013,
+      "modified_nanos": 273192
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/humanizer/SKILL.md",
+      "byte_len": 17858,
+      "modified_secs": 1778188647,
+      "modified_nanos": 185727931
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/impeccable/SKILL.md",
+      "byte_len": 12856,
+      "modified_secs": 1779715539,
+      "modified_nanos": 597478907
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/improve/SKILL.md",
+      "byte_len": 14990,
+      "modified_secs": 1781297454,
+      "modified_nanos": 297544945
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/job-description-analyzer/SKILL.md",
+      "byte_len": 14426,
+      "modified_secs": 1779329140,
+      "modified_nanos": 814847266
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/linkedin-profile-optimizer/SKILL.md",
+      "byte_len": 10171,
+      "modified_secs": 1779329140,
+      "modified_nanos": 827439218
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/no-workarounds/SKILL.md",
+      "byte_len": 13578,
+      "modified_secs": 1778188647,
+      "modified_nanos": 177970728
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/openclaw-skills-ralph-loop-agent-1.1.0/SKILL.md",
+      "byte_len": 8580,
+      "modified_secs": 1773242258,
+      "modified_nanos": 0
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/opentui/SKILL.md",
+      "byte_len": 3242,
+      "modified_secs": 1778373353,
+      "modified_nanos": 341615672
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/orca-cli/SKILL.md",
+      "byte_len": 30787,
+      "modified_secs": 1779367644,
+      "modified_nanos": 717305811
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/orchestration/SKILL.md",
+      "byte_len": 13167,
+      "modified_secs": 1779367644,
+      "modified_nanos": 739990972
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/pptx/SKILL.md",
+      "byte_len": 9182,
+      "modified_secs": 1781295375,
+      "modified_nanos": 545568105
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/prototype/SKILL.md",
+      "byte_len": 3251,
+      "modified_secs": 1778614022,
+      "modified_nanos": 894361096
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/qa-execution/SKILL.md",
+      "byte_len": 13082,
+      "modified_secs": 1778188647,
+      "modified_nanos": 144783043
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/react/SKILL.md",
+      "byte_len": 8986,
+      "modified_secs": 1778188647,
+      "modified_nanos": 125896098
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/resume-formatter/SKILL.md",
+      "byte_len": 8537,
+      "modified_secs": 1779329140,
+      "modified_nanos": 839039593
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/resume-tailor/SKILL.md",
+      "byte_len": 9371,
+      "modified_secs": 1779329140,
+      "modified_nanos": 870908949
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/rust-async-patterns/SKILL.md",
+      "byte_len": 2679,
+      "modified_secs": 1780521725,
+      "modified_nanos": 54421702
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/rust-best-practices/SKILL.md",
+      "byte_len": 4341,
+      "modified_secs": 1780521749,
+      "modified_nanos": 245594357
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/rust-patterns/SKILL.md",
+      "byte_len": 13378,
+      "modified_secs": 1780521738,
+      "modified_nanos": 533235819
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/rust-testing/SKILL.md",
+      "byte_len": 11699,
+      "modified_secs": 1780521713,
+      "modified_nanos": 772793461
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/swift-architecture/SKILL.md",
+      "byte_len": 17680,
+      "modified_secs": 1780002075,
+      "modified_nanos": 448013622
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/swift-best-practices/SKILL.md",
+      "byte_len": 10726,
+      "modified_secs": 1780002078,
+      "modified_nanos": 458312416
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/swift-concurrency/SKILL.md",
+      "byte_len": 12526,
+      "modified_secs": 1780002080,
+      "modified_nanos": 459329858
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/swiftui-expert-skill/SKILL.md",
+      "byte_len": 11383,
+      "modified_secs": 1780002082,
+      "modified_nanos": 520164043
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/tailwindcss/SKILL.md",
+      "byte_len": 3079,
+      "modified_secs": 1778188647,
+      "modified_nanos": 115285148
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/tanstack-query-best-practices/SKILL.md",
+      "byte_len": 4926,
+      "modified_secs": 1778188647,
+      "modified_nanos": 90556165
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/tanstack/SKILL.md",
+      "byte_len": 7981,
+      "modified_secs": 1778188647,
+      "modified_nanos": 105800571
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/task-management/SKILL.md",
+      "byte_len": 2604,
+      "modified_secs": 1778681251,
+      "modified_nanos": 713419587
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/tauri-v2/SKILL.md",
+      "byte_len": 9997,
+      "modified_secs": 1778188647,
+      "modified_nanos": 51609234
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/tdd/SKILL.md",
+      "byte_len": 4395,
+      "modified_secs": 1778676758,
+      "modified_nanos": 194257264
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/tech-resume-optimizer/SKILL.md",
+      "byte_len": 10556,
+      "modified_secs": 1779329140,
+      "modified_nanos": 850974966
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/technical-specification/SKILL.md",
+      "byte_len": 2955,
+      "modified_secs": 1778676814,
+      "modified_nanos": 67864223
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/testing-boss/SKILL.md",
+      "byte_len": 16906,
+      "modified_secs": 1778620469,
+      "modified_nanos": 151551473
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/to-issues/SKILL.md",
+      "byte_len": 3576,
+      "modified_secs": 1778676758,
+      "modified_nanos": 124251899
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/to-prd/SKILL.md",
+      "byte_len": 3113,
+      "modified_secs": 1778676758,
+      "modified_nanos": 92263975
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/tui-design/SKILL.md",
+      "byte_len": 20975,
+      "modified_secs": 1778188647,
+      "modified_nanos": 33061706
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/typescript-advanced/SKILL.md",
+      "byte_len": 19094,
+      "modified_secs": 1778188647,
+      "modified_nanos": 22503630
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/ui-craft/SKILL.md",
+      "byte_len": 29281,
+      "modified_secs": 1778620464,
+      "modified_nanos": 662336216
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/ui-ux-pro-max/SKILL.md",
+      "byte_len": 14398,
+      "modified_secs": 1778188647,
+      "modified_nanos": 10389055
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/vercel-react-native-skills/SKILL.md",
+      "byte_len": 4439,
+      "modified_secs": 1778685257,
+      "modified_nanos": 495834443
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/verification-before-completion/SKILL.md",
+      "byte_len": 4736,
+      "modified_secs": 1778188646,
+      "modified_nanos": 951066181
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/vitest/SKILL.md",
+      "byte_len": 3308,
+      "modified_secs": 1778188646,
+      "modified_nanos": 943652811
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/web-design-guidelines/SKILL.md",
+      "byte_len": 1232,
+      "modified_secs": 1778188646,
+      "modified_nanos": 908646294
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/write-a-skill/SKILL.md",
+      "byte_len": 3056,
+      "modified_secs": 1778676758,
+      "modified_nanos": 57025916
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/xp/SKILL.md",
+      "byte_len": 7053,
+      "modified_secs": 1781320628,
+      "modified_nanos": 396888613
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/zod/SKILL.md",
+      "byte_len": 5660,
+      "modified_secs": 1778188646,
+      "modified_nanos": 888877017
+    },
+    {
+      "path": "/Users/matheusbbarni/.claude/skills/zustand/SKILL.md",
+      "byte_len": 4355,
+      "modified_secs": 1778188646,
+      "modified_nanos": 901939257
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/compozy/SKILL.md",
+      "byte_len": 14245,
+      "modified_secs": 1781111541,
+      "modified_nanos": 964720703
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-create-prd/SKILL.md",
+      "byte_len": 12754,
+      "modified_secs": 1781111541,
+      "modified_nanos": 975304157
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-create-tasks/SKILL.md",
+      "byte_len": 8034,
+      "modified_secs": 1781111541,
+      "modified_nanos": 982084041
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-create-techspec/SKILL.md",
+      "byte_len": 9939,
+      "modified_secs": 1781111541,
+      "modified_nanos": 989248011
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-execute-task/SKILL.md",
+      "byte_len": 3969,
+      "modified_secs": 1781111541,
+      "modified_nanos": 993795129
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-final-verify/SKILL.md",
+      "byte_len": 7549,
+      "modified_secs": 1781111541,
+      "modified_nanos": 996240064
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-fix-reviews/SKILL.md",
+      "byte_len": 3923,
+      "modified_secs": 1781111541,
+      "modified_nanos": 998337496
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-review-round/SKILL.md",
+      "byte_len": 9458,
+      "modified_secs": 1781111542,
+      "modified_nanos": 3438701
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-workflow-memory/SKILL.md",
+      "byte_len": 4996,
+      "modified_secs": 1781111542,
+      "modified_nanos": 8619490
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.claude/skills/compozy/SKILL.md",
+      "byte_len": 14245,
+      "modified_secs": 1781111541,
+      "modified_nanos": 964720703
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.claude/skills/cy-create-prd/SKILL.md",
+      "byte_len": 12754,
+      "modified_secs": 1781111541,
+      "modified_nanos": 975304157
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.claude/skills/cy-create-tasks/SKILL.md",
+      "byte_len": 8034,
+      "modified_secs": 1781111541,
+      "modified_nanos": 982084041
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.claude/skills/cy-create-techspec/SKILL.md",
+      "byte_len": 9939,
+      "modified_secs": 1781111541,
+      "modified_nanos": 989248011
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.claude/skills/cy-execute-task/SKILL.md",
+      "byte_len": 3969,
+      "modified_secs": 1781111541,
+      "modified_nanos": 993795129
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.claude/skills/cy-final-verify/SKILL.md",
+      "byte_len": 7549,
+      "modified_secs": 1781111541,
+      "modified_nanos": 996240064
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.claude/skills/cy-fix-reviews/SKILL.md",
+      "byte_len": 3923,
+      "modified_secs": 1781111541,
+      "modified_nanos": 998337496
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.claude/skills/cy-review-round/SKILL.md",
+      "byte_len": 9458,
+      "modified_secs": 1781111542,
+      "modified_nanos": 3438701
+    },
+    {
+      "path": "/Users/matheusbbarni/projects/multiagent-harness/.claude/skills/cy-workflow-memory/SKILL.md",
+      "byte_len": 4996,
+      "modified_secs": 1781111542,
+      "modified_nanos": 8619490
+    }
+  ],
+  "suggestions": [
+    {
+      "alias": "compozy",
+      "display_name": "compozy",
+      "description": "Explains Compozy capabilities, CLI commands, core workflow skills, optional extension skills, configuration, artifact structure, reusable agents, and extensions. Use when the user asks how to use Compozy, what commands are available, how the workflow pipeline works, or how to configure a workspace. Do not use for executing workflow steps — use the specific cy- skills instead.",
+      "source_tag": "Project",
+      "source_origin": ".agents/skills",
+      "canonical_id": ".agents/skills/compozy/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/compozy",
+      "source_path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/compozy/SKILL.md"
+    },
+    {
+      "alias": "cy-create-prd",
+      "display_name": "cy-create-prd",
+      "description": "Creates a Product Requirements Document through interactive brainstorming with parallel codebase and web research. Use when starting a new feature or product, building a PRD, or brainstorming requirements. Do not use for technical specifications, task breakdowns, or code implementation.",
+      "source_tag": "Project",
+      "source_origin": ".agents/skills",
+      "canonical_id": ".agents/skills/cy-create-prd/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-create-prd",
+      "source_path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-create-prd/SKILL.md"
+    },
+    {
+      "alias": "cy-create-tasks",
+      "display_name": "cy-create-tasks",
+      "description": "Decomposes PRDs and TechSpecs into detailed, independently implementable task files with enrichment from codebase exploration. Use when a PRD or TechSpec exists and needs to be broken down into executable tasks, or when task files need enrichment with implementation context. Do not use for PRD creation, TechSpec generation, or direct task execution.",
+      "source_tag": "Project",
+      "source_origin": ".agents/skills",
+      "canonical_id": ".agents/skills/cy-create-tasks/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-create-tasks",
+      "source_path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-create-tasks/SKILL.md"
+    },
+    {
+      "alias": "cy-create-techspec",
+      "display_name": "cy-create-techspec",
+      "description": "Creates a Technical Specification by translating PRD business requirements into implementation designs through interactive technical clarification. Use when a PRD exists and needs a technical plan, or when technical architecture decisions need documentation. Do not use for PRD creation, task breakdown, or direct code implementation.",
+      "source_tag": "Project",
+      "source_origin": ".agents/skills",
+      "canonical_id": ".agents/skills/cy-create-techspec/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-create-techspec",
+      "source_path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-create-techspec/SKILL.md"
+    },
+    {
+      "alias": "cy-execute-task",
+      "display_name": "cy-execute-task",
+      "description": "Executes one PRD task end-to-end using a provided task file, PRD directory, tracking file paths, and auto-commit mode. Use when a prompt includes a task specification that must be implemented, validated, and reflected in task tracking files. Do not use for PR review batches, generic coding tasks without a PRD task file, or standalone verification-only work.",
+      "source_tag": "Project",
+      "source_origin": ".agents/skills",
+      "canonical_id": ".agents/skills/cy-execute-task/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-execute-task",
+      "source_path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-execute-task/SKILL.md"
+    },
+    {
+      "alias": "cy-final-verify",
+      "display_name": "cy-final-verify",
+      "description": "Enforces fresh verification evidence before any completion, fix, or passing claim, and before commits or PR creation. Use when an agent is about to report success, hand off work, or commit code. Do not use for early planning, brainstorming, or tasks that have not yet reached a concrete verification step.",
+      "source_tag": "Project",
+      "source_origin": ".agents/skills",
+      "canonical_id": ".agents/skills/cy-final-verify/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-final-verify",
+      "source_path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-final-verify/SKILL.md"
+    },
+    {
+      "alias": "cy-fix-reviews",
+      "display_name": "cy-fix-reviews",
+      "description": "Executes provider-agnostic PR review remediation using existing review round files under .compozy/tasks/<name>/reviews-NNN/. Use when resolving batched review issues, updating issue markdown files, implementing fixes, and verifying the result. Do not use for PRD task execution, review export/fetch, or generic coding tasks without review issue files.",
+      "source_tag": "Project",
+      "source_origin": ".agents/skills",
+      "canonical_id": ".agents/skills/cy-fix-reviews/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-fix-reviews",
+      "source_path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-fix-reviews/SKILL.md"
+    },
+    {
+      "alias": "cy-review-round",
+      "display_name": "cy-review-round",
+      "description": "Performs a comprehensive code review of a PRD implementation and generates a review round directory with issue files compatible with cy-fix-reviews. Use when reviewing implemented PRD tasks, creating a manual review round without an external provider, or performing a quality audit of code changes. Do not use for fetching reviews from external providers, fixing existing review issues, executing PRD tasks, or editing source code.",
+      "source_tag": "Project",
+      "source_origin": ".agents/skills",
+      "canonical_id": ".agents/skills/cy-review-round/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-review-round",
+      "source_path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-review-round/SKILL.md"
+    },
+    {
+      "alias": "cy-workflow-memory",
+      "display_name": "cy-workflow-memory",
+      "description": "Maintains workflow-scoped task memory for Compozy runs using .compozy/tasks/<name>/memory/ files. Use when a task prompt provides workflow memory paths and requires the agent to read, update, compact, and promote durable context across PRD task executions. Do not use for PR review remediation, global user preferences, or programmatic event-log summarization.",
+      "source_tag": "Project",
+      "source_origin": ".agents/skills",
+      "canonical_id": ".agents/skills/cy-workflow-memory/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-workflow-memory",
+      "source_path": "/Users/matheusbbarni/projects/multiagent-harness/.agents/skills/cy-workflow-memory/SKILL.md"
+    },
+    {
+      "alias": "context7-mcp",
+      "display_name": "context7-mcp",
+      "description": "This skill should be used when the user asks about libraries, frameworks, API references, or needs code examples. Activates for setup questions, code generation involving libraries, or mentions of specific frameworks like React, Vue, Next.js, Prisma, Supabase, etc.",
+      "source_tag": "Personal",
+      "source_origin": "~/.agents/skills",
+      "canonical_id": "~/.agents/skills/context7-mcp/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.agents/skills/context7-mcp",
+      "source_path": "/Users/matheusbbarni/.agents/skills/context7-mcp/SKILL.md"
+    },
+    {
+      "alias": "create-skill",
+      "display_name": "create-skill",
+      "description": "Guide for creating effective skills following best practices. Use when creating or updating skills that extend agent capabilities.",
+      "source_tag": "Personal",
+      "source_origin": "~/.agents/skills",
+      "canonical_id": "~/.agents/skills/create-skill/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.agents/skills/create-skill",
+      "source_path": "/Users/matheusbbarni/.agents/skills/create-skill/SKILL.md"
+    },
+    {
+      "alias": "cy-batch-tasks",
+      "display_name": "cy-batch-tasks",
+      "description": "Sequentially executes a range of Compozy PRD tasks under one task slug, delegating each task_NN.md to the cy-execute-task skill — optionally committing once per task via an auto-commit flag (default off). Use when the user wants to run multiple or all tasks in a .compozy/tasks/<slug>/ folder in one pass (e.g. \"task_01 to task_10\" or \"all\"). Do not use for a single task (use cy-execute-task directly) or for PR review batches.",
+      "source_tag": "Personal",
+      "source_origin": "~/.agents/skills",
+      "canonical_id": "~/.agents/skills/cy-batch-tasks/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.agents/skills/cy-batch-tasks",
+      "source_path": "/Users/matheusbbarni/.agents/skills/cy-batch-tasks/SKILL.md"
+    },
+    {
+      "alias": "improve",
+      "display_name": "improve",
+      "description": "Survey any codebase as a senior advisor and produce prioritized, self-contained implementation plans for OTHER models/agents to execute. Strictly read-only on source code — never implements, fixes, or refactors anything itself. Use when asked to audit a codebase, find improvement opportunities (bugs, security, performance, test coverage, tech debt, migrations, DX), suggest features or where to take the project next (roadmap, product direction), or generate handoff plans for another agent to implement.",
+      "source_tag": "Personal",
+      "source_origin": "~/.agents/skills",
+      "canonical_id": "~/.agents/skills/improve/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.agents/skills/improve",
+      "source_path": "/Users/matheusbbarni/.agents/skills/improve/SKILL.md"
+    },
+    {
+      "alias": "pptx",
+      "display_name": "pptx",
+      "description": "Use this skill any time a .pptx file is involved in any way — as input, output, or both. This includes: creating slide decks, pitch decks, or presentations; reading, parsing, or extracting text from any .pptx file (even if the extracted content will be used elsewhere, like in an email or summary); editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates, layouts, speaker notes, or comments. Trigger whenever the user mentions \"deck,\" \"slides,\" \"presentation,\" or references a .pptx filename, regardless of what they plan to do with the content afterward. If a .pptx file needs to be opened, created, or touched, use this skill.",
+      "source_tag": "Personal",
+      "source_origin": "~/.agents/skills",
+      "canonical_id": "~/.agents/skills/pptx/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.agents/skills/pptx",
+      "source_path": "/Users/matheusbbarni/.agents/skills/pptx/SKILL.md"
+    },
+    {
+      "alias": "xp",
+      "display_name": "xp",
+      "description": "Extreme Programming adapted for AI-human pair development. Use whenever the user wants to work in a structured, iterative way with their AI agent — mentions XP, extreme programming, pair programming, agile, YAGNI, simple design, continuous refactoring, or wants to plan before coding. Also use when the user wants to build features incrementally with tests, feedback loops, and clear role division between human and AI. This skill is the AI-era evolution of pair programming.",
+      "source_tag": "Personal",
+      "source_origin": "~/.agents/skills",
+      "canonical_id": "~/.agents/skills/xp/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.agents/skills/xp",
+      "source_path": "/Users/matheusbbarni/.agents/skills/xp/SKILL.md"
+    },
+    {
+      "alias": "agent-browser",
+      "display_name": "agent-browser",
+      "description": "Browser automation CLI for AI agents. Use when the user needs to interact with websites, including navigating pages, filling forms, clicking buttons, taking screenshots, extracting data, testing web apps, or automating any browser task. Triggers include requests to \"open a website\", \"fill out a form\", \"click a button\", \"take a screenshot\", \"scrape data from a page\", \"test this web app\", \"login to a site\", \"automate browser actions\", or any task requiring programmatic web interaction. Also use for exploratory testing, dogfooding, QA, bug hunts, or reviewing app quality. Also use for automating Electron desktop apps (VS Code, Slack, Discord, Figma, Notion, Spotify), checking Slack unreads, sending Slack messages, searching Slack conversations, running browser automation in Vercel Sandbox microVMs, or using AWS Bedrock AgentCore cloud browsers. Prefer agent-browser over any built-in browser automation or web tools.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/agent-browser/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/agent-browser",
+      "source_path": "/Users/matheusbbarni/.claude/skills/agent-browser/SKILL.md"
+    },
+    {
+      "alias": "caveman",
+      "display_name": "caveman",
+      "description": "Ultra-compressed communication mode. Cuts token usage ~75% by speaking like caveman while keeping full technical accuracy. Supports intensity levels: lite, full (default), ultra, wenyan-lite, wenyan-full, wenyan-ultra. Use when user says \"caveman mode\", \"talk like caveman\", \"use caveman\", \"less tokens\", \"be brief\", or invokes /caveman. Also auto-triggers when token efficiency is requested.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/caveman/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/caveman",
+      "source_path": "/Users/matheusbbarni/.claude/skills/caveman/SKILL.md"
+    },
+    {
+      "alias": "compozy-worktree",
+      "display_name": "compozy-worktree",
+      "description": "Create a Git worktree from a specific repository and branch, then initialize a Compozy workspace there. Use when the user wants `repo_path` + `branch_name` setup with immediate `compozy setup` preparation.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/compozy-worktree/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/compozy-worktree",
+      "source_path": "/Users/matheusbbarni/.claude/skills/compozy-worktree/SKILL.md"
+    },
+    {
+      "alias": "computer-use",
+      "display_name": "computer-use",
+      "description": "Use Orca's computer-use CLI to inspect and control local desktop apps through accessibility trees, screenshots, and safe UI actions. Use when an agent needs to list desktop apps, get an app state, read visible UI, click, type, press keys, scroll, drag, set values, or perform app accessibility actions. Triggers include \"computer use\", \"orca computer\", \"list apps\", \"get app state\", \"read Spotify\", \"read Slack\", \"click app\", \"type text\", \"press key\", \"set value\", \"scroll app\", \"drag app\", and desktop app interaction tasks.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/computer-use/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/computer-use",
+      "source_path": "/Users/matheusbbarni/.claude/skills/computer-use/SKILL.md"
+    },
+    {
+      "alias": "cover-letter-generator",
+      "display_name": "cover-letter-generator",
+      "description": "Create personalized, compelling cover letters from resume and job description",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/cover-letter-generator/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/cover-letter-generator",
+      "source_path": "/Users/matheusbbarni/.claude/skills/cover-letter-generator/SKILL.md"
+    },
+    {
+      "alias": "create-specification",
+      "display_name": "create-specification",
+      "description": "Create a new specification file for the solution, optimized for Generative AI consumption.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/create-specification/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/create-specification",
+      "source_path": "/Users/matheusbbarni/.claude/skills/create-specification/SKILL.md"
+    },
+    {
+      "alias": "cy-idea-factory",
+      "display_name": "cy-idea-factory",
+      "description": "Expands a raw idea into a structured, research-backed spec in .compozy/tasks/<slug>/_idea.md through interactive brainstorming, web research, business analysis, and multi-advisor debate. Use when the user has a feature idea and wants to explore and structure it before creating a PRD. Do not use for PRD creation, technical specifications, task breakdown, or code implementation.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/cy-idea-factory/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/cy-idea-factory",
+      "source_path": "/Users/matheusbbarni/.claude/skills/cy-idea-factory/SKILL.md"
+    },
+    {
+      "alias": "dev-workflow",
+      "display_name": "dev-workflow",
+      "description": "End-to-end development workflow evaluating requirements, generating code, and reviewing. Requires a description; PRD and spec files are optional.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/dev-workflow/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/dev-workflow",
+      "source_path": "/Users/matheusbbarni/.claude/skills/dev-workflow/SKILL.md"
+    },
+    {
+      "alias": "electron-dev",
+      "display_name": "electron-dev",
+      "description": "Expert guide for Electron development with Electron Vite and Electron Builder. Use when developing Electron applications, working with main/renderer processes, IPC communication, preload scripts, security configuration, native module handling, or build/distribution setup.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/electron-dev/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/electron-dev",
+      "source_path": "/Users/matheusbbarni/.claude/skills/electron-dev/SKILL.md"
+    },
+    {
+      "alias": "elysia",
+      "display_name": "elysia",
+      "description": "Expert guide for building APIs with the Elysia framework, including routing, validation, plugins, error handling, and type-safe handlers. Use when building APIs with Elysia framework, defining routes, plugins, or type-safe handlers.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/elysia/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/elysia",
+      "source_path": "/Users/matheusbbarni/.claude/skills/elysia/SKILL.md"
+    },
+    {
+      "alias": "find-skills",
+      "display_name": "find-skills",
+      "description": "Helps users discover and install agent skills when they ask questions like \"how do I do X\", \"find a skill for X\", \"is there a skill that can...\", or express interest in extending capabilities. This skill should be used when the user is looking for functionality that might exist as an installable skill.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/find-skills/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/find-skills",
+      "source_path": "/Users/matheusbbarni/.claude/skills/find-skills/SKILL.md"
+    },
+    {
+      "alias": "frontend-design",
+      "display_name": "frontend-design",
+      "description": "Create distinctive, production-grade frontend interfaces with high design quality. Use this skill when the user asks to build web components, pages, or applications. Generates creative, polished code that avoids generic AI aesthetics.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/frontend-design/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/frontend-design",
+      "source_path": "/Users/matheusbbarni/.claude/skills/frontend-design/SKILL.md"
+    },
+    {
+      "alias": "git-ckp",
+      "display_name": "git-ckp",
+      "description": "Safely fetch, checkout/switch to, and pull a named Git branch supplied as an argument in local repositories. Use when the user asks to checkout a branch, switch branches, fetch and pull, update a branch from origin, or move the workspace onto an existing local or remote branch without losing local work.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/git-ckp/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/git-ckp",
+      "source_path": "/Users/matheusbbarni/.claude/skills/git-ckp/SKILL.md"
+    },
+    {
+      "alias": "git-commit",
+      "display_name": "git-commit",
+      "description": "Generates and runs a conventional git commit by analyzing staged changes (git diff --cached) and crafting a concise commit message (max 90 chars). Use this skill whenever the user wants to commit changes, asks to \"generate a commit\", \"commit my changes\", \"create a git commit\", or says something like \"commit with type feat/fix/chore/etc\". The user must provide the commit type (feat, fix, chore, refactor, docs, style, test, perf, ci, build, revert). The skill runs: git commit --no-verify -m \"type: message\". Always use this skill — do NOT attempt to run git commits manually without it.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/git-commit/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/git-commit",
+      "source_path": "/Users/matheusbbarni/.claude/skills/git-commit/SKILL.md"
+    },
+    {
+      "alias": "git-workflow",
+      "display_name": "git-workflow",
+      "description": "Run an end-to-end GitHub delivery workflow for a local branch: use $git-commit with a required conventional commit type, push the branch, open a pull request, inspect and review it, address actionable comments, commit and push fixes if needed, merge the PR, and close a specified issue. Use when the user asks to publish/ship/merge current repo work through PR review and issue closure, especially with inputs like commit type and issue number.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/git-workflow/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/git-workflow",
+      "source_path": "/Users/matheusbbarni/.claude/skills/git-workflow/SKILL.md"
+    },
+    {
+      "alias": "git-worktree",
+      "display_name": "git-worktree",
+      "description": "Create Git worktrees from the current repository in the standard local layout. Use when the user asks to create, prepare, open, or set up a git worktree from the repo Codex is currently in, especially with the convention ~/projects/worktree/{half-uuid}/{original-repo-folder}.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/git-worktree/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/git-worktree",
+      "source_path": "/Users/matheusbbarni/.claude/skills/git-worktree/SKILL.md"
+    },
+    {
+      "alias": "gpt-image-2",
+      "display_name": "gpt-image-2",
+      "description": "Generate images with GPT Image 2 (ChatGPT Images 2.0) inside Claude Code, using your existing ChatGPT Plus or Pro subscription — no separate OpenAI access, no per-image billing. Supports text-to-image, image-to-image editing, style transfer, and multi-reference composition via the local Codex CLI. Triggers on \"gpt image 2\", \"gpt-image-2\", \"ChatGPT Images 2.0\", \"image 2\", or any explicit ask to generate or edit an image through the user's ChatGPT plan.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/gpt-image-2/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/gpt-image-2",
+      "source_path": "/Users/matheusbbarni/.claude/skills/gpt-image-2/SKILL.md"
+    },
+    {
+      "alias": "grill-and-create-tasks",
+      "display_name": "grill-and-create-tasks",
+      "description": "Grill a PRD/tech spec plan deeply, then generate or update executable tasks via cy-create-tasks. Use when a user has a PRD + tech-spec and wants a rigorously reviewed plan converted into task files in the provided feature-task-dir.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/grill-and-create-tasks/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/grill-and-create-tasks",
+      "source_path": "/Users/matheusbbarni/.claude/skills/grill-and-create-tasks/SKILL.md"
+    },
+    {
+      "alias": "grill-me",
+      "display_name": "grill-me",
+      "description": "Interview the user relentlessly about a plan or design until reaching shared understanding, resolving each branch of the decision tree. Use when user wants to stress-test a plan, get grilled on their design, or mentions \"grill me\".",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/grill-me/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/grill-me",
+      "source_path": "/Users/matheusbbarni/.claude/skills/grill-me/SKILL.md"
+    },
+    {
+      "alias": "grill-techspec",
+      "display_name": "grill-techspec",
+      "description": "Runs a focused grilling session that turns an idea, plan, draft RFC, or architecture proposal into a rigorous technical specification. Use when the user asks to be grilled on a tech spec, stress-test a technical design, resolve architecture decisions before writing a spec, or refine an existing technical specification through one-question-at-a-time interrogation.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/grill-techspec/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/grill-techspec",
+      "source_path": "/Users/matheusbbarni/.claude/skills/grill-techspec/SKILL.md"
+    },
+    {
+      "alias": "grill-with-docs",
+      "display_name": "grill-with-docs",
+      "description": "Grilling session that challenges your plan against the existing domain model, sharpens terminology, and updates documentation (CONTEXT.md, ADRs) inline as decisions crystallise. Use when user wants to stress-test a plan against their project's language and documented decisions.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/grill-with-docs/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/grill-with-docs",
+      "source_path": "/Users/matheusbbarni/.claude/skills/grill-with-docs/SKILL.md"
+    },
+    {
+      "alias": "handoff",
+      "display_name": "handoff",
+      "description": "Compact the current conversation into a handoff document for another agent to pick up.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/handoff/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/handoff",
+      "source_path": "/Users/matheusbbarni/.claude/skills/handoff/SKILL.md"
+    },
+    {
+      "alias": "heroui-native",
+      "display_name": "heroui-native",
+      "description": "HeroUI Native component library for React Native (Tailwind v4 via Uniwind). Use when building mobile UIs with HeroUI Native — creating Buttons, Cards, TextFields, Dialogs; installing heroui-native; configuring dark/light themes; or fetching component docs. Keywords: HeroUI Native, heroui-native, React Native UI, Uniwind, mobile components.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/heroui-native/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/heroui-native",
+      "source_path": "/Users/matheusbbarni/.claude/skills/heroui-native/SKILL.md"
+    },
+    {
+      "alias": "heroui-react",
+      "display_name": "heroui-react",
+      "description": "HeroUI v3 React component library (Tailwind CSS v4 + React Aria). Use when building UIs with HeroUI — creating Buttons, Modals, Forms, Cards; installing @heroui/react; configuring dark/light themes with oklch variables; or fetching component docs. Keywords: HeroUI, Hero UI, heroui, @heroui/react, @heroui/styles.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/heroui-react/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/heroui-react",
+      "source_path": "/Users/matheusbbarni/.claude/skills/heroui-react/SKILL.md"
+    },
+    {
+      "alias": "humanizer",
+      "display_name": "humanizer",
+      "description": "Remove signs of AI-generated writing from text. Use when editing or reviewing\ntext to make it sound more natural and human-written. Based on Wikipedia's\ncomprehensive \"Signs of AI writing\" guide. Detects and fixes patterns including:\ninflated symbolism, promotional language, superficial -ing analyses, vague\nattributions, em dash overuse, rule of three, AI vocabulary words, negative\nparallelisms, and excessive conjunctive phrases.\n\nCredits: Original skill by @blader - https://github.com/blader/humanizer",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/humanizer/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/humanizer",
+      "source_path": "/Users/matheusbbarni/.claude/skills/humanizer/SKILL.md"
+    },
+    {
+      "alias": "imagegen",
+      "display_name": "imagegen",
+      "description": "Generate or edit raster images when the task benefits from AI-created bitmap visuals such as photos, illustrations, textures, sprites, mockups, or transparent-background cutouts. Use when Codex should create a brand-new image, transform an existing image, or derive visual variants from references, and the output should be a bitmap asset rather than repo-native code or vector. Do not use when the task is better handled by editing existing SVG/vector/code-native assets, extending an established icon or logo system, or building the visual directly in HTML/CSS/canvas.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/.system/imagegen/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/.system/imagegen",
+      "source_path": "/Users/matheusbbarni/.claude/skills/.system/imagegen/SKILL.md"
+    },
+    {
+      "alias": "impeccable",
+      "display_name": "impeccable",
+      "description": "Use when the user wants to design, redesign, shape, critique, audit, polish, clarify, distill, harden, optimize, adapt, animate, colorize, extract, or otherwise improve a frontend interface. Covers websites, landing pages, dashboards, product UI, app shells, components, forms, settings, onboarding, and empty states. Handles UX review, visual hierarchy, information architecture, cognitive load, accessibility, performance, responsive behavior, theming, anti-patterns, typography, fonts, spacing, layout, alignment, color, motion, micro-interactions, UX copy, error states, edge cases, i18n, and reusable design systems or tokens. Also use for bland designs that need to become bolder or more delightful, loud designs that should become quieter, live browser iteration on UI elements, or ambitious visual effects that should feel technically extraordinary. Not for backend-only or non-UI tasks.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/impeccable/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/impeccable",
+      "source_path": "/Users/matheusbbarni/.claude/skills/impeccable/SKILL.md"
+    },
+    {
+      "alias": "job-description-analyzer",
+      "display_name": "job-description-analyzer",
+      "description": "Analyze job postings, calculate match scores, identify gaps, and create application strategy",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/job-description-analyzer/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/job-description-analyzer",
+      "source_path": "/Users/matheusbbarni/.claude/skills/job-description-analyzer/SKILL.md"
+    },
+    {
+      "alias": "linkedin-profile-optimizer",
+      "display_name": "linkedin-profile-optimizer",
+      "description": "Optimize LinkedIn profile for searchability, recruiter visibility, and engagement",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/linkedin-profile-optimizer/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/linkedin-profile-optimizer",
+      "source_path": "/Users/matheusbbarni/.claude/skills/linkedin-profile-optimizer/SKILL.md"
+    },
+    {
+      "alias": "no-workarounds",
+      "display_name": "no-workarounds",
+      "description": "Enforce root-cause fixes over workarounds, hacks, and symptom patches in all software engineering tasks. Use when debugging issues, fixing bugs, resolving test failures, planning solutions, making architectural decisions, or reviewing code changes. Activates gate functions that detect and reject common workaround patterns such as type assertions, lint suppressions, error swallowing, timing hacks, and monkey patches. Don't use for trivial formatting changes or documentation-only edits.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/no-workarounds/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/no-workarounds",
+      "source_path": "/Users/matheusbbarni/.claude/skills/no-workarounds/SKILL.md"
+    },
+    {
+      "alias": "openai-docs",
+      "display_name": "openai-docs",
+      "description": "Use when the user asks how to build with OpenAI products or APIs and needs up-to-date official documentation with citations, help choosing the latest model for a use case, or model upgrade and prompt-upgrade guidance; prioritize OpenAI docs MCP tools, use bundled references only as helper context, and restrict any fallback browsing to official OpenAI domains.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/.system/openai-docs/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/.system/openai-docs",
+      "source_path": "/Users/matheusbbarni/.claude/skills/.system/openai-docs/SKILL.md"
+    },
+    {
+      "alias": "openclaw-skills-ralph-loop-agent-1.1.0",
+      "display_name": "ralph-loop",
+      "description": "Guide OpenClaw agents to execute Ralph Wiggum loops using exec and process tools. Agent orchestrates coding agents (Codex, Claude Code, OpenCode, Goose) with proper TTY support via pty:true. Plans/builds code via PROMPT.md + AGENTS.md, SPECS and IMPLEMENTATION_PLAN.md. Includes PLANNING vs BUILDING modes, backpressure, sandboxing, and completion conditions. Users request loops, agents execute using tools.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/openclaw-skills-ralph-loop-agent-1.1.0/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/openclaw-skills-ralph-loop-agent-1.1.0",
+      "source_path": "/Users/matheusbbarni/.claude/skills/openclaw-skills-ralph-loop-agent-1.1.0/SKILL.md"
+    },
+    {
+      "alias": "opentui",
+      "display_name": "opentui",
+      "description": "Build terminal UIs with OpenTUI. Covers the core API, keymaps, React and Solid bindings, components, layout, keyboard input, plugins, and testing.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/opentui/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/opentui",
+      "source_path": "/Users/matheusbbarni/.claude/skills/opentui/SKILL.md"
+    },
+    {
+      "alias": "orca-cli",
+      "display_name": "orca-cli",
+      "description": "Use the `orca` CLI to drive a running Orca editor — manage Orca worktrees; create and manage scheduled automations; create, read, and run shell commands in Orca-managed terminals; and automate Orca's built-in browser (snapshot/click/fill/screenshot/tabs). Use this instead of raw `git worktree`, ad hoc shell PTYs, or Playwright whenever the task touches Orca state. Coding agents inside an Orca worktree should also use it to keep the worktree comment fresh at meaningful checkpoints. Boundary with `orchestration`: if the recipient of a terminal write is another AI agent (Claude Code, Gemini, Codex, a worker), use `orchestration` — it is the only correct way to send messages, nudges, replies, or task hand-offs to agents. orca-cli writes are for non-agent terminals (shells, build/test commands); reading or `wait`ing on any terminal — including agent terminals — stays in orca-cli.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/orca-cli/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/orca-cli",
+      "source_path": "/Users/matheusbbarni/.claude/skills/orca-cli/SKILL.md"
+    },
+    {
+      "alias": "orchestration",
+      "display_name": "orchestration",
+      "description": "Use `orca orchestration` when coordinating multiple AI agents through Orca: pass context, instructions, questions, findings, reviews, handoffs, or structured results between agents; delegate subtasks; dispatch work; track task DAGs; wait for worker_done/escalation; or run coordinator loops and decision gates. This is the right skill for semantic agent-to-agent communication. Boundary with `orca-cli`: do not use orchestration for ordinary terminal control, shell commands, browser automation, worktree management, or reading/waiting on terminals; use `orca-cli` for those. Triggers include \"tell the other agent\", \"ask <agent>\", \"hand off to\", \"pass this to <agent>\", \"delegate to <agent>\", \"have <agent> do X\", \"let <agent> know\", \"share with the other AI\", \"coordinate agents\", \"what did <agent> find\", \"check orchestration inbox\", \"reply to <agent>\", \"dispatch task\", \"orchestrate agents\", \"multi-agent\", \"task DAG\", \"worker_done\", \"escalation\", \"decision gate\", and \"coordinator loop\".",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/orchestration/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/orchestration",
+      "source_path": "/Users/matheusbbarni/.claude/skills/orchestration/SKILL.md"
+    },
+    {
+      "alias": "plugin-creator",
+      "display_name": "plugin-creator",
+      "description": "Create and scaffold plugin directories for Codex with a required `.codex-plugin/plugin.json`, optional plugin folders/files, and baseline placeholders you can edit before publishing or testing. Use when Codex needs to create a new local plugin, add optional plugin structure, or generate or update repo-root `.agents/plugins/marketplace.json` entries for plugin ordering and availability metadata.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/.system/plugin-creator/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/.system/plugin-creator",
+      "source_path": "/Users/matheusbbarni/.claude/skills/.system/plugin-creator/SKILL.md"
+    },
+    {
+      "alias": "prototype",
+      "display_name": "prototype",
+      "description": "Build a throwaway prototype to flesh out a design before committing to it. Routes between two branches — a runnable terminal app for state/business-logic questions, or several radically different UI variations toggleable from one route. Use when the user wants to prototype, sanity-check a data model or state machine, mock up a UI, explore design options, or says \"prototype this\", \"let me play with it\", \"try a few designs\".",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/prototype/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/prototype",
+      "source_path": "/Users/matheusbbarni/.claude/skills/prototype/SKILL.md"
+    },
+    {
+      "alias": "qa-execution",
+      "display_name": "qa-execution",
+      "description": "Executes full-project QA like a real user by discovering the repository verification and E2E contracts, running build, lint, test, and startup commands, exercising core workflows end-to-end through CLI, HTTP, and browser interfaces, requiring automated regression coverage for supported critical flows, fixing root-cause regressions, and rerunning the full gate. Uses the agent-browser companion skill for Web UI validation when a web surface exists. Use when validating a branch, release candidate, migration, refactor, or risky commit. Do not use for static code review only, one-off unit test edits, planning test cases, or architecture brainstorming without execution — use qa-report for planning and documentation.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/qa-execution/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/qa-execution",
+      "source_path": "/Users/matheusbbarni/.claude/skills/qa-execution/SKILL.md"
+    },
+    {
+      "alias": "ralph-loop",
+      "display_name": "ralph-loop",
+      "description": "Guide OpenClaw agents to execute Ralph Wiggum loops using exec and process tools. Agent orchestrates coding agents (Codex, Claude Code, OpenCode, Goose) with proper TTY support via pty:true. Plans/builds code via PROMPT.md + AGENTS.md, SPECS and IMPLEMENTATION_PLAN.md. Includes PLANNING vs BUILDING modes, backpressure, sandboxing, and completion conditions. Users request loops, agents execute using tools.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/openclaw-skills-ralph-loop-agent-1.1.0/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/openclaw-skills-ralph-loop-agent-1.1.0",
+      "source_path": "/Users/matheusbbarni/.claude/skills/openclaw-skills-ralph-loop-agent-1.1.0/SKILL.md"
+    },
+    {
+      "alias": "react",
+      "display_name": "react",
+      "description": "Comprehensive React development guide covering component architecture, hooks, state management, TypeScript integration, useEffect patterns, and testing with Vitest. Use when creating React components, custom hooks, managing state, or any frontend React code. Essential for React 19+ development.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/react/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/react",
+      "source_path": "/Users/matheusbbarni/.claude/skills/react/SKILL.md"
+    },
+    {
+      "alias": "resume-formatter",
+      "display_name": "resume-formatter",
+      "description": "Ensure ATS-friendly formatting and create clean scannable layouts",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/resume-formatter/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/resume-formatter",
+      "source_path": "/Users/matheusbbarni/.claude/skills/resume-formatter/SKILL.md"
+    },
+    {
+      "alias": "resume-tailor",
+      "display_name": "resume-tailor",
+      "description": "Customize resume for specific job postings while maintaining truthfulness",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/resume-tailor/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/resume-tailor",
+      "source_path": "/Users/matheusbbarni/.claude/skills/resume-tailor/SKILL.md"
+    },
+    {
+      "alias": "rust-async-patterns",
+      "display_name": "rust-async-patterns",
+      "description": "Master Rust async programming with Tokio, async traits, error handling, and concurrent patterns. Use when building async Rust applications, implementing concurrent systems, or debugging async code.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/rust-async-patterns/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/rust-async-patterns",
+      "source_path": "/Users/matheusbbarni/.claude/skills/rust-async-patterns/SKILL.md"
+    },
+    {
+      "alias": "rust-best-practices",
+      "display_name": "rust-best-practices",
+      "description": "Guide for writing idiomatic Rust code based on Apollo GraphQL's best practices handbook. Use this skill when: (1) writing new Rust code or functions, (2) reviewing or refactoring existing Rust code, (3) deciding between borrowing vs cloning or ownership patterns, (4) implementing error handling with Result types, (5) optimizing Rust code for performance, (6) writing tests or documentation for Rust projects.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/rust-best-practices/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/rust-best-practices",
+      "source_path": "/Users/matheusbbarni/.claude/skills/rust-best-practices/SKILL.md"
+    },
+    {
+      "alias": "rust-patterns",
+      "display_name": "rust-patterns",
+      "description": "Idiomatic Rust patterns, ownership, error handling, traits, concurrency, and best practices for building safe, performant applications.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/rust-patterns/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/rust-patterns",
+      "source_path": "/Users/matheusbbarni/.claude/skills/rust-patterns/SKILL.md"
+    },
+    {
+      "alias": "rust-testing",
+      "display_name": "rust-testing",
+      "description": "Rust testing patterns including unit tests, integration tests, async testing, property-based testing, mocking, and coverage. Follows TDD methodology.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/rust-testing/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/rust-testing",
+      "source_path": "/Users/matheusbbarni/.claude/skills/rust-testing/SKILL.md"
+    },
+    {
+      "alias": "skill-creator",
+      "display_name": "skill-creator",
+      "description": "Guide for creating effective skills. This skill should be used when users want to create a new skill (or update an existing skill) that extends Codex's capabilities with specialized knowledge, workflows, or tool integrations.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/.system/skill-creator/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/.system/skill-creator",
+      "source_path": "/Users/matheusbbarni/.claude/skills/.system/skill-creator/SKILL.md"
+    },
+    {
+      "alias": "skill-installer",
+      "display_name": "skill-installer",
+      "description": "Install Codex skills into $CODEX_HOME/skills from a curated list or a GitHub repo path. Use when a user asks to list installable skills, install a curated skill, or install a skill from another repo (including private repos).",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/.system/skill-installer/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/.system/skill-installer",
+      "source_path": "/Users/matheusbbarni/.claude/skills/.system/skill-installer/SKILL.md"
+    },
+    {
+      "alias": "swift-architecture",
+      "display_name": "swift-architecture",
+      "description": "Select, implement, or migrate between app architecture patterns for Apple platform apps. Use when choosing between MV (Model-View with @Observable), MVVM, MVI, TCA (The Composable Architecture), Clean Architecture, VIPER, or Coordinator patterns; when evaluating architecture fit for a feature's complexity; when migrating from one pattern to another; or when reviewing whether an app's current architecture is appropriate. Scoped to Apple-platform patterns using Swift 6.3, SwiftUI, and UIKit.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/swift-architecture/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/swift-architecture",
+      "source_path": "/Users/matheusbbarni/.claude/skills/swift-architecture/SKILL.md"
+    },
+    {
+      "alias": "swift-best-practices",
+      "display_name": "swift-best-practices",
+      "description": "| This skill should be used when writing or reviewing Swift code for iOS or macOS projects. Apply modern Swift 6+ best practices, concurrency patterns, API design guidelines, and migration strategies. Covers async/await, actors, MainActor, Sendable, typed throws, and Swift 6 breaking changes.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/swift-best-practices/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/swift-best-practices",
+      "source_path": "/Users/matheusbbarni/.claude/skills/swift-best-practices/SKILL.md"
+    },
+    {
+      "alias": "swift-concurrency",
+      "display_name": "swift-concurrency",
+      "description": "Diagnose Swift Concurrency issues, refactor callback-based code to async/await, and guide Swift 6 migration when working with tasks, actors, @MainActor, Sendable, data races, thread safety, or concurrency-related compiler and linter warnings.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/swift-concurrency/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/swift-concurrency",
+      "source_path": "/Users/matheusbbarni/.claude/skills/swift-concurrency/SKILL.md"
+    },
+    {
+      "alias": "swiftui-expert-skill",
+      "display_name": "swiftui-expert-skill",
+      "description": "Use when writing, reviewing, or refactoring SwiftUI code for iOS or macOS, including state management, view composition, performance, Liquid Glass adoption, or Instruments `.trace` capture/analysis for hangs, hitches, CPU hotspots, or excessive view updates.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/swiftui-expert-skill/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/swiftui-expert-skill",
+      "source_path": "/Users/matheusbbarni/.claude/skills/swiftui-expert-skill/SKILL.md"
+    },
+    {
+      "alias": "tailwindcss",
+      "display_name": "tailwindcss",
+      "description": "Guide for Tailwind CSS v4 patterns and best practices. Use when styling components with Tailwind CSS, creating responsive layouts, or working with Tailwind 4 features.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/tailwindcss/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/tailwindcss",
+      "source_path": "/Users/matheusbbarni/.claude/skills/tailwindcss/SKILL.md"
+    },
+    {
+      "alias": "tanstack",
+      "display_name": "tanstack",
+      "description": "Comprehensive guide for TanStack ecosystem in React - Query/DB for data fetching, Form for form handling, and Router for client-side routing. Use when working with collections, live queries, optimistic updates, forms, validation, routing, URL parameters, or navigation.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/tanstack/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/tanstack",
+      "source_path": "/Users/matheusbbarni/.claude/skills/tanstack/SKILL.md"
+    },
+    {
+      "alias": "tanstack-query-best-practices",
+      "display_name": "tanstack-query-best-practices",
+      "description": "TanStack Query (React Query) best practices for data fetching, caching, mutations, and server state management. Activate when building data-driven React applications with server state.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/tanstack-query-best-practices/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/tanstack-query-best-practices",
+      "source_path": "/Users/matheusbbarni/.claude/skills/tanstack-query-best-practices/SKILL.md"
+    },
+    {
+      "alias": "task-management",
+      "display_name": "task-management",
+      "description": "Simple task management using a shared TASKS.md file. Reference this when the user asks about their tasks, wants to add/complete tasks, or needs help tracking commitments.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/task-management/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/task-management",
+      "source_path": "/Users/matheusbbarni/.claude/skills/task-management/SKILL.md"
+    },
+    {
+      "alias": "tauri-v2",
+      "display_name": "tauri-v2",
+      "description": "Tauri v2 cross-platform app development with Rust backend. Use when configuring tauri.conf.json, implementing Rust commands (#[tauri::command]), setting up IPC patterns (invoke, emit, channels), configuring permissions/capabilities, troubleshooting build issues, or deploying desktop/mobile apps. Triggers on Tauri, src-tauri, invoke, emit, capabilities.json.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/tauri-v2/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/tauri-v2",
+      "source_path": "/Users/matheusbbarni/.claude/skills/tauri-v2/SKILL.md"
+    },
+    {
+      "alias": "tdd",
+      "display_name": "tdd",
+      "description": "Test-driven development with red-green-refactor loop. Use when user wants to build features or fix bugs using TDD, mentions \"red-green-refactor\", wants integration tests, or asks for test-first development.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/tdd/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/tdd",
+      "source_path": "/Users/matheusbbarni/.claude/skills/tdd/SKILL.md"
+    },
+    {
+      "alias": "tech-resume-optimizer",
+      "display_name": "tech-resume-optimizer",
+      "description": "Optimize resumes for software engineering, PM, and technical roles",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/tech-resume-optimizer/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/tech-resume-optimizer",
+      "source_path": "/Users/matheusbbarni/.claude/skills/tech-resume-optimizer/SKILL.md"
+    },
+    {
+      "alias": "technical-specification",
+      "display_name": "technical-specification",
+      "description": "Create detailed technical specifications, requirements documents, design documents, and system architecture specs. Use when writing technical specs, requirements docs, or design documents.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/technical-specification/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/technical-specification",
+      "source_path": "/Users/matheusbbarni/.claude/skills/technical-specification/SKILL.md"
+    },
+    {
+      "alias": "testing-boss",
+      "display_name": "testing-boss",
+      "description": "Comprehensive testing doctrine for software and AI systems — covers positive patterns, anti-patterns, gates for coding agents writing tests, CI discipline, and an LLM/agent evaluation primer. Use when authoring or reviewing tests, adding mocks, deciding test placement, generating tests via agents, debugging flaky CI, designing eval suites for LLM features, or rebuilding a brittle test suite. Contains 12 positive patterns (selector hierarchy, table-driven, builders, real-system gates), 25 anti-patterns across Brittleness, Flakiness, Mock-misuse, Process, and AI-specific families, 7 mandatory gates for agents writing tests, flaky-test taxonomy with quarantine workflow, contract / property / mutation testing patterns, and an oracle-ladder primer for LLM-as-judge and agent eval. Language-agnostic — pseudo-code only. Don't use for general code review, library-specific debugging unrelated to tests, non-testing CI pipeline design, or production observability.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/testing-boss/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/testing-boss",
+      "source_path": "/Users/matheusbbarni/.claude/skills/testing-boss/SKILL.md"
+    },
+    {
+      "alias": "to-issues",
+      "display_name": "to-issues",
+      "description": "Break a plan, spec, or PRD into independently-grabbable issues on the project issue tracker using tracer-bullet vertical slices. Use when user wants to convert a plan into issues, create implementation tickets, or break down work into issues.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/to-issues/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/to-issues",
+      "source_path": "/Users/matheusbbarni/.claude/skills/to-issues/SKILL.md"
+    },
+    {
+      "alias": "to-prd",
+      "display_name": "to-prd",
+      "description": "Turn the current conversation context into a PRD and publish it to the project issue tracker. Use when user wants to create a PRD from the current context.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/to-prd/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/to-prd",
+      "source_path": "/Users/matheusbbarni/.claude/skills/to-prd/SKILL.md"
+    },
+    {
+      "alias": "tui-design",
+      "display_name": "tui-design",
+      "description": "This skill should be used when designing terminal user interfaces, creating TUI layouts, choosing TUI color schemes, implementing keyboard navigation, building terminal dashboards, or working with any TUI framework. Activates on mentions of TUI design, terminal UI, Ratatui layout, Ink components, Textual widgets, Bubbletea views, terminal color palette, keybinding design, panel layout, split panes, terminal dashboard, box-drawing characters, sparklines, progress bars, modal dialogs, focus management, or terminal accessibility.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/tui-design/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/tui-design",
+      "source_path": "/Users/matheusbbarni/.claude/skills/tui-design/SKILL.md"
+    },
+    {
+      "alias": "typescript-advanced",
+      "display_name": "typescript-advanced",
+      "description": "Master TypeScript's advanced type system including generics, conditional types, mapped types, template literals, and utility types for building type-safe applications. Use when implementing complex type logic, creating reusable type utilities, or ensuring compile-time type safety in TypeScript projects.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/typescript-advanced/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/typescript-advanced",
+      "source_path": "/Users/matheusbbarni/.claude/skills/typescript-advanced/SKILL.md"
+    },
+    {
+      "alias": "ui-craft",
+      "display_name": "ui-craft",
+      "description": "Provides guardrails for user-facing UI work: usability heuristics, accessibility floors, design-system discipline, component states, microcopy, motion, dark mode, responsive behavior, and human-AI UX. Use when designing, generating, reviewing, or refactoring visible product surfaces such as components, pages, dashboards, forms, dialogs, loading/empty/error states, or AI interfaces. Do not use for backend-only work, infrastructure, CLI/TUI design, or pure documentation editing.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/ui-craft/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/ui-craft",
+      "source_path": "/Users/matheusbbarni/.claude/skills/ui-craft/SKILL.md"
+    },
+    {
+      "alias": "ui-ux-pro-max",
+      "display_name": "ui-ux-pro-max",
+      "description": "UI/UX design intelligence. 50 styles, 21 palettes, 50 font pairings, 20 charts, 9 stacks (React, Next.js, Vue, Svelte, SwiftUI, React Native, Flutter, Tailwind, shadcn/ui). Actions: plan, build, create, design, implement, review, fix, improve, optimize, enhance, refactor, check UI/UX code. Projects: website, landing page, dashboard, admin panel, e-commerce, SaaS, portfolio, blog, mobile app, .html, .tsx, .vue, .svelte. Elements: button, modal, navbar, sidebar, card, table, form, chart. Styles: glassmorphism, claymorphism, minimalism, brutalism, neumorphism, bento grid, dark mode, responsive, skeuomorphism, flat design. Topics: color palette, accessibility, animation, layout, typography, font pairing, spacing, hover, shadow, gradient. Integrations: shadcn/ui MCP for component search and examples.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/ui-ux-pro-max/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/ui-ux-pro-max",
+      "source_path": "/Users/matheusbbarni/.claude/skills/ui-ux-pro-max/SKILL.md"
+    },
+    {
+      "alias": "vercel-react-native-skills",
+      "display_name": "vercel-react-native-skills",
+      "description": "React Native and Expo best practices for building performant mobile apps. Use when building React Native components, optimizing list performance, implementing animations, or working with native modules. Triggers on tasks involving React Native, Expo, mobile performance, or native platform APIs.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/vercel-react-native-skills/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/vercel-react-native-skills",
+      "source_path": "/Users/matheusbbarni/.claude/skills/vercel-react-native-skills/SKILL.md"
+    },
+    {
+      "alias": "verification-before-completion",
+      "display_name": "verification-before-completion",
+      "description": "Use when about to claim work is complete, fixed, or passing, before committing or creating PRs - requires running verification commands and confirming output before making any success claims; evidence before assertions always",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/verification-before-completion/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/verification-before-completion",
+      "source_path": "/Users/matheusbbarni/.claude/skills/verification-before-completion/SKILL.md"
+    },
+    {
+      "alias": "vitest",
+      "display_name": "vitest",
+      "description": "Vitest fast unit testing framework powered by Vite with Jest-compatible API. Use when writing tests, mocking, configuring coverage, or working with test filtering and fixtures.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/vitest/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/vitest",
+      "source_path": "/Users/matheusbbarni/.claude/skills/vitest/SKILL.md"
+    },
+    {
+      "alias": "web-design-guidelines",
+      "display_name": "web-design-guidelines",
+      "description": "Review UI code for Web Interface Guidelines compliance. Use when asked to \"review my UI\", \"check accessibility\", \"audit design\", \"review UX\", or \"check my site against best practices\".",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/web-design-guidelines/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/web-design-guidelines",
+      "source_path": "/Users/matheusbbarni/.claude/skills/web-design-guidelines/SKILL.md"
+    },
+    {
+      "alias": "write-a-skill",
+      "display_name": "write-a-skill",
+      "description": "Create new agent skills with proper structure, progressive disclosure, and bundled resources. Use when user wants to create, write, or build a new skill.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/write-a-skill/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/write-a-skill",
+      "source_path": "/Users/matheusbbarni/.claude/skills/write-a-skill/SKILL.md"
+    },
+    {
+      "alias": "zod",
+      "display_name": "zod",
+      "description": "Zod schema validation best practices for type safety, parsing, and error handling. This skill should be used when defining z.object schemas, using z.string validations, safeParse, or z.infer. This skill does NOT cover React Hook Form integration patterns (use react-hook-form skill) or OpenAPI client generation (use orval skill).",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/zod/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/zod",
+      "source_path": "/Users/matheusbbarni/.claude/skills/zod/SKILL.md"
+    },
+    {
+      "alias": "zustand",
+      "display_name": "zustand",
+      "description": "Expert guide for Zustand state management patterns, store organization, and best practices. Use when implementing client state management with Zustand, creating stores, or managing shared UI state across components.",
+      "source_tag": "Personal",
+      "source_origin": "~/.claude/skills",
+      "canonical_id": "~/.claude/skills/zustand/SKILL.md",
+      "skill_dir": "/Users/matheusbbarni/.claude/skills/zustand",
+      "source_path": "/Users/matheusbbarni/.claude/skills/zustand/SKILL.md"
+    }
+  ]
+}

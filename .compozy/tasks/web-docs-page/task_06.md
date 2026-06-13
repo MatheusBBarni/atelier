@@ -1,10 +1,10 @@
 ---
-status: pending
+status: completed
 title: "Write the Governance and Safety page"
 type: docs
 complexity: medium
 dependencies:
-  - task_03
+    - task_03
 ---
 
 # Write the Governance and Safety page

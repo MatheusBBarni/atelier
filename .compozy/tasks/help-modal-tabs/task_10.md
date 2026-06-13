@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: First-approval explainer with show-once latch (Phase 2)
 type: frontend
 complexity: high
@@ -36,10 +36,10 @@ persisted "shown" latch because the app has no first-run/show-once tracking toda
 </requirements>
 
 ## Subtasks
-- [ ] 10.1 Decide and document the minimal show-once latch mechanism (new ADR).
-- [ ] 10.2 Implement reading/writing the latch.
-- [ ] 10.3 Render the explainer on the first approval only, gated by the latch.
-- [ ] 10.4 Add tests for first-show, subsequent-suppression, and latch persistence.
+- [x] 10.1 Decide and document the minimal show-once latch mechanism (new ADR).
+- [x] 10.2 Implement reading/writing the latch.
+- [x] 10.3 Render the explainer on the first approval only, gated by the latch.
+- [x] 10.4 Add tests for first-show, subsequent-suppression, and latch persistence.
 
 ## Implementation Details
 Approvals render inline in the chat: a fallback at `src/tui/mod.rs:2370` and a projected
@@ -69,11 +69,19 @@ dismissible).
 
 ## Tests
 - Unit tests:
-  - [ ] With the latch unset, the first approval render includes the explainer line.
-  - [ ] With the latch set, an approval render does NOT include the explainer.
-  - [ ] Showing the explainer sets the latch exactly once (idempotent on repeat renders within the same approval).
+  - [x] With the latch unset, the first approval render includes the explainer line.
+        (`tui::renders_first_approval_explainer_when_flag_set`,
+        `projection::first_approval_explainer_renders_when_flag_set`)
+  - [x] With the latch set, an approval render does NOT include the explainer.
+        (`tui::suppresses_first_approval_explainer_when_flag_unset`,
+        `projection::approval_omits_explainer_when_flag_unset`)
+  - [x] Showing the explainer sets the latch exactly once (idempotent on repeat renders within the same approval).
+        (`history::marking_first_approval_explainer_is_idempotent`,
+        `projection::re_applying_first_approval_is_idempotent_on_body`)
 - Integration tests:
-  - [ ] First approval after a fresh install shows the explainer; a later approval (latch persisted) does not.
+  - [x] First approval after a fresh install shows the explainer; a later approval (latch persisted) does not.
+        (`app::first_approval_shows_explainer_and_latches_then_suppresses`,
+        `history::first_approval_explainer_latch_defaults_unset_then_persists`)
 - Test coverage target: >=80%
 - All tests must pass
 

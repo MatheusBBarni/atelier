@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Help tab navigation keys and commands
 type: frontend
 complexity: medium
@@ -31,10 +31,10 @@ help-visible key branch so users can cycle tabs. Esc must still close from any t
 </requirements>
 
 ## Subtasks
-- [ ] 07.1 Add the `HelpNextTab`/`HelpPrevTab` command variants.
-- [ ] 07.2 Handle them in the executor to advance/retreat `help_active_tab`.
-- [ ] 07.3 Bind Arrows + Tab/Shift-Tab in the help-visible key branch.
-- [ ] 07.4 Add routing tests for each nav key and an end-to-end cycle integration test.
+- [x] 07.1 Add the `HelpNextTab`/`HelpPrevTab` command variants.
+- [x] 07.2 Handle them in the executor to advance/retreat `help_active_tab`.
+- [x] 07.3 Bind Arrows + Tab/Shift-Tab in the help-visible key branch.
+- [x] 07.4 Add routing tests for each nav key and an end-to-end cycle integration test.
 
 ## Implementation Details
 The help-visible branch currently maps Esc and Ctrl-C and returns `None` for everything else
@@ -59,12 +59,12 @@ The help-visible branch currently maps Esc and Ctrl-C and returns `None` for eve
 
 ## Tests
 - Unit tests:
-  - [ ] With `help_visible`, `KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)` → `Some(HelpNextTab)`; `KeyCode::Tab`/NONE → `Some(HelpNextTab)`.
-  - [ ] `KeyCode::Left`/NONE → `Some(HelpPrevTab)`; `KeyCode::Tab`/SHIFT → `Some(HelpPrevTab)`.
-  - [ ] `KeyCode::Esc` still → `Some(ToggleHelp)`; an unrelated key (e.g. `Char('x')`) → `None`.
-  - [ ] Executing `HelpNextTab` from `GettingStarted` sets `help_active_tab == Commands`; from `Cli` wraps to `GettingStarted`.
+  - [x] With `help_visible`, `KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)` → `Some(HelpNextTab)`; `KeyCode::Tab`/NONE → `Some(HelpNextTab)`.
+  - [x] `KeyCode::Left`/NONE → `Some(HelpPrevTab)`; `KeyCode::Tab`/SHIFT → `Some(HelpPrevTab)`.
+  - [x] `KeyCode::Esc` still → `Some(ToggleHelp)`; an unrelated key (e.g. `Char('x')`) → `None`.
+  - [x] Executing `HelpNextTab` from `GettingStarted` sets `help_active_tab == Commands`; from `Cli` wraps to `GettingStarted`.
 - Integration tests:
-  - [ ] Open help, send Right ×6 → render returns to the Getting Started body (full cycle); send Esc from the Skills tab → modal closes (`help_visible == false`).
+  - [x] Open help, send Right ×6 → render returns to the Getting Started body (full cycle); send Esc from the Skills tab → modal closes (`help_visible == false`).
 - Test coverage target: >=80%
 - All tests must pass
 

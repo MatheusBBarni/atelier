@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Wire generated reference into the docs site"
 type: frontend
 complexity: medium
@@ -35,11 +35,11 @@ flow into the machine-readable surfaces (PRD F7/F8, ADR-003/004).
 </requirements>
 
 ## Subtasks
-- [ ] 11.1 Add the `generate` + `prebuild`/`predev` scripts to `web/package.json`.
-- [ ] 11.2 Add `_generated/` to `web/.gitignore`.
-- [ ] 11.3 Author the hand-written `[presets.*]` reference into the Configuration source.
-- [ ] 11.4 Verify the generated pages render through `DocsLayout` and are themed.
-- [ ] 11.5 Verify the generated pages appear in `llms-full.txt` and have `.md` twins.
+- [x] 11.1 Add the `generate` + `prebuild`/`predev` scripts to `web/package.json`.
+- [x] 11.2 Add `_generated/` to `web/.gitignore`.
+- [x] 11.3 Author the hand-written `[presets.*]` reference into the Configuration source.
+- [x] 11.4 Verify the generated pages render through `DocsLayout` and are themed.
+- [x] 11.5 Verify the generated pages appear in `llms-full.txt` and have `.md` twins.
 
 ## Implementation Details
 
