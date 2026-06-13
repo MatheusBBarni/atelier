@@ -929,21 +929,73 @@ fn redact_token(token: &str) -> String {
     if looks_like_email(token) {
         return "[redacted-email]".to_string();
     }
-    // Handle `key=value` / `key: value` shapes, redacting only the value when
-    // the key is sensitive or the value itself looks secret.
+    // A sensitive key (e.g. `token=…`, `authorization:…`) means the whole value
+    // is secret, even when the value itself looks innocuous.
     for separator in ['=', ':'] {
         if let Some((key, value)) = token.split_once(separator) {
-            if !value.is_empty()
-                && (key_is_sensitive(key) || looks_like_secret(value) || looks_like_email(value))
-            {
+            if !value.is_empty() && key_is_sensitive(key) {
                 return format!("{key}{separator}[redacted]");
             }
         }
     }
-    if looks_like_secret(token) {
-        return "[redacted]".to_string();
+    // Otherwise redact any secret-like or email-like sub-segment, splitting on
+    // structural delimiters so a secret embedded in a URL/query string
+    // (e.g. `https://h/p?id=x&token=sk-live…`) cannot slip through the
+    // whitespace-only tokenizing in `redact_secrets`.
+    redact_segments(token)
+}
+
+/// Split a single whitespace token on structural delimiters (query/URL/markup
+/// separators) and redact each secret-like or email-like sub-segment,
+/// reassembling with the original delimiters preserved.
+fn redact_segments(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut segment_start = 0;
+    for (index, ch) in token.char_indices() {
+        if is_segment_delimiter(ch) {
+            out.push_str(&redact_segment(&token[segment_start..index]));
+            out.push(ch);
+            segment_start = index + ch.len_utf8();
+        }
     }
-    token.to_string()
+    out.push_str(&redact_segment(&token[segment_start..]));
+    out
+}
+
+fn redact_segment(segment: &str) -> String {
+    if looks_like_email(segment) {
+        "[redacted-email]".to_string()
+    } else if looks_like_secret(segment) {
+        "[redacted]".to_string()
+    } else {
+        segment.to_string()
+    }
+}
+
+/// Characters that separate logically distinct values inside one token. These
+/// are deliberately NOT part of the secret alphabet (`looks_like_secret`), so
+/// splitting on them isolates an embedded secret without fragmenting it.
+fn is_segment_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        '=' | ':'
+            | '&'
+            | '?'
+            | '#'
+            | ';'
+            | ','
+            | '|'
+            | '"'
+            | '\''
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+    )
 }
 
 fn looks_like_email(token: &str) -> bool {
@@ -1545,6 +1597,33 @@ mod tests {
     fn redaction_preserves_official_urls_and_plain_text() {
         let text = "ready; check https://claude.ai/settings/usage before a long run";
         assert_eq!(redact_secrets(text), text);
+    }
+
+    #[test]
+    fn redaction_catches_secrets_embedded_in_query_strings() {
+        // A secret glued into a URL/query string is one whitespace token, so it
+        // must be split on structural delimiters (`?`, `&`, `=`) and redacted —
+        // it would otherwise slip past whitespace-only tokenizing.
+        let text = "request failed: \
+             https://api.example.com/v1?client_id=abc&secret=sk-ABCD1234abcd5678ijkl&ok=1";
+        let out = redact_secrets(text);
+        assert!(
+            !out.contains("sk-ABCD1234abcd5678ijkl"),
+            "embedded secret leaked: {out}"
+        );
+        assert!(out.contains("[redacted]"), "{out}");
+        // The surrounding non-secret structure survives.
+        assert!(out.contains("client_id=abc"), "{out}");
+        assert!(out.contains("api.example.com"), "{out}");
+    }
+
+    #[test]
+    fn redaction_catches_bearer_token_after_separator() {
+        // `Authorization:Bearer <secret>` style — the secret is isolated by the
+        // `:` segment split even though the key is not the sensitive part.
+        let out = redact_secrets("Authorization:Bearer ghp_abcd1234EFGH5678ijkl done");
+        assert!(!out.contains("ghp_abcd1234EFGH5678ijkl"), "{out}");
+        assert!(out.contains("done"));
     }
 
     fn status(
