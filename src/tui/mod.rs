@@ -169,6 +169,8 @@ enum TuiCommand {
     ToggleHelp,
     HelpNextTab,
     HelpPrevTab,
+    HelpFilterCharacter(char),
+    HelpFilterBackspace,
     ScrollEvents(EventScrollCommand),
     MoveInputCursor(InputCursorCommand),
     AgentDropdown(DropdownCommand),
@@ -271,6 +273,11 @@ struct TuiUiState {
     /// event-sourced `AppState` snapshot. Reset to `GettingStarted` on close so
     /// reopening always lands on the front-door tab.
     help_active_tab: HelpTab,
+    /// Type-to-filter buffer for the Commands help tab (Phase 2). Ephemeral UI
+    /// state, never in the snapshot and fully isolated from the composer
+    /// `state.input`. Cleared on tab change and on modal close so each tab/open
+    /// starts unfiltered.
+    help_filter: String,
     event_scroll: usize,
     event_follow: bool,
     event_content_lines: usize,
@@ -319,6 +326,7 @@ impl Default for TuiUiState {
             roster_visible: true,
             help_visible: false,
             help_active_tab: HelpTab::GettingStarted,
+            help_filter: String::new(),
             event_scroll: 0,
             event_follow: true,
             event_content_lines: 0,
@@ -580,16 +588,29 @@ async fn execute_tui_command_with_interrupt(
                 // Reset to the front-door tab so reopening always starts on
                 // Getting Started. Ephemeral UI state, never in the snapshot.
                 ui_state.help_active_tab = HelpTab::GettingStarted;
+                // Drop any Commands-tab filter so the next open starts clean.
+                ui_state.help_filter.clear();
             }
             clear_input(state, ui_state);
             Ok(true)
         }
         TuiCommand::HelpNextTab => {
             ui_state.help_active_tab = ui_state.help_active_tab.next();
+            // Filtering is Commands-tab-local; reset it on every tab change.
+            ui_state.help_filter.clear();
             Ok(true)
         }
         TuiCommand::HelpPrevTab => {
             ui_state.help_active_tab = ui_state.help_active_tab.prev();
+            ui_state.help_filter.clear();
+            Ok(true)
+        }
+        TuiCommand::HelpFilterCharacter(ch) => {
+            ui_state.help_filter.push(ch);
+            Ok(true)
+        }
+        TuiCommand::HelpFilterBackspace => {
+            ui_state.help_filter.pop();
             Ok(true)
         }
         TuiCommand::ScrollEvents(command) => {
@@ -920,6 +941,25 @@ fn key_event_to_tui_command_with_ui(
                 code: KeyCode::BackTab,
                 ..
             } => Some(TuiCommand::HelpPrevTab),
+            // Commands-tab type-to-filter (Phase 2): printable characters and
+            // Backspace narrow the command list via `help_filter`. Captured only
+            // on the Commands tab; every other tab leaves typed text inert. Nav
+            // keys above (arrows/Tab) are not `Char` codes, so they never conflict.
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if ui_state.help_active_tab == HelpTab::Commands => {
+                Some(TuiCommand::HelpFilterBackspace)
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if ui_state.help_active_tab == HelpTab::Commands
+                && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT) =>
+            {
+                Some(TuiCommand::HelpFilterCharacter(ch))
+            }
             _ => None,
         }
     } else if state.pending_clarification.is_some() {
@@ -3366,7 +3406,7 @@ fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState,
     // Render the active tab body by dispatching to its per-tab builder.
     let body = match active {
         HelpTab::GettingStarted => getting_started_lines(state, theme),
-        HelpTab::Commands => commands_tab_lines("", theme),
+        HelpTab::Commands => commands_tab_lines(&ui_state.help_filter, theme),
         HelpTab::Keys => keys_tab_lines(theme),
         HelpTab::Skills => skills_tab_lines(ui_state, theme),
         HelpTab::Approvals => approvals_tab_lines(theme),
@@ -3512,16 +3552,62 @@ fn getting_started_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> 
     lines
 }
 
-/// Commands tab body — derived from `slash_commands::catalog()` via
-/// `help_command_lines()` so the tab never drifts from the dropdown or
-/// unknown-command guidance. `filter` is a no-op in MVP (the substring filter
-/// lands in task 09); rows stay plain to match the pre-tab help render. Pure
-/// builder consumed by the tabbed render (task 06).
-fn commands_tab_lines(_filter: &str, _theme: &Theme) -> Vec<Line<'static>> {
-    crate::slash_commands::help_command_lines()
-        .into_iter()
-        .map(Line::from)
-        .collect()
+/// Commands tab body — derived from `slash_commands::catalog()` so the tab never
+/// drifts from the dropdown or unknown-command guidance. A leading filter line
+/// echoes the current `help_filter`; rows are narrowed by a case-insensitive
+/// `.contains()` over each command's usage/label (mirroring `skill_suggestions`
+/// filtering). An empty filter shows every command; a no-match filter renders an
+/// empty-result indicator. Pure builder consumed by the tabbed render. The usage
+/// column is padded from the full catalog so alignment stays stable while filtered.
+fn commands_tab_lines(filter: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let needle = filter.to_ascii_lowercase();
+    let catalog = crate::slash_commands::catalog();
+    let usage_width = catalog
+        .iter()
+        .map(|spec| spec.usage.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    // Filter line: echo the typed text so the user sees what they're narrowing
+    // by; a dim hint stands in when the buffer is empty.
+    let filter_line = if filter.is_empty() {
+        Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(theme.accent)),
+            Span::styled(
+                "(type to narrow commands)",
+                Style::default().fg(theme.text_dim),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(theme.accent)),
+            Span::styled(filter.to_string(), Style::default().fg(theme.text)),
+        ])
+    };
+    let mut lines = vec![filter_line, Line::from("")];
+
+    let matches: Vec<&crate::slash_commands::SlashCommandSpec> = catalog
+        .iter()
+        .filter(|spec| {
+            needle.is_empty()
+                || spec.usage.to_ascii_lowercase().contains(&needle)
+                || spec.label.to_ascii_lowercase().contains(&needle)
+        })
+        .collect();
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("No commands match \"{filter}\"."),
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        lines.extend(
+            matches.into_iter().map(|spec| {
+                Line::from(format!("{:usage_width$}  {}", spec.usage, spec.description))
+            }),
+        );
+    }
+    lines
 }
 
 /// Skills tab body — live from `ui_state.skill_suggestions` (project + personal
@@ -10012,6 +10098,225 @@ runtime = "fake"
         assert!(text.contains("/workflow <prompt>"));
         assert!(text.contains("/queue <message>"));
         assert!(text.contains("/reload:skills"));
+    }
+
+    #[test]
+    fn commands_tab_lines_filter_narrows_to_matching_usage() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("goal", &theme));
+        // Both /goal rows match the substring; /workflow does not.
+        assert!(text.contains("/goal | /goal <text>"), "missing /goal row");
+        assert!(text.contains("/goal clear"), "missing /goal clear row");
+        assert!(
+            !text.contains("/workflow <prompt>"),
+            "/workflow should be filtered out"
+        );
+        // The echoed filter text is visible.
+        assert!(
+            text.contains("Filter: goal"),
+            "filter line missing typed text"
+        );
+    }
+
+    #[test]
+    fn commands_tab_lines_empty_filter_shows_all_commands() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("", &theme));
+        for spec in crate::slash_commands::catalog() {
+            assert!(text.contains(spec.usage), "missing usage {}", spec.usage);
+        }
+    }
+
+    #[test]
+    fn commands_tab_lines_no_match_renders_empty_indicator() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("zzz-nope", &theme));
+        assert!(
+            text.contains("No commands match"),
+            "missing empty-result indicator"
+        );
+        // No catalog usage leaks through on a no-match filter.
+        for spec in crate::slash_commands::catalog() {
+            assert!(
+                !text.contains(spec.usage),
+                "unexpected usage {} on empty result",
+                spec.usage
+            );
+        }
+    }
+
+    #[test]
+    fn commands_tab_filter_is_case_insensitive() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("GOAL", &theme));
+        assert!(
+            text.contains("/goal clear"),
+            "uppercase filter should match"
+        );
+    }
+
+    #[test]
+    fn help_filter_keys_route_only_on_commands_tab() {
+        let state = state_with_input("", false);
+        let commands_ui = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            ..TuiUiState::default()
+        };
+        // On the Commands tab, printable chars feed the filter; Backspace edits it.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &commands_ui,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpFilterCharacter('g'))
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &commands_ui,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpFilterBackspace)
+        );
+        // Arrow/Tab navigation still wins over filter capture on the Commands tab.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &commands_ui,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpNextTab)
+        );
+
+        // On any other tab the same key does NOT route to the filter.
+        let keys_ui = TuiUiState {
+            help_active_tab: HelpTab::Keys,
+            ..commands_ui
+        };
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &keys_ui,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn help_filter_backspace_broadens_and_tab_change_resets() {
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            help_filter: "go".to_string(),
+            ..TuiUiState::default()
+        };
+
+        // Backspace on "go" yields "g" and broadens the list.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::HelpFilterBackspace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ui_state.help_filter, "g");
+
+        // Switching tabs resets the filter to "".
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::HelpNextTab)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_filter, "");
+
+        // Closing the modal also clears any filter.
+        ui_state.help_active_tab = HelpTab::Commands;
+        ui_state.help_filter = "wf".to_string();
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::ToggleHelp)
+            .await
+            .unwrap();
+        assert!(!ui_state.help_visible);
+        assert_eq!(ui_state.help_filter, "");
+    }
+
+    #[tokio::test]
+    async fn help_filter_does_not_touch_composer_input() {
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut state = state_with_input("draft prompt", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            ..TuiUiState::default()
+        };
+
+        for ch in ['g', 'o', 'a', 'l'] {
+            execute_tui_command(
+                &mut state,
+                &mut ui_state,
+                &sender,
+                TuiCommand::HelpFilterCharacter(ch),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(ui_state.help_filter, "goal");
+        // The live composer is untouched by filtering.
+        assert_eq!(state.input, "draft prompt");
+    }
+
+    #[tokio::test]
+    async fn help_commands_filter_narrows_then_shows_empty_state() {
+        // End-to-end: open help → Commands tab → type a matching substring →
+        // only matching rows render; extend to a no-match query → empty indicator.
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            ..TuiUiState::default()
+        };
+
+        for ch in ['g', 'o', 'a', 'l'] {
+            let command = key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            )
+            .expect("Commands tab should capture filter characters");
+            execute_tui_command(&mut state, &mut ui_state, &sender, command)
+                .await
+                .unwrap();
+        }
+        assert_eq!(ui_state.help_filter, "goal");
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        assert!(text.contains("/goal clear"), "matching row should render");
+        assert!(
+            !text.contains("/workflow <prompt>"),
+            "non-matching row should be hidden"
+        );
+        // Filtering never leaks into the composer.
+        assert_eq!(state.input, "");
+
+        // One more character makes the query match nothing → empty indicator.
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        )
+        .expect("Commands tab should capture filter characters");
+        execute_tui_command(&mut state, &mut ui_state, &sender, command)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_filter, "goalz");
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        assert!(
+            text.contains("No commands match"),
+            "empty-result indicator should render"
+        );
     }
 
     #[test]
