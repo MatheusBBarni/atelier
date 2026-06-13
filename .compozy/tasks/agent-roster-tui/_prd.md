@@ -97,7 +97,7 @@ Orchestration timeline / handoff view (delegation graph, parallel tree), integra
 - **Users don't notice/learn the new signals** → states are self-evident (glyph+label), the roster is visible by default, and labels mirror the chat's existing vocabulary; no new controls.
 - **Competitive overlap** — Zed Parallel Agents and Cline Kanban shipped multi-agent panels in 2025/26 → Atelier's niche is an always-on, *in-terminal*, single-orchestrator roster with live-activity-first weighting and an explicit progress-confidence (stalled) angle those panels don't foreground.
 - **Solo-maintainer opportunity cost** (polish vs. harness capability) → V1 is bounded and rides the existing theme/accent work rather than rebuilding it.
-- **Sequencing dependency** with `atelier-tui-redesign` F5 (both touch roster rendering) → coordinate ordering before implementation (Open Questions).
+- **Sequencing with `atelier-tui-redesign` F5** — *resolved* (ADR-006): the redesign is complete and merged to `main` (F5/per-agent accents landed); this work is a successor, not a parallel collision. Land it before the redesign's still-pending manual asset capture (task 09).
 
 ## Architecture Decision Records
 
@@ -111,4 +111,4 @@ Orchestration timeline / handoff view (delegation graph, parallel tree), integra
 - **Summary header at rest:** show "0 working" when idle, or hide the header until a run is active?
 - **Idle-tail disclosure:** for large rosters, collapse/summarize idle agents beyond ~N, or always show all? (Phase 2 candidate.)
 - **Glyph set & ASCII fallback:** confirm the exact portable glyph per state and its ASCII-safe equivalent (visual review).
-- **Sequencing vs. redesign F5:** confirm build order so the information-architecture layer (this) and the color-identity layer (F5) don't collide.
+- ~~**Sequencing vs. redesign F5**~~ — *resolved* (ADR-006): redesign code is merged to `main`; branch this work from `main`, land it before the redesign's manual asset capture (task 09).

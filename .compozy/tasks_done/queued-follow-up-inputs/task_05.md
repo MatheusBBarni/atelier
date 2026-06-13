@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Align Queue Command Discoverability And Documentation"
 type: docs
 complexity: medium

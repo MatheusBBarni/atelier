@@ -922,7 +922,7 @@ impl App {
         if self.handle_subtask_command(&prompt).await? {
             return Ok(());
         }
-        if self.handle_queue_command(&prompt)? {
+        if self.handle_queue_command(&prompt).await? {
             return Ok(());
         }
         if matches!(self.state.run_state, RunState::WaitingForUser) {
@@ -1094,7 +1094,7 @@ impl App {
         Ok(true)
     }
 
-    fn handle_queue_command(&mut self, prompt: &str) -> Result<bool> {
+    async fn handle_queue_command(&mut self, prompt: &str) -> Result<bool> {
         let Some(message) = parse_queue_command(prompt)? else {
             return Ok(false);
         };
@@ -1114,6 +1114,14 @@ impl App {
             }),
             format!("Queued follow-up: {}", single_line_event_text(&view.prompt)),
         )?;
+        // The worker drives a run to completion before it can service the next
+        // command, so a `/queue` submitted *during* a run is only processed once
+        // that run has already ended — after its run-end drain has passed. When
+        // the app is already idle on a clean completion, start the queued item
+        // now instead of leaving it stuck with nothing to trigger its replay.
+        if self.can_replay_now() {
+            self.react_to_run_end_for_queue().await?;
+        }
         Ok(true)
     }
 
@@ -9122,6 +9130,36 @@ runtime = "fake"
             .iter()
             .any(|event| event.kind == "run_completed" && event.run_id == replay_submitted.run_id));
         assert!(app.state.queued_follow_ups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_command_processed_after_run_finishes_starts_immediately() {
+        // In the TUI the worker drives a run to completion before it can service
+        // the next command, so a `/queue` typed during a run is only processed
+        // after the run already ended. The queued item must still start rather
+        // than sit forever with no run-end to trigger its drain.
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        // The run has already finished when the queued follow-up arrives.
+        queue_via_event(&mut app, "deferred work").await;
+
+        assert_eq!(app.state.run_state, RunState::Completed);
+        assert!(
+            app.state.queued_follow_ups.is_empty(),
+            "queued follow-up should have started instead of staying queued"
+        );
+        assert!(replay_started_prompts(&app).contains(&"deferred work".to_string()));
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "prompt_submitted" && event.payload["prompt"] == "deferred work"
+        }));
     }
 
     #[tokio::test]
