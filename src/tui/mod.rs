@@ -223,6 +223,10 @@ struct TuiUiState {
     /// question_id of the clarification the above selection state belongs to, so
     /// the composer resets cleanly when a new question arrives.
     clarification_question_id: Option<String>,
+    /// True once an answer has been submitted but the worker has not yet cleared
+    /// `pending_clarification`; freezes the composer so a fast second Enter can't
+    /// queue a duplicate answer that the worker would later reject.
+    clarification_submitting: bool,
     queue_selection_index: usize,
     status_message: Option<String>,
     work_spinner_frame: usize,
@@ -256,6 +260,7 @@ impl Default for TuiUiState {
             clarification_custom_answer: String::new(),
             clarification_selected: BTreeSet::new(),
             clarification_question_id: None,
+            clarification_submitting: false,
             queue_selection_index: 0,
             status_message: None,
             work_spinner_frame: 0,
@@ -1005,6 +1010,11 @@ fn clarification_key_command(
     key: KeyEvent,
 ) -> Option<TuiCommand> {
     let clarification = state.pending_clarification.as_ref()?;
+    // An answer is already in flight; freeze the composer (Ctrl-C still falls
+    // through to the caller) until the worker clears the pending clarification.
+    if ui_state.clarification_submitting {
+        return None;
+    }
     // The custom answer lives on a synthetic row past the real options. Typing
     // is only routed into the custom field while that row is focused.
     let custom_row = clarification.options.len();
@@ -1639,7 +1649,10 @@ async fn apply_clarification_command(
             ui_state.clarification_custom_answer.clear();
             ui_state.clarification_option_index = 0;
             ui_state.clarification_selected.clear();
-            ui_state.clarification_question_id = None;
+            // Keep `clarification_question_id` so `sync_clarification_state`
+            // does not treat the still-pending question as new; the submitting
+            // gate is cleared there once the worker drops the pending answer.
+            ui_state.clarification_submitting = true;
             Ok(true)
         }
     }
@@ -4041,6 +4054,7 @@ fn sync_clarification_state(state: &AppState, ui_state: &mut TuiUiState) {
                 ui_state.clarification_question_id = Some(view.question_id.clone());
                 ui_state.clarification_selected.clear();
                 ui_state.clarification_custom_answer.clear();
+                ui_state.clarification_submitting = false;
                 let focus = clarification_default_focus(view);
                 ui_state.clarification_option_index = focus;
                 // In multi-select, pre-check the recommended option so the
@@ -4056,11 +4070,12 @@ fn sync_clarification_state(state: &AppState, ui_state: &mut TuiUiState) {
             }
         }
         None => {
-            if ui_state.clarification_question_id.is_some() {
+            if ui_state.clarification_question_id.is_some() || ui_state.clarification_submitting {
                 ui_state.clarification_question_id = None;
                 ui_state.clarification_selected.clear();
                 ui_state.clarification_custom_answer.clear();
                 ui_state.clarification_option_index = 0;
+                ui_state.clarification_submitting = false;
             }
         }
     }
@@ -7195,6 +7210,43 @@ mod tests {
             "recommended pre-checked: {joined}"
         );
         assert!(ui_state.clarification_selected.contains(&1));
+    }
+
+    #[tokio::test]
+    async fn second_enter_after_submit_does_not_queue_duplicate_answer() {
+        let mut ui_state = TuiUiState::default();
+        let mut app_state = state_with_input("", false);
+        app_state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("a", "Alpha"),
+            clarification_option("b", "Beta"),
+        ]));
+
+        let (sender, mut receiver) = mpsc::channel(4);
+        // First submit dispatches the answer and arms the submitting gate.
+        execute_tui_command(
+            &mut app_state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::Clarification(ClarificationCommand::Submit),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::ClarificationAnswered(_))
+        ));
+        assert!(ui_state.clarification_submitting);
+
+        // A second Enter while the clarification is still pending is swallowed
+        // (only Ctrl-C falls through), so no duplicate answer is queued.
+        let command = key_event_to_tui_command_with_ui(&app_state, &ui_state, key(KeyCode::Enter));
+        assert_eq!(command, None);
+        assert!(receiver.try_recv().is_err());
+
+        // Once the worker clears the pending clarification, the gate releases.
+        app_state.pending_clarification = None;
+        sync_clarification_state(&app_state, &mut ui_state);
+        assert!(!ui_state.clarification_submitting);
     }
 
     #[tokio::test]

@@ -161,4 +161,62 @@ mod tests {
 
         assert!(preview.truncated);
     }
+
+    #[test]
+    fn build_content_preview_truncates_on_bytes() {
+        // Few lines, but together they exceed MAX_PREVIEW_BYTES, so truncation
+        // is driven by the byte budget rather than the line count.
+        let line = "a".repeat(600);
+        let content = vec![line; 10].join("\n");
+
+        let preview = build_content_preview(&content);
+
+        assert!(preview.truncated);
+        assert!(!preview.preview_lines.is_empty());
+        assert!(
+            preview.preview_lines.len() < MAX_PREVIEW_LINES,
+            "byte budget should cut off before the line cap: {}",
+            preview.preview_lines.len()
+        );
+    }
+
+    #[test]
+    fn build_content_preview_truncates_on_line_count() {
+        // Many short lines stay well under MAX_PREVIEW_BYTES, so truncation is
+        // driven by the line cap.
+        let content = (0..MAX_PREVIEW_LINES * 2)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let preview = build_content_preview(&content);
+
+        assert!(preview.truncated);
+        assert_eq!(preview.preview_lines.len(), MAX_PREVIEW_LINES);
+    }
+
+    #[test]
+    fn build_content_preview_empty_content_is_empty_and_not_truncated() {
+        let preview = build_content_preview("");
+
+        assert!(preview.preview_lines.is_empty());
+        assert!(!preview.truncated);
+    }
+
+    #[test]
+    fn build_content_preview_applies_concise_to_long_lines() {
+        // A single line under the byte and line budgets, but longer than the
+        // per-line concise() limit, so only its text is shortened.
+        let content = "a".repeat(500);
+
+        let preview = build_content_preview(&content);
+
+        assert!(!preview.truncated);
+        assert_eq!(preview.preview_lines.len(), 1);
+        let line = &preview.preview_lines[0];
+        assert_eq!(line.style, ChatLineStyle::DiffContext);
+        assert_eq!(line.text, concise(&content, 220));
+        assert!(line.text.ends_with("..."));
+        assert_eq!(line.text.chars().count(), 220);
+    }
 }

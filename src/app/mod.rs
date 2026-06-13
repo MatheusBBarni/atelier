@@ -1117,9 +1117,13 @@ impl App {
         // The worker drives a run to completion before it can service the next
         // command, so a `/queue` submitted *during* a run is only processed once
         // that run has already ended — after its run-end drain has passed. When
-        // the app is already idle on a clean completion, start the queued item
-        // now instead of leaving it stuck with nothing to trigger its replay.
-        if self.can_replay_now() {
+        // no run is in flight, run the run-end handling now so the new item is
+        // drained on a clean completion or paused (with the right reason) after
+        // a non-clean ending, instead of sitting Pending with nothing to trigger
+        // it. A run that is `WaitingForUser` still owns `active_run_id`, so it is
+        // excluded here — its queued items stay Pending and replay once the user
+        // resolves the wait, rather than being wrongly paused.
+        if self.state.active_run_id.is_none() {
             self.react_to_run_end_for_queue().await?;
         }
         Ok(true)
@@ -9252,6 +9256,31 @@ runtime = "fake"
             app.state.queued_follow_ups[0].status,
             QueuedFollowUpStatus::Paused
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_queue_after_failed_run_is_paused_with_reason() {
+        // The run has already ended in Failed by the time the worker processes
+        // the `/queue` (it was blocked driving the run). The new item must be
+        // paused with the failure reason rather than left Pending forever.
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.handle_event(AppEvent::PromptSubmitted(
+            "always parse error create a feature".to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(app.state.run_state, RunState::Failed);
+
+        queue_via_event(&mut app, "post-failure work").await;
+
+        assert!(replay_started_prompts(&app).is_empty());
+        assert_eq!(app.state.queued_follow_ups.len(), 1);
+        let item = &app.state.queued_follow_ups[0];
+        assert_eq!(item.status, QueuedFollowUpStatus::Paused);
+        assert_eq!(item.pause_reason.as_deref(), Some("previous run failed"));
     }
 
     #[tokio::test]
