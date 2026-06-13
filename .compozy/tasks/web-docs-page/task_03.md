@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Scaffold the docs content collection, layout, nav, and styles"
 type: frontend
 complexity: medium
@@ -36,12 +36,12 @@ entries so prose (task_04–06) and generated reference (task_11) can plug in la
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Define the `docs` collection + schema in `content.config.ts`.
-- [ ] 3.2 Build `DocsLayout.astro` (composes `Base.astro`; adds section nav + TOC).
-- [ ] 3.3 Add the `/docs` index route and the dynamic entry route.
-- [ ] 3.4 Add the base-aware "Docs" nav link in `Base.astro`.
-- [ ] 3.5 Add doc CSS: heading scale, themed Markdown tables, code blocks.
-- [ ] 3.6 Verify the section builds and renders a sample entry through `DocsLayout`.
+- [x] 3.1 Define the `docs` collection + schema in `content.config.ts`.
+- [x] 3.2 Build `DocsLayout.astro` (composes `Base.astro`; adds section nav + TOC).
+- [x] 3.3 Add the `/docs` index route and the dynamic entry route.
+- [x] 3.4 Add the base-aware "Docs" nav link in `Base.astro`.
+- [x] 3.5 Add doc CSS: heading scale, themed Markdown tables, code blocks.
+- [x] 3.6 Verify the section builds and renders a sample entry through `DocsLayout`.
 
 ## Implementation Details
 
@@ -73,12 +73,12 @@ than new patterns.
 
 ## Tests
 - Unit tests:
-  - [ ] Not applicable (Astro scaffolding); covered by build + render below.
+  - [x] Not applicable (Astro scaffolding); covered by build + render below.
 - Integration tests:
-  - [ ] `astro build` (with `GITHUB_PAGES=true`) emits the `/docs/` index and a dynamic entry route from a sample collection entry.
-  - [ ] A sample entry with `{title, nav_order}` renders through `DocsLayout` with its TOC and the section nav ordered by `nav_order`.
-  - [ ] The "Docs" nav link resolves to `/atelier/docs/` under the GitHub Pages base (not `/docs/`).
-  - [ ] Doc headings and a sample Markdown table render with the themed doc styles, not the marketing hero scale.
+  - [x] `astro build` (with `GITHUB_PAGES=true`) emits the `/docs/` index and a dynamic entry route from a sample collection entry.
+  - [x] A sample entry with `{title, nav_order}` renders through `DocsLayout` with its TOC and the section nav ordered by `nav_order`.
+  - [x] The "Docs" nav link resolves to `/atelier/docs/` under the GitHub Pages base (not `/docs/`).
+  - [x] Doc headings and a sample Markdown table render with the themed doc styles, not the marketing hero scale.
 - Test coverage target: >=80%
 - All tests must pass
 

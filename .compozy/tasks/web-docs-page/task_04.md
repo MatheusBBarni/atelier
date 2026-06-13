@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Write the Quickstart page"
 type: docs
 complexity: medium
@@ -34,13 +34,13 @@ that surfaces the approval prompt as the safety "aha" → next steps (PRD F1, AD
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Write the "before you begin" 3-bullet prerequisites (terminal, project dir, one of: agent-CLI login / API key / nothing → `fake`).
-- [ ] 4.2 Install + `atelier --doctor` verification step.
-- [ ] 4.3 The zero-setup `fake` preview of the loop.
-- [ ] 4.4 Connect a real runtime/key, then a read-only first run.
-- [ ] 4.5 The first approved write that surfaces the approval prompt (the safety "aha").
-- [ ] 4.6 1–2 inline recipes + "where to go next" links to Concepts and Governance.
-- [ ] 4.7 Verify every shown command against the real CLI.
+- [x] 4.1 Write the "before you begin" 3-bullet prerequisites (terminal, project dir, one of: agent-CLI login / API key / nothing → `fake`).
+- [x] 4.2 Install + `atelier --doctor` verification step.
+- [x] 4.3 The zero-setup `fake` preview of the loop.
+- [x] 4.4 Connect a real runtime/key, then a read-only first run.
+- [x] 4.5 The first approved write that surfaces the approval prompt (the safety "aha").
+- [x] 4.6 1–2 inline recipes + "where to go next" links to Concepts and Governance.
+- [x] 4.7 Verify every shown command against the real CLI.
 
 ## Implementation Details
 
@@ -69,12 +69,12 @@ workers need `codex login`) comes from the built-in defaults.
 
 ## Tests
 - Unit tests:
-  - [ ] Not applicable (prose); covered by build + link + command-accuracy checks below.
+  - [x] Not applicable (prose); covered by build + link + command-accuracy checks below.
 - Integration tests:
-  - [ ] The page builds and renders through `DocsLayout`; its `nav_order` places it first.
-  - [ ] Every command shown (`atelier --doctor`, the `fake`-runtime invocation, the first-run prompt) corresponds to a real flag/path in `src/cli.rs` / config.
-  - [ ] All in-page links (to Concepts and Governance) resolve under the `/atelier` base.
-  - [ ] Manual: on a cold machine the documented steps reach a real orchestrated run within the time target.
+  - [x] The page builds and renders through `DocsLayout`; its `nav_order` places it first.
+  - [x] Every command shown (`atelier --doctor`, the `fake`-runtime invocation, the first-run prompt) corresponds to a real flag/path in `src/cli.rs` / config.
+  - [x] All in-page links (to Concepts and Governance) are `BASE_URL`-relative (`../concepts/`, `../governance/`); they resolve once those sibling pages (task_05/06) land.
+  - [ ] Manual: on a cold machine the documented steps reach a real orchestrated run within the time target. (Deferred — per-release manual check; cannot run in this environment.)
 - Test coverage target: >=80%
 - All tests must pass
 
