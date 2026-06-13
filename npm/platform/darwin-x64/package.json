@@ -1,6 +1,6 @@
 {
   "name": "@matheusbbarni/atelier-darwin-x64",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "macOS x64 native binary for Atelier",
   "license": "MIT",
   "os": [
