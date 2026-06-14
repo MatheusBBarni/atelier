@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add help_active_tab state to TuiUiState
 type: frontend
 complexity: low
@@ -31,10 +31,10 @@ closes. This state is UI-only and must never enter the event-sourced `AppState` 
 </requirements>
 
 ## Subtasks
-- [ ] 03.1 Add the `help_active_tab` field to `TuiUiState`.
-- [ ] 03.2 Initialize it to `GettingStarted` in `Default`.
-- [ ] 03.3 Reset it to `GettingStarted` in the `ToggleHelp` handler when closing.
-- [ ] 03.4 Add unit tests for the default value and the reset-on-close behavior.
+- [x] 03.1 Add the `help_active_tab` field to `TuiUiState`.
+- [x] 03.2 Initialize it to `GettingStarted` in `Default`.
+- [x] 03.3 Reset it to `GettingStarted` in the `ToggleHelp` handler when closing.
+- [x] 03.4 Add unit tests for the default value and the reset-on-close behavior.
 
 ## Implementation Details
 `TuiUiState` follows a simple field + `Default` pattern; index fields like

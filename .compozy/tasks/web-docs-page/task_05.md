@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Write the Concepts page"
 type: docs
 complexity: low
@@ -34,11 +34,11 @@ Configuration page.
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Explain the run lifecycle states and what advances them.
-- [ ] 5.2 Explain orchestrator routing (single agent / council / parallel group).
-- [ ] 5.3 Explain agent profiles vs runtimes.
-- [ ] 5.4 Summarize the control plane and link to Governance for detail.
-- [ ] 5.5 Cross-link to Governance and Configuration.
+- [x] 5.1 Explain the run lifecycle states and what advances them.
+- [x] 5.2 Explain orchestrator routing (single agent / council / parallel group).
+- [x] 5.3 Explain agent profiles vs runtimes.
+- [x] 5.4 Summarize the control plane and link to Governance for detail.
+- [x] 5.5 Cross-link to Governance and Configuration.
 
 ## Implementation Details
 

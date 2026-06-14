@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Up/Down recall interaction with collision gate and draft preservation"
 type: frontend
 complexity: high
@@ -34,11 +34,11 @@ and restored (ADR-001, ADR-003).
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Implement `try_recall_history` with boundary and emptiness gating.
-- [ ] 5.2 Wire it into the `MoveInputCursor` branch of `execute_tui_command`, falling back to `move_input_cursor`.
-- [ ] 5.3 Save the draft on entry and restore it on exit past the newest entry.
-- [ ] 5.4 Place the input cursor at the end of recalled text on each step.
-- [ ] 5.5 Add the full key-handling matrix (recall, no-collision, draft, yields).
+- [x] 5.1 Implement `try_recall_history` with boundary and emptiness gating.
+- [x] 5.2 Wire it into the `MoveInputCursor` branch of `execute_tui_command`, falling back to `move_input_cursor`.
+- [x] 5.3 Save the draft on entry and restore it on exit past the newest entry.
+- [x] 5.4 Place the input cursor at the end of recalled text on each step.
+- [x] 5.5 Add the full key-handling matrix (recall, no-collision, draft, yields).
 
 ## Implementation Details
 

@@ -1,0 +1,77 @@
+---
+import { getCollection, type CollectionEntry } from "astro:content";
+import type { MarkdownHeading } from "astro";
+import Base from "./Base.astro";
+import { assetPath } from "../lib/basePath";
+
+interface Props {
+  /** The doc entry being rendered. */
+  entry: CollectionEntry<"docs">;
+  /** Headings from `render(entry)`, used to build the in-page table of contents. */
+  headings: MarkdownHeading[];
+}
+
+const { entry, headings } = Astro.props;
+
+// Section nav: every doc entry ordered by `nav_order`. Built here so the whole
+// `/docs` section shares one ordering source.
+const sections = (await getCollection("docs")).sort(
+  (a, b) => a.data.nav_order - b.data.nav_order,
+);
+
+// In-page TOC: keep h2/h3 only so deep headings do not crowd the rail.
+const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
+
+const docHref = (id: string) => assetPath(`/docs/${id}/`);
+---
+
+<Base
+  title={`${entry.data.title} - Atelier docs`}
+  description={`${entry.data.title} — Atelier documentation.`}
+>
+  <main class="docs">
+    <nav class="docs__nav" aria-label="Documentation sections">
+      <p class="eyebrow">Docs</p>
+      <ul>
+        {
+          sections.map((section) => (
+            <li>
+              <a
+                href={docHref(section.id)}
+                aria-current={section.id === entry.id ? "page" : undefined}
+                class:list={[
+                  "docs__nav-link",
+                  { "is-current": section.id === entry.id },
+                ]}
+              >
+                {section.data.title}
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+    </nav>
+
+    <article class="docs__body">
+      <h1 class="docs__title">{entry.data.title}</h1>
+      <div class="doc-prose">
+        <slot />
+      </div>
+    </article>
+
+    {
+      toc.length > 0 && (
+        <nav class="docs__toc" aria-label="On this page">
+          <p class="eyebrow">On this page</p>
+          <ul>
+            {toc.map((heading) => (
+              <li class:list={["docs__toc-item", `is-depth-${heading.depth}`]}>
+                <a href={`#${heading.slug}`}>{heading.text}</a>
+              </li>
+            ))}
+          </ul>
+        </nav>
+      )
+    }
+  </main>
+</Base>

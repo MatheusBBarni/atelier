@@ -1,0 +1,63 @@
+---
+import "../styles/global.css";
+import { assetPath } from "../lib/basePath";
+import Nav from "../components/Nav.astro";
+
+interface Props {
+  /** Document `<title>`. */
+  title: string;
+  /** `<meta name="description">` content. */
+  description: string;
+  /** Optional canonical URL; emits `<link rel="canonical">` when set. */
+  canonical?: string;
+  /** Optional Open Graph image URL; emits `<meta property="og:image">` when set. */
+  ogImage?: string;
+  /**
+   * Render the shared top nav at the start of `<body>`. Defaults to `true` so
+   * docs pages get the nav for free. The landing page sets this to `false`
+   * because its nav lives inside the hero section.
+   */
+  renderHeader?: boolean;
+}
+
+const {
+  title,
+  description,
+  canonical,
+  ogImage,
+  renderHeader = true,
+} = Astro.props;
+
+const hasFooter = Astro.slots.has("footer");
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <title>{title}</title>
+    <link rel="icon" href={assetPath("/favicon.svg")} type="image/svg+xml" />
+    <link rel="apple-touch-icon" href={assetPath("/images/atelier-logo-256.png")} />
+    <meta name="theme-color" content="#08131f" />
+    {canonical && <link rel="canonical" href={canonical} />}
+    {ogImage && <meta property="og:image" content={ogImage} />}
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap"
+      rel="stylesheet"
+    />
+    <slot name="head" />
+  </head>
+  <body>
+    {renderHeader && <Nav />}
+    <slot />
+    {hasFooter && (
+      <footer class="site-footer">
+        <slot name="footer" />
+      </footer>
+    )}
+  </body>
+</html>

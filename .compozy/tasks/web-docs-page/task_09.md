@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Refactor the redacted-config builder for reuse"
 type: refactor
 complexity: medium
@@ -33,11 +33,11 @@ Markdown — without changing `--print-config`'s output (ADR-003).
 </requirements>
 
 ## Subtasks
-- [ ] 9.1 Extract `build_printable_config` from `to_redacted_toml`.
-- [ ] 9.2 Rewrite `to_redacted_toml` as a thin serialize-only wrapper.
-- [ ] 9.3 Expose the `Printable*` types at crate visibility for `docgen`.
-- [ ] 9.4 Run the redaction guardrail tests and confirm they still pass.
-- [ ] 9.5 Confirm `atelier --print-config` output is unchanged.
+- [x] 9.1 Extract `build_printable_config` from `to_redacted_toml`.
+- [x] 9.2 Rewrite `to_redacted_toml` as a thin serialize-only wrapper.
+- [x] 9.3 Expose the `Printable*` types at crate visibility for `docgen`.
+- [x] 9.4 Run the redaction guardrail tests and confirm they still pass.
+- [x] 9.5 Confirm `atelier --print-config` output is unchanged.
 
 ## Implementation Details
 

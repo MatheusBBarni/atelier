@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Fix README runtime-requirements accuracy"
 type: docs
 complexity: low
@@ -33,10 +33,10 @@ This task corrects that wording so a new user's first-run expectations are hones
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Re-read the README "Requirements" and "Runtimes" sections against the actual defaults.
-- [ ] 1.2 Cross-check the default orchestrator runtime/model and the default worker runtimes in `src/config/mod.rs`.
-- [ ] 1.3 Rewrite the wording to distinguish required-by-default credentials from genuinely optional ones.
-- [ ] 1.4 Confirm the 3-line quick-start still reflects reality after the wording change.
+- [x] 1.1 Re-read the README "Requirements" and "Runtimes" sections against the actual defaults.
+- [x] 1.2 Cross-check the default orchestrator runtime/model and the default worker runtimes in `src/config/mod.rs`.
+- [x] 1.3 Rewrite the wording to distinguish required-by-default credentials from genuinely optional ones.
+- [x] 1.4 Confirm the 3-line quick-start still reflects reality after the wording change.
 
 ## Implementation Details
 
@@ -63,11 +63,11 @@ on the README "Optional" wording.
 
 ## Tests
 - Unit tests:
-  - [ ] Not applicable (prose-only change); claims are verified against code instead.
+  - [x] Not applicable (prose-only change); claims are verified against code instead.
 - Integration tests:
-  - [ ] The README's stated default orchestrator runtime/model ("zai"/"glm-5.1") matches `src/config/mod.rs` defaults.
-  - [ ] The README's stated default worker runtime ("codex") matches the explorer/fixer/reviewer defaults.
-  - [ ] No README section other than requirements/runtimes wording is modified (diff review).
+  - [x] The README's stated default orchestrator runtime/model ("zai"/"glm-5.1") matches `src/config/mod.rs` defaults (orchestrator at lines 633-636).
+  - [x] The README's stated default worker runtime ("codex") matches the explorer/fixer/reviewer defaults (lines 650, 696, 716).
+  - [x] No README section other than requirements/runtimes wording is modified (diff review: 11 insertions, 4 deletions).
 - Test coverage target: >=80%
 - All tests must pass
 

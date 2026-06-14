@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "PromptSource enum and AppEvent::PromptSubmitted extension"
 type: refactor
 complexity: medium
@@ -33,11 +33,11 @@ default to `Fresh`, leaving behavior unchanged.
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Define `PromptSource` in the app event module.
-- [ ] 3.2 Extend the `AppEvent::PromptSubmitted` variant.
-- [ ] 3.3 Update all construction sites (TUI Enter handler, app/test fixtures) to `Fresh`.
-- [ ] 3.4 Update all match sites (the worker handler, tests).
-- [ ] 3.5 Add a unit test asserting the variant carries and exposes a source.
+- [x] 3.1 Define `PromptSource` in the app event module.
+- [x] 3.2 Extend the `AppEvent::PromptSubmitted` variant.
+- [x] 3.3 Update all construction sites (TUI Enter handler, app/test fixtures) to `Fresh`.
+- [x] 3.4 Update all match sites (the worker handler, tests).
+- [x] 3.5 Add a unit test asserting the variant carries and exposes a source.
 
 ## Implementation Details
 

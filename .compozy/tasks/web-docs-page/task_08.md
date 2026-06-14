@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add the web-checks PR workflow with link checking"
 type: infra
 complexity: medium
@@ -34,11 +34,11 @@ and base-path 404s fail before merge (PRD F9, ADR-005).
 </requirements>
 
 ## Subtasks
-- [ ] 8.1 Create the workflow with the PR trigger and `web/**` path filters.
-- [ ] 8.2 Add node 24 setup + `npm ci` + build (`GITHUB_PAGES=true`).
-- [ ] 8.3 Add the lychee link-check over `web/dist`, scoped to internal links.
-- [ ] 8.4 Confirm the gate fails on a seeded broken internal link and passes on a clean build.
-- [ ] 8.5 Document the local equivalent command.
+- [x] 8.1 Create the workflow with the PR trigger and `web/**` path filters.
+- [x] 8.2 Add node 24 setup + `npm ci` + build (`GITHUB_PAGES=true`).
+- [x] 8.3 Add the lychee link-check over `web/dist`, scoped to internal links.
+- [x] 8.4 Confirm the gate fails on a seeded broken internal link and passes on a clean build.
+- [x] 8.5 Document the local equivalent command.
 
 ## Implementation Details
 

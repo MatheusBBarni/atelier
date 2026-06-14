@@ -3,6 +3,7 @@ pub mod diff_preview;
 mod projection;
 
 pub use projection::ChatProjection;
+pub(crate) use projection::FIRST_APPROVAL_EXPLAINER;
 
 use serde::{Deserialize, Serialize};
 

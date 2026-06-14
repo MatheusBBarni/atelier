@@ -59,6 +59,19 @@ impl HistoryEvent {
     }
 }
 
+/// Cross-session UI flags persisted at the `.atelier/` data root (ADR-004).
+/// Lives outside `sessions/`, so it survives `clean_sessions` and a fresh launch.
+/// New show-once flags are added here with `#[serde(default)]` for forward
+/// compatibility — never a new file per flag.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistentUiState {
+    #[serde(default)]
+    first_approval_explainer_shown: bool,
+}
+
+/// Root-level filename for [`PersistentUiState`].
+const UI_STATE_FILE: &str = "ui_state.json";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMetadata {
     pub schema_version: u32,
@@ -78,7 +91,7 @@ pub struct HistoryStore {
 
 impl HistoryStore {
     pub fn create(working_directory: &Path) -> Result<Self> {
-        let root = working_directory.join(".multiagent");
+        let root = working_directory.join(".atelier");
         let session_id = new_id();
         let session_dir = root.join("sessions").join(&session_id);
         let artifacts_dir = session_dir.join("artifacts");
@@ -168,6 +181,40 @@ impl HistoryStore {
         read_events_from_path(&self.events_path)
     }
 
+    fn ui_state_path(&self) -> PathBuf {
+        self.root.join(UI_STATE_FILE)
+    }
+
+    fn read_ui_state(&self) -> PersistentUiState {
+        // A missing or unparseable file degrades to defaults rather than failing
+        // the run — at worst the show-once explainer shows one extra time.
+        fs::read_to_string(self.ui_state_path())
+            .ok()
+            .and_then(|raw| serde_json::from_str::<PersistentUiState>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Whether the first-approval explainer has already been shown once for this
+    /// user (cross-session show-once latch, ADR-004).
+    pub fn first_approval_explainer_shown(&self) -> bool {
+        self.read_ui_state().first_approval_explainer_shown
+    }
+
+    /// Idempotently latch the first-approval explainer as shown. A no-op (no
+    /// write) when the flag is already set.
+    pub fn mark_first_approval_explainer_shown(&self) -> Result<()> {
+        let mut state = self.read_ui_state();
+        if state.first_approval_explainer_shown {
+            return Ok(());
+        }
+        state.first_approval_explainer_shown = true;
+        write_private_file(
+            &self.ui_state_path(),
+            serde_json::to_string_pretty(&state)?.as_bytes(),
+        )?;
+        Ok(())
+    }
+
     pub fn write_run_record<T: Serialize>(&self, run_id: &str, record: &T) -> Result<PathBuf> {
         let path = self.root.join("runs").join(format!("{run_id}.json"));
         write_private_file(&path, serde_json::to_string_pretty(record)?.as_bytes())?;
@@ -191,8 +238,13 @@ impl HistoryStore {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let relative_path = path
-            .strip_prefix(&self.root)
+        // Report the path relative to the workspace root (so it includes the
+        // `.atelier/` prefix) — that form is findable and copyable from the
+        // project root, unlike a path relative to the hidden data dir.
+        let relative_path = self
+            .root
+            .parent()
+            .and_then(|workspace| path.strip_prefix(workspace).ok())
             .unwrap_or(&path)
             .to_string_lossy()
             .to_string();
@@ -231,8 +283,104 @@ pub fn read_events_from_path(path: &Path) -> Result<Vec<HistoryEvent>> {
     Ok(events)
 }
 
+/// Enumerate every session's event log under `<root>/sessions/*/events.jsonl`.
+///
+/// `root` is the `.atelier` data root. Returns an empty list (not an error) when
+/// the `sessions/` directory is absent — a fresh project simply has no history
+/// yet. Paths are sorted for determinism; the recall ordering itself is decided
+/// later by event timestamp in [`project_prompt_history`]. This is the one new
+/// reader primitive, reusable by future Ctrl-R / scope-cycling / outcome views
+/// (ADR-004).
+pub fn list_session_event_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let sessions_dir = root.join("sessions");
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(&sessions_dir)
+        .with_context(|| format!("failed to read {}", sessions_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", sessions_dir.display()))?;
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let events_path = entry.path().join("events.jsonl");
+        if events_path.is_file() {
+            paths.push(events_path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Project a per-project prompt-recall list from the event log (ADR-001, ADR-004).
+///
+/// Reads every session log under `root`, keeps `prompt_submitted` events, drops
+/// prompts beginning with a leading space (the secrets escape hatch), sorts by
+/// event `timestamp` descending (RFC3339 millis are lexically sortable),
+/// collapses *consecutive* duplicates, and truncates to `max`. Pure and
+/// read-only — it adds no persistence.
+///
+/// Tolerant by construction: a single unreadable or legacy-schema file is
+/// skipped (`read_events_from_path` errors on `schema_version != 1`), so one bad
+/// file can never empty the whole projection. A missing `sessions/` directory
+/// yields an empty list. Memory is kept proportional to the prompt count rather
+/// than the full event log — only `(timestamp, prompt)` pairs are retained past
+/// each per-file fold, and the result is capped to `max`.
+pub fn project_prompt_history(root: &Path, max: usize) -> Vec<String> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let paths = match list_session_event_paths(root) {
+        Ok(paths) => paths,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for path in paths {
+        // Per-file tolerance: skip a file that fails to read or carries an
+        // unsupported schema_version, rather than failing the whole projection.
+        let Ok(events) = read_events_from_path(&path) else {
+            continue;
+        };
+        for event in events {
+            if event.kind != "prompt_submitted" {
+                continue;
+            }
+            let Some(prompt) = event.payload.get("prompt").and_then(Value::as_str) else {
+                continue;
+            };
+            // Leading-space-skip: a prompt beginning with a space is the secrets
+            // escape hatch and never surfaces in recall (the durable event log is
+            // unchanged — this is a filter, not a deletion).
+            if prompt.starts_with(' ') {
+                continue;
+            }
+            entries.push((event.timestamp, prompt.to_string()));
+        }
+    }
+
+    // Newest first by event timestamp (lexical sort is valid for RFC3339 millis).
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut history: Vec<String> = Vec::with_capacity(entries.len().min(max));
+    for (_, prompt) in entries {
+        // Consecutive-dedup: collapse an immediately repeated prompt; a
+        // non-consecutive repeat (a different prompt in between) is preserved.
+        if history.last().map(String::as_str) == Some(prompt.as_str()) {
+            continue;
+        }
+        history.push(prompt);
+        if history.len() >= max {
+            break;
+        }
+    }
+    history
+}
+
 pub fn clean_sessions(working_directory: &Path) -> Result<Vec<PathBuf>> {
-    let root = working_directory.join(".multiagent");
+    let root = working_directory.join(".atelier");
     let targets = [root.join("sessions"), root.join("runs")];
     let mut deleted = Vec::new();
     for target in targets {
@@ -335,12 +483,251 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
         assert!(store.session_dir().join("artifacts").exists());
+        // The reported path is workspace-relative (keeps the `.atelier/` prefix)
+        // and resolves back to the file from the project root, so it is findable
+        // and copyable.
+        assert!(artifact.path.starts_with(".atelier/sessions/"));
+        assert!(dir.path().join(&artifact.path).is_file());
+    }
+
+    #[test]
+    fn first_approval_explainer_latch_defaults_unset_then_persists() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+
+        // Fresh install: latch unset.
+        assert!(!store.first_approval_explainer_shown());
+
+        store.mark_first_approval_explainer_shown().unwrap();
+        assert!(store.first_approval_explainer_shown());
+
+        // Persists across sessions: a new store on the same workspace root (a
+        // fresh session dir) still sees the latch — the flag lives at the root.
+        let next_session = HistoryStore::create(dir.path()).unwrap();
+        assert!(next_session.first_approval_explainer_shown());
+        // And it survives session cleanup (the flag is not under sessions/).
+        clean_sessions(dir.path()).unwrap();
+        let after_clean = HistoryStore::create(dir.path()).unwrap();
+        assert!(after_clean.first_approval_explainer_shown());
+    }
+
+    #[test]
+    fn marking_first_approval_explainer_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        store.mark_first_approval_explainer_shown().unwrap();
+        // Repeat calls are a no-op and keep the latch set.
+        store.mark_first_approval_explainer_shown().unwrap();
+        assert!(store.first_approval_explainer_shown());
+    }
+
+    #[test]
+    fn first_approval_latch_degrades_to_unset_on_corrupt_file() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        // Latch once so the flag file exists at its real (root-agnostic) path,
+        // then corrupt it in place.
+        store.mark_first_approval_explainer_shown().unwrap();
+        let flag_path = store.ui_state_path();
+        fs::write(&flag_path, "not json").unwrap();
+        // A corrupt flag file must not panic or error — it reads as not-yet-shown.
+        assert!(!store.first_approval_explainer_shown());
+    }
+
+    fn prompt_event(timestamp: &str, prompt: &str) -> HistoryEvent {
+        let mut event = HistoryEvent::new(
+            "session",
+            None,
+            None,
+            "prompt_submitted",
+            json!({ "prompt": prompt }),
+        );
+        event.timestamp = timestamp.to_string();
+        event
+    }
+
+    fn write_session(root: &Path, session_id: &str, events: &[HistoryEvent]) {
+        let dir = root.join("sessions").join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let mut contents = String::new();
+        for event in events {
+            contents.push_str(&serde_json::to_string(event).unwrap());
+            contents.push('\n');
+        }
+        fs::write(dir.join("events.jsonl"), contents).unwrap();
+    }
+
+    #[test]
+    fn lists_session_event_paths_and_empty_when_sessions_absent() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+
+        // No sessions/ yet → empty, no error.
+        assert!(list_session_event_paths(&root).unwrap().is_empty());
+
+        write_session(
+            &root,
+            "a",
+            &[prompt_event("2026-06-06T00:00:00.000Z", "one")],
+        );
+        write_session(
+            &root,
+            "b",
+            &[prompt_event("2026-06-06T00:00:01.000Z", "two")],
+        );
+        // A session directory without an events.jsonl is ignored.
+        fs::create_dir_all(root.join("sessions").join("c")).unwrap();
+
+        let paths = list_session_event_paths(&root).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths
+            .iter()
+            .all(|path| path.file_name().unwrap() == "events.jsonl"));
+    }
+
+    #[test]
+    fn projects_prompts_newest_first_across_sessions() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        write_session(
+            &root,
+            "a",
+            &[
+                prompt_event("2026-06-06T00:00:00.000Z", "one"),
+                prompt_event("2026-06-06T00:00:02.000Z", "two"),
+            ],
+        );
+        write_session(
+            &root,
+            "b",
+            &[prompt_event("2026-06-06T00:00:01.000Z", "three")],
+        );
+
+        let history = project_prompt_history(&root, 10);
+        assert_eq!(history, vec!["two", "three", "one"]);
+    }
+
+    #[test]
+    fn collapses_consecutive_duplicates_but_keeps_non_consecutive() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        // Sorted newest-first: x(t4), x(t3), y(t2), x(t1).
+        write_session(
+            &root,
+            "a",
+            &[
+                prompt_event("2026-06-06T00:00:01.000Z", "x"),
+                prompt_event("2026-06-06T00:00:02.000Z", "y"),
+                prompt_event("2026-06-06T00:00:03.000Z", "x"),
+                prompt_event("2026-06-06T00:00:04.000Z", "x"),
+            ],
+        );
+
+        // The consecutive x/x collapses to one; the earlier x (with y between) stays.
+        assert_eq!(project_prompt_history(&root, 10), vec!["x", "y", "x"]);
+    }
+
+    #[test]
+    fn truncates_to_max_keeping_newest() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        write_session(
+            &root,
+            "a",
+            &[
+                prompt_event("2026-06-06T00:00:01.000Z", "p1"),
+                prompt_event("2026-06-06T00:00:02.000Z", "p2"),
+                prompt_event("2026-06-06T00:00:03.000Z", "p3"),
+                prompt_event("2026-06-06T00:00:04.000Z", "p4"),
+                prompt_event("2026-06-06T00:00:05.000Z", "p5"),
+            ],
+        );
+
+        assert_eq!(project_prompt_history(&root, 2), vec!["p5", "p4"]);
+    }
+
+    #[test]
+    fn excludes_leading_space_prompts() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        write_session(
+            &root,
+            "a",
+            &[
+                prompt_event("2026-06-06T00:00:01.000Z", "visible"),
+                prompt_event("2026-06-06T00:00:02.000Z", " secret"),
+            ],
+        );
+
+        assert_eq!(project_prompt_history(&root, 10), vec!["visible"]);
+    }
+
+    #[test]
+    fn skips_unreadable_or_legacy_files_without_emptying_result() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        write_session(
+            &root,
+            "good",
+            &[prompt_event("2026-06-06T00:00:01.000Z", "valid")],
+        );
+        // A future schema version errors in read_events_from_path → file skipped.
+        fs::create_dir_all(root.join("sessions").join("legacy")).unwrap();
+        fs::write(
+            root.join("sessions").join("legacy").join("events.jsonl"),
+            r#"{"schema_version":2,"event_id":"e","session_id":"s","run_id":null,"step_id":null,"timestamp":"2026-06-06T00:00:09.000Z","kind":"prompt_submitted","payload":{"prompt":"from-future"}}"#,
+        )
+        .unwrap();
+        // A malformed line also fails its file's read → file skipped.
+        fs::create_dir_all(root.join("sessions").join("garbage")).unwrap();
+        fs::write(
+            root.join("sessions").join("garbage").join("events.jsonl"),
+            "not json at all\n",
+        )
+        .unwrap();
+
+        // The bad files are skipped; the valid prompt still surfaces.
+        assert_eq!(project_prompt_history(&root, 10), vec!["valid"]);
+    }
+
+    #[test]
+    fn ignores_non_prompt_events_and_missing_prompt_field() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        let mut other = HistoryEvent::new("session", None, None, "run_started", json!({}));
+        other.timestamp = "2026-06-06T00:00:09.000Z".to_string();
+        let mut no_prompt = HistoryEvent::new(
+            "session",
+            None,
+            None,
+            "prompt_submitted",
+            json!({ "other": 1 }),
+        );
+        no_prompt.timestamp = "2026-06-06T00:00:08.000Z".to_string();
+        write_session(
+            &root,
+            "a",
+            &[
+                other,
+                no_prompt,
+                prompt_event("2026-06-06T00:00:01.000Z", "real"),
+            ],
+        );
+
+        assert_eq!(project_prompt_history(&root, 10), vec!["real"]);
+    }
+
+    #[test]
+    fn missing_sessions_dir_projects_empty() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        assert!(project_prompt_history(&root, 10).is_empty());
     }
 
     #[test]
     fn cleanup_deletes_only_sessions_and_runs() {
         let dir = tempdir().unwrap();
-        let root = dir.path().join(".multiagent");
+        let root = dir.path().join(".atelier");
         fs::create_dir_all(root.join("sessions/a")).unwrap();
         fs::create_dir_all(root.join("runs")).unwrap();
         fs::write(root.join("debug.log"), "keep").unwrap();

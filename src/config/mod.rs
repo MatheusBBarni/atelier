@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
@@ -197,15 +198,52 @@ pub struct Features {
     pub parallel_step_groups: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct UiConfig {
     pub hide_banner: bool,
+    /// Enable shell-style ↑/↓ recall of this project's past prompts. On by
+    /// default (ADR-002); set `[ui] prompt_history_enabled = false` to disable
+    /// the background loader and recall entirely.
+    pub prompt_history_enabled: bool,
+    /// Upper bound on how many past prompts are retained for recall (ADR-004's
+    /// bounded projection). Defaults to 200.
+    pub prompt_history_max: usize,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            hide_banner: false,
+            prompt_history_enabled: true,
+            prompt_history_max: 200,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspacePolicy {
     pub extra_read_roots: Vec<PathBuf>,
     pub extra_write_roots: Vec<PathBuf>,
+    /// Opt-in (`[workspace] allow_unrestricted_reads = true`): let the model
+    /// read any absolute path on the machine. Reads only — writes still require
+    /// `extra_write_roots`.
+    #[serde(default)]
+    pub allow_unrestricted_reads: bool,
+}
+
+impl WorkspacePolicy {
+    /// Read roots the model may target. When `allow_unrestricted_reads` is set,
+    /// the filesystem root is returned so every absolute path is a valid read
+    /// root; otherwise only the configured `extra_read_roots` apply. Writes are
+    /// unaffected — they always gate on `extra_write_roots`.
+    pub fn read_roots(&self) -> Cow<'_, [PathBuf]> {
+        if self.allow_unrestricted_reads {
+            Cow::Owned(vec![PathBuf::from(std::path::MAIN_SEPARATOR_STR)])
+        } else {
+            Cow::Borrowed(&self.extra_read_roots)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -403,6 +441,7 @@ struct RawPreset {
 struct RawWorkspacePolicy {
     extra_read_roots: Option<Vec<PathBuf>>,
     extra_write_roots: Option<Vec<PathBuf>>,
+    allow_unrestricted_reads: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -415,6 +454,8 @@ struct RawFeatures {
 #[serde(deny_unknown_fields)]
 struct RawUiConfig {
     hide_banner: Option<bool>,
+    prompt_history_enabled: Option<bool>,
+    prompt_history_max: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -578,6 +619,92 @@ struct MergedConfig {
     agent_layers: Vec<PendingAgentLayer>,
 }
 
+/// Canonical default system prompts for the six core structured-runtime agents.
+///
+/// These constants are the single source of truth for the built-in agent defaults
+/// (`insert_builtin_agent`) and the generated starter instruction files
+/// (`starter_instruction_files`). Keeping both consumers pointed at these constants
+/// prevents prompt drift between implicit built-ins and freshly initialized projects.
+/// They intentionally do not change any runtime schema, action contract, capability,
+/// model default, or permission behavior — only the instruction text.
+const DEFAULT_ORCHESTRATOR_INSTRUCTIONS: &str = "\
+You are the Orchestrator. You own run planning, agent routing, clarification, and delegation for the structured runtime.\n\
+\n\
+Contract: obey the runtime-requested structured output contract exactly. Return only the requested orchestrator decision and emit no prose outside the requested JSON envelope.\n\
+\n\
+Do: choose the next specialist agent from the available capabilities based on the current stop condition; define the next step, required capabilities, reason, and stop condition clearly; ask one targeted clarifying question only when the decision cannot be made safely.\n\
+\n\
+Do not: edit files, run commands, inspect the repository, or perform specialist work directly; embed action descriptors inside decisions; route to unavailable agents or capabilities.\n\
+\n\
+Harness actions: you never run them yourself. Route any file, command, edit, or verification work to a specialist agent that requests those harness actions.\n\
+\n\
+Blockers: report a blocker that names the missing user decision, capability, or context. Stop once the next step is decided, the run is complete, or you are blocked.";
+
+const DEFAULT_EXPLORER_INSTRUCTIONS: &str = "\
+You are the Explorer. You own read-only repository and context discovery.\n\
+\n\
+Contract: obey the runtime-requested structured output contract exactly. Return only the requested result and emit no prose outside the requested JSON envelope.\n\
+\n\
+Do: request read, list, search, or safe inspection harness actions when repository data is needed; return factual findings with file paths and observed behavior; label uncertainty; identify the next useful files, commands, or decisions when discovery is incomplete.\n\
+\n\
+Do not: edit files, run modifying commands, or present unverified conclusions as facts.\n\
+\n\
+Harness actions: you have no direct tool access. Obtain any file read, search, or inspection result by requesting the matching harness action; never claim to have run it yourself.\n\
+\n\
+Blockers: report a blocker that names the missing file, permission, action result, or context. Stop when discovery for the assigned step is complete or blocked.";
+
+const DEFAULT_FIXER_INSTRUCTIONS: &str = "\
+You are the Fixer. You own scoped implementation changes and targeted verification.\n\
+\n\
+Contract: obey the runtime-requested structured output contract exactly. Return only the requested result and emit no prose outside the requested JSON envelope.\n\
+\n\
+Do: request reads before editing when file context is missing; request edits through harness actions; request commands for formatting, tests, or verification; report changed files, commands run, verification evidence, and residual blockers in the proper result fields.\n\
+\n\
+Do not: claim direct tool access; perform unrelated refactors; mark completion without either verification evidence or a specific blocker explaining why verification could not run.\n\
+\n\
+Harness actions: every file, command, edit, or verification operation must be requested as a harness action; you cannot touch the filesystem or shell directly.\n\
+\n\
+Blockers: report a blocker that names the missing action result, command output, permission, or decision. Stop when the assigned change is verified, blocked, or failed.";
+
+const DEFAULT_REVIEWER_INSTRUCTIONS: &str = "\
+You are the Reviewer. You own risk-first review of completed work.\n\
+\n\
+Contract: obey the runtime-requested structured output contract exactly. Return only the requested result and emit no prose outside the requested JSON envelope.\n\
+\n\
+Do: review for bugs, regressions, missing tests, incomplete requirements, and verification gaps; lead with findings ordered by severity; reference files and evidence; state explicitly when no issues are found and name residual risk or test gaps.\n\
+\n\
+Do not: edit files, take over implementation, or raise vague concerns without concrete evidence or an explicit uncertainty label.\n\
+\n\
+Harness actions: request any file, command, or verification you need as a harness action; you have no direct tool access and do not modify the work under review.\n\
+\n\
+Blockers: report a blocker that names the missing diff, file, command result, or context. Stop when the review of the assigned work is complete or blocked.";
+
+const DEFAULT_ORACLE_INSTRUCTIONS: &str = "\
+You are the Oracle. You own focused advisory answers drawn from available evidence.\n\
+\n\
+Contract: obey the runtime-requested structured output contract exactly. Return only the requested result and emit no prose outside the requested JSON envelope.\n\
+\n\
+Do: answer the narrow question using provided context and any requested reads or searches; label uncertainty and name missing evidence; keep the answer scoped to the question.\n\
+\n\
+Do not: pretend to have unseen repository, web, or command data; edit files or execute implementation steps; overrule runtime constraints.\n\
+\n\
+Harness actions: obtain any file or search result you rely on by requesting the matching harness action rather than assuming it; you have no direct tool access.\n\
+\n\
+Blockers: report a blocker that names the missing evidence, context, or decision required to answer. Stop when the question is answered or blocked.";
+
+const DEFAULT_CONSUL_INSTRUCTIONS: &str = "\
+You are the Consul. You own adversarial critique, trade-off analysis, and assumption testing.\n\
+\n\
+Contract: obey the runtime-requested structured output contract exactly. Return only the requested result and emit no prose outside the requested JSON envelope.\n\
+\n\
+Do: challenge plans, risks, and assumptions; identify decision trade-offs and failure modes; recommend adjustments while leaving execution ownership with the responsible agent.\n\
+\n\
+Do not: edit files, execute the plan, or add process overhead when the path is already clear and low risk.\n\
+\n\
+Harness actions: request any file or search result you need to ground a critique as a harness action; you have no direct tool access and do not implement the work.\n\
+\n\
+Blockers: report a blocker that names the missing plan detail, evidence, or decision required to critique. Stop when the critique of the assigned plan is complete or blocked.";
+
 impl MergedConfig {
     fn builtin(working_directory: PathBuf) -> Self {
         let mut runtimes = BTreeMap::new();
@@ -637,7 +764,7 @@ impl MergedConfig {
                 effort: AgentEffort::High,
                 thinking: true,
                 capabilities: vec![Capability::Plan],
-                instructions: "Own the run plan, choose specialized agents, ask clarifying questions, and decide when the run is complete.",
+                instructions: DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
                 orchestrator_description: None,
                 enabled: true,
             },
@@ -652,7 +779,7 @@ impl MergedConfig {
                 effort: AgentEffort::Medium,
                 thinking: false,
                 capabilities: vec![Capability::Read],
-                instructions: "Read code, documentation, repository state, optional codemap.md files, and session context without changing files. Treat codemap.md as user-editable and verify source files when freshness matters.",
+                instructions: DEFAULT_EXPLORER_INSTRUCTIONS,
                 orchestrator_description: None,
                 enabled: true,
             },
@@ -667,7 +794,7 @@ impl MergedConfig {
                 effort: AgentEffort::Medium,
                 thinking: true,
                 capabilities: vec![Capability::Read, Capability::Answer],
-                instructions: "Answer design or implementation questions from gathered context inside the typed result envelope.",
+                instructions: DEFAULT_ORACLE_INSTRUCTIONS,
                 orchestrator_description: None,
                 enabled: true,
             },
@@ -682,8 +809,7 @@ impl MergedConfig {
                 effort: AgentEffort::High,
                 thinking: true,
                 capabilities: vec![Capability::Read, Capability::Challenge],
-                instructions:
-                    "Challenge plans, architecture, and domain decisions before work proceeds.",
+                instructions: DEFAULT_CONSUL_INSTRUCTIONS,
                 orchestrator_description: None,
                 enabled: true,
             },
@@ -703,7 +829,7 @@ impl MergedConfig {
                     Capability::Command,
                     Capability::Verify,
                 ],
-                instructions: "Apply scoped file changes through harness actions and run targeted verification.",
+                instructions: DEFAULT_FIXER_INSTRUCTIONS,
                 orchestrator_description: None,
                 enabled: true,
             },
@@ -723,8 +849,7 @@ impl MergedConfig {
                     Capability::Verify,
                     Capability::Review,
                 ],
-                instructions:
-                    "Review changes for bugs, regressions, and missing tests without editing files.",
+                instructions: DEFAULT_REVIEWER_INSTRUCTIONS,
                 orchestrator_description: None,
                 enabled: true,
             },
@@ -805,6 +930,9 @@ impl MergedConfig {
                     .map(|path| resolve_config_path(source_dir, path))
                     .collect();
             }
+            if let Some(allow_unrestricted_reads) = workspace.allow_unrestricted_reads {
+                self.workspace.allow_unrestricted_reads = allow_unrestricted_reads;
+            }
         }
 
         if let Some(features) = raw.features {
@@ -816,6 +944,12 @@ impl MergedConfig {
         if let Some(ui) = raw.ui {
             if let Some(value) = ui.hide_banner {
                 self.ui.hide_banner = value;
+            }
+            if let Some(value) = ui.prompt_history_enabled {
+                self.ui.prompt_history_enabled = value;
+            }
+            if let Some(value) = ui.prompt_history_max {
+                self.ui.prompt_history_max = value;
             }
         }
 
@@ -1511,7 +1645,6 @@ fn insert_builtin_agent(agents: &mut BTreeMap<String, MergedAgentProfile>, agent
 }
 
 pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConfig> {
-    let explicit_config_path = options.config_path.is_some();
     let working_directory = options.working_directory.canonicalize().with_context(|| {
         format!(
             "failed to resolve working directory {}",
@@ -1520,34 +1653,61 @@ pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConf
     })?;
     let mut merged = MergedConfig::builtin(working_directory.clone());
 
-    let env_config_path = env::var_os("MULTIAGENT_CONFIG").map(PathBuf::from);
-    let config_path = options.config_path.or(env_config_path.clone());
-    let home_config = config_path.unwrap_or_else(default_home_config_path);
-    let explicit_home_config = explicit_config_path || env_config_path.is_some();
+    let env_config_path = env::var_os("ATELIER_CONFIG")
+        .or_else(|| env::var_os("MULTIAGENT_CONFIG")) // back-compat
+        .map(PathBuf::from);
+    let config_path = options.config_path.or(env_config_path);
 
-    if home_config.exists() {
+    if let Some(home_config) = config_path {
+        // Explicit path (CLI flag or env var): it must exist.
+        if home_config.exists() {
+            apply_config_file(&mut merged, &home_config)?;
+        } else {
+            bail!(
+                "configured harness configuration file does not exist: {}",
+                home_config.display()
+            );
+        }
+    } else if let Some(home_config) =
+        first_existing([default_home_config_path(), legacy_home_config_path()])
+    {
+        // No explicit path: prefer ~/.config/.atelier/atelier.toml, but still
+        // load the legacy ~/.config/.multiagent/multiagent.toml if that's all
+        // that exists.
         apply_config_file(&mut merged, &home_config)?;
-    } else if explicit_home_config {
-        bail!(
-            "configured harness configuration file does not exist: {}",
-            home_config.display()
-        );
     }
 
-    let local_config = working_directory.join("multiagent.toml");
-    if local_config.exists() {
+    // Local override: prefer ./atelier.toml, fall back to legacy ./multiagent.toml.
+    if let Some(local_config) = first_existing([
+        working_directory.join("atelier.toml"),
+        working_directory.join("multiagent.toml"),
+    ]) {
         apply_config_file(&mut merged, &local_config)?;
     }
 
     merged.into_effective()
 }
 
-pub fn default_home_config_path() -> PathBuf {
+/// Legacy home config location, kept so configs written before the `.atelier`
+/// rename keep loading without a manual move.
+fn legacy_home_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join(".multiagent")
         .join("multiagent.toml")
+}
+
+fn first_existing<I: IntoIterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| path.exists())
+}
+
+pub fn default_home_config_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join(".atelier")
+        .join("atelier.toml")
 }
 
 fn apply_config_file(merged: &mut MergedConfig, path: &Path) -> Result<()> {
@@ -1789,82 +1949,91 @@ fn title_case_id(id: &str) -> String {
     }
 }
 
+/// Redacted, serializable projection of [`EffectiveConfig`] used by `--print-config`
+/// (via [`to_redacted_toml`]) and the docs generator (`src/docgen`). Field visibility is
+/// `pub(crate)` so `docgen` can read the same redacted view it renders to Markdown.
 #[derive(Clone, Debug, Serialize)]
-struct PrintableConfig {
-    schema_version: u32,
+pub(crate) struct PrintableConfig {
+    pub(crate) schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    preset: Option<String>,
-    approval_mode: ApprovalMode,
-    workspace: WorkspacePolicy,
-    features: Features,
-    ui: UiConfig,
-    limits: Limits,
-    council: PrintableCouncilConfig,
-    runtimes: BTreeMap<String, PrintableRuntime>,
-    agents: BTreeMap<String, PrintableAgent>,
+    pub(crate) preset: Option<String>,
+    pub(crate) approval_mode: ApprovalMode,
+    pub(crate) workspace: WorkspacePolicy,
+    pub(crate) features: Features,
+    pub(crate) ui: UiConfig,
+    pub(crate) limits: Limits,
+    pub(crate) council: PrintableCouncilConfig,
+    pub(crate) runtimes: BTreeMap<String, PrintableRuntime>,
+    pub(crate) agents: BTreeMap<String, PrintableAgent>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PrintableRuntime {
+pub(crate) struct PrintableRuntime {
     #[serde(rename = "type")]
-    kind: RuntimeKind,
+    pub(crate) kind: RuntimeKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    command: Option<String>,
+    pub(crate) command: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    args: Vec<String>,
+    pub(crate) args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_mode: Option<PromptMode>,
+    pub(crate) prompt_mode: Option<PromptMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    base_url: Option<String>,
+    pub(crate) base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    api_key_env: Option<String>,
+    pub(crate) api_key_env: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PrintableAgent {
-    display_name: String,
-    runtime: String,
-    model: String,
+pub(crate) struct PrintableAgent {
+    pub(crate) display_name: String,
+    pub(crate) runtime: String,
+    pub(crate) model: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    model_fallbacks: Vec<String>,
-    effort: AgentEffort,
-    thinking: bool,
-    capabilities: Vec<Capability>,
+    pub(crate) model_fallbacks: Vec<String>,
+    pub(crate) effort: AgentEffort,
+    pub(crate) thinking: bool,
+    pub(crate) capabilities: Vec<Capability>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ToolName>>,
-    prompt_source: String,
+    pub(crate) tools: Option<Vec<ToolName>>,
+    pub(crate) prompt_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    instructions_file: Option<PathBuf>,
+    pub(crate) instructions_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    instructions_append_file: Option<PathBuf>,
+    pub(crate) instructions_append_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    orchestrator_description_file: Option<PathBuf>,
-    enabled: bool,
+    pub(crate) orchestrator_description_file: Option<PathBuf>,
+    pub(crate) enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PrintableCouncilConfig {
-    default_preset: String,
-    timeout_seconds: u64,
-    execution_mode: CouncilExecutionMode,
-    presets: BTreeMap<String, BTreeMap<String, PrintableCouncilMember>>,
+pub(crate) struct PrintableCouncilConfig {
+    pub(crate) default_preset: String,
+    pub(crate) timeout_seconds: u64,
+    pub(crate) execution_mode: CouncilExecutionMode,
+    pub(crate) presets: BTreeMap<String, BTreeMap<String, PrintableCouncilMember>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct PrintableCouncilMember {
-    runtime: String,
-    model: String,
+pub(crate) struct PrintableCouncilMember {
+    pub(crate) runtime: String,
+    pub(crate) model: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    model_fallbacks: Vec<String>,
-    effort: AgentEffort,
-    thinking: bool,
-    prompt_source: String,
+    pub(crate) model_fallbacks: Vec<String>,
+    pub(crate) effort: AgentEffort,
+    pub(crate) thinking: bool,
+    pub(crate) prompt_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_file: Option<PathBuf>,
+    pub(crate) prompt_file: Option<PathBuf>,
 }
 
-pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
-    let printable = PrintableConfig {
+/// Builds the redacted [`PrintableConfig`] projection of `config`. This is the single
+/// place the `EffectiveConfig → PrintableConfig` mapping lives; both [`to_redacted_toml`]
+/// (for `--print-config`) and the docs generator reuse it so the redacted view stays
+/// identical across surfaces. Preserves every redaction invariant: env-var names (not
+/// secrets), `prompt_source` labels, authored-args-only runtimes, and prompt-file paths
+/// without bodies.
+pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfig {
+    PrintableConfig {
         schema_version: config.schema_version,
         preset: config.active_preset.clone(),
         approval_mode: config.approval_mode.clone(),
@@ -1964,8 +2133,14 @@ pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
                 )
             })
             .collect(),
-    };
+    }
+}
 
+/// Renders the redacted effective configuration as TOML for `--print-config`. Thin
+/// serialize-only wrapper over [`build_printable_config`]; output is byte-identical to the
+/// previous inlined implementation.
+pub fn to_redacted_toml(config: &EffectiveConfig) -> Result<String> {
+    let printable = build_printable_config(config);
     toml::to_string_pretty(&printable).context("failed to render effective configuration")
 }
 
@@ -2024,9 +2199,11 @@ approval_mode = "yolo"
 [features]
 parallel_step_groups = false
 
-# Optional UI tweaks. Uncomment to suppress the welcome banner.
+# Optional UI tweaks. Uncomment to adjust the input experience.
 # [ui]
-# hide_banner = true
+# hide_banner = true             # suppress the welcome banner
+# prompt_history_enabled = true  # ↑/↓ recall of past prompts (on by default)
+# prompt_history_max = 200       # how many past prompts to keep for recall
 
 [runtimes.codex]
 type = "codex"
@@ -2158,30 +2335,12 @@ enabled = false
 
 fn starter_instruction_files() -> Vec<(&'static str, &'static str)> {
     vec![
-        (
-            "orchestrator",
-            "Own the run plan, choose specialized agents, ask clarifying questions, and return only structured orchestrator decisions.",
-        ),
-        (
-            "explorer",
-            "Read repository context and optional codemap.md files without changing files. Treat codemap.md as user-editable and verify source files when freshness matters.",
-        ),
-        (
-            "oracle",
-            "Answer design and implementation questions using gathered context and return a typed agent result.",
-        ),
-        (
-            "consul",
-            "Challenge plans and architecture decisions before implementation proceeds.",
-        ),
-        (
-            "fixer",
-            "Apply scoped changes through harness actions and run targeted verification.",
-        ),
-        (
-            "reviewer",
-            "Review diffs and verification evidence without editing files.",
-        ),
+        ("orchestrator", DEFAULT_ORCHESTRATOR_INSTRUCTIONS),
+        ("explorer", DEFAULT_EXPLORER_INSTRUCTIONS),
+        ("oracle", DEFAULT_ORACLE_INSTRUCTIONS),
+        ("consul", DEFAULT_CONSUL_INSTRUCTIONS),
+        ("fixer", DEFAULT_FIXER_INSTRUCTIONS),
+        ("reviewer", DEFAULT_REVIEWER_INSTRUCTIONS),
         (
             "librarian",
             "Research current official documentation and APIs. Return cited answers without editing files or running commands.",
@@ -2257,7 +2416,7 @@ mod tests {
 
     fn load_from_temp(contents: &str) -> Result<EffectiveConfig> {
         let dir = tempdir()?;
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(&config_path, contents)?;
         load_effective_config(ConfigLoadOptions {
             working_directory: dir.path().to_path_buf(),
@@ -2320,7 +2479,7 @@ mod tests {
     #[test]
     fn default_home_config_path_uses_dot_config_multiagent() {
         let path = default_home_config_path();
-        assert!(path.ends_with(Path::new(".config/.multiagent/multiagent.toml")));
+        assert!(path.ends_with(Path::new(".config/.atelier/atelier.toml")));
     }
 
     #[test]
@@ -2375,6 +2534,98 @@ hide_banner = true
         .unwrap();
 
         assert!(config.ui.hide_banner);
+    }
+
+    #[test]
+    fn ui_prompt_history_defaults_on_with_cap_200() {
+        // Omitted keys → recall on by default, capped at 200 (ADR-002 / ADR-004).
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+
+        assert!(config.ui.prompt_history_enabled);
+        assert_eq!(config.ui.prompt_history_max, 200);
+    }
+
+    #[test]
+    fn ui_prompt_history_can_be_disabled() {
+        let config = load_from_temp(
+            r#"
+[ui]
+prompt_history_enabled = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.ui.prompt_history_enabled);
+        // The cap keeps its default when only the toggle is set.
+        assert_eq!(config.ui.prompt_history_max, 200);
+    }
+
+    #[test]
+    fn ui_prompt_history_max_override() {
+        let config = load_from_temp(
+            r#"
+[ui]
+prompt_history_max = 50
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.ui.prompt_history_max, 50);
+        // The toggle keeps its default when only the cap is set.
+        assert!(config.ui.prompt_history_enabled);
+    }
+
+    #[test]
+    fn ui_prompt_history_local_overrides_home() {
+        // Layer precedence (built-in → home → local): home disables recall, the
+        // project file re-enables it; local wins.
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(
+            &home_path,
+            "schema_version = 1\n[ui]\nprompt_history_enabled = false\n",
+        )
+        .unwrap();
+
+        let local_dir = tempdir().unwrap();
+        fs::write(
+            local_dir.path().join("atelier.toml"),
+            "[ui]\nprompt_history_enabled = true\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: local_dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        assert!(config.ui.prompt_history_enabled);
+    }
+
+    #[test]
+    fn ui_prompt_history_max_flows_from_project_toml() {
+        // Integration: a project-level multiagent.toml [ui] override reaches the
+        // effective config. A hermetic empty home config keeps the developer's
+        // real ~/.config out of the result.
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(&home_path, "schema_version = 1\n").unwrap();
+
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("multiagent.toml"),
+            "[ui]\nprompt_history_max = 10\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        assert_eq!(config.ui.prompt_history_max, 10);
     }
 
     #[test]
@@ -2455,7 +2706,7 @@ effort = "minimal"
         )
         .unwrap();
         fs::write(
-            dir.path().join("multiagent.toml"),
+            dir.path().join("atelier.toml"),
             r#"
 [agents.fixer]
 model = "local-model"
@@ -2474,6 +2725,69 @@ model = "local-model"
         assert_eq!(fixer.model, "local-model");
         assert_eq!(fixer.model_fallbacks, vec!["preset-fallback"]);
         assert_eq!(fixer.effort, AgentEffort::Minimal);
+    }
+
+    #[test]
+    fn workspace_allow_unrestricted_reads_parses_and_widens_read_roots() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("atelier.toml"),
+            r#"
+[workspace]
+allow_unrestricted_reads = true
+"#,
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        assert!(config.workspace.allow_unrestricted_reads);
+        // The flag turns the filesystem root into the read root; writes untouched.
+        assert_eq!(
+            config.workspace.read_roots().to_vec(),
+            vec![PathBuf::from(std::path::MAIN_SEPARATOR_STR)]
+        );
+        assert!(config.workspace.extra_write_roots.is_empty());
+    }
+
+    #[test]
+    fn legacy_local_multiagent_toml_is_still_loaded() {
+        // Configs written before the `.atelier` rename keep working without a
+        // manual move: ./multiagent.toml is still discovered as a local override.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("multiagent.toml"),
+            "[workspace]\nallow_unrestricted_reads = true\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        assert!(config.workspace.allow_unrestricted_reads);
+    }
+
+    #[test]
+    fn workspace_read_roots_default_to_configured_extra_roots() {
+        let default = WorkspacePolicy::default();
+        assert!(!default.allow_unrestricted_reads);
+        assert!(default.read_roots().is_empty());
+
+        let scoped = WorkspacePolicy {
+            extra_read_roots: vec![PathBuf::from("/tmp/refs")],
+            ..Default::default()
+        };
+        assert_eq!(
+            scoped.read_roots().to_vec(),
+            vec![PathBuf::from("/tmp/refs")]
+        );
     }
 
     #[test]
@@ -2496,7 +2810,7 @@ effort = "high"
         )
         .unwrap();
         fs::write(
-            dir.path().join("multiagent.toml"),
+            dir.path().join("atelier.toml"),
             r#"
 preset = "accurate"
 "#,
@@ -2844,8 +3158,54 @@ api_key_env = "sk-secret"
         assert!(rendered.contains("effort = \"high\""));
         assert!(rendered.contains("thinking = true"));
         assert!(rendered.contains("prompt_source = \"inline_redacted\""));
-        assert!(!rendered.contains("Own the run plan"));
+        // Sentinel: the inline prompt body must never leak into the redacted output.
+        // Key it to the live orchestrator default (not a hard-coded phrase) so a future
+        // prompt rewrite cannot silently make this assertion vacuous.
+        let orchestrator_body = config.agents["orchestrator"].instructions.as_str();
+        assert!(!orchestrator_body.is_empty());
+        assert!(!rendered.contains(orchestrator_body));
         assert!(!rendered.contains("Bearer"));
+    }
+
+    #[test]
+    fn build_printable_config_matches_to_redacted_toml() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("empty-home.toml");
+        fs::write(&config_path, "schema_version = 1\n").unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let via_builder = toml::to_string_pretty(&build_printable_config(&config)).unwrap();
+        let via_wrapper = to_redacted_toml(&config).unwrap();
+
+        assert_eq!(via_builder, via_wrapper);
+    }
+
+    #[test]
+    fn build_printable_config_exposes_all_sections() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("empty-home.toml");
+        fs::write(&config_path, "schema_version = 1\n").unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let printable = build_printable_config(&config);
+
+        // Agents, runtimes, and council presets are all reachable from the reusable
+        // builder for the docs generator (task_10).
+        assert!(!printable.agents.is_empty());
+        assert!(!printable.runtimes.is_empty());
+        assert!(!printable.council.presets.is_empty());
+        // The scalar limits/ui/workspace sections are reachable by construction.
+        assert!(printable.limits.max_parallel_agent_steps > 0);
+        let _ = printable.workspace.extra_read_roots.len();
+        let _ = printable.ui.hide_banner;
     }
 
     #[test]
@@ -2985,5 +3345,92 @@ instructions_file = "agents/fixer.md"
             .as_deref()
             .unwrap()
             .contains("do not use for backend-only"));
+    }
+
+    /// The six core structured-runtime roles whose default prompts must stay
+    /// aligned between built-in defaults and generated starter instruction files.
+    /// Listing them explicitly means adding or removing a core role requires an
+    /// intentional update to these drift tests.
+    const CORE_PROMPT_ROLES: [&str; 6] = [
+        "orchestrator",
+        "explorer",
+        "fixer",
+        "reviewer",
+        "oracle",
+        "consul",
+    ];
+
+    fn builtin_defaults() -> EffectiveConfig {
+        load_from_temp("schema_version = 1\n").unwrap()
+    }
+
+    fn starter_instruction(role: &str) -> &'static str {
+        starter_instruction_files()
+            .into_iter()
+            .find(|(name, _)| *name == role)
+            .unwrap_or_else(|| panic!("missing starter instruction file for {role}"))
+            .1
+    }
+
+    #[test]
+    fn core_builtin_and_starter_prompts_stay_aligned() {
+        let config = builtin_defaults();
+        for role in CORE_PROMPT_ROLES {
+            let builtin = config
+                .agents
+                .get(role)
+                .unwrap_or_else(|| panic!("missing built-in agent {role}"))
+                .instructions
+                .as_str();
+            assert_eq!(
+                builtin,
+                starter_instruction(role),
+                "built-in default and generated starter prompts drifted for `{role}`"
+            );
+        }
+    }
+
+    #[test]
+    fn core_prompts_contain_contract_first_language() {
+        let config = builtin_defaults();
+        for role in CORE_PROMPT_ROLES {
+            let prompt = config.agents[role].instructions.as_str();
+            for phrase in [
+                "structured output contract",
+                "JSON envelope",
+                "harness action",
+                "blocker",
+                "Stop ",
+            ] {
+                assert!(
+                    prompt.contains(phrase),
+                    "`{role}` prompt is missing required contract phrase {phrase:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn core_prompts_assert_role_boundaries() {
+        let config = builtin_defaults();
+        let boundaries: [(&str, &[&str]); 6] = [
+            ("orchestrator", &["inspect the repository", "edit files"]),
+            ("explorer", &["read-only", "edit files"]),
+            ("fixer", &["verification evidence or a specific blocker"]),
+            ("reviewer", &["take over implementation"]),
+            ("oracle", &["pretend to have unseen"]),
+            ("consul", &["execute the plan"]),
+        ];
+        // Every core role must carry an explicit boundary case.
+        assert_eq!(boundaries.len(), CORE_PROMPT_ROLES.len());
+        for (role, phrases) in boundaries {
+            let prompt = config.agents[role].instructions.as_str();
+            for phrase in phrases {
+                assert!(
+                    prompt.contains(phrase),
+                    "`{role}` prompt is missing role-boundary phrase {phrase:?}"
+                );
+            }
+        }
     }
 }

@@ -1477,7 +1477,7 @@ mod tests {
     #[test]
     fn generated_orchestrator_prompt_lists_enabled_custom_agents() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -1607,7 +1607,7 @@ orchestrator_description = "Use for official documentation and API lookup."
     #[test]
     fn generated_orchestrator_prompt_includes_designer_guidance_when_enabled() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         std::fs::write(
             &config_path,
             r#"

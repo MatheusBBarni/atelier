@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Live and Getting Started tab builders
 type: frontend
 complexity: medium
@@ -34,10 +34,19 @@ the feature's primary new-user value and the live differentiator.
 </requirements>
 
 ## Subtasks
-- [ ] 05.1 Implement `getting_started_lines` (model line + example prompts + compact agents).
-- [ ] 05.2 Implement `commands_tab_lines` from the catalog with a no-op `filter` param.
-- [ ] 05.3 Implement `skills_tab_lines` from `skill_suggestions`, including the disclaimer and empty state.
-- [ ] 05.4 Add unit tests for each builder (catalog coverage, skills listing, GS content + compact rows).
+- [x] 05.1 Implement `getting_started_lines` (model line + example prompts + compact agents).
+- [x] 05.2 Implement `commands_tab_lines` from the catalog with a no-op `filter` param.
+- [x] 05.3 Implement `skills_tab_lines` from `skill_suggestions`, including the disclaimer and empty state.
+- [x] 05.4 Add unit tests for each builder (catalog coverage, skills listing, GS content + compact rows).
+
+> **Implementation note (compact agent rows):** `getting_started_lines -> Vec<Line>` cannot
+> consume `agent_roster_items -> Vec<ListItem>` (ratatui 0.29 `ListItem` content is not publicly
+> readable). The shared compact-row logic was extracted into `agent_compact_line(index,
+> &AgentView, &Theme) -> Line`; `agent_roster_items`' `Compact` arm wraps it and Getting Started
+> reuses it directly, preserving the single data path the requirement intends.
+> **Example prompts (PRD Open Question):** chose two runnable, read-first prompts — "Summarize
+> what this project does and how the run loop works." and "Find where approval mode is enforced
+> and add a test for it." — marked with a `> ` prefix.
 
 ## Implementation Details
 Commands content already flows through `slash_commands::help_command_lines()` /
@@ -65,12 +74,12 @@ runnable prompts and note the choice in the PR. See TechSpec "Core Interfaces".
 
 ## Tests
 - Unit tests:
-  - [ ] `commands_tab_lines("", &theme)` contains every `slash_commands::catalog()` usage exactly once (mirror the existing `help_modal_command_rows_are_catalog_derived` assertion).
-  - [ ] `skills_tab_lines` with `test_skill_suggestions()` lists aliases `"project-alpha"` and `"personal-beta"` and includes the guidance disclaimer.
-  - [ ] `skills_tab_lines` with an empty `skill_suggestions` renders a "no skills" empty-state line (no panic).
-  - [ ] `getting_started_lines` with two agents contains the routing mental-model phrase, ≥2 example prompts, and exactly two compact agent rows (one per agent).
+  - [x] `commands_tab_lines("", &theme)` contains every `slash_commands::catalog()` usage exactly once (mirror the existing `help_modal_command_rows_are_catalog_derived` assertion). — `commands_tab_lines_cover_every_catalog_command_once`
+  - [x] `skills_tab_lines` with `test_skill_suggestions()` lists aliases `"project-alpha"` and `"personal-beta"` and includes the guidance disclaimer. — `skills_tab_lines_list_aliases_and_disclaimer`
+  - [x] `skills_tab_lines` with an empty `skill_suggestions` renders a "no skills" empty-state line (no panic). — `skills_tab_lines_render_empty_state_without_panic`
+  - [x] `getting_started_lines` with two agents contains the routing mental-model phrase, ≥2 example prompts, and exactly two compact agent rows (one per agent). — `getting_started_lines_render_model_examples_and_compact_agents`
 - Integration tests:
-  - [ ] Rendered via task_06 when each tab is active.
+  - [ ] Rendered via task_06 when each tab is active. — deferred to task_06 (builders not yet wired into `render_help_modal`).
 - Test coverage target: >=80%
 - All tests must pass
 

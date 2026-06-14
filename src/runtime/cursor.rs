@@ -65,7 +65,7 @@ impl Runtime for CursorRuntime {
                 runtime_id: self.config.id.clone(),
                 status: RuntimeAvailabilityStatus::Unavailable,
                 message: "cursor command is not configured".to_string(),
-                remediation: Some("Set [runtimes.cursor].command in multiagent.toml.".to_string()),
+                remediation: Some("Set [runtimes.cursor].command in atelier.toml.".to_string()),
             };
         };
 
@@ -1088,7 +1088,7 @@ fn join_status_parts(left: &str, right: &str) -> String {
 }
 
 fn cursor_login_remediation() -> String {
-    "Run cursor-agent login and verify with cursor-agent status. For automation, set CURSOR_API_KEY in the environment; do not store it in multiagent.toml.".to_string()
+    "Run cursor-agent login and verify with cursor-agent status. For automation, set CURSOR_API_KEY in the environment; do not store it in atelier.toml.".to_string()
 }
 
 fn env_var_is_set(name: &str) -> bool {

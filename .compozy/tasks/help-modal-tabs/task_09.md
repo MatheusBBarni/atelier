@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Commands tab substring filter (Phase 2)
 type: frontend
 complexity: medium
@@ -32,10 +32,10 @@ list by substring. The filter uses a dedicated `help_filter` buffer in `TuiUiSta
 </requirements>
 
 ## Subtasks
-- [ ] 09.1 Add the `help_filter` field with default + reset rules.
-- [ ] 09.2 Add the filter command variants and route them only on the Commands tab.
-- [ ] 09.3 Apply the substring filter inside `commands_tab_lines` and render the filter line.
-- [ ] 09.4 Add unit tests for filtering, backspace, reset, and composer isolation.
+- [x] 09.1 Add the `help_filter` field with default + reset rules.
+- [x] 09.2 Add the filter command variants and route them only on the Commands tab.
+- [x] 09.3 Apply the substring filter inside `commands_tab_lines` and render the filter line.
+- [x] 09.4 Add unit tests for filtering, backspace, reset, and composer isolation.
 
 ## Implementation Details
 Reuse the established substring-filter pattern from `skill_suggestions` (`src/tui/mod.rs:2067`)
@@ -62,13 +62,13 @@ Sequencing" step 9 and "Technical Considerations" (filter decision).
 
 ## Tests
 - Unit tests:
-  - [ ] `commands_tab_lines("goal", &theme)` includes `/goal` and `/goal clear` and excludes `/workflow`.
-  - [ ] `commands_tab_lines("", &theme)` shows all catalog commands (unfiltered).
-  - [ ] On the Commands tab with `help_visible`, `Char('g')` → `HelpFilterCharacter('g')`; on the Keys tab the same key does NOT route to the filter.
-  - [ ] `HelpFilterBackspace` on `"go"` yields `"g"` and broadens the list; switching tabs resets `help_filter` to `""`.
-  - [ ] Applying the filter leaves `state.input` unchanged.
+  - [x] `commands_tab_lines("goal", &theme)` includes `/goal` and `/goal clear` and excludes `/workflow`. (`commands_tab_lines_filter_narrows_to_matching_usage`)
+  - [x] `commands_tab_lines("", &theme)` shows all catalog commands (unfiltered). (`commands_tab_lines_empty_filter_shows_all_commands`)
+  - [x] On the Commands tab with `help_visible`, `Char('g')` → `HelpFilterCharacter('g')`; on the Keys tab the same key does NOT route to the filter. (`help_filter_keys_route_only_on_commands_tab`)
+  - [x] `HelpFilterBackspace` on `"go"` yields `"g"` and broadens the list; switching tabs resets `help_filter` to `""`. (`help_filter_backspace_broadens_and_tab_change_resets`)
+  - [x] Applying the filter leaves `state.input` unchanged. (`help_filter_does_not_touch_composer_input`)
 - Integration tests:
-  - [ ] Open help → Commands tab → type "doc" → render shows only `atelier --doctor`-related/`/`-commands matching "doc"; an unmatched query renders the empty-result indicator.
+  - [x] Open help → Commands tab → type a substring → render shows only matching commands; an unmatched query renders the empty-result indicator. (`help_commands_filter_narrows_then_shows_empty_state`) NOTE: the spec's "doc" example matches no catalog command (those are CLI flags), so the test uses "goal" for the matching case and "goalz" for the empty case.
 - Test coverage target: >=80%
 - All tests must pass
 

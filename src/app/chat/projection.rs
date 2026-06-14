@@ -9,6 +9,11 @@ use crate::history::HistoryEvent;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// One-line explainer shown beside the first approval a user ever hits (ADR-004,
+/// Phase 2). Kept to a single line and shown at most once per user.
+pub(crate) const FIRST_APPROVAL_EXPLAINER: &str =
+    "First approval: an agent wants to run a gated action — reply y to approve or n to deny.";
+
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_SUMMARY_CHARS: usize = 240;
 const MAX_BODY_LINES: usize = 12;
@@ -144,7 +149,7 @@ impl ChatProjection {
                     "[{}:{marker}:#{}] {}",
                     stream.stream,
                     stream.sequence_end,
-                    concise(&stream.content, MAX_SUMMARY_CHARS)
+                    readable_stream_preview(&stream.content)
                 )));
             }
         }
@@ -184,7 +189,11 @@ impl ChatProjection {
         });
     }
 
-    pub fn apply_pending_approval(&mut self, approval: Option<&PendingApprovalView>) {
+    pub fn apply_pending_approval(
+        &mut self,
+        approval: Option<&PendingApprovalView>,
+        show_first_approval_explainer: bool,
+    ) {
         let Some(approval) = approval else {
             let previous_key = self.pending_key.take();
             self.remove_waiting_approval_key(previous_key);
@@ -196,7 +205,14 @@ impl ChatProjection {
             action_id: approval.action_id.clone(),
         };
         self.pending_key = Some(key.clone());
-        let mut body = vec![ChatLineView::warning(&approval.summary)];
+        let mut body = Vec::new();
+        // First-approval explainer: a single muted line shown at most once per
+        // user (ADR-004), gated by the caller's persisted latch. Additive — it
+        // never changes the approve/deny prompt below it.
+        if show_first_approval_explainer {
+            body.push(ChatLineView::muted(FIRST_APPROVAL_EXPLAINER));
+        }
+        body.push(ChatLineView::warning(&approval.summary));
         if let Some(diagnostic) = approval.diagnostic.as_deref() {
             body.push(ChatLineView::warning(concise(
                 diagnostic,
@@ -2204,6 +2220,55 @@ fn human_json_summary(value: &Value) -> Option<String> {
     Some(format!("{} fields", object.len()))
 }
 
+/// Render a live runtime stream chunk as a readable one-liner. Runtime stderr is
+/// frequently raw JSON — structured-response chunks and coalesced event
+/// envelopes (e.g. `{"kind":"runtime_stream_delta","payload":{"content":{"preview":…}}}`).
+/// Surface the human-readable text buried inside rather than the escaped blob;
+/// fall back to a compact summary, then to the trimmed text for non-JSON output.
+fn readable_stream_preview(content: &str) -> String {
+    match json_value_from_text(content) {
+        Some(value) => readable_string_in(&value, 3)
+            .or_else(|| human_json_summary(&value))
+            .unwrap_or_else(|| concise(content, MAX_SUMMARY_CHARS)),
+        None => concise(content, MAX_SUMMARY_CHARS),
+    }
+}
+
+/// Find the first human-readable string in known content fields, recursing up to
+/// `depth` levels through wrapper keys (`payload`/`content`/…). Surfaces a
+/// streamed `preview`/`text` buried inside an event envelope without dumping the
+/// whole structure.
+fn readable_string_in(value: &Value, depth: usize) -> Option<String> {
+    let object = value.as_object()?;
+    for key in [
+        "summary",
+        "final_summary",
+        "message",
+        "preview",
+        "text",
+        "content",
+        "delta",
+    ] {
+        if let Some(text) = object.get(key).and_then(Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(concise(trimmed, MAX_SUMMARY_CHARS));
+            }
+        }
+    }
+    if depth > 0 {
+        for key in ["payload", "content", "data", "result"] {
+            if let Some(found) = object
+                .get(key)
+                .and_then(|nested| readable_string_in(nested, depth - 1))
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 fn human_json_body_lines(value: &Value) -> Vec<ChatLineView> {
     match value {
         Value::Object(object) => human_json_object_lines(object),
@@ -3135,6 +3200,30 @@ mod tests {
     }
 
     #[test]
+    fn live_stream_preview_surfaces_buried_text_from_event_envelope() {
+        // A coalesced runtime_stream_delta event: the real streamed text lives at
+        // payload.content.preview, not the top-level envelope. The live "running"
+        // line should show that text, not the raw escaped JSON blob.
+        let raw = r#"{"event_id":"01ABC","group_id":null,"kind":"runtime_stream_delta","payload":{"agent":"explorer","coalesced":true,"content":{"chars":2044,"preview":"reading the orchestrator module"}}}"#;
+        let preview = readable_stream_preview(raw);
+        assert_eq!(preview, "reading the orchestrator module");
+        assert!(!preview.contains("event_id"));
+        assert!(!preview.contains("runtime_stream_delta"));
+    }
+
+    #[test]
+    fn live_stream_preview_passes_plain_text_through() {
+        assert_eq!(readable_stream_preview("checking files"), "checking files");
+    }
+
+    #[test]
+    fn live_stream_preview_uses_summary_for_structured_response() {
+        let raw =
+            r#"{"status":"completed","agent":"reviewer","summary":"no blocking issues found"}"#;
+        assert_eq!(readable_stream_preview(raw), "no blocking issues found");
+    }
+
+    #[test]
     fn command_lifecycle_aggregates_into_one_item() {
         let events = vec![
             event(
@@ -3640,6 +3729,71 @@ mod tests {
 
         assert_eq!(item.kind, ChatItemKind::Approval);
         assert_eq!(item.status, ChatItemStatus::WaitingApproval);
+    }
+
+    fn pending_approval_view() -> PendingApprovalView {
+        PendingApprovalView {
+            run_id: "run-1".to_string(),
+            group_id: None,
+            step_id: "step-1".to_string(),
+            action_id: "action-1".to_string(),
+            agent: "fixer".to_string(),
+            summary: "Execute dangerous command".to_string(),
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn first_approval_explainer_renders_when_flag_set() {
+        let mut projection = ChatProjection::rebuild(&[]);
+        let approval = pending_approval_view();
+        projection.apply_pending_approval(Some(&approval), true);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::Approval);
+        // The explainer is the first body line, muted, and additive — the
+        // original approval summary still follows it.
+        assert_eq!(item.body[0].style, ChatLineStyle::Muted);
+        assert_eq!(item.body[0].text, FIRST_APPROVAL_EXPLAINER);
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == approval.summary && line.style == ChatLineStyle::Warning));
+    }
+
+    #[test]
+    fn approval_omits_explainer_when_flag_unset() {
+        let mut projection = ChatProjection::rebuild(&[]);
+        let approval = pending_approval_view();
+        projection.apply_pending_approval(Some(&approval), false);
+
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::Approval);
+        assert!(item
+            .body
+            .iter()
+            .all(|line| line.text != FIRST_APPROVAL_EXPLAINER));
+        // The approval summary remains the first body line (unchanged semantics).
+        assert_eq!(item.body[0].text, approval.summary);
+    }
+
+    #[test]
+    fn re_applying_first_approval_is_idempotent_on_body() {
+        // Repeated syncs within the same pending approval must not stack the
+        // explainer line (render is called every frame).
+        let mut projection = ChatProjection::rebuild(&[]);
+        let approval = pending_approval_view();
+        projection.apply_pending_approval(Some(&approval), true);
+        projection.apply_pending_approval(Some(&approval), true);
+
+        let item = &projection.items()[0];
+        let explainer_lines = item
+            .body
+            .iter()
+            .filter(|line| line.text == FIRST_APPROVAL_EXPLAINER)
+            .count();
+        assert_eq!(explainer_lines, 1);
+        assert_eq!(projection.items().len(), 1);
     }
 
     #[test]

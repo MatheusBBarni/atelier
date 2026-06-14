@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "activity_glyph / activity_label helpers (Set 1 glyphs + ASCII/NO_COLOR)"
 type: frontend
 complexity: low
@@ -51,19 +51,19 @@ Add two pure helper functions in `src/tui/mod.rs` to provide the glyph and label
 
 ## Subtasks
 
-- [ ] 05.1 Define `ActivityState` enum in `src/app/mod.rs` (derives Clone, Debug, PartialEq, Eq, Serialize, Deserialize) with four variants: Active, NeedsInput, Stalled, Idle.
+- [x] 05.1 `ActivityState` enum (Clone, Debug, PartialEq, Eq, Serialize, Deserialize; 4 variants) already exists in `src/app/mod.rs` (task_01). Verified.
 
-- [ ] 05.2 Add `activity_glyph(state: ActivityState, ascii: bool) -> &'static str` function in `src/tui/mod.rs` with Set 1 glyph mapping and ASCII fallback; verify no Color literals appear.
+- [x] 05.2 `activity_glyph(state: ActivityState, ascii: bool) -> &'static str` added in `src/tui/mod.rs` (Set 1 glyphs + ASCII fallback). No inline color literals.
 
-- [ ] 05.3 Add `activity_label(state: ActivityState) -> &'static str` function in `src/tui/mod.rs` with label mapping; confirm labels are pairwise distinct and non-empty.
+- [x] 05.3 `activity_label(state: ActivityState) -> &'static str` added; labels pairwise distinct and non-empty.
 
-- [ ] 05.4 Write unit tests asserting each ActivityState maps to the expected Unicode glyph (ascii=false), expected ASCII glyph (ascii=true), and expected label.
+- [x] 05.4 Unit tests assert each state's Unicode glyph, ASCII glyph, and label.
 
-- [ ] 05.5 Write unit test asserting all labels are pairwise distinct and non-empty.
+- [x] 05.5 Unit test asserts labels are pairwise distinct and non-empty (plus an ADR-002 single-char/BMP portability check).
 
-- [ ] 05.6 Write NO_COLOR integration test via TestBackend snapshot confirming every state is disambiguated by glyph+label with colors collapsed to Color::Reset.
+- [ ] 05.6 **Deferred to task_06.** The NO_COLOR render-snapshot test needs the render path to call `activity_glyph`/`activity_label`; that wiring lands in the task_06 rewrite. The no-color-literal requirement is enforced now by the `colors_live_only_in_theme_module` invariant.
 
-- [ ] 05.7 Run `cargo test --lib activity_glyph activity_label` and confirm `colors_live_only_in_theme_module` still passes (CI invariant satisfied).
+- [x] 05.7 `cargo test --lib activity_` passes; `colors_live_only_in_theme_module` passes; full `cargo test --lib` green (776).
 
 ## Implementation Details
 

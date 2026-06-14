@@ -1,0 +1,100 @@
+name: web checks
+
+# PR gate for the docs site. Builds the `atelier` binary, runs `--emit-docs` to
+# generate the reference fragments, then builds web/ with the GitHub Pages base
+# path (/atelier) and link-checks the output so broken internal links and
+# base-path 404s — including on generated pages — fail before merge
+# (ADR-005, PRD F9). Generator-source changes also trip the gate.
+on:
+  pull_request:
+    paths:
+      - "web/**"
+      - "src/cli.rs"
+      - "src/config/**"
+      - "src/slash_commands.rs"
+      - "src/docgen/**"
+      - ".github/workflows/web-checks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-link-check:
+    name: Build and link-check the docs site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build atelier (release)
+        run: cargo build --locked --release --bin atelier
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+
+      # Run the prebuilt binary's --emit-docs into the content collection so the
+      # link-check below covers the generated reference pages. ATELIER_BIN reuses
+      # the release build above instead of `cargo run`.
+      - name: Generate reference docs
+        working-directory: web
+        run: npm run generate
+        env:
+          ATELIER_BIN: ${{ github.workspace }}/target/release/atelier
+
+      # `npx astro build` (not `npm run build`) so the `prebuild` hook does not
+      # re-run generate — the step above already produced the fragments.
+      - name: Build site (GitHub Pages base path)
+        working-directory: web
+        run: npx astro build
+        env:
+          GITHUB_PAGES: "true"
+
+      - name: Verify machine-readable surfaces
+        working-directory: web
+        run: npm run check:surfaces
+        env:
+          GITHUB_PAGES: "true"
+
+      # The site is served under /atelier on Pages, but `astro build` emits files
+      # at dist root. Stage dist under an `atelier/` directory so root-relative
+      # links (/atelier/docs/...) resolve correctly; a link missing the base
+      # (/docs/...) — a production 404 — then fails the check. The `.md` LLM
+      # twins are dropped from the link-check copy: their relative links target
+      # the rendered HTML routes, not sibling files, and they are already
+      # validated by `check:surfaces`.
+      - name: Stage built site under the /atelier base path
+        run: |
+          rm -rf "${{ github.workspace }}/_site"
+          mkdir -p "${{ github.workspace }}/_site/atelier"
+          cp -r web/dist/. "${{ github.workspace }}/_site/atelier/"
+          find "${{ github.workspace }}/_site/atelier" -name '*.md' -delete
+
+      # --offline checks only local file links, skipping external URLs so the
+      # gate never flakes on external rate limits (PRD F9 internal-only scope).
+      - name: Link-check internal links (lychee)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --offline
+            --root-dir ${{ github.workspace }}/_site
+            ${{ github.workspace }}/_site/atelier
+          fail: true

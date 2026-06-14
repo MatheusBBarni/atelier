@@ -3,8 +3,8 @@ use crate::app::chat::{
 };
 use crate::app::git::GitContext;
 use crate::app::{
-    AgentView, App, AppEvent, AppState, ApprovalHandle, InterruptHandle, PendingClarificationView,
-    QueuedFollowUpStatus, QueuedFollowUpView,
+    ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, InterruptHandle,
+    PendingClarificationView, PromptSource, QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
@@ -59,6 +59,10 @@ const FILE_MENTION_PREFIX: &str = "@";
 const RELOAD_SKILLS_COMMAND: &str = "/reload:skills";
 const DROPDOWN_MAX_ITEMS: usize = 6;
 const WORK_HINT: &str = "/help";
+/// Contextual hint shown in place of `WORK_HINT` when recall is available
+/// (input empty, history loaded, no active work). Advertises ↑/↓ recall while
+/// keeping `/help` discoverable; concise like `QUEUE_HINT` (ADR-002, task_07).
+const HISTORY_HINT: &str = "↑ recall · /help";
 const WORK_INDICATOR_HEIGHT: u16 = 1;
 /// Ambient status footer line (repo·branch · run state · agents), below the
 /// work-indicator/hint line.
@@ -88,12 +92,89 @@ const QUEUE_SELECTED_MARKER: &str = "> ";
 const QUEUE_UNSELECTED_MARKER: &str = "  ";
 const QUEUE_HINT: &str = "↑/↓ select · Del cancel · Ctrl-R resume (clear input to focus)";
 
+/// Identifies the six tabs of the help modal and provides ordered iteration
+/// plus wrap-around navigation. Pure value type — carries no rendering or state.
+///
+/// The active tab lives in `TuiUiState.help_active_tab`; `render_help_modal`
+/// dispatches on it to the per-tab builders. Wrap-around navigation
+/// (`next`/`prev`) is wired into key routing by task 07.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelpTab {
+    GettingStarted,
+    Commands,
+    Keys,
+    Skills,
+    Approvals,
+    Cli,
+}
+
+// `ALL`/`title` are consumed by the tabbed render (task 06); `next`/`prev` are
+// consumed by tab navigation (task 07).
+impl HelpTab {
+    /// Tabs in declared left-to-right order (Getting Started first, CLI last).
+    const ALL: [HelpTab; 6] = [
+        HelpTab::GettingStarted,
+        HelpTab::Commands,
+        HelpTab::Keys,
+        HelpTab::Skills,
+        HelpTab::Approvals,
+        HelpTab::Cli,
+    ];
+
+    /// Human-readable tab title shown in the tab strip.
+    fn title(self) -> &'static str {
+        match self {
+            HelpTab::GettingStarted => "Getting Started",
+            HelpTab::Commands => "Commands",
+            HelpTab::Keys => "Keys",
+            HelpTab::Skills => "Skills",
+            HelpTab::Approvals => "Approvals",
+            HelpTab::Cli => "CLI",
+        }
+    }
+
+    /// Next tab in `ALL`, wrapping from the last back to the first.
+    fn next(self) -> HelpTab {
+        let index = HelpTab::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .unwrap_or(0);
+        HelpTab::ALL[(index + 1) % HelpTab::ALL.len()]
+    }
+
+    /// Previous tab in `ALL`, wrapping from the first back to the last.
+    fn prev(self) -> HelpTab {
+        let index = HelpTab::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .unwrap_or(0);
+        HelpTab::ALL[(index + HelpTab::ALL.len() - 1) % HelpTab::ALL.len()]
+    }
+}
+
+/// Row presentation style for the shared agent-roster builder: `Full` renders
+/// three lines per agent (Ctrl-L roster), `Compact` renders one (Getting Started).
+///
+/// Consumed by the `agent_roster_items` builder (task 02). `Full` is live in the
+/// Ctrl-L roster; `Compact` lands with the Getting Started tab (task 05), so the
+/// `allow(dead_code)` stays until that variant is constructed in production.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RosterRowStyle {
+    Full,
+    Compact,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TuiCommand {
     Dispatch(AppEvent),
     DispatchAndQuit(AppEvent),
     ToggleRoster,
     ToggleHelp,
+    HelpNextTab,
+    HelpPrevTab,
+    HelpFilterCharacter(char),
+    HelpFilterBackspace,
     ScrollEvents(EventScrollCommand),
     MoveInputCursor(InputCursorCommand),
     AgentDropdown(DropdownCommand),
@@ -192,6 +273,15 @@ enum AppWorkerCommand {
 struct TuiUiState {
     roster_visible: bool,
     help_visible: bool,
+    /// Active tab in the help modal. Ephemeral UI state only — never enters the
+    /// event-sourced `AppState` snapshot. Reset to `GettingStarted` on close so
+    /// reopening always lands on the front-door tab.
+    help_active_tab: HelpTab,
+    /// Type-to-filter buffer for the Commands help tab (Phase 2). Ephemeral UI
+    /// state, never in the snapshot and fully isolated from the composer
+    /// `state.input`. Cleared on tab change and on modal close so each tab/open
+    /// starts unfiltered.
+    help_filter: String,
     event_scroll: usize,
     event_follow: bool,
     event_content_lines: usize,
@@ -201,6 +291,22 @@ struct TuiUiState {
     input_cursor: usize,
     input_preferred_col: Option<usize>,
     input_width: usize,
+    /// Recall ring: this project's past prompts, newest-first, deduped and
+    /// capped (ADR-001/004). Seeded once off-thread at startup over a `watch`
+    /// channel; empty until that load lands, or when recall is disabled.
+    prompt_history: Vec<String>,
+    /// Recall cursor: `0` = the live draft; `N` = the Nth-newest entry. Drives
+    /// the `Fresh`/`Recalled` provenance tag (task_05/06).
+    prompt_history_cursor: usize,
+    /// The in-progress draft saved while browsing history, restored when ↓ steps
+    /// back past the newest entry (task_05).
+    prompt_history_draft: String,
+    /// Whether recall is enabled (config `ui.prompt_history_enabled`). Gates the
+    /// in-session prepend so a disabled session never builds a recallable ring.
+    prompt_history_enabled: bool,
+    /// Upper bound on the in-memory ring (config `ui.prompt_history_max`); the
+    /// in-session prepend truncates to this after adding a submission.
+    prompt_history_max: usize,
     agent_selection_index: usize,
     skill_suggestions: Vec<SkillSuggestion>,
     skill_selection_index: usize,
@@ -239,6 +345,8 @@ impl Default for TuiUiState {
         Self {
             roster_visible: true,
             help_visible: false,
+            help_active_tab: HelpTab::GettingStarted,
+            help_filter: String::new(),
             event_scroll: 0,
             event_follow: true,
             event_content_lines: 0,
@@ -248,6 +356,11 @@ impl Default for TuiUiState {
             input_cursor: 0,
             input_preferred_col: None,
             input_width: 1,
+            prompt_history: Vec::new(),
+            prompt_history_cursor: 0,
+            prompt_history_draft: String::new(),
+            prompt_history_enabled: true,
+            prompt_history_max: 200,
             agent_selection_index: 0,
             skill_suggestions: Vec::new(),
             skill_selection_index: 0,
@@ -363,6 +476,8 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
 
     let working_directory = config.working_directory.clone();
     let hide_banner = config.ui.hide_banner;
+    let prompt_history_enabled = config.ui.prompt_history_enabled;
+    let prompt_history_max = config.ui.prompt_history_max;
     let theme = Theme::resolve(TerminalCaps::detect());
     let mut app = App::new_with_debug(config, debug_enabled).await?;
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
@@ -374,6 +489,10 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     // working directory off-thread and publishes the latest `Vec<FileEntry>`
     // here; the render loop consumes it.
     let (file_index_sender, file_index_receiver) = watch::channel(Vec::<FileEntry>::new());
+    // One-time recall load → TUI channel (ADR-004). The loader (spawned below,
+    // gated on the toggle) projects `prompt_submitted` history off-thread and
+    // publishes the ring once; the render loop syncs it into `TuiUiState`.
+    let (prompt_history_sender, prompt_history_receiver) = watch::channel(Vec::<String>::new());
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -386,6 +505,14 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
         file_index_sender,
         Some(working_directory.clone()),
     ));
+    // Detached recall load: never blocks the first paint, and skipped entirely
+    // when recall is disabled so the ring stays empty (ADR-004).
+    maybe_spawn_prompt_history_load(
+        prompt_history_enabled,
+        Some(working_directory.clone()),
+        prompt_history_max,
+        prompt_history_sender,
+    );
 
     // No loading interstitial: the main UI (with the branded welcome item)
     // renders on the first frame, and skill scanning happens behind it inside
@@ -393,6 +520,8 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let mut ui_state = TuiUiState::with_skill_suggestions(working_directory, Vec::new());
     ui_state.theme = theme;
     ui_state.hide_banner = hide_banner;
+    ui_state.prompt_history_enabled = prompt_history_enabled;
+    ui_state.prompt_history_max = prompt_history_max;
     let result = run_loop(
         &mut terminal,
         state_receiver,
@@ -400,6 +529,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
         interrupt_handle,
         approval_handle,
         file_index_receiver,
+        prompt_history_receiver,
         ui_state,
     )
     .await;
@@ -421,6 +551,11 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     shutdown_result
 }
 
+// The render loop legitimately wires together every long-lived TUI channel and
+// handle (state, commands, interrupt/approval, the two background-load
+// receivers, and the UI state); bundling them into a struct would only move the
+// same fields behind one more indirection.
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut state_receiver: watch::Receiver<AppState>,
@@ -428,6 +563,7 @@ async fn run_loop(
     interrupt_handle: InterruptHandle,
     approval_handle: ApprovalHandle,
     mut file_index_receiver: watch::Receiver<Vec<FileEntry>>,
+    mut prompt_history_receiver: watch::Receiver<Vec<String>>,
     mut ui_state: TuiUiState,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
@@ -441,6 +577,7 @@ async fn run_loop(
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
         sync_file_index(&mut ui_state, &mut file_index_receiver);
+        sync_prompt_history(&mut ui_state, &mut prompt_history_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
         terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
 
@@ -496,7 +633,33 @@ async fn execute_tui_command_with_interrupt(
         }
         TuiCommand::ToggleHelp => {
             ui_state.help_visible = !ui_state.help_visible;
+            if !ui_state.help_visible {
+                // Reset to the front-door tab so reopening always starts on
+                // Getting Started. Ephemeral UI state, never in the snapshot.
+                ui_state.help_active_tab = HelpTab::GettingStarted;
+                // Drop any Commands-tab filter so the next open starts clean.
+                ui_state.help_filter.clear();
+            }
             clear_input(state, ui_state);
+            Ok(true)
+        }
+        TuiCommand::HelpNextTab => {
+            ui_state.help_active_tab = ui_state.help_active_tab.next();
+            // Filtering is Commands-tab-local; reset it on every tab change.
+            ui_state.help_filter.clear();
+            Ok(true)
+        }
+        TuiCommand::HelpPrevTab => {
+            ui_state.help_active_tab = ui_state.help_active_tab.prev();
+            ui_state.help_filter.clear();
+            Ok(true)
+        }
+        TuiCommand::HelpFilterCharacter(ch) => {
+            ui_state.help_filter.push(ch);
+            Ok(true)
+        }
+        TuiCommand::HelpFilterBackspace => {
+            ui_state.help_filter.pop();
             Ok(true)
         }
         TuiCommand::ScrollEvents(command) => {
@@ -504,7 +667,11 @@ async fn execute_tui_command_with_interrupt(
             Ok(true)
         }
         TuiCommand::MoveInputCursor(command) => {
-            move_input_cursor(ui_state, &state.input, command);
+            // ↑/↓ walk the recall ring at the input's top/bottom boundary;
+            // otherwise (and for ←/→) they move the cursor as before.
+            if !try_recall_history(ui_state, state, command) {
+                move_input_cursor(ui_state, &state.input, command);
+            }
             Ok(true)
         }
         TuiCommand::AgentDropdown(command) => {
@@ -561,9 +728,25 @@ async fn execute_tui_command_with_interrupt(
                 clear_input(state, ui_state);
                 return Ok(true);
             }
+            // Finalize submission provenance and maintain the in-session recall
+            // ring here, where `ui_state.prompt_history_cursor` is visible
+            // (ADR-003/004): tag `Recalled` iff the composition originated from
+            // the ring, then prepend the prompt so it is recallable this session.
+            // `clear_input` (below) resets the cursor to a fresh draft.
+            let event = if let AppEvent::PromptSubmitted(prompt, _) = event {
+                let source = if ui_state.prompt_history_cursor != 0 {
+                    PromptSource::Recalled
+                } else {
+                    PromptSource::Fresh
+                };
+                record_in_session_prompt(ui_state, &prompt);
+                AppEvent::PromptSubmitted(prompt, source)
+            } else {
+                event
+            };
             let clears_input = matches!(
                 event,
-                AppEvent::PromptSubmitted(_) | AppEvent::ApprovalAnswered(_)
+                AppEvent::PromptSubmitted(_, _) | AppEvent::ApprovalAnswered(_)
             );
             if let AppEvent::ApprovalAnswered(approved) = &event {
                 if let (Some(approval_handle), Some(pending)) =
@@ -597,7 +780,7 @@ async fn execute_tui_command_with_interrupt(
 }
 
 fn matches_help_command(event: &AppEvent) -> bool {
-    matches!(event, AppEvent::PromptSubmitted(prompt) if prompt.trim() == "/help")
+    matches!(event, AppEvent::PromptSubmitted(prompt, _) if prompt.trim() == "/help")
 }
 
 fn reload_skills(state: &mut AppState, ui_state: &mut TuiUiState) {
@@ -635,6 +818,73 @@ fn sync_file_index(
     }
 }
 
+/// Project this project's recall list off the render thread and publish it to
+/// the TUI (ADR-004). `project_prompt_history` is synchronous file I/O, so it
+/// runs inside `spawn_blocking`; a join error (panic) or a closed receiver
+/// simply leaves the ring unchanged. No-op without a working directory.
+async fn refresh_prompt_history(
+    working_directory: Option<&Path>,
+    max: usize,
+    prompt_history_sender: &watch::Sender<Vec<String>>,
+) {
+    let Some(working_directory) = working_directory.map(Path::to_path_buf) else {
+        return;
+    };
+    // Recall reads the `.atelier` data root (mirrors `HistoryStore::create`),
+    // not the workspace root itself.
+    let data_root = working_directory.join(".atelier");
+    if let Ok(history) =
+        tokio::task::spawn_blocking(move || crate::history::project_prompt_history(&data_root, max))
+            .await
+    {
+        let _ = prompt_history_sender.send(history);
+    }
+}
+
+/// Kick off the one-time recall load on a detached task (mirrors
+/// `spawn_file_index_refresh`). Unlike the file-index walk this fires once at
+/// startup: recall is seeded from disk and then maintained in memory (ADR-004),
+/// so there is no periodic re-scan and the cold read never blocks the first
+/// paint.
+fn spawn_prompt_history_load(
+    working_directory: Option<PathBuf>,
+    max: usize,
+    prompt_history_sender: watch::Sender<Vec<String>>,
+) {
+    tokio::spawn(async move {
+        refresh_prompt_history(working_directory.as_deref(), max, &prompt_history_sender).await;
+    });
+}
+
+/// Spawn the recall load only when the toggle is on, returning whether it
+/// spawned. Disabled → no load and the ring stays empty (ADR-004). Split from
+/// `run_tui` so the gate is unit-testable without a terminal.
+fn maybe_spawn_prompt_history_load(
+    enabled: bool,
+    working_directory: Option<PathBuf>,
+    max: usize,
+    prompt_history_sender: watch::Sender<Vec<String>>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    spawn_prompt_history_load(working_directory, max, prompt_history_sender);
+    true
+}
+
+/// Adopt the latest published recall list into UI state (mirrors
+/// `sync_file_index`). The load publishes once at startup; later in-session
+/// submissions mutate the ring directly (task_06), and the channel does not
+/// change again, so this never clobbers them after the initial delivery.
+fn sync_prompt_history(
+    ui_state: &mut TuiUiState,
+    prompt_history_receiver: &mut watch::Receiver<Vec<String>>,
+) {
+    if prompt_history_receiver.has_changed().unwrap_or(false) {
+        ui_state.prompt_history = prompt_history_receiver.borrow_and_update().clone();
+    }
+}
+
 async fn queue_app_event(
     command_sender: &mpsc::Sender<AppWorkerCommand>,
     event: AppEvent,
@@ -652,6 +902,11 @@ const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// purpose: the walk is off-thread but still real work, so it runs rarely and
 /// only exists to surface files created mid-session.
 const FILE_INDEX_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Cadence of the roster refresh tick (ADR-004). 1 Hz keeps coarse elapsed and
+/// stall detection current during a quiet step; cheap and change-gated, so it
+/// only publishes when a row actually moves.
+const ROSTER_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Walk the working directory off the worker's async thread and publish the
 /// snapshot to the TUI. Extracted from the worker `select!` so it is
@@ -733,6 +988,14 @@ async fn run_app_worker(
     file_index_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     file_index_poll.tick().await; // consume the immediate first tick (startup covered it)
 
+    // Bounded 1 Hz roster refresh (ADR-004). Stream deltas already refresh the
+    // roster under load, so this only needs to fire while a step is quiet;
+    // `refresh_roster_tick` self-gates to active runs and change-gates before
+    // publishing. Skip missed ticks so heavy streaming can't queue a burst.
+    let mut roster_poll = tokio::time::interval(ROSTER_REFRESH_INTERVAL);
+    roster_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    roster_poll.tick().await; // consume the immediate first tick
+
     loop {
         tokio::select! {
             command = command_receiver.recv() => match command {
@@ -757,6 +1020,9 @@ async fn run_app_worker(
                     file_index_sender.clone(),
                     walk_cancel.clone(),
                 );
+            }
+            _ = roster_poll.tick() => {
+                app.refresh_roster_tick();
             }
         }
     }
@@ -802,6 +1068,50 @@ fn key_event_to_tui_command_with_ui(
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
+            // Tab navigation is handled entirely within the help-visible branch so
+            // these keys never leak to the base handler. Right/Tab advance; Left/
+            // Shift-Tab retreat. Shift-Tab is distinguished by the SHIFT modifier.
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => Some(TuiCommand::HelpNextTab),
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::BackTab,
+                ..
+            } => Some(TuiCommand::HelpPrevTab),
+            // Commands-tab type-to-filter (Phase 2): printable characters and
+            // Backspace narrow the command list via `help_filter`. Captured only
+            // on the Commands tab; every other tab leaves typed text inert. Nav
+            // keys above (arrows/Tab) are not `Char` codes, so they never conflict.
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if ui_state.help_active_tab == HelpTab::Commands => {
+                Some(TuiCommand::HelpFilterBackspace)
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if ui_state.help_active_tab == HelpTab::Commands
+                && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT) =>
+            {
+                Some(TuiCommand::HelpFilterCharacter(ch))
+            }
             _ => None,
         }
     } else if state.pending_clarification.is_some() {
@@ -1136,6 +1446,10 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
             ..
         } => Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
             state.input.clone(),
+            // Placeholder: this routing layer has no `ui_state`, so the real
+            // provenance (Recalled iff the composition came from the ring) is
+            // finalized in the `Dispatch` arm of `execute_tui_command`.
+            PromptSource::Fresh,
         ))),
         KeyEvent {
             code: KeyCode::Backspace,
@@ -1186,6 +1500,10 @@ fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
     state.input.clear();
     ui_state.input_cursor = 0;
     ui_state.input_preferred_col = None;
+    // Clearing returns the composer to a fresh live draft, so recall starts over
+    // from the newest entry and the next submission is Fresh (ADR-003).
+    ui_state.prompt_history_cursor = 0;
+    ui_state.prompt_history_draft.clear();
     clear_command_dropdown_dismissal(ui_state);
     clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
@@ -1232,6 +1550,12 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     ui_state.input_cursor = removed_char_index;
     ui_state.input_preferred_col = None;
     ui_state.status_message = None;
+    // Backspacing a recalled composition all the way to empty returns to a fresh
+    // live draft, so a delete-all-then-retype is tagged Fresh (ADR-003).
+    if state.input.is_empty() {
+        ui_state.prompt_history_cursor = 0;
+        ui_state.prompt_history_draft.clear();
+    }
     clear_command_dropdown_dismissal(ui_state);
     clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
@@ -1277,6 +1601,108 @@ fn move_input_cursor_vertically(
     let line_end = line_start.saturating_add(width).min(input_len);
     ui_state.input_cursor = line_start.saturating_add(preferred_col).min(line_end);
     ui_state.input_preferred_col = Some(preferred_col);
+}
+
+/// Walk the recall ring in response to ↑/↓ at the input's top/bottom visual-row
+/// boundary, returning whether the key was consumed (the caller falls back to
+/// ordinary cursor navigation on `false`). ADR-001/003:
+///
+/// - Recall fires only at the boundary (`current_line == 0` for ↑, the last
+///   visual row for ↓), reusing the same row math as
+///   `move_input_cursor_vertically`. Inside a wrapped draft or recalled entry,
+///   ↑/↓ keep moving the cursor — this gate is what avoids the #1 competitor
+///   bug (multi-line collision).
+/// - The live draft is saved when entering history (cursor `0 → 1`) and restored
+///   when ↓ steps back past the newest entry (cursor `1 → 0`).
+/// - Each step replaces `state.input` and parks the cursor at the end of the
+///   recalled text; `prompt_history_cursor` tracks depth (`0` = live draft,
+///   `N` = Nth-newest entry).
+///
+/// Yields entirely when the ring is empty (which also covers the disabled case,
+/// since the loader never populates it). Dropdown / queue / clarification
+/// precedence is handled upstream in `key_event_to_tui_command_with_ui`, so this
+/// is only ever reached for plain-input ↑/↓.
+fn try_recall_history(
+    ui_state: &mut TuiUiState,
+    state: &mut AppState,
+    command: InputCursorCommand,
+) -> bool {
+    if ui_state.prompt_history.is_empty() {
+        return false;
+    }
+    clamp_input_cursor(ui_state, &state.input);
+    let width = ui_state.input_width.max(1);
+    let input_len = input_char_count(&state.input);
+    let current_line = ui_state.input_cursor / width;
+    let last_line = input_len / width;
+    match command {
+        InputCursorCommand::Up => {
+            if current_line != 0 {
+                return false; // mid-draft: let the cursor move up a visual row
+            }
+            if ui_state.prompt_history_cursor >= ui_state.prompt_history.len() {
+                return true; // already at the oldest entry — consume, no change
+            }
+            if ui_state.prompt_history_cursor == 0 {
+                ui_state.prompt_history_draft = state.input.clone();
+            }
+            ui_state.prompt_history_cursor += 1;
+            let entry = ui_state.prompt_history[ui_state.prompt_history_cursor - 1].clone();
+            set_recalled_input(ui_state, state, entry);
+            true
+        }
+        InputCursorCommand::Down => {
+            if current_line != last_line {
+                return false; // mid-draft: let the cursor move down a visual row
+            }
+            if ui_state.prompt_history_cursor == 0 {
+                return false; // on the live draft — nothing newer to recall
+            }
+            ui_state.prompt_history_cursor -= 1;
+            let text = if ui_state.prompt_history_cursor == 0 {
+                // Stepped past the newest entry → restore the saved live draft.
+                ui_state.prompt_history_draft.clone()
+            } else {
+                ui_state.prompt_history[ui_state.prompt_history_cursor - 1].clone()
+            };
+            set_recalled_input(ui_state, state, text);
+            true
+        }
+        InputCursorCommand::Left | InputCursorCommand::Right => false,
+    }
+}
+
+/// Replace the composer with a recalled entry (or the restored draft): set the
+/// text, park the cursor at its end, and run the same dropdown/status
+/// housekeeping as ordinary input edits so discovery re-activates cleanly.
+fn set_recalled_input(ui_state: &mut TuiUiState, state: &mut AppState, text: String) {
+    ui_state.input_cursor = input_char_count(&text);
+    ui_state.input_preferred_col = None;
+    ui_state.status_message = None;
+    state.input = text;
+    clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
+    reset_dropdown_selections(ui_state);
+}
+
+/// Keep the in-session recall ring current by prepending a just-submitted prompt
+/// (ADR-004), so this session's prompts are recallable without a disk reload:
+/// newest-first, consecutive-deduped, capped to `prompt_history_max`. A no-op
+/// when recall is disabled (so a disabled session never builds a recallable
+/// ring), for empty submissions, and for leading-space prompts (the secrets
+/// escape hatch — matching the projection's filters).
+fn record_in_session_prompt(ui_state: &mut TuiUiState, prompt: &str) {
+    if !ui_state.prompt_history_enabled || prompt.trim().is_empty() || prompt.starts_with(' ') {
+        return;
+    }
+    // Consecutive-dedup: don't stack an identical prompt on the current front.
+    if ui_state.prompt_history.first().map(String::as_str) == Some(prompt) {
+        return;
+    }
+    ui_state.prompt_history.insert(0, prompt.to_string());
+    ui_state
+        .prompt_history
+        .truncate(ui_state.prompt_history_max);
 }
 
 fn scroll_events(ui_state: &mut TuiUiState, command: EventScrollCommand) {
@@ -1370,9 +1796,7 @@ fn refresh_skill_suggestions(
 }
 
 fn skill_cache_path(working_directory: &Path) -> PathBuf {
-    working_directory
-        .join(".multiagent")
-        .join("skills-cache.json")
+    working_directory.join(".atelier").join("skills-cache.json")
 }
 
 fn read_cached_skill_suggestions(
@@ -2130,56 +2554,8 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
             .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
             .split(main_area);
 
-        let roster_items = state
-            .agents
-            .iter()
-            .enumerate()
-            .map(|(index, agent)| {
-                let availability = availability_label(&agent.availability);
-                ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{} ", agent.name),
-                            Style::default()
-                                .fg(theme.accent_for(index))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            agent_status_label(&agent.status),
-                            status_style(&theme, &agent.status),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{}/{} ", agent.runtime, agent.model),
-                            Style::default().fg(theme.text_muted),
-                        ),
-                        Span::styled(
-                            availability,
-                            availability_style(&theme, &agent.availability),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("effort:{} ", agent.effort),
-                            Style::default().fg(theme.text_muted),
-                        ),
-                        Span::styled(
-                            if agent.thinking {
-                                "thinking:on"
-                            } else {
-                                "thinking:off"
-                            },
-                            if agent.thinking {
-                                Style::default().fg(theme.accent)
-                            } else {
-                                Style::default().fg(theme.text_dim)
-                            },
-                        ),
-                    ]),
-                ])
-            })
-            .collect::<Vec<_>>();
+        let roster_items =
+            agent_roster_items(&state.roster_rows, ui_state.work_spinner_frame, &theme);
         let roster = List::new(roster_items).block(
             Block::default()
                 .title(" Agent Roster ")
@@ -2204,7 +2580,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         render_clarification_composer(frame, areas.input, clarification, ui_state);
         render_clarification_status(frame, areas.status, &theme, clarification.multi_select);
         if ui_state.help_visible {
-            render_help_modal(frame, &theme);
+            render_help_modal(frame, state, ui_state, &theme);
         } else {
             set_clarification_cursor(frame, areas.input, clarification, ui_state);
         }
@@ -2228,7 +2604,13 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     )
     .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
     frame.render_widget(input, input_areas.input);
-    render_input_status(frame, input_areas.status, ui_state, work_active);
+    render_input_status(
+        frame,
+        input_areas.status,
+        ui_state,
+        work_active,
+        state.input.is_empty(),
+    );
     render_footer(frame, input_areas.footer, state, &theme);
     // Dropdown precedence mirrors key routing: agent, then skill, then the
     // `@` file mention, then the top-level command dropdown. Help takes over the
@@ -2246,7 +2628,7 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         }
     }
     if ui_state.help_visible {
-        render_help_modal(frame, &theme);
+        render_help_modal(frame, state, ui_state, &theme);
     } else {
         set_input_cursor(frame, input_areas.input, input_layout);
     }
@@ -2381,18 +2763,27 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
             &welcome_facts,
         )
     } else if let Some(pending) = &state.pending_approval {
-        vec![
-            Line::from(format!(
-                "Approval required for {} action {}.",
-                pending.agent, pending.action_id
-            )),
-            Line::from(
-                pending
-                    .diagnostic
-                    .as_deref()
-                    .unwrap_or("Approve or deny the pending action."),
-            ),
-        ]
+        let mut lines = Vec::new();
+        // First-approval explainer: a single muted line shown at most once per
+        // user (ADR-004), gated by the persisted latch via `AppState`. Additive —
+        // the approval prompt below is unchanged.
+        if state.show_first_approval_explainer {
+            lines.push(Line::styled(
+                crate::app::chat::FIRST_APPROVAL_EXPLAINER,
+                Style::default().fg(theme.text_muted),
+            ));
+        }
+        lines.push(Line::from(format!(
+            "Approval required for {} action {}.",
+            pending.agent, pending.action_id
+        )));
+        lines.push(Line::from(
+            pending
+                .diagnostic
+                .as_deref()
+                .unwrap_or("Approve or deny the pending action."),
+        ));
+        lines
     } else if state.events.is_empty() {
         vec![Line::from("No chat yet.")]
     } else {
@@ -2498,12 +2889,14 @@ fn render_agent_dropdown(
         .skip(first_visible)
         .take(visible_count)
         .map(|(index, suggestion)| {
-            // Resolve the agent's accent by its roster position so the dropdown
-            // matches the roster/chat coloring for the same agent.
+            // Single-source accent rule (ADR-005, task_07; see `item_agent_accent`):
+            // resolve the accent by the agent's canonical identity index — its
+            // position in the canonical `agents` slice, found by `id` — so the
+            // dropdown matches the roster/chat color regardless of dropdown rank.
             let accent = agents
                 .iter()
                 .position(|agent| agent.id == suggestion.id)
-                .map(|roster_index| theme.accent_for(roster_index))
+                .map(|canonical_index| theme.accent_for(canonical_index))
                 .unwrap_or(theme.accent);
             agent_dropdown_item(theme, suggestion, index == selected, accent)
         })
@@ -3122,9 +3515,23 @@ fn agent_index_for_title(agents: &[AgentView], title: &str) -> Option<usize> {
 }
 
 /// Accent for an agent-attributed item's title: the owning agent's round-robin
-/// color (ADR-006). `None` for non-attributed kinds or unmatched agents, so the
-/// caller falls back to severity styling. Consistent with the roster/dropdown
-/// because all three resolve through `theme.accent_for(roster_index)`.
+/// color. `None` for non-attributed kinds or unmatched agents, so the caller
+/// falls back to severity styling.
+///
+/// Single-source accent rule (ADR-005, task_07): an agent's color is anchored to
+/// its **canonical identity index**, never its render-time position. All three
+/// surfaces resolve the same index for a given agent:
+///
+/// 1. roster — `RosterRow.accent_index` (canonical, fixed before the
+///    `NeedsInput` pin reorders rows), read in `roster_row_item`;
+/// 2. chat — `agent_index_for_title` looks the agent up in the canonical
+///    `agents` slice (this function);
+/// 3. `/agent:` dropdown — `agents.position(|a| a.id == suggestion.id)`.
+///
+/// So the pin can never recolor an agent or break its link to the transcript.
+/// RISK: a future fourth surface that derives accent from a display position
+/// would silently break this contract — route any new accent through one of the
+/// canonical-index lookups above.
 fn item_agent_accent(theme: &Theme, agents: &[AgentView], item: &ChatItemView) -> Option<Color> {
     if !matches!(
         item.kind,
@@ -3267,51 +3674,44 @@ fn wrapped_event_line_count(lines: &[Line<'_>], width: u16) -> usize {
         .sum()
 }
 
-fn render_help_modal(frame: &mut Frame, theme: &Theme) {
+/// Tabbed help overlay. Pure function of `(AppState, TuiUiState, Theme)` — reads
+/// no `App` internals. Draws a theme-token tab strip (active tab highlighted) and
+/// dispatches on `ui_state.help_active_tab` to the matching per-tab builder. The
+/// default tab (`GettingStarted`) renders on open. Tab navigation is handled in the
+/// key-routing layer (task 07); this render just reflects `help_active_tab`.
+fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState, theme: &Theme) {
     let area = centered_rect(78, 100, frame.area());
-    let section_header = |label: &'static str, color| {
-        Line::from(vec![
-            Span::styled(
-                label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" commands", Style::default().fg(theme.text)),
-        ])
+    let active = ui_state.help_active_tab;
+
+    // Tab strip: every `HelpTab::ALL` title, the active one highlighted via theme
+    // tokens only (no inline color literals — ADR-003 rejects `ratatui::Tabs`).
+    let mut strip: Vec<Span<'static>> = Vec::new();
+    for (index, tab) in HelpTab::ALL.iter().enumerate() {
+        if index > 0 {
+            strip.push(Span::styled("  ", Style::default().fg(theme.text_dim)));
+        }
+        let style = if *tab == active {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.text_muted)
+        };
+        strip.push(Span::styled(tab.title(), style));
+    }
+    let mut lines = vec![Line::from(strip), Line::from("")];
+
+    // Render the active tab body by dispatching to its per-tab builder.
+    let body = match active {
+        HelpTab::GettingStarted => getting_started_lines(state, theme),
+        HelpTab::Commands => commands_tab_lines(&ui_state.help_filter, theme),
+        HelpTab::Keys => keys_tab_lines(theme),
+        HelpTab::Skills => skills_tab_lines(ui_state, theme),
+        HelpTab::Approvals => approvals_tab_lines(theme),
+        HelpTab::Cli => cli_tab_lines(theme),
     };
-    let mut lines = vec![section_header("TUI", theme.accent)];
-    // Slash-command rows come from the shared catalog so help stays aligned
-    // with the dropdown and unknown-command guidance (ADR-003). Non-command
-    // rows (keys, scrolling, CLI flags) stay literal below.
-    lines.extend(
-        crate::slash_commands::help_command_lines()
-            .into_iter()
-            .map(Line::from),
-    );
-    lines.extend([
-        Line::from("Enter                submit prompt or answer approval"),
-        Line::from("Ctrl-L               show or hide Agent Roster"),
-        Line::from("Arrow keys           move input cursor"),
-        Line::from("PageUp/PageDown     scroll Chat by page"),
-        Line::from("Mouse wheel         scroll Chat by line"),
-        Line::from("Home/End            jump Chat to top/latest"),
-        Line::from("Ctrl-C               interrupt active run and exit"),
-        Line::from("Backspace            delete input character"),
-        Line::from("Text                 edit the input composer"),
-        Line::from(""),
-    ]);
-    lines.push(section_header("CLI", theme.status_ok));
-    lines.extend([
-        Line::from("atelier                            open the TUI"),
-        Line::from("atelier --cwd <path>               run from a workspace"),
-        Line::from("atelier --config <path>            use a config file"),
-        Line::from("atelier --doctor [--json]          check runtimes and history"),
-        Line::from("atelier --print-config             print merged config"),
-        Line::from("atelier --init-config              create config files"),
-        Line::from("atelier --codemap init|changes|update manage repo maps"),
-        Line::from("atelier --clean-sessions [--yes]   delete local history"),
-        Line::from("atelier --debug                    write debug events"),
-        Line::from("atelier --help                     print CLI help"),
-    ]);
+    lines.extend(body);
+
     let help = Paragraph::new(lines)
         .style(Style::default().fg(theme.text).bg(theme.ink))
         .block(
@@ -3329,6 +3729,218 @@ fn render_help_modal(frame: &mut Frame, theme: &Theme) {
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
     frame.render_widget(help, area);
+}
+
+/// Keybinding rows for the Keys help tab. Relocated verbatim from the pre-tab
+/// `render_help_modal` literals; pure builder consumed by the tabbed render
+/// (task 06). No `AppState`/`TuiUiState` reads.
+fn keys_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from("Enter                submit prompt or answer approval"),
+        Line::from("Ctrl-L               show or hide Agent Roster"),
+        Line::from("Arrow keys           move input cursor"),
+        Line::from("↑/↓ at input edges   recall recent prompts"),
+        Line::from("PageUp/PageDown     scroll Chat by page"),
+        Line::from("Mouse wheel         scroll Chat by line"),
+        Line::from("Home/End            jump Chat to top/latest"),
+        Line::from("Ctrl-C               interrupt active run and exit"),
+        Line::from("Backspace            delete input character"),
+        Line::from("Text                 edit the input composer"),
+    ]
+}
+
+/// CLI flag rows for the CLI help tab. Relocated verbatim from the pre-tab
+/// `render_help_modal` literals; pure builder consumed by the tabbed render
+/// (task 06). No `AppState`/`TuiUiState` reads.
+fn cli_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from("atelier                            open the TUI"),
+        Line::from("atelier --cwd <path>               run from a workspace"),
+        Line::from("atelier --config <path>            use a config file"),
+        Line::from("atelier --doctor [--json]          check runtimes and history"),
+        Line::from("atelier --print-config             print merged config"),
+        Line::from("atelier --init-config              create config files"),
+        Line::from("atelier --codemap init|changes|update manage repo maps"),
+        Line::from("atelier --clean-sessions [--yes]   delete local history"),
+        Line::from("atelier --debug                    write debug events"),
+        Line::from("atelier --help                     print CLI help"),
+    ]
+}
+
+/// Static Approvals & Modes prose for the help tab (ADR-001: static in V1).
+/// Plain-language explanation of the two approval modes, agent capabilities,
+/// and the workspace read/write-roots concept. Net-new content; pure builder
+/// consumed by the tabbed render (task 06). No `AppState`/`TuiUiState` reads.
+fn approvals_tab_lines(theme: &Theme) -> Vec<Line<'static>> {
+    let header = |label: &'static str| {
+        Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let body = |text: &'static str| Line::from(Span::styled(text, Style::default().fg(theme.text)));
+    vec![
+        header("Approval modes"),
+        body("yolo (default): agents act without asking — file writes and"),
+        body("commands run automatically. Best for trusted, fast iteration."),
+        body("normal: every write or command pauses for your approval before"),
+        body("it runs. Read-only actions still proceed without a prompt."),
+        Line::from(""),
+        header("Capabilities"),
+        body("Each agent is granted only the capabilities it needs (read,"),
+        body("edit, command, plan, review …). An agent cannot take an action"),
+        body("its profile does not allow, regardless of approval mode."),
+        Line::from(""),
+        header("Read / write roots"),
+        body("The workspace sets which paths agents may touch. Writes are"),
+        body("confined to the write roots; reads to the read roots. Anything"),
+        body("outside those roots is off-limits even in yolo mode."),
+    ]
+}
+
+/// Getting Started tab body — the default help front door. Renders, in order:
+/// a one-line routing mental model, two copy-pasteable example prompts, then a
+/// compact live agent summary (one row per configured agent via
+/// `agent_compact_line`, the shared `Compact` row definition). Pure builder
+/// consumed by the tabbed render (task 06).
+fn getting_started_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let header = |label: &'static str| {
+        Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let body = |text: &'static str| Line::from(Span::styled(text, Style::default().fg(theme.text)));
+    // Copy-pasteable example prompts (PRD Open Question): real, runnable, and
+    // read-first so a newcomer can try them safely. Marked with `> `.
+    let example = |text: &'static str| {
+        Line::from(Span::styled(
+            format!("> {text}"),
+            Style::default().fg(theme.text_muted),
+        ))
+    };
+    let mut lines = vec![
+        header("How Atelier works"),
+        body("Your prompt -> orchestrator -> named agents do the work."),
+        body("In normal mode, approvals gate every file write and command."),
+        Line::from(""),
+        header("Try a prompt"),
+        example("Summarize what this project does and how the run loop works."),
+        example("Find where approval mode is enforced and add a test for it."),
+        Line::from(""),
+        header("Your agents"),
+    ];
+    if state.agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No agents configured.",
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        lines.extend(
+            state
+                .agents
+                .iter()
+                .enumerate()
+                .map(|(index, agent)| agent_compact_line(index, agent, theme)),
+        );
+    }
+    lines
+}
+
+/// Commands tab body — derived from `slash_commands::catalog()` so the tab never
+/// drifts from the dropdown or unknown-command guidance. A leading filter line
+/// echoes the current `help_filter`; rows are narrowed by a case-insensitive
+/// `.contains()` over each command's usage/label (mirroring `skill_suggestions`
+/// filtering). An empty filter shows every command; a no-match filter renders an
+/// empty-result indicator. Pure builder consumed by the tabbed render. The usage
+/// column is padded from the full catalog so alignment stays stable while filtered.
+fn commands_tab_lines(filter: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let needle = filter.to_ascii_lowercase();
+    let catalog = crate::slash_commands::catalog();
+    let usage_width = catalog
+        .iter()
+        .map(|spec| spec.usage.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    // Filter line: echo the typed text so the user sees what they're narrowing
+    // by; a dim hint stands in when the buffer is empty.
+    let filter_line = if filter.is_empty() {
+        Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(theme.accent)),
+            Span::styled(
+                "(type to narrow commands)",
+                Style::default().fg(theme.text_dim),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(theme.accent)),
+            Span::styled(filter.to_string(), Style::default().fg(theme.text)),
+        ])
+    };
+    let mut lines = vec![filter_line, Line::from("")];
+
+    let matches: Vec<&crate::slash_commands::SlashCommandSpec> = catalog
+        .iter()
+        .filter(|spec| {
+            needle.is_empty()
+                || spec.usage.to_ascii_lowercase().contains(&needle)
+                || spec.label.to_ascii_lowercase().contains(&needle)
+        })
+        .collect();
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("No commands match \"{filter}\"."),
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        lines.extend(
+            matches.into_iter().map(|spec| {
+                Line::from(format!("{:usage_width$}  {}", spec.usage, spec.description))
+            }),
+        );
+    }
+    lines
+}
+
+/// Skills tab body — live from `ui_state.skill_suggestions` (project + personal
+/// discovery). Lists each skill's `/skill:` alias with its source tag, renders
+/// an empty-state line when no skills are discovered, and always closes with the
+/// guidance disclaimer (skills do not bypass approvals/permissions). Pure builder
+/// consumed by the tabbed render (task 06).
+fn skills_tab_lines(ui_state: &TuiUiState, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if ui_state.skill_suggestions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No skills discovered in .agents/skills or .claude/skills.",
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        for suggestion in &ui_state.skill_suggestions {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("/skill:{} ", suggestion.alias),
+                    Style::default().fg(theme.accent),
+                ),
+                Span::styled(
+                    format!("[{}]", suggestion.source_tag.label()),
+                    Style::default().fg(theme.text_muted),
+                ),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Skills are guidance and do not bypass approvals or permissions.",
+        Style::default().fg(theme.text_dim),
+    )));
+    lines
 }
 
 fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
@@ -3398,6 +4010,36 @@ fn agent_status_label(status: &str) -> &str {
     }
 }
 
+/// Glyph vocabulary for the four-state activity model (ADR-002). Set 1 uses
+/// portable BMP circles so each state reads without color; `ascii` swaps to a
+/// 7-bit fallback for constrained terminals. Plain text only — no inline color
+/// literals — so legibility is carried by the glyph plus [`activity_label`]
+/// alone (NO_COLOR criterion). Consumed by the roster render (`roster_row_item`).
+fn activity_glyph(state: ActivityState, ascii: bool) -> &'static str {
+    match (state, ascii) {
+        (ActivityState::Active, false) => "◐",
+        (ActivityState::NeedsInput, false) => "◔",
+        (ActivityState::Stalled, false) => "○",
+        (ActivityState::Idle, false) => "·",
+        (ActivityState::Active, true) => ">",
+        (ActivityState::NeedsInput, true) => "?",
+        (ActivityState::Stalled, true) => "!",
+        (ActivityState::Idle, true) => ".",
+    }
+}
+
+/// Distinct, non-empty text label per activity state (ADR-002). Pairs with
+/// [`activity_glyph`] so the roster stays legible under `NO_COLOR`. Consumed by
+/// the roster render (`roster_row_item`).
+fn activity_label(state: ActivityState) -> &'static str {
+    match state {
+        ActivityState::Active => "working",
+        ActivityState::NeedsInput => "waiting",
+        ActivityState::Stalled => "stalled?",
+        ActivityState::Idle => "idle",
+    }
+}
+
 fn availability_style(
     theme: &Theme,
     availability: &Option<crate::runtime::RuntimeAvailability>,
@@ -3427,6 +4069,182 @@ fn availability_label(availability: &Option<crate::runtime::RuntimeAvailability>
         Some(crate::runtime::RuntimeAvailabilityStatus::Unavailable) => "down",
         Some(crate::runtime::RuntimeAvailabilityStatus::Unknown) | None => "?",
     }
+}
+
+/// Single compact agent row (`name · runtime/model · availability`) shared by
+/// the `Compact` roster style and the Getting Started help tab. Extracted so
+/// both surfaces render a compact row from one definition: the Getting Started
+/// builder returns `Vec<Line>` and cannot consume `agent_roster_items`' opaque
+/// `ListItem`s, so the shared core is the line, not the list item. Agent colors
+/// cycle via `theme.accent_for(index)`.
+fn agent_compact_line(index: usize, agent: &AgentView, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{} ", agent.name),
+            Style::default()
+                .fg(theme.accent_for(index))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{}/{} ", agent.runtime, agent.model),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            availability_label(&agent.availability),
+            availability_style(theme, &agent.availability),
+        ),
+    ])
+}
+
+/// Builds the per-agent roster rows shared by the Ctrl-L Agent Roster and the
+/// Getting Started help tab. `Full` reproduces the three-line roster row
+/// (name + status / `runtime/model` + availability / effort + thinking state);
+/// `Compact` renders a single line (name · `runtime/model` · availability label).
+/// Quarter-circle frames cycled by `work_spinner_frame` so an `Active` agent's
+/// glyph visibly turns (ADR-002). Frame 0 is `◐` so a single static render
+/// matches [`activity_glyph`]`(Active, _)`. All BMP, no emoji presentation.
+const ROSTER_ACTIVE_SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+/// Build the roster list from the pre-computed [`RosterRow`] view-model (ADR-003):
+/// a summary-header line followed by one item per row. The renderer stays a pure
+/// function of `AppState` — every time-dependent value is read from the row, and
+/// agent colors come from `row.accent_index` (canonical identity, ADR-005), never
+/// the render-time position, so the `NeedsInput` pin cannot recolor an agent.
+fn agent_roster_items(
+    rows: &[RosterRow],
+    spinner_frame: usize,
+    theme: &Theme,
+) -> Vec<ListItem<'static>> {
+    let mut items = vec![roster_summary_header_item(rows, theme)];
+    items.extend(
+        rows.iter()
+            .map(|row| roster_row_item(row, spinner_frame, theme)),
+    );
+    items
+}
+
+/// One-line activity census above the roster (ADR-001 item: summary header).
+/// At rest it shows a calm lineup count; during a run it shows working/waiting/
+/// stalled counts with portable glyphs. Theme tokens only — no inline colors.
+fn roster_summary_header_item(rows: &[RosterRow], theme: &Theme) -> ListItem<'static> {
+    let mut working = 0usize;
+    let mut waiting = 0usize;
+    let mut stalled = 0usize;
+    for row in rows {
+        match row.activity {
+            ActivityState::Active => working += 1,
+            ActivityState::NeedsInput => waiting += 1,
+            ActivityState::Stalled => stalled += 1,
+            ActivityState::Idle => {}
+        }
+    }
+    let line = if working == 0 && waiting == 0 && stalled == 0 {
+        Line::from(Span::styled(
+            format!("● {} agents idle", rows.len()),
+            Style::default().fg(theme.text_dim),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!("▶ {working} working · ◔ {waiting} waiting · ○ {stalled} stalled"),
+            Style::default()
+                .fg(theme.text_muted)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    ListItem::new(line)
+}
+
+/// Render one roster row: glyph + activity label + name on the lead line (weight
+/// driven by activity), then runtime/model + effort/thinking, and — for active
+/// states only — the pre-formatted current step and coarse elapsed. Terminal and
+/// plain-idle rows keep the existing status label instead of an activity glyph.
+fn roster_row_item(row: &RosterRow, spinner_frame: usize, theme: &Theme) -> ListItem<'static> {
+    // Single-source accent rule (ADR-005, task_07; see `item_agent_accent`):
+    // canonical identity index, never the render-time row position — so the
+    // `NeedsInput` pin reorders rows without recoloring any agent.
+    let accent = theme.accent_for(row.accent_index);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let mut lead: Vec<Span<'static>> = Vec::new();
+    let active_states = !matches!(row.activity, ActivityState::Idle);
+    if active_states {
+        let glyph = if matches!(row.activity, ActivityState::Active) {
+            ROSTER_ACTIVE_SPINNER[spinner_frame % ROSTER_ACTIVE_SPINNER.len()]
+        } else {
+            activity_glyph(row.activity.clone(), false)
+        };
+        // Active rows are bold and brightly named; waiting/stalled stay normal
+        // weight but keep the prominent glyph + label (ADR-001).
+        let name_style = if matches!(row.activity, ActivityState::Active) {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(accent)
+        };
+        lead.push(Span::styled(
+            format!("{glyph} {} ", activity_label(row.activity.clone())),
+            Style::default().fg(theme.text),
+        ));
+        lead.push(Span::styled(row.name.clone(), name_style));
+    } else {
+        // Idle recedes via the DIM modifier, but the name keeps its identity
+        // accent (ADR-005) — never `text_dim`, or it loses the agent color that
+        // links the roster to the chat transcript. Terminal statuses keep their
+        // labelled badge.
+        lead.push(Span::styled(
+            format!("{} ", row.name),
+            Style::default().fg(accent).add_modifier(Modifier::DIM),
+        ));
+        if row.status != "idle" {
+            lead.push(Span::styled(
+                agent_status_label(&row.status).to_string(),
+                status_style(theme, &row.status),
+            ));
+        }
+    }
+    lines.push(Line::from(lead));
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{} ", row.runtime_model),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            format!("effort:{} ", row.effort),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            if row.thinking {
+                "thinking:on"
+            } else {
+                "thinking:off"
+            },
+            if row.thinking {
+                Style::default().fg(theme.accent)
+            } else {
+                Style::default().fg(theme.text_dim)
+            },
+        ),
+    ]));
+
+    // Step + elapsed are pre-formatted on the row (active states only).
+    if row.current_step.is_some() || row.elapsed.is_some() {
+        let mut detail = String::new();
+        if let Some(step) = &row.current_step {
+            detail.push_str(step);
+        }
+        if let Some(elapsed) = &row.elapsed {
+            if !detail.is_empty() {
+                detail.push_str(" | ");
+            }
+            detail.push_str(elapsed);
+        }
+        lines.push(Line::from(Span::styled(
+            detail,
+            Style::default().fg(theme.text_dim),
+        )));
+    }
+
+    ListItem::new(lines)
 }
 
 fn work_indicator_active(state: &AppState) -> bool {
@@ -3471,6 +4289,7 @@ fn render_input_status(
     status_area: Rect,
     ui_state: &mut TuiUiState,
     work_active: bool,
+    input_empty: bool,
 ) {
     if status_area.width == 0 || status_area.height == 0 {
         return;
@@ -3493,7 +4312,14 @@ fn render_input_status(
     } else {
         0
     };
-    let hint_width = WORK_HINT.chars().count();
+    // Advertise ↑/↓ recall only when it can actually fire: no active work, an
+    // empty composer, and a non-empty ring. Otherwise keep the plain /help hint.
+    let hint = if !work_active && input_empty && !ui_state.prompt_history.is_empty() {
+        HISTORY_HINT
+    } else {
+        WORK_HINT
+    };
+    let hint_width = hint.chars().count();
     let mut spans = Vec::new();
     if work_active {
         let spinner = WORK_SPINNER_FRAMES[ui_state.work_spinner_frame % WORK_SPINNER_FRAMES.len()];
@@ -3522,7 +4348,7 @@ fn render_input_status(
             " ".repeat(line_width.saturating_sub(left_width + hint_width)),
         ));
         spans.push(Span::styled(
-            WORK_HINT,
+            hint,
             Style::default()
                 .fg(theme.text_muted)
                 .add_modifier(Modifier::BOLD),
@@ -4112,6 +4938,344 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn help_tab_all_is_ordered_and_complete() {
+        assert_eq!(HelpTab::ALL.len(), 6);
+        assert_eq!(HelpTab::ALL[0], HelpTab::GettingStarted);
+        assert_eq!(*HelpTab::ALL.last().unwrap(), HelpTab::Cli);
+        assert_eq!(
+            HelpTab::ALL,
+            [
+                HelpTab::GettingStarted,
+                HelpTab::Commands,
+                HelpTab::Keys,
+                HelpTab::Skills,
+                HelpTab::Approvals,
+                HelpTab::Cli,
+            ]
+        );
+    }
+
+    #[test]
+    fn help_tab_next_wraps_around() {
+        assert_eq!(HelpTab::GettingStarted.next(), HelpTab::Commands);
+        assert_eq!(HelpTab::Commands.next(), HelpTab::Keys);
+        assert_eq!(HelpTab::Cli.next(), HelpTab::GettingStarted);
+    }
+
+    #[test]
+    fn help_tab_prev_wraps_around() {
+        assert_eq!(HelpTab::GettingStarted.prev(), HelpTab::Cli);
+        assert_eq!(HelpTab::Commands.prev(), HelpTab::GettingStarted);
+        assert_eq!(HelpTab::Cli.prev(), HelpTab::Approvals);
+    }
+
+    #[test]
+    fn help_tab_next_prev_round_trip_for_every_tab() {
+        for tab in HelpTab::ALL {
+            assert_eq!(tab.next().prev(), tab);
+            assert_eq!(tab.prev().next(), tab);
+        }
+    }
+
+    #[test]
+    fn help_tab_titles_are_correct() {
+        assert_eq!(HelpTab::GettingStarted.title(), "Getting Started");
+        assert_eq!(HelpTab::Commands.title(), "Commands");
+        assert_eq!(HelpTab::Keys.title(), "Keys");
+        assert_eq!(HelpTab::Skills.title(), "Skills");
+        assert_eq!(HelpTab::Approvals.title(), "Approvals");
+        assert_eq!(HelpTab::Cli.title(), "CLI");
+    }
+
+    #[test]
+    fn roster_row_style_variants_are_distinct() {
+        assert_ne!(RosterRowStyle::Full, RosterRowStyle::Compact);
+    }
+
+    /// Renders a built list of roster items to flattened buffer text so tests can
+    /// assert on the visible content without reaching into `ListItem` internals.
+    fn roster_items_to_text(items: Vec<ListItem<'static>>, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(List::new(items), frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn unavailable_agent_view() -> AgentView {
+        AgentView {
+            id: "fixer".to_string(),
+            name: "Fixer".to_string(),
+            runtime: "codex".to_string(),
+            model: "default".to_string(),
+            effort: "high".to_string(),
+            thinking: false,
+            capabilities: vec!["read".to_string()],
+            availability: Some(RuntimeAvailability {
+                runtime_id: "codex".to_string(),
+                status: RuntimeAvailabilityStatus::Unavailable,
+                message: "missing command".to_string(),
+                remediation: None,
+            }),
+            status: "running".to_string(),
+        }
+    }
+
+    fn roster_row(
+        agent_id: &str,
+        name: &str,
+        accent_index: usize,
+        activity: ActivityState,
+        current_step: Option<&str>,
+        elapsed: Option<&str>,
+    ) -> RosterRow {
+        RosterRow {
+            agent_id: agent_id.to_string(),
+            name: name.to_string(),
+            accent_index,
+            activity,
+            runtime_model: "fake/default".to_string(),
+            effort: "medium".to_string(),
+            thinking: false,
+            current_step: current_step.map(str::to_string),
+            elapsed: elapsed.map(str::to_string),
+            status: "idle".to_string(),
+        }
+    }
+
+    /// Populate `state.roster_rows` from `agents`/`live_steps` the way
+    /// `publish_state` does in production, so full-frame render tests see the
+    /// roster they expect (the renderer reads `roster_rows`, never `agents`).
+    fn populate_roster_rows(state: &mut AppState) {
+        state.roster_rows = crate::app::build_roster_rows(
+            &state.agents,
+            &state.live_steps,
+            &std::collections::BTreeMap::new(),
+            std::time::Instant::now(),
+        );
+    }
+
+    #[test]
+    fn agent_roster_items_emits_header_then_one_item_per_row() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![
+            roster_row(
+                "fixer",
+                "Fixer",
+                0,
+                ActivityState::Active,
+                Some("patching"),
+                Some("12s"),
+            ),
+            roster_row("planner", "Planner", 1, ActivityState::Idle, None, None),
+        ];
+        let items = agent_roster_items(&rows, 0, &theme);
+        // One summary header item plus one item per row.
+        assert_eq!(items.len(), rows.len() + 1);
+    }
+
+    #[test]
+    fn roster_header_counts_active_states() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![
+            roster_row("a", "Anna", 0, ActivityState::Active, None, None),
+            roster_row("b", "Bret", 1, ActivityState::Active, None, None),
+            roster_row("c", "Cleo", 2, ActivityState::NeedsInput, None, None),
+            roster_row("d", "Dane", 3, ActivityState::Stalled, None, None),
+        ];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
+        assert!(
+            text.contains("▶ 2 working · ◔ 1 waiting · ○ 1 stalled"),
+            "summary header counts: {text}"
+        );
+    }
+
+    #[test]
+    fn roster_header_at_rest_shows_idle_lineup() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![
+            roster_row("a", "Anna", 0, ActivityState::Idle, None, None),
+            roster_row("b", "Bret", 1, ActivityState::Idle, None, None),
+            roster_row("c", "Cleo", 2, ActivityState::Idle, None, None),
+        ];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
+        assert!(text.contains("● 3 agents idle"), "at-rest header: {text}");
+    }
+
+    #[test]
+    fn roster_active_row_shows_glyph_label_step_and_elapsed() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![roster_row(
+            "explorer",
+            "Explorer",
+            0,
+            ActivityState::Active,
+            Some("exploring options"),
+            Some("45s"),
+        )];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
+        assert!(text.contains('◐'), "active glyph (frame 0): {text}");
+        assert!(text.contains("working"));
+        assert!(text.contains("Explorer"));
+        assert!(text.contains("exploring options"));
+        assert!(text.contains("45s"));
+    }
+
+    #[test]
+    fn roster_idle_row_has_no_activity_glyph_or_label() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![roster_row(
+            "planner",
+            "Planner",
+            0,
+            ActivityState::Idle,
+            None,
+            None,
+        )];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
+        assert!(text.contains("Planner"));
+        assert!(
+            !text.contains("working"),
+            "idle row shows no activity label"
+        );
+        assert!(!text.contains('◐'), "idle row shows no active glyph");
+    }
+
+    #[test]
+    fn roster_stalled_row_shows_frozen_glyph_and_elapsed() {
+        let theme = TuiUiState::default().theme;
+        let rows = vec![roster_row(
+            "explorer",
+            "Explorer",
+            0,
+            ActivityState::Stalled,
+            None,
+            Some("34s"),
+        )];
+        let text = roster_items_to_text(agent_roster_items(&rows, 0, &theme), 80, 20);
+        assert!(text.contains('○'), "stalled glyph: {text}");
+        assert!(text.contains("stalled?"));
+        assert!(text.contains("34s"));
+    }
+
+    #[test]
+    fn roster_render_is_deterministic_when_idle() {
+        // Pure render of a clock-free row vec: repeated frames are byte-identical
+        // with no `now` advance (no spinner, no elapsed tick).
+        let mut state = state_with_input("", false);
+        state.agents = vec![agent_view("explorer", "Explorer", "idle", &[])];
+        state.roster_rows = vec![roster_row(
+            "explorer",
+            "Explorer",
+            0,
+            ActivityState::Idle,
+            None,
+            None,
+        )];
+        let a = render_to_text(&state, 100, 24);
+        let b = render_to_text(&state, 100, 24);
+        let c = render_to_text(&state, 100, 24);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn roster_renders_glyph_at_narrow_width_without_breakage() {
+        let mut state = state_with_input("", false);
+        state.run_state = RunState::Running;
+        state.agents = vec![agent_view("explorer", "Explorer", "running", &[])];
+        state.roster_rows = vec![roster_row(
+            "explorer",
+            "Explorer",
+            0,
+            ActivityState::Active,
+            Some("a-very-long-step-label-that-overflows-the-sidebar"),
+            Some("9s"),
+        )];
+        // The List clips overflow to the ~28% sidebar; the row stays legible and
+        // the frame renders without panicking or breaking layout.
+        let text = render_to_text(&state, 40, 24);
+        assert!(
+            text.contains('◐'),
+            "active glyph survives narrow width: {text}"
+        );
+    }
+
+    #[test]
+    fn roster_no_color_states_legible_by_glyph_and_label() {
+        // Under NO_COLOR every state must read from glyph + label alone.
+        let mut state = state_with_input("", false);
+        state.run_state = RunState::Running;
+        state.roster_rows = vec![
+            roster_row("a", "Aida", 0, ActivityState::Active, None, None),
+            roster_row("b", "Bram", 1, ActivityState::NeedsInput, None, None),
+            roster_row("c", "Cody", 2, ActivityState::Stalled, None, None),
+        ];
+        let no_color_ui = TuiUiState {
+            theme: Theme::resolve(TerminalCaps {
+                no_color: true,
+                truecolor: false,
+            }),
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &no_color_ui, 100, 24);
+        assert!(text.contains('◐') && text.contains("working"));
+        assert!(text.contains('◔') && text.contains("waiting"));
+        assert!(text.contains('○') && text.contains("stalled?"));
+    }
+
+    #[test]
+    fn ctrl_l_roster_render_shows_each_agent_after_extraction() {
+        let mut state = AppState {
+            session_id: "session".to_string(),
+            run_state: RunState::Running,
+            active_run_id: Some("run".to_string()),
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
+            live_steps: Vec::new(),
+            pending_approval: None,
+            show_first_approval_explainer: false,
+            pending_clarification: None,
+            agents: vec![
+                AgentView {
+                    runtime: "codex".to_string(),
+                    ..agent_view("fixer", "Fixer", "running", &["read"])
+                },
+                AgentView {
+                    runtime: "claude".to_string(),
+                    ..unavailable_agent_view()
+                },
+            ],
+            roster_rows: Vec::new(),
+            chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
+            events: Vec::new(),
+            input: String::new(),
+            git_context: None,
+        };
+        populate_roster_rows(&mut state);
+        let ui_state = TuiUiState {
+            roster_visible: true,
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(text.contains("Agent Roster"));
+        // The roster view-model carries name + runtime/model (availability is no
+        // longer a roster field — the rewrite shows activity instead, ADR-003).
+        assert!(text.contains("Fixer"));
+        assert!(text.contains("codex/default"));
+        assert!(text.contains("claude/default"));
+    }
+
+    #[test]
     fn renders_empty_tui_surfaces() {
         let state = AppState {
             session_id: "session".to_string(),
@@ -4122,8 +5286,10 @@ mod tests {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: Vec::new(),
+            roster_rows: Vec::new(),
             chat_items: Vec::new(),
             queued_follow_ups: Vec::new(),
             events: Vec::new(),
@@ -4140,7 +5306,7 @@ mod tests {
 
     #[test]
     fn renders_agent_availability_events_and_input() {
-        let state = AppState {
+        let mut state = AppState {
             session_id: "session".to_string(),
             run_state: RunState::Running,
             active_run_id: Some("run".to_string()),
@@ -4149,6 +5315,7 @@ mod tests {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
@@ -4166,6 +5333,7 @@ mod tests {
                 }),
                 status: "running".to_string(),
             }],
+            roster_rows: Vec::new(),
             chat_items: Vec::new(),
             queued_follow_ups: Vec::new(),
             events: vec![
@@ -4175,11 +5343,12 @@ mod tests {
             input: "follow up".to_string(),
             git_context: None,
         };
+        populate_roster_rows(&mut state);
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Fixer"));
         assert!(text.contains("codex/default"));
         assert!(text.contains("effort:high"));
-        assert!(text.contains("down"));
+        // Availability ("down") is no longer a roster field (ADR-003 view-model).
         assert!(text.contains("Fixer step started."));
         assert!(text.contains("follow up"));
     }
@@ -4273,6 +5442,7 @@ mod tests {
             availability: None,
             status: "streaming".to_string(),
         }];
+        populate_roster_rows(&mut state);
 
         let text = render_to_text(&state, 100, 24);
 
@@ -4343,8 +5513,8 @@ mod tests {
         state.config_status = ConfigStatusView {
             summary: "Config: sources=2 preset=research warnings=1".to_string(),
             sources: vec![
-                "/home/user/.config/.multiagent/multiagent.toml".to_string(),
-                "multiagent.toml".to_string(),
+                "/home/user/.config/.atelier/atelier.toml".to_string(),
+                "atelier.toml".to_string(),
             ],
             preset: Some("research".to_string()),
             warnings: vec!["enabled agents without model_fallbacks: explorer".to_string()],
@@ -4370,8 +5540,10 @@ mod tests {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: Vec::new(),
+            roster_rows: Vec::new(),
             chat_items: Vec::new(),
             queued_follow_ups: Vec::new(),
             events: vec!["You: build a feature".to_string()],
@@ -4471,8 +5643,10 @@ mod tests {
                 summary: "Action requires action approval.".to_string(),
                 diagnostic: Some("command requires action approval: cargo install x".to_string()),
             }),
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: Vec::new(),
+            roster_rows: Vec::new(),
             chat_items: Vec::new(),
             queued_follow_ups: Vec::new(),
             events: vec!["Action approval required.".to_string()],
@@ -4482,6 +5656,58 @@ mod tests {
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Approval required for fixer action action."));
         assert!(text.contains("command requires action approval"));
+        // No explainer when the show-once latch is already set.
+        assert!(!text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
+    }
+
+    fn fallback_approval_state(show_first_approval_explainer: bool) -> AppState {
+        AppState {
+            session_id: "session".to_string(),
+            run_state: RunState::WaitingForUser,
+            active_run_id: Some("run".to_string()),
+            session_goal: None,
+            config_status: default_config_status(),
+            live_step: None,
+            live_steps: Vec::new(),
+            pending_approval: Some(crate::app::PendingApprovalView {
+                run_id: "run".to_string(),
+                group_id: None,
+                step_id: "step".to_string(),
+                action_id: "action".to_string(),
+                agent: "fixer".to_string(),
+                summary: "Action requires action approval.".to_string(),
+                diagnostic: Some("command requires action approval: cargo install x".to_string()),
+            }),
+            show_first_approval_explainer,
+            pending_clarification: None,
+            agents: Vec::new(),
+            roster_rows: Vec::new(),
+            // Empty so the pending-approval fallback render path is exercised.
+            chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
+            events: vec!["Action approval required.".to_string()],
+            input: String::new(),
+            git_context: None,
+        }
+    }
+
+    #[test]
+    fn renders_first_approval_explainer_when_flag_set() {
+        let state = fallback_approval_state(true);
+        // Wide enough that the single explainer line is not wrapped by the
+        // paragraph renderer, so the full text is contiguous in the output.
+        let text = render_to_text(&state, 200, 24);
+        // The explainer line shows alongside the (unchanged) approval prompt.
+        assert!(text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
+        assert!(text.contains("Approval required for fixer action action."));
+    }
+
+    #[test]
+    fn suppresses_first_approval_explainer_when_flag_unset() {
+        let state = fallback_approval_state(false);
+        let text = render_to_text(&state, 100, 24);
+        assert!(!text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
+        assert!(text.contains("Approval required for fixer action action."));
     }
 
     #[test]
@@ -4491,7 +5717,8 @@ mod tests {
         assert_eq!(
             key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "build this".to_string()
+                "build this".to_string(),
+                PromptSource::Fresh
             )))
         );
     }
@@ -4506,7 +5733,10 @@ mod tests {
             &mut state,
             &mut ui_state,
             &sender,
-            TuiCommand::Dispatch(AppEvent::PromptSubmitted("slow prompt".to_string())),
+            TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+                "slow prompt".to_string(),
+                PromptSource::Fresh,
+            )),
         )
         .await
         .unwrap();
@@ -4516,7 +5746,7 @@ mod tests {
         assert_eq!(ui_state.input_cursor, 0);
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            AppWorkerCommand::Event(AppEvent::PromptSubmitted(prompt)) if prompt == "slow prompt"
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(prompt, _)) if prompt == "slow prompt"
         ));
     }
 
@@ -4541,6 +5771,48 @@ mod tests {
         assert_eq!(ui_state.input_cursor, 0);
         assert!(ui_state.help_visible);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn help_active_tab_defaults_to_getting_started() {
+        assert_eq!(
+            TuiUiState::default().help_active_tab,
+            HelpTab::GettingStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_help_close_resets_active_tab() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Cli,
+            ..TuiUiState::default()
+        };
+
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::ToggleHelp)
+            .await
+            .unwrap();
+
+        assert!(!ui_state.help_visible);
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
+    }
+
+    #[tokio::test]
+    async fn toggle_help_open_preserves_default_active_tab() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState::default();
+        assert!(!ui_state.help_visible);
+
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::ToggleHelp)
+            .await
+            .unwrap();
+
+        // Opening flips visibility and leaves the active tab at the default.
+        assert!(ui_state.help_visible);
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
     }
 
     #[test]
@@ -4609,11 +5881,14 @@ mod tests {
     #[test]
     fn renders_help_modal_commands() {
         let state = state_with_input("", false);
-        let ui_state = TuiUiState {
+        // Tabbed help renders one tab at a time, so each assertion group is routed
+        // to its tab. The modal frame + Commands content render on the Commands tab.
+        let commands_ui = TuiUiState {
             help_visible: true,
+            help_active_tab: HelpTab::Commands,
             ..TuiUiState::default()
         };
-        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        let text = render_to_text_with_ui(&state, &commands_ui, 120, 32);
 
         assert!(text.contains("Help"));
         let header = text.lines().find(|line| line.contains("Help")).unwrap();
@@ -4632,21 +5907,37 @@ mod tests {
         assert!(text.contains("/workflow <prompt>"));
         assert!(text.contains("execute a broad prompt with workflow evidence"));
         assert!(text.contains("/config"));
-        assert!(text.contains("Mouse wheel"));
         assert!(!text.contains("close this help"));
-        assert!(text.contains("Ctrl-L"));
-        assert!(text.contains("Arrow keys"));
-        assert!(text.contains("PageUp/PageDown"));
-        assert!(text.contains("Home/End"));
-        assert!(text.contains("atelier --doctor"));
-        assert!(text.contains("atelier --clean-sessions"));
+
+        // Keybinding rows live on the Keys tab.
+        let keys_ui = TuiUiState {
+            help_active_tab: HelpTab::Keys,
+            ..commands_ui.clone()
+        };
+        let keys_text = render_to_text_with_ui(&state, &keys_ui, 120, 32);
+        assert!(keys_text.contains("Mouse wheel"));
+        assert!(keys_text.contains("Ctrl-L"));
+        assert!(keys_text.contains("Arrow keys"));
+        assert!(keys_text.contains("PageUp/PageDown"));
+        assert!(keys_text.contains("Home/End"));
+
+        // CLI flag rows live on the CLI tab.
+        let cli_ui = TuiUiState {
+            help_active_tab: HelpTab::Cli,
+            ..commands_ui
+        };
+        let cli_text = render_to_text_with_ui(&state, &cli_ui, 120, 32);
+        assert!(cli_text.contains("atelier --doctor"));
+        assert!(cli_text.contains("atelier --clean-sessions"));
     }
 
     #[test]
     fn help_modal_command_rows_are_catalog_derived() {
         let state = state_with_input("", false);
+        // Catalog-derived contract lives on the Commands tab.
         let ui_state = TuiUiState {
             help_visible: true,
+            help_active_tab: HelpTab::Commands,
             ..TuiUiState::default()
         };
         let text = render_to_text_with_ui(&state, &ui_state, 120, 40);
@@ -4670,17 +5961,26 @@ mod tests {
         assert!(text.contains("/reload:skills"));
         assert!(text.contains("/workflow <prompt>"));
         assert!(text.contains("/queue <message>"));
-        // Non-command rows survive the catalog routing.
-        assert!(text.contains("Ctrl-L"));
-        assert!(text.contains("Arrow keys"));
-        assert!(text.contains("Mouse wheel"));
+
+        // Non-command rows survive on the Keys tab (catalog routing did not drop
+        // the literal keybinding rows).
+        let keys_ui = TuiUiState {
+            help_active_tab: HelpTab::Keys,
+            ..ui_state
+        };
+        let keys_text = render_to_text_with_ui(&state, &keys_ui, 120, 40);
+        assert!(keys_text.contains("Ctrl-L"));
+        assert!(keys_text.contains("Arrow keys"));
+        assert!(keys_text.contains("Mouse wheel"));
     }
 
     #[test]
     fn readme_skill_command_wording_matches_help_language() {
         let state = state_with_input("", false);
+        // `/skill:` wording lives on the Commands tab.
         let ui_state = TuiUiState {
             help_visible: true,
+            help_active_tab: HelpTab::Commands,
             ..TuiUiState::default()
         };
         let help_text = render_to_text_with_ui(&state, &ui_state, 120, 32);
@@ -4697,8 +5997,10 @@ mod tests {
     #[test]
     fn readme_workflow_command_wording_matches_v1_limits() {
         let state = state_with_input("", false);
+        // `/workflow` wording lives on the Commands tab.
         let ui_state = TuiUiState {
             help_visible: true,
+            help_active_tab: HelpTab::Commands,
             ..TuiUiState::default()
         };
         let help_text = render_to_text_with_ui(&state, &ui_state, 120, 32);
@@ -5239,7 +6541,10 @@ mod tests {
         };
         let text = render_to_text_with_ui(&state, &ui_state, 80, 32);
         assert!(text.contains("Help"));
-        assert!(!text.contains("Commands"));
+        // The tabbed help strip legitimately renders the "Commands" tab title, so
+        // suppression is verified by the absence of the command dropdown's unique
+        // right-aligned navigation hint rather than the bare word "Commands".
+        assert!(!text.contains("Up/Down Tab/Enter"));
     }
 
     #[test]
@@ -5432,7 +6737,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "hello world".to_string()
+                "hello world".to_string(),
+                PromptSource::Fresh
             )))
         );
     }
@@ -5451,7 +6757,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "/goal ship v2".to_string()
+                "/goal ship v2".to_string(),
+                PromptSource::Fresh
             )))
         );
     }
@@ -5567,7 +6874,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "/goal ship v2".to_string()
+                "/goal ship v2".to_string(),
+                PromptSource::Fresh
             )))
         );
         // Nothing was dispatched during acceptance or typing.
@@ -5664,7 +6972,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "/config".to_string()
+                "/config".to_string(),
+                PromptSource::Fresh
             )))
         );
     }
@@ -5887,7 +7196,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "/agent:fixer inspect docs".to_string()
+                "/agent:fixer inspect docs".to_string(),
+                PromptSource::Fresh
             )))
         );
     }
@@ -6297,6 +7607,121 @@ mod tests {
         );
     }
 
+    #[test]
+    fn help_visible_arrows_and_tab_navigate_tabs() {
+        let state = state_with_input("", false);
+        let visible = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+
+        // Right + Tab advance to the next tab.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpNextTab)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpNextTab)
+        );
+
+        // Left + Shift-Tab (and the terminal BackTab variant) retreat.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpPrevTab)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)
+            ),
+            Some(TuiCommand::HelpPrevTab)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+            ),
+            Some(TuiCommand::HelpPrevTab)
+        );
+
+        // Esc still closes; an unrelated key does not leak to the base handler.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::ToggleHelp)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &visible,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            ),
+            None
+        );
+
+        // Navigation keys are inert when help is closed (no leakage the other way).
+        let hidden = TuiUiState::default();
+        assert_ne!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &hidden,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpNextTab)
+        );
+    }
+
+    #[tokio::test]
+    async fn help_next_prev_tab_commands_advance_active_tab() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::GettingStarted,
+            ..TuiUiState::default()
+        };
+
+        // Next from the first tab moves to Commands.
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::HelpNextTab)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_active_tab, HelpTab::Commands);
+
+        // Next from the last tab (Cli) wraps back to Getting Started.
+        ui_state.help_active_tab = HelpTab::Cli;
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::HelpNextTab)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
+
+        // Prev from the first tab wraps back to Cli.
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::HelpPrevTab)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_active_tab, HelpTab::Cli);
+
+        // Navigation is local UI state — no app event emitted.
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn ctrl_l_toggles_roster_visibility_without_app_event() {
         let state = state_with_input("", false);
@@ -6337,6 +7762,7 @@ mod tests {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
@@ -6349,6 +7775,7 @@ mod tests {
                 availability: None,
                 status: "idle".to_string(),
             }],
+            roster_rows: Vec::new(),
             chat_items: Vec::new(),
             queued_follow_ups: Vec::new(),
             events: vec!["Run started.".to_string()],
@@ -6455,8 +7882,10 @@ mod tests {
                 summary: "Action requires approval.".to_string(),
                 diagnostic: None,
             }),
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: Vec::new(),
+            roster_rows: Vec::new(),
             chat_items: Vec::new(),
             queued_follow_ups: Vec::new(),
             events: Vec::new(),
@@ -7810,6 +9239,68 @@ runtime = "fake"
         assert_eq!(disabled.fg, Some(theme.text_dim));
     }
 
+    // --- task_05: activity_glyph / activity_label vocabulary (ADR-002) --------
+
+    #[test]
+    fn activity_glyph_uses_set_1_unicode() {
+        assert_eq!(activity_glyph(ActivityState::Active, false), "◐");
+        assert_eq!(activity_glyph(ActivityState::NeedsInput, false), "◔");
+        assert_eq!(activity_glyph(ActivityState::Stalled, false), "○");
+        assert_eq!(activity_glyph(ActivityState::Idle, false), "·");
+    }
+
+    #[test]
+    fn activity_glyph_ascii_fallback() {
+        assert_eq!(activity_glyph(ActivityState::Active, true), ">");
+        assert_eq!(activity_glyph(ActivityState::NeedsInput, true), "?");
+        assert_eq!(activity_glyph(ActivityState::Stalled, true), "!");
+        assert_eq!(activity_glyph(ActivityState::Idle, true), ".");
+    }
+
+    #[test]
+    fn activity_label_vocabulary() {
+        assert_eq!(activity_label(ActivityState::Active), "working");
+        assert_eq!(activity_label(ActivityState::NeedsInput), "waiting");
+        assert_eq!(activity_label(ActivityState::Stalled), "stalled?");
+        assert_eq!(activity_label(ActivityState::Idle), "idle");
+    }
+
+    #[test]
+    fn activity_labels_are_distinct_and_non_empty() {
+        let labels = [
+            activity_label(ActivityState::Active),
+            activity_label(ActivityState::NeedsInput),
+            activity_label(ActivityState::Stalled),
+            activity_label(ActivityState::Idle),
+        ];
+        assert!(labels.iter().all(|label| !label.is_empty()));
+        let unique: std::collections::BTreeSet<_> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "labels must be pairwise distinct"
+        );
+    }
+
+    #[test]
+    fn activity_glyphs_are_single_portable_bmp_chars() {
+        // ADR-002: portable BMP glyphs only — no emoji-presentation or
+        // double-width characters, so each state reads on a constrained terminal.
+        for state in [
+            ActivityState::Active,
+            ActivityState::NeedsInput,
+            ActivityState::Stalled,
+            ActivityState::Idle,
+        ] {
+            for ascii in [false, true] {
+                let glyph = activity_glyph(state.clone(), ascii);
+                assert_eq!(glyph.chars().count(), 1, "single char: {glyph:?}");
+                let ch = glyph.chars().next().unwrap();
+                assert!((ch as u32) <= 0xFFFF, "BMP only: {glyph:?}");
+            }
+        }
+    }
+
     #[test]
     fn severity_badge_error_uses_status_error_background() {
         let theme = TuiUiState::default().theme;
@@ -7821,7 +9312,8 @@ runtime = "fake"
     /// resolves to truecolor or to the `NO_COLOR` (terminal-default) tier.
     #[test]
     fn no_color_render_matches_truecolor_text_content() {
-        let state = state_with_agent_roster("draft prompt");
+        let mut state = state_with_agent_roster("draft prompt");
+        populate_roster_rows(&mut state);
         let truecolor = render_to_text(&state, 80, 24);
 
         let no_color_ui = TuiUiState {
@@ -7876,6 +9368,25 @@ runtime = "fake"
         );
         assert!(text.contains("Atelier"), "wordmark present");
         assert!(!text.contains("No chat yet."), "empty state replaced");
+    }
+
+    #[test]
+    fn welcome_shows_routing_onboarding_hint_on_empty_chat() {
+        // task_08: a newcomer on an empty chat (only the synthetic Welcome item)
+        // sees the routing hint pointing through the orchestrator to /help.
+        let mut state = state_with_agent_roster("");
+        state.chat_items = vec![ChatItemView::welcome()];
+
+        let text = render_to_text(&state, 80, 24);
+
+        assert!(
+            text.contains("orchestrator"),
+            "routing onboarding hint visible in welcome area"
+        );
+        assert!(
+            text.contains("type /help for commands"),
+            "existing /help cue retained beside the hint"
+        );
     }
 
     #[test]
@@ -8017,6 +9528,551 @@ runtime = "fake"
             .borrow()
             .iter()
             .any(|entry| entry.rel_path == "second.rs"));
+    }
+
+    // ── task_04 prompt-history recall load ──
+
+    fn write_prompt_history_session(root: &Path, session: &str, prompts: &[(&str, &str)]) {
+        // Write a `.atelier/sessions/<session>/events.jsonl` of prompt_submitted
+        // events with explicit (timestamp, prompt), as a real run records them.
+        let dir = root.join(".atelier/sessions").join(session);
+        fs::create_dir_all(&dir).unwrap();
+        let mut contents = String::new();
+        for (timestamp, prompt) in prompts {
+            let mut event = HistoryEvent::new(
+                "session",
+                None,
+                None,
+                "prompt_submitted",
+                json!({ "prompt": prompt }),
+            );
+            event.timestamp = (*timestamp).to_string();
+            contents.push_str(&serde_json::to_string(&event).unwrap());
+            contents.push('\n');
+        }
+        fs::write(dir.join("events.jsonl"), contents).unwrap();
+    }
+
+    #[test]
+    fn default_ui_state_initializes_prompt_history_fields() {
+        let ui_state = TuiUiState::default();
+        assert!(ui_state.prompt_history.is_empty());
+        assert_eq!(ui_state.prompt_history_cursor, 0);
+        assert!(ui_state.prompt_history_draft.is_empty());
+    }
+
+    #[test]
+    fn sync_prompt_history_adopts_published_ring() {
+        let (sender, mut receiver) = watch::channel(Vec::<String>::new());
+        let mut ui_state = TuiUiState::default();
+        sender.send(vec!["b".to_string(), "a".to_string()]).unwrap();
+
+        sync_prompt_history(&mut ui_state, &mut receiver);
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["b".to_string(), "a".to_string()]
+        );
+    }
+
+    #[test]
+    fn disabled_recall_skips_load_and_leaves_ring_empty() {
+        // Gate off: nothing is spawned, the channel never publishes, and the ring
+        // stays empty after a sync tick (a closed channel reads as "no change").
+        let (sender, mut receiver) = watch::channel(Vec::<String>::new());
+        let spawned = maybe_spawn_prompt_history_load(
+            false,
+            Some(PathBuf::from("/nonexistent")),
+            200,
+            sender,
+        );
+        assert!(!spawned);
+
+        let mut ui_state = TuiUiState::default();
+        sync_prompt_history(&mut ui_state, &mut receiver);
+        assert!(ui_state.prompt_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_prompt_history_publishes_recall_newest_first() {
+        // Integration: two prompt_submitted events on disk → the load publishes
+        // them newest-first, and a sync tick adopts them into the ring.
+        let dir = tempdir().unwrap();
+        write_prompt_history_session(
+            dir.path(),
+            "s",
+            &[
+                ("2026-06-06T00:00:01.000Z", "alpha"),
+                ("2026-06-06T00:00:02.000Z", "beta"),
+            ],
+        );
+
+        let (sender, mut receiver) = watch::channel(Vec::<String>::new());
+        refresh_prompt_history(Some(dir.path()), 200, &sender).await;
+
+        let mut ui_state = TuiUiState::default();
+        sync_prompt_history(&mut ui_state, &mut receiver);
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["beta".to_string(), "alpha".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_recall_load_spawns_and_publishes_ring() {
+        let dir = tempdir().unwrap();
+        write_prompt_history_session(dir.path(), "s", &[("2026-06-06T00:00:01.000Z", "alpha")]);
+
+        let (sender, mut receiver) = watch::channel(Vec::<String>::new());
+        let spawned =
+            maybe_spawn_prompt_history_load(true, Some(dir.path().to_path_buf()), 200, sender);
+        assert!(spawned);
+
+        // The detached load publishes exactly once; await that and assert it landed.
+        receiver.changed().await.unwrap();
+        assert_eq!(*receiver.borrow(), vec!["alpha".to_string()]);
+    }
+
+    // ── prompt-history recall interaction (task_05) ──
+
+    fn ui_state_with_history(history: &[&str]) -> TuiUiState {
+        TuiUiState {
+            prompt_history: history.iter().map(|s| (*s).to_string()).collect(),
+            // Wide so single-word entries stay on one visual row (cursor on the
+            // top/bottom boundary), isolating recall from cursor-nav.
+            input_width: 80,
+            ..TuiUiState::default()
+        }
+    }
+
+    #[test]
+    fn up_down_walk_recall_ring_newest_first() {
+        let mut state = state_with_input("", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]); // newest-first
+
+        // ↑ → newest "b", cursor parked at the end, depth 1.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "b");
+        assert_eq!(ui_state.input_cursor, 1);
+        assert_eq!(ui_state.prompt_history_cursor, 1);
+
+        // ↑ again → older "a".
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "a");
+
+        // ↓ → newer "b".
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Down
+        ));
+        assert_eq!(state.input, "b");
+    }
+
+    #[test]
+    fn up_at_oldest_entry_is_consumed_noop() {
+        let mut state = state_with_input("", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]);
+        try_recall_history(&mut ui_state, &mut state, InputCursorCommand::Up); // "b"
+        try_recall_history(&mut ui_state, &mut state, InputCursorCommand::Up); // "a" (oldest)
+        assert_eq!(state.input, "a");
+
+        // A further ↑ is consumed (so it never moves the cursor) but is a no-op.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "a");
+        assert_eq!(ui_state.prompt_history_cursor, 2);
+    }
+
+    #[test]
+    fn draft_is_saved_on_entry_and_restored_past_newest() {
+        let mut state = state_with_input("draft", false);
+        let mut ui_state = TuiUiState {
+            prompt_history: vec!["b".to_string()],
+            input_width: 80,
+            input_cursor: input_char_count("draft"),
+            ..TuiUiState::default()
+        };
+
+        // ↑ saves the in-progress draft and shows the newest entry.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "b");
+        assert_eq!(ui_state.prompt_history_draft, "draft");
+
+        // ↓ past the newest entry restores the exact draft and cursor.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Down
+        ));
+        assert_eq!(state.input, "draft");
+        assert_eq!(ui_state.prompt_history_cursor, 0);
+        assert_eq!(ui_state.input_cursor, input_char_count("draft"));
+    }
+
+    #[test]
+    fn wrapped_draft_moves_cursor_before_recalling_at_top_row() {
+        // width 5, "abcdefgh" wraps to two rows: row 0 "abcde", row 1 "fgh".
+        let mut state = state_with_input("abcdefgh", false);
+        let mut ui_state = TuiUiState {
+            prompt_history: vec!["recalled".to_string()],
+            input_width: 5,
+            input_cursor: 7, // col 2 of row 1
+            ..TuiUiState::default()
+        };
+
+        // On row 1, ↑ is NOT recall — it yields so the cursor moves up a row.
+        assert!(!try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "abcdefgh"); // draft untouched
+        move_input_cursor(&mut ui_state, &state.input, InputCursorCommand::Up);
+        assert_eq!(ui_state.input_cursor / 5, 0); // now on the top row
+
+        // Only at the top row does a further ↑ recall.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "recalled");
+        assert_eq!(ui_state.prompt_history_draft, "abcdefgh");
+    }
+
+    #[test]
+    fn empty_ring_does_not_recall() {
+        // No history (e.g. recall disabled → loader never populated the ring).
+        let mut state = state_with_input("hello", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: input_char_count("hello"),
+            input_width: 80,
+            ..TuiUiState::default()
+        };
+        assert!(!try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "hello");
+    }
+
+    #[test]
+    fn up_drives_queue_not_recall_when_queue_focused() {
+        // Empty input + a queued follow-up → queue focus owns ↑ (precedence),
+        // even though the ring is non-empty, so recall is never reached.
+        let mut state = state_with_queue(vec![queue_view(
+            "q1",
+            "do it",
+            QueuedFollowUpStatus::Pending,
+            None,
+        )]);
+        state.input.clear();
+        let ui_state = ui_state_with_history(&["b", "a"]);
+
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            command,
+            Some(TuiCommand::QueueSelection(QueueSelectionCommand::Previous))
+        );
+    }
+
+    #[test]
+    fn up_drives_command_dropdown_not_recall_when_open() {
+        // "/g" is a single slash-word → the command dropdown owns ↑ (precedence).
+        let state = state_with_input("/g", false);
+        let ui_state = TuiUiState {
+            prompt_history: vec!["b".to_string(), "a".to_string()],
+            input_cursor: 2,
+            ..TuiUiState::default()
+        };
+        assert!(command_dropdown(&state, &ui_state).is_some());
+
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        );
+        assert!(matches!(command, Some(TuiCommand::CommandDropdown(_))));
+    }
+
+    #[tokio::test]
+    async fn recall_then_enter_submits_recalled_text_to_worker() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]);
+
+        // ↑ through the real command handler recalls the newest entry.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::MoveInputCursor(InputCursorCommand::Up),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "b");
+
+        // Enter routes to a submit of the recalled text.
+        let submit = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(prompt, _)) if prompt == "b"
+        ));
+        // Submitting cleared the composer and reset recall to a fresh draft.
+        assert!(state.input.is_empty());
+        assert_eq!(ui_state.prompt_history_cursor, 0);
+    }
+
+    // ── prompt-history provenance + in-session ring (task_06) ──
+
+    #[test]
+    fn in_session_prepend_dedups_caps_and_skips_disabled_and_leading_space() {
+        let mut ui_state = TuiUiState {
+            prompt_history_max: 2,
+            ..TuiUiState::default()
+        };
+        record_in_session_prompt(&mut ui_state, "a");
+        record_in_session_prompt(&mut ui_state, "b");
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["b".to_string(), "a".to_string()]
+        );
+
+        // A consecutive duplicate of the front is ignored.
+        record_in_session_prompt(&mut ui_state, "b");
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["b".to_string(), "a".to_string()]
+        );
+
+        // Cap respected (max 2): adding "c" drops the oldest "a".
+        record_in_session_prompt(&mut ui_state, "c");
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["c".to_string(), "b".to_string()]
+        );
+
+        // Leading-space and empty submissions never enter the ring.
+        record_in_session_prompt(&mut ui_state, " secret");
+        record_in_session_prompt(&mut ui_state, "   ");
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["c".to_string(), "b".to_string()]
+        );
+
+        // Disabled recall → no prepend, the ring stays empty.
+        let mut disabled = TuiUiState {
+            prompt_history_enabled: false,
+            ..TuiUiState::default()
+        };
+        record_in_session_prompt(&mut disabled, "x");
+        assert!(disabled.prompt_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_from_recall_tags_recalled() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("a", false);
+        let mut ui_state = TuiUiState {
+            prompt_history: vec!["a".to_string(), "b".to_string()],
+            prompt_history_cursor: 2, // composition originated from the ring
+            input_cursor: 1,
+            ..TuiUiState::default()
+        };
+
+        let submit = TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+            "a".to_string(),
+            PromptSource::Fresh, // placeholder; the handler finalizes provenance
+        ));
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(p, PromptSource::Recalled)) if p == "a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_freshly_typed_tags_fresh() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("typed", false);
+        // cursor 0 → a fresh live draft.
+        let mut ui_state = ui_state_with_cursor_at_end("typed");
+
+        let submit = TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+            "typed".to_string(),
+            PromptSource::Fresh,
+        ));
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(p, PromptSource::Fresh)) if p == "typed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn recall_then_clear_to_empty_then_retype_tags_fresh() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]);
+
+        // ↑ recalls "b" (cursor → 1).
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::MoveInputCursor(InputCursorCommand::Up),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ui_state.prompt_history_cursor, 1);
+
+        // Backspacing the recalled text to empty resets the cursor to a draft.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::InputBackspace,
+        )
+        .await
+        .unwrap();
+        assert!(state.input.is_empty());
+        assert_eq!(ui_state.prompt_history_cursor, 0);
+
+        // Type fresh text and submit → Fresh (only the submit reaches the worker).
+        for ch in "new".chars() {
+            execute_tui_command(
+                &mut state,
+                &mut ui_state,
+                &sender,
+                TuiCommand::InputCharacter(ch),
+            )
+            .await
+            .unwrap();
+        }
+        let submit = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(p, PromptSource::Fresh)) if p == "new"
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_prepends_to_in_session_ring_and_resets_cursor() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("gamma", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]);
+        ui_state.input_cursor = input_char_count("gamma");
+
+        let submit = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        // "gamma" is prepended newest-first; the cursor resets and input clears.
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["gamma".to_string(), "b".to_string(), "a".to_string()]
+        );
+        assert_eq!(ui_state.prompt_history_cursor, 0);
+        assert!(state.input.is_empty());
+    }
+
+    // ── prompt-history discoverability hint + help (task_07) ──
+
+    #[test]
+    fn recall_hint_shows_with_empty_input_and_history() {
+        let state = state_with_input("", false); // Idle → work not active
+        let ui_state = ui_state_with_history(&["b", "a"]);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(text.contains("↑ recall"));
+    }
+
+    #[test]
+    fn recall_hint_hidden_with_nonempty_input() {
+        let state = state_with_input("typing", false);
+        let ui_state = ui_state_with_history(&["b", "a"]);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(!text.contains("↑ recall"));
+        assert!(text.contains("/help"));
+    }
+
+    #[test]
+    fn recall_hint_hidden_with_empty_history() {
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState::default(); // empty ring
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(!text.contains("↑ recall"));
+        assert!(text.contains("/help"));
+    }
+
+    #[test]
+    fn recall_hint_suppressed_while_work_active() {
+        let mut state = state_with_input("", false);
+        state.run_state = RunState::Running; // the work indicator wins
+        let ui_state = ui_state_with_history(&["b", "a"]);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(!text.contains("↑ recall"));
+    }
+
+    #[test]
+    fn help_overlay_documents_recall_keys() {
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Keys,
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        assert!(text.contains("recall recent prompts"));
     }
 
     // ── task_05 TUI file-index state and consumer ──
@@ -8911,11 +10967,21 @@ runtime = "fake"
 
     #[test]
     fn roster_names_carry_same_accents_as_chat() {
+        // ADR-005: accent follows canonical identity, not render position. Fixer
+        // is canonical index 1 but pinned to the top row (NeedsInput); its name
+        // must still render `accent_for(1)` — the same accent the chat transcript
+        // resolves for that agent (by its canonical position in `agents`).
         let theme = TuiUiState::default().theme;
         let mut state = state_with_input("", false);
         state.agents = vec![
             agent_view("explorer", "Explorer", "idle", &[]),
             agent_view("fixer", "Fixer", "idle", &[]),
+        ];
+        // Pinned-reorder roster: NeedsInput Fixer (canonical accent 1) at row 0,
+        // Explorer (canonical accent 0) below it.
+        state.roster_rows = vec![
+            roster_row("fixer", "Fixer", 1, ActivityState::NeedsInput, None, None),
+            roster_row("explorer", "Explorer", 0, ActivityState::Idle, None, None),
         ];
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -8925,11 +10991,12 @@ runtime = "fake"
             .unwrap();
         let buffer = terminal.backend().buffer();
 
+        // Pinned to row 0, Fixer keeps its canonical accent — not the row-0 accent.
+        assert_eq!(title_cell_fg(buffer, "Fixer").unwrap(), theme.accent_for(1));
         assert_eq!(
             title_cell_fg(buffer, "Explorer").unwrap(),
             theme.accent_for(0)
         );
-        assert_eq!(title_cell_fg(buffer, "Fixer").unwrap(), theme.accent_for(1));
     }
 
     #[test]
@@ -8953,11 +11020,19 @@ runtime = "fake"
 
     #[test]
     fn agent_dropdown_ids_carry_same_accents_as_roster() {
+        // Cross-surface consistency under the pin (ADR-005, task_07): with the
+        // roster pinned so fixer (canonical 1) sits at row 0, both the roster
+        // name and the `/agent:` dropdown id must still show `accent_for(1)` —
+        // the dropdown resolves by canonical `id`, never by dropdown rank.
         let theme = TuiUiState::default().theme;
-        // Roster order: explorer (0), fixer (1), archived/disabled (2, filtered).
-        let state = state_with_agent_roster("/agent:");
+        // Canonical order: explorer (0), fixer (1).
+        let mut state = state_with_agent_roster("/agent:");
+        state.roster_rows = vec![
+            roster_row("fixer", "Fixer", 1, ActivityState::NeedsInput, None, None),
+            roster_row("explorer", "Explorer", 0, ActivityState::Idle, None, None),
+        ];
         let mut ui_state = TuiUiState {
-            roster_visible: false,
+            roster_visible: true,
             input_cursor: input_char_count("/agent:"),
             ..TuiUiState::default()
         };
@@ -8968,11 +11043,18 @@ runtime = "fake"
             .unwrap();
         let buffer = terminal.backend().buffer();
 
+        // Dropdown ids (lowercase) — canonical accent regardless of dropdown rank.
         assert_eq!(
             title_cell_fg(buffer, "explorer").unwrap(),
             theme.accent_for(0)
         );
         assert_eq!(title_cell_fg(buffer, "fixer").unwrap(), theme.accent_for(1));
+        // Roster names (capitalized) — fixer keeps accent_for(1) at pinned row 0.
+        assert_eq!(title_cell_fg(buffer, "Fixer").unwrap(), theme.accent_for(1));
+        assert_eq!(
+            title_cell_fg(buffer, "Explorer").unwrap(),
+            theme.accent_for(0)
+        );
     }
 
     // ── task_08 surface polish ──
@@ -9278,5 +11360,446 @@ runtime = "fake"
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn commands_tab_lines_cover_every_catalog_command_once() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("", &theme));
+        // Mirrors `help_modal_command_rows_are_catalog_derived`: every catalog
+        // command's usage renders, and each description renders exactly once,
+        // proving the rows are catalog-derived and not duplicated.
+        for spec in crate::slash_commands::catalog() {
+            assert!(text.contains(spec.usage), "missing usage {}", spec.usage);
+            let occurrences = text.matches(spec.description).count();
+            assert_eq!(
+                occurrences, 1,
+                "description {:?} rendered {occurrences} times",
+                spec.description
+            );
+        }
+        assert!(text.contains("/workflow <prompt>"));
+        assert!(text.contains("/queue <message>"));
+        assert!(text.contains("/reload:skills"));
+    }
+
+    #[test]
+    fn commands_tab_lines_filter_narrows_to_matching_usage() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("goal", &theme));
+        // Both /goal rows match the substring; /workflow does not.
+        assert!(text.contains("/goal | /goal <text>"), "missing /goal row");
+        assert!(text.contains("/goal clear"), "missing /goal clear row");
+        assert!(
+            !text.contains("/workflow <prompt>"),
+            "/workflow should be filtered out"
+        );
+        // The echoed filter text is visible.
+        assert!(
+            text.contains("Filter: goal"),
+            "filter line missing typed text"
+        );
+    }
+
+    #[test]
+    fn commands_tab_lines_empty_filter_shows_all_commands() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("", &theme));
+        for spec in crate::slash_commands::catalog() {
+            assert!(text.contains(spec.usage), "missing usage {}", spec.usage);
+        }
+    }
+
+    #[test]
+    fn commands_tab_lines_no_match_renders_empty_indicator() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("zzz-nope", &theme));
+        assert!(
+            text.contains("No commands match"),
+            "missing empty-result indicator"
+        );
+        // No catalog usage leaks through on a no-match filter.
+        for spec in crate::slash_commands::catalog() {
+            assert!(
+                !text.contains(spec.usage),
+                "unexpected usage {} on empty result",
+                spec.usage
+            );
+        }
+    }
+
+    #[test]
+    fn commands_tab_filter_is_case_insensitive() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&commands_tab_lines("GOAL", &theme));
+        assert!(
+            text.contains("/goal clear"),
+            "uppercase filter should match"
+        );
+    }
+
+    #[test]
+    fn help_filter_keys_route_only_on_commands_tab() {
+        let state = state_with_input("", false);
+        let commands_ui = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            ..TuiUiState::default()
+        };
+        // On the Commands tab, printable chars feed the filter; Backspace edits it.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &commands_ui,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpFilterCharacter('g'))
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &commands_ui,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpFilterBackspace)
+        );
+        // Arrow/Tab navigation still wins over filter capture on the Commands tab.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &commands_ui,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::HelpNextTab)
+        );
+
+        // On any other tab the same key does NOT route to the filter.
+        let keys_ui = TuiUiState {
+            help_active_tab: HelpTab::Keys,
+            ..commands_ui
+        };
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &keys_ui,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn help_filter_backspace_broadens_and_tab_change_resets() {
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            help_filter: "go".to_string(),
+            ..TuiUiState::default()
+        };
+
+        // Backspace on "go" yields "g" and broadens the list.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::HelpFilterBackspace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ui_state.help_filter, "g");
+
+        // Switching tabs resets the filter to "".
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::HelpNextTab)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_filter, "");
+
+        // Closing the modal also clears any filter.
+        ui_state.help_active_tab = HelpTab::Commands;
+        ui_state.help_filter = "wf".to_string();
+        execute_tui_command(&mut state, &mut ui_state, &sender, TuiCommand::ToggleHelp)
+            .await
+            .unwrap();
+        assert!(!ui_state.help_visible);
+        assert_eq!(ui_state.help_filter, "");
+    }
+
+    #[tokio::test]
+    async fn help_filter_does_not_touch_composer_input() {
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut state = state_with_input("draft prompt", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            ..TuiUiState::default()
+        };
+
+        for ch in ['g', 'o', 'a', 'l'] {
+            execute_tui_command(
+                &mut state,
+                &mut ui_state,
+                &sender,
+                TuiCommand::HelpFilterCharacter(ch),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(ui_state.help_filter, "goal");
+        // The live composer is untouched by filtering.
+        assert_eq!(state.input, "draft prompt");
+    }
+
+    #[tokio::test]
+    async fn help_commands_filter_narrows_then_shows_empty_state() {
+        // End-to-end: open help → Commands tab → type a matching substring →
+        // only matching rows render; extend to a no-match query → empty indicator.
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            ..TuiUiState::default()
+        };
+
+        for ch in ['g', 'o', 'a', 'l'] {
+            let command = key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            )
+            .expect("Commands tab should capture filter characters");
+            execute_tui_command(&mut state, &mut ui_state, &sender, command)
+                .await
+                .unwrap();
+        }
+        assert_eq!(ui_state.help_filter, "goal");
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        assert!(text.contains("/goal clear"), "matching row should render");
+        assert!(
+            !text.contains("/workflow <prompt>"),
+            "non-matching row should be hidden"
+        );
+        // Filtering never leaks into the composer.
+        assert_eq!(state.input, "");
+
+        // One more character makes the query match nothing → empty indicator.
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        )
+        .expect("Commands tab should capture filter characters");
+        execute_tui_command(&mut state, &mut ui_state, &sender, command)
+            .await
+            .unwrap();
+        assert_eq!(ui_state.help_filter, "goalz");
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        assert!(
+            text.contains("No commands match"),
+            "empty-result indicator should render"
+        );
+    }
+
+    #[test]
+    fn skills_tab_lines_list_aliases_and_disclaimer() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let ui_state = TuiUiState {
+            skill_suggestions: test_skill_suggestions(),
+            ..TuiUiState::default()
+        };
+        let text = help_tab_text(&skills_tab_lines(&ui_state, &theme));
+        assert!(text.contains("project-alpha"), "missing project alias");
+        assert!(text.contains("personal-beta"), "missing personal alias");
+        // Source tags are surfaced.
+        assert!(text.contains("Project") && text.contains("Personal"));
+        // The guidance disclaimer is always present.
+        assert!(text.to_lowercase().contains("guidance"));
+        assert!(text.to_lowercase().contains("approvals"));
+    }
+
+    #[test]
+    fn skills_tab_lines_render_empty_state_without_panic() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let ui_state = TuiUiState {
+            skill_suggestions: Vec::new(),
+            ..TuiUiState::default()
+        };
+        let text = help_tab_text(&skills_tab_lines(&ui_state, &theme));
+        assert!(text.to_lowercase().contains("no skills"));
+        // The disclaimer survives the empty state.
+        assert!(text.to_lowercase().contains("guidance"));
+    }
+
+    #[test]
+    fn getting_started_lines_render_model_examples_and_compact_agents() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let mut state = state_with_input("", false);
+        state.agents = vec![
+            agent_view("explorer", "Explorer", "idle", &["read"]),
+            agent_view("fixer", "Fixer", "idle", &["read", "edit"]),
+        ];
+        let lines = getting_started_lines(&state, &theme);
+        let text = help_tab_text(&lines);
+        // Routing mental model: prompt -> orchestrator -> named agents.
+        assert!(text.contains("orchestrator"));
+        assert!(text.contains("agents"));
+        // At least two copy-pasteable example prompts (marked with "> ").
+        let example_count = lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .first()
+                    .is_some_and(|span| span.content.starts_with("> "))
+            })
+            .count();
+        assert!(example_count >= 2, "expected >=2 example prompts");
+        // Exactly one compact agent row per configured agent.
+        assert!(text.contains("Explorer"));
+        assert!(text.contains("Fixer"));
+        let agent_rows = lines
+            .iter()
+            .filter(|line| {
+                let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                joined.contains("Explorer") || joined.contains("Fixer")
+            })
+            .count();
+        assert_eq!(agent_rows, 2, "expected one compact row per agent");
+    }
+
+    fn help_tab_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn keys_tab_lines_contains_expected_keybindings() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&keys_tab_lines(&theme));
+        assert!(text.contains("Ctrl-L"));
+        assert!(text.contains("PageUp/PageDown"));
+        assert!(text.contains("Home/End"));
+        // Verbatim relocation: the full keybinding set is present.
+        assert!(text.contains("Enter"));
+        assert!(text.contains("Backspace"));
+    }
+
+    #[test]
+    fn cli_tab_lines_contains_expected_flags() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&cli_tab_lines(&theme));
+        assert!(text.contains("atelier --doctor"));
+        assert!(text.contains("atelier --init-config"));
+        assert!(text.contains("atelier --help"));
+    }
+
+    #[test]
+    fn approvals_tab_lines_explains_modes_and_roots() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&approvals_tab_lines(&theme));
+        assert!(text.contains("yolo"));
+        assert!(text.contains("normal"));
+        // Mentions the read/write-roots concept and capabilities.
+        assert!(text.contains("read roots") && text.contains("write roots"));
+        assert!(text.to_lowercase().contains("capabilities"));
+    }
+
+    #[test]
+    fn approvals_tab_lines_style_uses_theme_tokens() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        // Every styled span draws from theme tokens (no inline Color literals);
+        // the header line uses the accent token.
+        let lines = approvals_tab_lines(&theme);
+        let header = &lines[0];
+        assert_eq!(header.spans[0].style.fg, Some(theme.accent));
+    }
+
+    #[test]
+    fn help_modal_opens_on_getting_started_with_tab_strip() {
+        // Opening help (default `help_active_tab`) renders the Getting Started body
+        // plus a tab strip listing every tab title.
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+
+        // Getting Started routing line is the default body.
+        assert!(text.contains("orchestrator"));
+        // The tab strip lists each tab title.
+        assert!(text.contains("Getting Started"));
+        assert!(text.contains("Commands"));
+        assert!(text.contains("Keys"));
+        assert!(text.contains("Skills"));
+        assert!(text.contains("Approvals"));
+        // The default body is Getting Started, not the Commands catalog.
+        assert!(!text.contains("toggle the help overlay"));
+    }
+
+    #[test]
+    fn help_modal_commands_tab_renders_catalog() {
+        // Selecting the Commands tab renders the catalog-derived command rows.
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Commands,
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+
+        assert!(text.contains("/help"));
+        assert!(text.contains("toggle the help overlay"));
+    }
+
+    #[tokio::test]
+    async fn help_tabs_cycle_with_arrows_and_esc_closes_from_any_tab() {
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut state = state_with_input("", false);
+        let mut ui_state = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+
+        // Six Right presses cycle through all six tabs and return to Getting
+        // Started — proving a full wrap. Each press is routed through the real
+        // key handler, then executed.
+        for _ in 0..HelpTab::ALL.len() {
+            let command = key_event_to_tui_command_with_ui(
+                &state,
+                &ui_state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            )
+            .expect("Right should navigate while help is visible");
+            execute_tui_command(&mut state, &mut ui_state, &sender, command)
+                .await
+                .unwrap();
+        }
+        assert_eq!(ui_state.help_active_tab, HelpTab::GettingStarted);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        assert!(text.contains("How Atelier works"));
+
+        // From the Skills tab, Esc closes the modal.
+        ui_state.help_active_tab = HelpTab::Skills;
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .expect("Esc should close help from any tab");
+        execute_tui_command(&mut state, &mut ui_state, &sender, command)
+            .await
+            .unwrap();
+        assert!(!ui_state.help_visible);
     }
 }

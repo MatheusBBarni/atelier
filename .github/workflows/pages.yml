@@ -1,11 +1,20 @@
 name: Deploy web to GitHub Pages
 
+# Custom Pages deploy (ADR-005, PRD F9 Wave-2). Replaces the Node-only
+# withastro/action: the docs reference is generated at build time from the Rust
+# source of truth, so the deploy must build `atelier`, run `--emit-docs`, then
+# `astro build`. A generator-source change (CLI/config/slash catalog) also
+# triggers a fresh deploy so the published reference never drifts.
 on:
   push:
     branches:
       - main
     paths:
       - "web/**"
+      - "src/cli.rs"
+      - "src/config/**"
+      - "src/slash_commands.rs"
+      - "src/docgen/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -26,13 +35,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install, build, and upload site
-        uses: withastro/action@v6
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build atelier (release)
+        run: cargo build --locked --release --bin atelier
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
-          path: web
-          node-version: 24
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+
+      # Run the prebuilt binary's --emit-docs into the content collection.
+      # ATELIER_BIN points generate-docs.mjs at the release binary so it reuses
+      # the build above instead of `cargo run`.
+      - name: Generate reference docs
+        working-directory: web
+        run: npm run generate
+        env:
+          ATELIER_BIN: ${{ github.workspace }}/target/release/atelier
+
+      # `npx astro build` (not `npm run build`) so the `prebuild` hook does not
+      # re-run generate — the step above already produced the fragments.
+      - name: Build site (GitHub Pages base path)
+        working-directory: web
+        run: npx astro build
         env:
           GITHUB_PAGES: "true"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
 
   deploy:
     name: Deploy GitHub Pages

@@ -1,0 +1,43 @@
+---
+import { getCollection } from "astro:content";
+import Base from "../../layouts/Base.astro";
+import { assetPath } from "../../lib/basePath";
+
+// Index lists every doc section ordered by `nav_order`. Builds cleanly with an
+// empty collection (renders the empty-state note instead of a list).
+const sections = (await getCollection("docs")).sort(
+  (a, b) => a.data.nav_order - b.data.nav_order,
+);
+---
+
+<Base
+  title="Documentation - Atelier"
+  description="Atelier documentation: quickstart, concepts, governance, configuration, and CLI reference."
+>
+  <main class="section docs-index">
+    <div class="section__heading section__heading--narrow">
+      <p class="eyebrow">Documentation</p>
+      <h2>Atelier docs</h2>
+      <p>
+        Get a run going, learn the orchestration model, and configure the
+        harness for your repository.
+      </p>
+    </div>
+
+    {
+      sections.length > 0 ? (
+        <ul class="docs-index__list">
+          {sections.map((section) => (
+            <li class="docs-index__item">
+              <a href={assetPath(`/docs/${section.id}/`)}>
+                {section.data.title}
+              </a>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p class="docs-index__empty">Documentation pages are coming soon.</p>
+      )
+    }
+  </main>
+</Base>

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Custom Pages deploy and generator step in CI"
 type: infra
 complexity: high
@@ -37,12 +37,12 @@ and the highest-regression-risk change, since it rewrites the working deploy
 </requirements>
 
 ## Subtasks
-- [ ] 12.1 Rewrite the `pages.yml` build job (Rust → `--emit-docs` → node → `astro build` → artifact).
-- [ ] 12.2 Keep the `deploy-pages` job and the concurrency/environment settings.
-- [ ] 12.3 Add the Rust build + generate step to `web-checks.yml`.
-- [ ] 12.4 Add cargo caching and reuse one binary build across steps.
-- [ ] 12.5 Verify a full deploy serves the landing page AND the generated `/docs` reference.
-- [ ] 12.6 Verify the PR gate now link-checks the generated pages.
+- [x] 12.1 Rewrite the `pages.yml` build job (Rust → `--emit-docs` → node → `astro build` → artifact).
+- [x] 12.2 Keep the `deploy-pages` job and the concurrency/environment settings.
+- [x] 12.3 Add the Rust build + generate step to `web-checks.yml`.
+- [x] 12.4 Add cargo caching and reuse one binary build across steps.
+- [x] 12.5 Verify a full deploy serves the landing page AND the generated `/docs` reference.
+- [x] 12.6 Verify the PR gate now link-checks the generated pages.
 
 ## Implementation Details
 

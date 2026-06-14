@@ -1,6 +1,6 @@
 {
   "name": "@matheusbbarni/atelier-win32-arm64",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Windows arm64 native binary for Atelier",
   "license": "MIT",
   "os": [

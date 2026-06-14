@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Roster render rewrite: weight, glyph+label, elapsed, current-step, animated indicator, summary header"
 type: frontend
 complexity: high
@@ -39,13 +39,13 @@ Rewrite the roster render block (TechSpec 'System Architecture' + 'Development S
 
 ## Subtasks
 
-- [ ] 6.1 Implement `activity_glyph(ActivityState, ascii_mode: bool)` and `activity_label(ActivityState)` helper functions near `status_style` in `tui/mod.rs`; cover all four states (`Active`/`NeedsInput`/`Stalled`/`Idle`) with portable glyphs (◐/◔/○/·) and ASCII fallbacks (>/\?/!/.).
-- [ ] 6.2 Rewrite the roster render block at `tui/mod.rs:2114–2177` to iterate `state.roster_rows` instead of `state.agents`; emit glyph+label + agent name (accented via `accent_index`) + runtime/model + effort/thinking on idle/normal rows; add current-step + elapsed for active rows only.
-- [ ] 6.3 Implement the summary-header line generation: count `roster_rows` by `ActivityState` (working, waiting, stalled, idle); render a single header line with counts and glyphs above the roster list; handle at-rest (idle run) case gracefully.
-- [ ] 6.4 Apply visual weight via theme tokens: active rows bold + normal text, idle rows dimmed via `text_dim`, `NeedsInput` rows normal weight but prominent glyph; use `Modifier::BOLD` and theme color tokens (no inline `Color::` literals outside `theme.rs`, per CI invariant).
-- [ ] 6.5 Add width-resilience truncation: measure sidebar width context and apply existing truncation helpers to model names and step labels; test at ~30–40 column widths to confirm no layout breakage.
-- [ ] 6.6 Update accent contract tests: modify `roster_names_carry_same_accents_as_chat` and `agent_dropdown_ids_carry_same_accents_as_roster` to use a pinned-reorder fixture (fixture has `NeedsInput` agent at canonical index 1 pinned to row 0); assert accent follows `agent.id` (canonical index), not enumerate position (see ADR-005).
-- [ ] 6.7 Add TestBackend snapshot tests (100×24 and ~35×24 narrow): idle lineup, single-active row, needs-input row pinned, stalled row with frozen glyph, summary-header line counts match, narrow-width graceful truncation, `NO_COLOR` monochrome rendering legible by glyph+label; guard determinism (repeated idle renders produce identical output, no `now` advance).
+- [x] 6.1 `activity_glyph`/`activity_label` (delivered task_05) consumed by the render; `#[allow(dead_code)]` removed.
+- [x] 6.2 Roster render rewritten: `agent_roster_items(&[RosterRow], spinner_frame, theme)` emits glyph+label + accented name + runtime/model + effort/thinking; current-step + elapsed on active rows only.
+- [x] 6.3 Summary-header line: counts by `ActivityState` → `▶ N working · ◔ N waiting · ○ N stalled`, at-rest `● N agents idle`.
+- [x] 6.4 Visual weight: active = bold accent name; idle = accent name + `DIM` (keeps identity color, ADR-005); NeedsInput/Stalled = normal-weight accent + prominent glyph. Theme tokens only.
+- [~] 6.5 Width resilience: the `List` widget clips overflow to the ~28% sidebar (no layout breakage), verified by a narrow-width (40-col) render test. **Explicit per-field `…` truncation of long model/step labels deferred** as polish (follow-up note).
+- [x] 6.6 `roster_names_carry_same_accents_as_chat` updated to a pinned-reorder fixture (NeedsInput agent canonical index 1 pinned to row 0 → still `accent_for(1)`). `agent_dropdown_ids_carry_same_accents_as_roster` already passes: the dropdown resolves accent by canonical `id` lookup (never reorders), so no change needed.
+- [x] 6.7 Snapshot/scenario tests added: idle lineup + header, single-active (glyph+label+step+elapsed), NeedsInput pinned, stalled frozen glyph, summary-header counts, NO_COLOR legible-by-glyph+label, idle determinism (3 identical frames), narrow-width without breakage.
 
 ## Implementation Details
 

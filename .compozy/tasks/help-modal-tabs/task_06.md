@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Tabbed render_help_modal with active-tab dispatch
 type: frontend
 complexity: medium
@@ -36,11 +36,11 @@ tests whose default view changes to Getting Started.
 </requirements>
 
 ## Subtasks
-- [ ] 06.1 Change the `render_help_modal` signature and update both call sites.
-- [ ] 06.2 Render the theme-token tab strip with active-tab highlight.
-- [ ] 06.3 Dispatch on `help_active_tab` to the per-tab builders and render the active body.
-- [ ] 06.4 Update the three Commands-asserting tests to select the Commands tab first.
-- [ ] 06.5 Add tests for default-tab render and tab-strip presence.
+- [x] 06.1 Change the `render_help_modal` signature and update both call sites.
+- [x] 06.2 Render the theme-token tab strip with active-tab highlight.
+- [x] 06.3 Dispatch on `help_active_tab` to the per-tab builders and render the active body.
+- [x] 06.4 Update the three Commands-asserting tests to select the Commands tab first.
+- [x] 06.5 Add tests for default-tab render and tab-strip presence.
 
 ## Implementation Details
 `render_help_modal` is currently stateless (`:3257`) and both call sites already have `state`

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Static reference tab builders (Keys, CLI, Approvals)
 type: frontend
 complexity: low
@@ -32,10 +32,10 @@ normal approval, capabilities, and read/write roots). These are pure functions r
 </requirements>
 
 ## Subtasks
-- [ ] 04.1 Implement `keys_tab_lines` from the existing keybinding literals.
-- [ ] 04.2 Implement `cli_tab_lines` from the existing CLI-flag literals.
-- [ ] 04.3 Write the Approvals & Modes static prose and implement `approvals_tab_lines`.
-- [ ] 04.4 Add unit tests asserting key rows, CLI rows, and approval-mode terms are present.
+- [x] 04.1 Implement `keys_tab_lines` from the existing keybinding literals.
+- [x] 04.2 Implement `cli_tab_lines` from the existing CLI-flag literals.
+- [x] 04.3 Write the Approvals & Modes static prose and implement `approvals_tab_lines`.
+- [x] 04.4 Add unit tests asserting key rows, CLI rows, and approval-mode terms are present.
 
 ## Implementation Details
 The keybinding and CLI content lives today as literal `Line::from(...)` rows inside
@@ -59,10 +59,10 @@ of text). See TechSpec "Core Interfaces" for builder shapes.
 
 ## Tests
 - Unit tests:
-  - [ ] `keys_tab_lines` output contains `"Ctrl-L"`, `"PageUp/PageDown"`, and `"Home/End"`.
-  - [ ] `cli_tab_lines` output contains `"atelier --doctor"` and `"atelier --init-config"`.
-  - [ ] `approvals_tab_lines` output contains both `"yolo"` and `"normal"` and mentions read/write roots.
-  - [ ] No builder references `AppState`/`TuiUiState` (compiles as a free `fn(&Theme) -> Vec<Line>`).
+  - [x] `keys_tab_lines` output contains `"Ctrl-L"`, `"PageUp/PageDown"`, and `"Home/End"`.
+  - [x] `cli_tab_lines` output contains `"atelier --doctor"` and `"atelier --init-config"`.
+  - [x] `approvals_tab_lines` output contains both `"yolo"` and `"normal"` and mentions read/write roots.
+  - [x] No builder references `AppState`/`TuiUiState` (compiles as a free `fn(&Theme) -> Vec<Line>`).
 - Integration tests:
   - [ ] Exercised via task_06 when the Keys/CLI/Approvals tabs render.
 - Test coverage target: >=80%

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Accent-by-identity consistency (roster/chat/dropdown) + strengthened contract tests"
 type: frontend
 complexity: medium
@@ -35,13 +35,13 @@ Make agent accent follow identity across all three surfaces (roster, chat, dropd
 
 ## Subtasks
 
-- [ ] 7.1 Verify `accent_index` is present on `RosterRow` (Task 06 deliverable) and is computed from canonical order before the pin-sort; add code comments at the three render sites documenting the single-source rule.
-- [ ] 7.2 Repoint the roster render block (`tui/mod.rs:2114-2177`) to use `row.accent_index` instead of the enumerate index; add the single-source rule comment with ADR-005 reference.
-- [ ] 7.3 Repoint chat title styling (`item_agent_accent` at `3115`) to resolve accent from the canonical agent identity index instead of the render-time position; add the single-source rule comment.
-- [ ] 7.4 Repoint `/agent:` dropdown accent lookup (`tui/mod.rs:2488`) to use the canonical agent identity index instead of the render-time enumerate position; add the single-source rule comment.
-- [ ] 7.5 Update `roster_names_carry_same_accents_as_chat` to use a pinned-reorder fixture: create a state where one agent has `NeedsInput` status and verify its roster color equals its canonical `theme.accent_for(canonical_index)`.
-- [ ] 7.6 Update `agent_dropdown_ids_carry_same_accents_as_roster` to use a pinned-reorder fixture; verify the pinned agent's dropdown accent matches its canonical index.
-- [ ] 7.7 Document the single-source rule and the fourth-surface risk in the codebase (e.g., as a CI invariant check or a summary comment near the accent resolution sites).
+- [x] 7.1 Verified `accent_index` on `RosterRow` is computed from canonical order before the pin-sort (task_03 builder; unit test `needs_input_pin_preserves_canonical_accent_index`). Single-source-rule comments added at the three sites.
+- [x] 7.2 Roster already reads `row.accent_index` (task_06); added the single-source-rule comment (ADR-005) at `roster_row_item`.
+- [x] 7.3 Chat `item_agent_accent` already resolves by canonical identity (`agent_index_for_title`); added the canonical single-source doc block here.
+- [x] 7.4 `/agent:` dropdown already resolves by canonical `id` lookup; added the single-source-rule comment.
+- [x] 7.5 `roster_names_carry_same_accents_as_chat` uses the pinned-reorder fixture (done task_06; NeedsInput fixer pinned to row 0 → `accent_for(1)`).
+- [x] 7.6 `agent_dropdown_ids_carry_same_accents_as_roster` strengthened: renders roster + dropdown together under the pin; asserts fixer = `accent_for(1)` in both surfaces.
+- [x] 7.7 Single-source rule + fourth-surface risk documented as a doc block on `item_agent_accent` (cross-referenced from the other two sites).
 
 ## Implementation Details
 

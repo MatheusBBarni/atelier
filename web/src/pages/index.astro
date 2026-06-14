@@ -1,10 +1,7 @@
 ---
-import "../styles/global.css";
-
-const basePath = import.meta.env.BASE_URL.endsWith("/")
-  ? import.meta.env.BASE_URL
-  : `${import.meta.env.BASE_URL}/`;
-const assetPath = (path) => `${basePath}${path.replace(/^\//, "")}`;
+import Base from "../layouts/Base.astro";
+import Nav from "../components/Nav.astro";
+import { assetPath } from "../lib/basePath";
 
 const installCommands = [
   "npm install -g @matheusbbarni/atelier",
@@ -71,9 +68,9 @@ const featureGroups = [
     title: "Project Memory",
     kicker: "Every run leaves useful evidence behind.",
     items: [
-      "Session events under .multiagent/sessions",
+      "Session events under .atelier/sessions",
       "Artifacts for large output, diffs, and run material",
-      "Run records under .multiagent/runs",
+      "Run records under .atelier/runs",
       "Context resume from harness-owned history",
       "Clean-session command for local history cleanup",
       "Codemap state for repository orientation",
@@ -126,7 +123,7 @@ const workflowSteps = [
   ["02", "Route", "The Orchestrator chooses a single agent, a council, or a parallel group."],
   ["03", "Act", "Agents ask the harness for reads, edits, commands, approvals, and verification."],
   ["04", "Review", "Reviewer findings go back to the Orchestrator instead of editing directly."],
-  ["05", "Record", "History, artifacts, diffs, diagnostics, and run results stay under .multiagent."],
+  ["05", "Record", "History, artifacts, diffs, diagnostics, and run results stay under .atelier."],
 ];
 
 const visualFrames = [
@@ -212,27 +209,11 @@ const leftAgents = supportingAgents.slice(0, 4);
 const rightAgents = supportingAgents.slice(4);
 ---
 
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta
-      name="description"
-      content="Atelier is a terminal-native agent orchestration harness for local repositories."
-    />
-    <title>Atelier - Terminal-native agent orchestration</title>
-    <link rel="icon" href={assetPath("/favicon.svg")} type="image/svg+xml" />
-    <link rel="apple-touch-icon" href={assetPath("/images/atelier-logo-256.png")} />
-    <meta name="theme-color" content="#08131f" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap"
-      rel="stylesheet"
-    />
-  </head>
-  <body>
+<Base
+  title="Atelier - Terminal-native agent orchestration"
+  description="Atelier is a terminal-native agent orchestration harness for local repositories."
+  renderHeader={false}
+>
     <main>
       <section class="hero" aria-labelledby="hero-title">
         <img
@@ -241,52 +222,7 @@ const rightAgents = supportingAgents.slice(4);
           alt="Dark terminal command center with agent panels, timelines, and diff-like surfaces."
         />
         <div class="hero__shade" aria-hidden="true"></div>
-        <header class="nav" aria-label="Primary">
-          <a class="brand" href="#top" aria-label="Atelier home">
-            <img
-              class="brand__mark"
-              src={assetPath("/images/atelier-logo-256.png")}
-              alt=""
-              aria-hidden="true"
-              width="36"
-              height="36"
-              loading="eager"
-            />
-            <span>Atelier</span>
-          </a>
-          <div class="nav__right">
-            <nav class="nav__links">
-              <a href="#features">Features</a>
-              <a href="#commands">Commands</a>
-              <a href="#install">Install</a>
-            </nav>
-            <a
-              class="github-star"
-              href="https://github.com/MatheusBBarni/atelier"
-              target="_blank"
-              rel="noreferrer"
-              aria-label="Star Atelier on GitHub"
-              data-github-star
-            >
-              <span class="github-star__github" aria-hidden="true">
-                <svg viewBox="0 0 24 24" focusable="false">
-                  <path
-                    d="M12 1.8c-5.7 0-10.3 4.6-10.3 10.3 0 4.5 2.9 8.4 7 9.8.5.1.7-.2.7-.5v-1.8c-2.8.6-3.4-1.2-3.4-1.2-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 .1 1.6 1.1 1.6 1.1.9 1.6 2.4 1.1 2.9.9.1-.7.4-1.1.7-1.4-2.3-.3-4.6-1.1-4.6-5 0-1.1.4-2 1.1-2.8-.1-.3-.5-1.3.1-2.8 0 0 .9-.3 2.8 1.1.8-.2 1.6-.3 2.5-.3s1.7.1 2.5.3c1.9-1.3 2.8-1.1 2.8-1.1.6 1.5.2 2.5.1 2.8.7.8 1.1 1.7 1.1 2.8 0 3.9-2.4 4.7-4.6 5 .4.3.7.9.7 1.8v2.7c0 .3.2.6.7.5 4.1-1.4 7-5.3 7-9.8 0-5.7-4.6-10.3-10.3-10.3z"
-                  />
-                </svg>
-              </span>
-              <span class="github-star__label">Star on GitHub</span>
-              <span class="github-star__count" data-github-star-count hidden></span>
-              <span class="github-star__star" aria-hidden="true">
-                <svg viewBox="0 0 24 24" focusable="false">
-                  <path
-                    d="m12 2.5 2.9 5.9 6.5 1-4.7 4.5 1.1 6.4L12 17.2l-5.8 3.1 1.1-6.4-4.7-4.5 6.5-1L12 2.5z"
-                  />
-                </svg>
-              </span>
-            </a>
-          </div>
-        </header>
+        <Nav />
 
         <div class="hero__content" id="top">
           <img
@@ -632,5 +568,4 @@ const rightAgents = supportingAgents.slice(4);
           });
       })();
     </script>
-  </body>
-</html>
+</Base>

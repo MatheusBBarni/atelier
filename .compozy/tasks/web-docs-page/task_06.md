@@ -1,10 +1,10 @@
 ---
-status: pending
+status: completed
 title: "Write the Governance and Safety page"
 type: docs
 complexity: medium
 dependencies:
-  - task_03
+    - task_03
 ---
 
 # Write the Governance and Safety page
@@ -34,12 +34,12 @@ limits, untrusted-input handling, and an honest-limits note (PRD F2, ADR-002/004
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Philosophy: the harness owns every action; agents only request.
-- [ ] 6.2 What an agent can and cannot touch: the action set + read/write roots.
-- [ ] 6.3 The two layers: capabilities vs `ApprovalMode` (with an action × capability × prompts-in-normal table).
-- [ ] 6.4 Limits and `LimitReached`.
-- [ ] 6.5 The durable, replayable record (audit/replay a run).
-- [ ] 6.6 Untrusted input + the skills-are-guidance disclaimer + an honest-limits note.
+- [x] 6.1 Philosophy: the harness owns every action; agents only request.
+- [x] 6.2 What an agent can and cannot touch: the action set + read/write roots.
+- [x] 6.3 The two layers: capabilities vs `ApprovalMode` (with an action × capability × prompts-in-normal table).
+- [x] 6.4 Limits and `LimitReached`.
+- [x] 6.5 The durable, replayable record (audit/replay a run).
+- [x] 6.6 Untrusted input + the skills-are-guidance disclaimer + an honest-limits note.
 
 ## Implementation Details
 
@@ -70,10 +70,10 @@ modes/capabilities, the workspace roots, and the limits in code — do not inven
 - Unit tests:
   - [ ] Not applicable (prose); covered by build + source-accuracy checks below.
 - Integration tests:
-  - [ ] The page builds and renders through `DocsLayout`.
-  - [ ] The documented action set matches the `ActionRequest` variants in `src/actions/mod.rs`.
-  - [ ] The documented approval modes (`yolo`/`normal`) and capability names match `src/config/mod.rs`.
-  - [ ] The skills-are-guidance disclaimer and an honest-limits note are present; no claim asserts an absolute guarantee.
+  - [x] The page builds and renders through `DocsLayout`.
+  - [x] The documented action set matches the `ActionRequest` variants in `src/actions/mod.rs`.
+  - [x] The documented approval modes (`yolo`/`normal`) and capability names match `src/config/mod.rs`.
+  - [x] The skills-are-guidance disclaimer and an honest-limits note are present; no claim asserts an absolute guarantee.
 - Test coverage target: >=80%
 - All tests must pass
 

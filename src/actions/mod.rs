@@ -12,6 +12,10 @@ use tokio::time::timeout;
 
 const DEFAULT_SEARCH_EXCLUDED_DIRS: &[&str] = &[
     ".git",
+    ".atelier",
+    // Legacy data root from before the `multiagent` -> `atelier` rename: an
+    // upgraded workspace can still have `.multiagent/sessions/` event logs
+    // (prior prompts and action output), so keep them out of model searches too.
     ".multiagent",
     "target",
     "node_modules",
@@ -172,7 +176,7 @@ pub fn validate_action_request_with_scope(
     let base_decision = match request.kind {
         ActionKind::ReadFile | ActionKind::ListFiles | ActionKind::SearchText => {
             if let Some(path) = path_param(&request.params) {
-                if let Err(error) = validate_model_path(path, &workspace.extra_read_roots) {
+                if let Err(error) = validate_model_path(path, &workspace.read_roots()) {
                     return ActionDecision::Denied(error.to_string());
                 }
             }
@@ -613,8 +617,34 @@ fn command_has_prefix(lower_command: &str, prefix: &str) -> bool {
 pub fn validate_model_path(path: &str, extra_roots: &[PathBuf]) -> Result<PathBuf> {
     let candidate = Path::new(path);
     if candidate.is_absolute() {
-        if extra_roots.iter().any(|root| candidate.starts_with(root)) {
-            return Ok(candidate.to_path_buf());
+        // Reject `..` traversal even for an authorized absolute path, so a scoped
+        // root prefix (e.g. `/workspace`) cannot be escaped via `/workspace/../secret`
+        // once the OS resolves the path.
+        if candidate
+            .components()
+            .any(|component| component == Component::ParentDir)
+        {
+            bail!("path traversal is not allowed: {path}");
+        }
+        // `read_roots()` returns the filesystem-root sentinel (`MAIN_SEPARATOR_STR`)
+        // to mean "any absolute path" under `allow_unrestricted_reads`. On Unix that
+        // root (`/`) already `starts_with`-matches every absolute path, but on Windows
+        // a bare separator never matches a drive-rooted path (`C:\…`), so match the
+        // sentinel explicitly to keep the opt-in working cross-platform.
+        let fs_root = Path::new(std::path::MAIN_SEPARATOR_STR);
+        for root in extra_roots {
+            if root.as_path() == fs_root {
+                // Unrestricted-reads sentinel: every absolute path is authorized.
+                return Ok(candidate.to_path_buf());
+            }
+            // A lexical prefix match is necessary but not sufficient: an in-root
+            // symlink (e.g. `/workspace/link` -> `/etc`) would let `/workspace/link/x`
+            // pass `starts_with` while the OS resolves it to `/etc/x`. Resolve
+            // symlinks and confirm the real target still lands inside the root before
+            // authorizing, so a symlink cannot escape the authorized boundary.
+            if candidate.starts_with(root) && canonical_path_within_root(candidate, root) {
+                return Ok(candidate.to_path_buf());
+            }
         }
         bail!("absolute paths are not allowed for model-requested actions: {path}");
     }
@@ -629,6 +659,44 @@ pub fn validate_model_path(path: &str, extra_roots: &[PathBuf]) -> Result<PathBu
         }
     }
     Ok(candidate.to_path_buf())
+}
+
+/// Confirm the symlink-resolved form of `candidate` still lands inside `root`.
+///
+/// `candidate` is already a lexical prefix match for `root`; this resolves
+/// symlinks so an in-root link pointing outside the authorized boundary cannot be
+/// used to escape it. Write targets may not exist yet, so the deepest *existing*
+/// ancestor is canonicalized and the not-yet-created tail is re-appended (a
+/// symlink must itself exist to redirect, so any link in the path lives within
+/// that existing prefix). When nothing along the path exists on disk there is no
+/// symlink to resolve and the caller's lexical verdict is preserved (`true`).
+///
+/// The check only ever tightens authorization: it can reject a lexical match
+/// whose real target escapes, but never authorizes a path the prefix match
+/// already rejected.
+fn canonical_path_within_root(candidate: &Path, root: &Path) -> bool {
+    // Walk up to the deepest ancestor that exists so symlinked prefixes resolve
+    // even when the leaf is a not-yet-created write target.
+    let mut existing = candidate;
+    let canonical_prefix = loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            break resolved;
+        }
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => return true, // nothing on disk to resolve; keep the lexical verdict
+        }
+    };
+    // Re-attach the components below the resolved prefix.
+    let Ok(suffix) = candidate.strip_prefix(existing) else {
+        return true;
+    };
+    let resolved = canonical_prefix.join(suffix);
+    // Compare against the canonical form of the root too: a symlinked root (e.g.
+    // macOS `/tmp` -> `/private/tmp`) must match the resolved candidate, or a
+    // legitimately in-root path would be wrongly rejected.
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    resolved.starts_with(&canonical_root)
 }
 
 fn required_capability(kind: &ActionKind) -> Option<Capability> {
@@ -651,13 +719,13 @@ fn validate_parallel_read_path(
     path: &str,
     workspace: &WorkspacePolicy,
 ) -> Result<()> {
-    let path = validate_model_path(path, &workspace.extra_read_roots)?;
+    let path = validate_model_path(path, &workspace.read_roots())?;
     if scope_path_matches_any(
         &path,
         &scope.write_files,
         &workspace.extra_write_roots,
         true,
-    )? || scope_path_is_under_any(&path, &scope.read_roots, &workspace.extra_read_roots)?
+    )? || scope_path_is_under_any(&path, &scope.read_roots, &workspace.read_roots())?
     {
         return Ok(());
     }
@@ -672,8 +740,8 @@ fn validate_parallel_read_root(
     path: &str,
     workspace: &WorkspacePolicy,
 ) -> Result<()> {
-    let path = validate_model_path(path, &workspace.extra_read_roots)?;
-    if scope_path_is_under_any(&path, &scope.read_roots, &workspace.extra_read_roots)? {
+    let path = validate_model_path(path, &workspace.read_roots())?;
+    if scope_path_is_under_any(&path, &scope.read_roots, &workspace.read_roots())? {
         return Ok(());
     }
     bail!(
@@ -797,7 +865,7 @@ fn execute_read_file(
     let resolved = resolve_action_path(
         &context.working_directory,
         path,
-        &context.workspace.extra_read_roots,
+        &context.workspace.read_roots(),
         true,
     )?;
     let contents = fs::read_to_string(&resolved)
@@ -819,7 +887,7 @@ fn execute_list_files(
     let resolved = resolve_action_path(
         &context.working_directory,
         path,
-        &context.workspace.extra_read_roots,
+        &context.workspace.read_roots(),
         true,
     )?;
     let max_entries = optional_u64_param(&request.params, "max_entries")
@@ -852,7 +920,7 @@ fn execute_search_text(
     let resolved = resolve_action_path(
         &context.working_directory,
         path,
-        &context.workspace.extra_read_roots,
+        &context.workspace.read_roots(),
         true,
     )?;
     let max_matches = optional_u64_param(&request.params, "max_matches")
@@ -1478,6 +1546,155 @@ mod tests {
     }
 
     #[test]
+    fn unrestricted_reads_flag_allows_absolute_read_outside_workspace() {
+        let (mut config, explorer) = fixture_agent("explorer");
+        // Hermetic baseline: `fixture_agent` loads the user's home config, which
+        // may opt into unrestricted reads — pin it off so the "without flag"
+        // path is exercised regardless of the ambient environment.
+        config.workspace.allow_unrestricted_reads = false;
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::ReadFile,
+            params: json!({ "path": "/Users/nobody/.claude/reference.md" }),
+        };
+
+        // Default policy: absolute paths outside the workspace are denied.
+        let denied = validate_action_request(
+            &explorer,
+            &config.workspace,
+            &config.approval_mode,
+            &request,
+        );
+        assert!(
+            matches!(&denied, ActionDecision::Denied(reason) if reason.contains("absolute paths are not allowed")),
+            "expected absolute-path denial, got {denied:?}"
+        );
+
+        // Opting in lets the model read any absolute path.
+        config.workspace.allow_unrestricted_reads = true;
+        let allowed = validate_action_request(
+            &explorer,
+            &config.workspace,
+            &config.approval_mode,
+            &request,
+        );
+        assert!(
+            matches!(allowed, ActionDecision::Allowed),
+            "got {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn validate_model_path_rejects_parent_traversal_in_absolute_path() {
+        // A scoped read root must not be escapable via `..`: `/workspace/../secret`
+        // resolves outside `/workspace`, so it is rejected before authorization even
+        // though it shares the root prefix.
+        let roots = [PathBuf::from("/workspace")];
+        let err = validate_model_path("/workspace/../secret", &roots).unwrap_err();
+        assert!(
+            err.to_string().contains("path traversal is not allowed"),
+            "{err}"
+        );
+        // An in-scope absolute path without traversal is still allowed.
+        assert!(validate_model_path("/workspace/sub/file.rs", &roots).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_model_path_rejects_in_root_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        // A symlink *inside* an authorized root that points outside it must not
+        // grant access to the link target: `<root>/link -> <outside>` cannot be
+        // used to reach `<outside>/secret` via `<root>/link/secret`, even though
+        // that spelled path lexically `starts_with` the root.
+        let root_dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+        fs::write(outside_dir.path().join("secret"), "TOP_SECRET").unwrap();
+        symlink(outside_dir.path(), root_dir.path().join("link")).unwrap();
+        let roots = [root_dir.path().to_path_buf()];
+
+        let escape = root_dir.path().join("link/secret");
+        let err = validate_model_path(escape.to_str().unwrap(), &roots).unwrap_err();
+        assert!(
+            err.to_string().contains("absolute paths are not allowed"),
+            "{err}"
+        );
+
+        // Real files genuinely inside the root stay authorized, and a not-yet-
+        // existing write target inside the root is still allowed (the symlink
+        // resolution must not reject paths whose leaf does not exist yet). This
+        // also exercises a symlinked root prefix (macOS tempdirs live under the
+        // `/var` -> `/private/var` link), proving both sides are canonicalized.
+        fs::write(root_dir.path().join("real.rs"), "fn main() {}").unwrap();
+        assert!(
+            validate_model_path(root_dir.path().join("real.rs").to_str().unwrap(), &roots).is_ok()
+        );
+        assert!(validate_model_path(
+            root_dir.path().join("new_dir/file.rs").to_str().unwrap(),
+            &roots
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn unrestricted_reads_flag_keeps_writes_restricted() {
+        // The flag is reads-only: writes outside the workspace stay denied even
+        // for a write-capable agent.
+        let (mut config, fixer) = fixture_agent("fixer");
+        config.workspace.allow_unrestricted_reads = true;
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::WriteFile,
+            params: json!({ "path": "/Users/nobody/.claude/reference.md" }),
+        };
+
+        let decision =
+            validate_action_request(&fixer, &config.workspace, &config.approval_mode, &request);
+        assert!(
+            matches!(&decision, ActionDecision::Denied(reason) if reason.contains("absolute paths are not allowed")),
+            "writes must stay restricted, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn unrestricted_reads_flag_executes_absolute_read_outside_workspace() {
+        let (mut config, _explorer) = fixture_agent("explorer");
+        // Hermetic baseline: ignore any ambient home-config opt-in (see sibling
+        // test) so the "without flag" denial path is exercised deterministically.
+        config.workspace.allow_unrestricted_reads = false;
+        let workspace_dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+        let outside_file = outside_dir.path().join("reference.md");
+        fs::write(&outside_file, "OUTSIDE_REFERENCE_BODY").unwrap();
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::ReadFile,
+            params: json!({ "path": outside_file.to_str().unwrap() }),
+        };
+
+        // Execution refuses the absolute path without the flag...
+        let denied_ctx = action_context(workspace_dir.path(), &config);
+        assert!(execute_read_file(&denied_ctx, &request).is_err());
+
+        // ...and reads it when the flag is set.
+        config.workspace.allow_unrestricted_reads = true;
+        let allowed_ctx = action_context(workspace_dir.path(), &config);
+        let result = execute_read_file(&allowed_ctx, &request).unwrap();
+        let body = result.content.unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(body, "OUTSIDE_REFERENCE_BODY");
+    }
+
+    #[test]
     fn path_scope_rejects_traversal() {
         let error = validate_model_path("../secret", &[]).unwrap_err();
         assert!(error.to_string().contains("traversal"));
@@ -1633,10 +1850,10 @@ mod tests {
     #[tokio::test]
     async fn search_text_skips_harness_runtime_history_by_default() {
         let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".multiagent/sessions/session")).unwrap();
+        fs::create_dir_all(dir.path().join(".atelier/sessions/session")).unwrap();
         fs::create_dir_all(dir.path().join("docs")).unwrap();
         fs::write(
-            dir.path().join(".multiagent/sessions/session/events.jsonl"),
+            dir.path().join(".atelier/sessions/session/events.jsonl"),
             "npm distribution plan\n".repeat(20),
         )
         .unwrap();

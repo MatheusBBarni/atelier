@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "UI config: prompt-history enable flag and size cap"
 type: backend
 complexity: low
@@ -32,11 +32,11 @@ bounded recall list.
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add the two fields to `UiConfig` with defaults.
-- [ ] 2.2 Add the two optional fields to `RawUiConfig`.
-- [ ] 2.3 Extend the `[ui]` merge to apply both.
-- [ ] 2.4 Document the keys briefly.
-- [ ] 2.5 Cover default, override, and layer-precedence behavior with tests.
+- [x] 2.1 Add the two fields to `UiConfig` with defaults.
+- [x] 2.2 Add the two optional fields to `RawUiConfig`.
+- [x] 2.3 Extend the `[ui]` merge to apply both.
+- [x] 2.4 Document the keys briefly.
+- [x] 2.5 Cover default, override, and layer-precedence behavior with tests.
 
 ## Implementation Details
 

@@ -12,7 +12,8 @@ const STATE_SCHEMA_VERSION: u32 = 1;
 const EXCLUDED_DIRS: &[&str] = &[
     ".git",
     ".hg",
-    ".multiagent",
+    ".atelier",
+    ".multiagent", // legacy data root pre-rename; keep old session logs out of the codemap
     ".next",
     ".pytest_cache",
     ".ruff_cache",
@@ -419,7 +420,7 @@ fn map_path(root: &Path, folder: &str) -> PathBuf {
 }
 
 fn state_path(root: &Path) -> PathBuf {
-    root.join(".multiagent").join("codemap.json")
+    root.join(".atelier").join("codemap.json")
 }
 
 fn read_state(root: &Path) -> Result<Option<CodemapState>> {
@@ -487,7 +488,7 @@ mod tests {
         let summary = run_codemap(dir.path(), CodemapCommand::Init).unwrap();
 
         assert_eq!(summary.scanned_files, 2);
-        assert!(dir.path().join(".multiagent/codemap.json").exists());
+        assert!(dir.path().join(".atelier/codemap.json").exists());
         assert!(dir.path().join("codemap.md").exists());
         assert!(dir.path().join("src/codemap.md").exists());
     }
@@ -497,14 +498,14 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
-        fs::create_dir_all(dir.path().join(".multiagent")).unwrap();
+        fs::create_dir_all(dir.path().join(".atelier")).unwrap();
         fs::create_dir_all(dir.path().join("target/debug")).unwrap();
         fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
         fs::create_dir_all(dir.path().join("vendor/lib")).unwrap();
         fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
         fs::write(dir.path().join("src/codemap.md"), "manual").unwrap();
         fs::write(dir.path().join(".git/config"), "git").unwrap();
-        fs::write(dir.path().join(".multiagent/old.json"), "{}").unwrap();
+        fs::write(dir.path().join(".atelier/old.json"), "{}").unwrap();
         fs::write(dir.path().join("target/debug/app"), "bin").unwrap();
         fs::write(dir.path().join("node_modules/pkg/index.js"), "dep").unwrap();
         fs::write(dir.path().join("vendor/lib/lib.rs"), "dep").unwrap();

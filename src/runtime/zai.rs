@@ -31,7 +31,7 @@ impl Runtime for ZaiRuntime {
                 runtime_id: self.config.id.clone(),
                 status: RuntimeAvailabilityStatus::Unavailable,
                 message: "Z.ai api_key_env is not configured".to_string(),
-                remediation: Some("Set [runtimes.zai].api_key_env in multiagent.toml.".to_string()),
+                remediation: Some("Set [runtimes.zai].api_key_env in atelier.toml.".to_string()),
             };
         };
         match env::var(api_key_env) {

@@ -1,4 +1,9 @@
 node_modules/
 dist/
+_site/
 .astro/
 .verification/
+
+# Build-time reference fragments emitted by `atelier --emit-docs` (task_11).
+# Generated on every build/dev via the `generate` script; never committed.
+src/content/docs/_generated/

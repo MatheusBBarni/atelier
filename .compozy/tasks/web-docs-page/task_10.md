@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Build the emit-docs reference generator"
 type: backend
 complexity: high
@@ -36,12 +36,12 @@ diverge from the binary (PRD F6, ADR-003/001).
 </requirements>
 
 ## Subtasks
-- [ ] 10.1 Add the `docgen` module with `DocgenSummary` + `emit_docs`, and register it in `lib.rs`.
-- [ ] 10.2 Configuration emitter: `build_printable_config` → Markdown.
-- [ ] 10.3 CLI emitter: walk `Cli::command().get_arguments()` → Markdown.
-- [ ] 10.4 Commands emitter: `slash_commands::catalog()` → Markdown.
-- [ ] 10.5 Wire the `--emit-docs` flag + exclusion guard + dispatch; update all `Cli` test literals.
-- [ ] 10.6 Write coverage + determinism unit tests.
+- [x] 10.1 Add the `docgen` module with `DocgenSummary` + `emit_docs`, and register it in `lib.rs`.
+- [x] 10.2 Configuration emitter: `build_printable_config` → Markdown.
+- [x] 10.3 CLI emitter: walk `Cli::command().get_arguments()` → Markdown.
+- [x] 10.4 Commands emitter: `slash_commands::catalog()` → Markdown.
+- [x] 10.5 Wire the `--emit-docs` flag + exclusion guard + dispatch; update all `Cli` test literals.
+- [x] 10.6 Write coverage + determinism unit tests.
 
 ## Implementation Details
 
@@ -73,14 +73,14 @@ collection schema in task_03.
 
 ## Tests
 - Unit tests:
-  - [ ] Over a default `EffectiveConfig`, the output contains every slash command from `catalog()` (assert each `SlashCommandSpec.label` appears).
-  - [ ] The output contains every CLI long flag from `Cli::command().get_arguments()`.
-  - [ ] The output contains each config section header (`[agents]`, `[runtimes]`, `[council]`, `[limits]`, `[ui]`, `[workspace]`).
-  - [ ] Two consecutive `emit_docs` runs produce byte-identical files (determinism); no timestamp or live-runtime text appears.
-  - [ ] Each fragment begins with valid `{title, nav_order}` frontmatter parseable by the collection schema.
+  - [x] Over a default `EffectiveConfig`, the output contains every slash command from `catalog()` (assert each `SlashCommandSpec.label` appears).
+  - [x] The output contains every CLI long flag from `Cli::command().get_arguments()`.
+  - [x] The output contains each config section header (`[agents]`, `[runtimes]`, `[council]`, `[limits]`, `[ui]`, `[workspace]`).
+  - [x] Two consecutive `emit_docs` runs produce byte-identical files (determinism); no timestamp or live-runtime text appears.
+  - [x] Each fragment begins with valid `{title, nav_order}` frontmatter parseable by the collection schema.
 - Integration tests:
-  - [ ] `Cli { emit_docs: Some(tmp), .. }` via `run_cli_with` writes the fragments into `tmp` (mirroring the `--codemap` test).
-  - [ ] `--emit-docs` combined with `--print-config` (or `--update`) fails with a `bail!` exclusion error.
+  - [x] `Cli { emit_docs: Some(tmp), .. }` via `run_cli_with` writes the fragments into `tmp` (mirroring the `--codemap` test).
+  - [x] `--emit-docs` combined with `--print-config` (or `--update`) fails with a `bail!` exclusion error.
 - Test coverage target: >=80%
 - All tests must pass
 

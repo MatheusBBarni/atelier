@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Render Compact Share-Safe Provider Status Output
 type: backend
 complexity: medium
@@ -30,12 +30,12 @@ This task creates the formatter for provider runway status results so terminal a
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Add a compact formatter for typed provider runway status results.
-- [ ] 4.2 Map every provider runway state to stable user-facing status labels and concise wording.
-- [ ] 4.3 Add explicit output for unsupported usage, unavailable usage, exact usage, unknown reset timing, and local-only status.
-- [ ] 4.4 Add redaction or omission behavior for diagnostics and sensitive values in default output.
-- [ ] 4.5 Expose the formatter through a small API that command routing can call without knowing provider-specific details.
-- [ ] 4.6 Add focused formatter tests for state labels, exact-usage gating, unsupported wording, and redaction.
+- [x] 4.1 Add a compact formatter for typed provider runway status results. (`render_provider_status`)
+- [x] 4.2 Map every provider runway state to stable user-facing status labels and concise wording. (`state_label`)
+- [x] 4.3 Add explicit output for unsupported usage, unavailable usage, exact usage, unknown reset timing, and local-only status. (`render_detail`, `render_exact_usage`, `render_reset`)
+- [x] 4.4 Add redaction or omission behavior for diagnostics and sensitive values in default output. (diagnostics omitted; name/reason via `redact_secrets`)
+- [x] 4.5 Expose the formatter through a small API that command routing can call without knowing provider-specific details. (`render_provider_status(&[ProviderRunwayStatus]) -> String`)
+- [x] 4.6 Add focused formatter tests for state labels, exact-usage gating, unsupported wording, and redaction.
 
 ## Implementation Details
 Create or update the provider status rendering layer near the runtime status model, or in the existing app output formatting location if the repository has a clearer established pattern. Reference the TechSpec "Output Rules" and "Status Model" sections for the exact product constraints and avoid copying interface definitions into the task implementation.
@@ -65,15 +65,15 @@ Create or update the provider status rendering layer near the runtime status mod
 
 ## Tests
 - Unit tests:
-  - [ ] `Ready` with unsupported usage renders ready wording and says exact remaining usage is unavailable.
-  - [ ] `UnavailableUsage` with unsupported usage renders the explicit unsupported message and a provider-native verification action.
-  - [ ] `UsageAvailability::Exact` renders exact usage only when the typed usage value is exact.
-  - [ ] `LocalOnlyStatus` renders local runtime readiness without account usage wording.
-  - [ ] Diagnostics containing token-like, email-like, or account-like strings are omitted or redacted from default output.
-  - [ ] Unknown reset timing renders as unknown rather than inferred text.
+  - [x] `Ready` with unsupported usage renders ready wording and says exact remaining usage is unavailable. (`ready_with_unsupported_usage_renders_ready_wording`)
+  - [x] `UnavailableUsage` with unsupported usage renders the explicit unsupported message and a provider-native verification action. (`unavailable_usage_renders_unsupported_message_and_verification_action`)
+  - [x] `UsageAvailability::Exact` renders exact usage only when the typed usage value is exact. (`exact_usage_renders_only_when_usage_is_exact`)
+  - [x] `LocalOnlyStatus` renders local runtime readiness without account usage wording. (`local_only_renders_without_account_usage_wording`)
+  - [x] Diagnostics containing token-like, email-like, or account-like strings are omitted or redacted from default output. (`diagnostics_with_sensitive_strings_are_omitted_from_default_output`)
+  - [x] Unknown reset timing renders as unknown rather than inferred text. (`unknown_reset_renders_as_unknown_not_inferred_text`)
 - Integration tests:
-  - [ ] A deterministic list of provider statuses renders one compact row per provider in stable order when the service returns multiple providers.
-  - [ ] Formatted output is suitable for the submitted app command surface without provider-specific branching in command metadata.
+  - [x] A deterministic list of provider statuses renders one compact row per provider in stable order when the service returns multiple providers. (`tests/provider_status_render.rs::renders_one_row_per_provider_in_stable_order`)
+  - [x] Formatted output is suitable for the submitted app command surface without provider-specific branching in command metadata. (`tests/provider_status_render.rs::default_output_is_command_surface_ready_and_share_safe`)
 - Test coverage target: >=80%
 - All tests must pass
 

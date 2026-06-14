@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "History reader and prompt projection"
 type: backend
 complexity: medium
@@ -32,11 +32,11 @@ the single data source for the whole feature (ADR-001) and adds no new persisten
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Add `list_session_event_paths` to the history module.
-- [ ] 1.2 Add `project_prompt_history` folding `prompt_submitted` payloads newest-first.
-- [ ] 1.3 Apply consecutive-dedup, leading-space-skip, and `max` truncation.
-- [ ] 1.4 Make per-file reads tolerant (skip on parse/schema error).
-- [ ] 1.5 Cover ordering, dedup, cap, skip, and tolerance with tests.
+- [x] 1.1 Add `list_session_event_paths` to the history module.
+- [x] 1.2 Add `project_prompt_history` folding `prompt_submitted` payloads newest-first.
+- [x] 1.3 Apply consecutive-dedup, leading-space-skip, and `max` truncation.
+- [x] 1.4 Make per-file reads tolerant (skip on parse/schema error).
+- [x] 1.5 Cover ordering, dedup, cap, skip, and tolerance with tests.
 
 ## Implementation Details
 

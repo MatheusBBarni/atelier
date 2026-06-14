@@ -68,6 +68,44 @@ pub struct AgentView {
     pub status: String,
 }
 
+/// Activity classification for a roster row (ADR-001/ADR-002). Computed in the
+/// app layer by the roster builder and pre-baked into [`RosterRow`] so the
+/// renderer never reads a clock. `snake_case` on the wire mirrors
+/// [`LiveStepStatus`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityState {
+    Active,
+    NeedsInput,
+    Stalled,
+    Idle,
+}
+
+/// Live-activity-first view-model for one agent in the roster (ADR-003). Joins
+/// identity ([`AgentView`]) with liveness ([`LiveStepView`]) and carries
+/// pre-formatted, clock-free values for the pure renderer. Built by the roster
+/// builder and stored on [`AppState::roster_rows`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterRow {
+    /// Stable identity key (`AgentView.id`).
+    pub agent_id: String,
+    pub name: String,
+    /// Canonical-order index into the theme accent palette (ADR-005); decoupled
+    /// from render-time position so the `NeedsInput` pin cannot recolor an agent.
+    pub accent_index: usize,
+    pub activity: ActivityState,
+    /// `"runtime/model"`.
+    pub runtime_model: String,
+    pub effort: String,
+    pub thinking: bool,
+    /// Step label, active rows only.
+    pub current_step: Option<String>,
+    /// Coarse pre-formatted elapsed (e.g. `"1m 20s"`), active rows only.
+    pub elapsed: Option<String>,
+    /// Existing terminal status labels, preserved.
+    pub status: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppState {
     pub session_id: String,
@@ -78,8 +116,17 @@ pub struct AppState {
     pub live_step: Option<LiveStepView>,
     pub live_steps: Vec<LiveStepView>,
     pub pending_approval: Option<PendingApprovalView>,
+    /// True only while the *first* approval a user ever hits is pending, so the
+    /// render path can show a one-line first-approval explainer at most once
+    /// per user (ADR-004). Gated by a persisted latch in `HistoryStore`.
+    #[serde(default)]
+    pub show_first_approval_explainer: bool,
     pub pending_clarification: Option<PendingClarificationView>,
     pub agents: Vec<AgentView>,
+    /// Live-activity-first roster view-model, rebuilt on every publish (ADR-003).
+    /// Empty until the roster builder (task 03) populates it.
+    #[serde(default)]
+    pub roster_rows: Vec<RosterRow>,
     pub chat_items: Vec<ChatItemView>,
     pub queued_follow_ups: Vec<QueuedFollowUpView>,
     pub events: Vec<String>,
@@ -209,9 +256,38 @@ pub struct ClarificationAnswer {
     pub answer_source: String,
 }
 
+/// Provenance of a submitted prompt for the recall-adoption KPI (ADR-003): a
+/// composition seeded from a recalled history entry is `Recalled`; anything
+/// freshly typed is `Fresh`. The payload tag is written in task_06.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptSource {
+    Fresh,
+    Recalled,
+}
+
+impl PromptSource {
+    /// Wire string written to the `prompt_submitted` payload `source` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptSource::Fresh => "fresh",
+            PromptSource::Recalled => "recalled",
+        }
+    }
+
+    /// Read a payload `source` value back into a `PromptSource`. A missing or
+    /// unrecognized value (events written before this field existed) defaults to
+    /// `Fresh`, keeping the change backward-compatible (ADR-003).
+    pub fn from_payload_value(value: Option<&Value>) -> Self {
+        match value.and_then(Value::as_str) {
+            Some("recalled") => PromptSource::Recalled,
+            _ => PromptSource::Fresh,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
-    PromptSubmitted(String),
+    PromptSubmitted(String, PromptSource),
     ApprovalAnswered(bool),
     ClarificationAnswered(ClarificationAnswer),
     FollowUpCancelled(String),
@@ -221,12 +297,32 @@ pub enum AppEvent {
     RunInterruptRequested,
 }
 
+/// Internal per-step lifecycle timing used to drive elapsed display and stall
+/// detection (Task 03). Held only on `App`; never serialized into `AppState`,
+/// `LiveStepView`, or the durable history record (ADR-004) so wall-clock
+/// `Instant`s stay out of the event stream.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StepTiming {
+    started_at: Instant,
+    last_activity: Instant,
+}
+
+/// A `Running`/`Streaming` step whose last activity is at least this old is
+/// classified `Stalled` rather than `Active` (ADR-004). Fixed in V1;
+/// configurability is a documented Non-Goal.
+const STALL_THRESHOLD: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 pub struct App {
     config: EffectiveConfig,
     history: HistoryStore,
     availability: BTreeMap<String, RuntimeAvailability>,
     state: AppState,
+    /// `step_id -> StepTiming`. Stamped on step registration, bumped on stream
+    /// arrival and active status transitions, cleared on step end. Private and
+    /// non-serialized (ADR-004); keyed by `step_id` so concurrent steps in a
+    /// parallel group track timing independently of one another.
+    step_timings: BTreeMap<String, StepTiming>,
     chat_projection: ChatProjection,
     pending_approval: Option<PendingApproval>,
     pending_clarification: Option<PendingClarification>,
@@ -757,8 +853,10 @@ impl App {
             live_step: None,
             live_steps: Vec::new(),
             pending_approval: None,
+            show_first_approval_explainer: false,
             pending_clarification: None,
             agents: build_agent_views(&config, &availability),
+            roster_rows: Vec::new(),
             // Branded welcome item present from the first frame (ADR-005);
             // `sync_chat_items` keeps it prepended across projection updates.
             chat_items: vec![ChatItemView::welcome()],
@@ -772,6 +870,7 @@ impl App {
             history,
             availability,
             state,
+            step_timings: BTreeMap::new(),
             chat_projection: ChatProjection::new(),
             pending_approval: None,
             pending_clarification: None,
@@ -834,13 +933,13 @@ impl App {
 
     pub async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
         match event {
-            AppEvent::PromptSubmitted(prompt) => {
+            AppEvent::PromptSubmitted(prompt, source) => {
                 self.state.input.clear();
                 // Refresh git before the run so the footer/welcome reflect the
                 // branch the prompt actually runs against (ADR-006).
                 self.refresh_git_context().await;
                 self.publish_state();
-                self.submit_prompt(prompt).await
+                self.submit_prompt_with_source(prompt, source).await
             }
             AppEvent::ApprovalAnswered(approved) => {
                 self.state.input.clear();
@@ -909,6 +1008,18 @@ impl App {
     }
 
     pub async fn submit_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
+        // Non-recall entry points (queued-follow-up replays, programmatic and
+        // test submits) are Fresh; the TUI recall path tags provenance by
+        // calling `submit_prompt_with_source` directly (ADR-003).
+        self.submit_prompt_with_source(prompt, PromptSource::Fresh)
+            .await
+    }
+
+    pub async fn submit_prompt_with_source(
+        &mut self,
+        prompt: impl Into<String>,
+        source: PromptSource,
+    ) -> Result<()> {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
             return Ok(());
@@ -923,6 +1034,9 @@ impl App {
             return Ok(());
         }
         if self.handle_queue_command(&prompt).await? {
+            return Ok(());
+        }
+        if self.handle_provider_status_command(&prompt).await? {
             return Ok(());
         }
         if matches!(self.state.run_state, RunState::WaitingForUser) {
@@ -949,7 +1063,10 @@ impl App {
                 .as_ref()
                 .map_or(prompt.as_str(), |start| start.command.prompt.as_str()),
         )?;
-        let mut visible_prompt = compiled_prompt.user_prompt.clone();
+        // Show the prompt as the user typed it so `/skill:` references stay
+        // visible in chat (mirrors the workflow branch below, which displays
+        // `original_command`). `run_prompt` stays stripped for the runtime.
+        let mut visible_prompt = compiled_prompt.submitted_prompt.clone();
         let mut run_prompt = compiled_prompt.user_prompt.clone();
         let mut submitted_prompt = compiled_prompt.submitted_prompt.clone();
         if let Some(start) = workflow_start.as_ref() {
@@ -976,6 +1093,7 @@ impl App {
             json!({
                 "prompt": visible_prompt.clone(),
                 "submitted_prompt": submitted_prompt.clone(),
+                "source": source.as_str(),
             }),
             user_event_display(&visible_prompt),
         )?;
@@ -1092,6 +1210,40 @@ impl App {
             config_status_display(&self.state.config_status),
         )?;
         Ok(true)
+    }
+
+    async fn handle_provider_status_command(&mut self, prompt: &str) -> Result<bool> {
+        let trimmed = prompt.trim();
+        if trimmed != "/provider:status" {
+            // Only the exact (optionally whitespace-trimmed) command is handled
+            // here. `/provider:statusFOO` is a malformed provider-status call;
+            // unrelated commands like `/provider:unknown` fall through to the
+            // existing unknown-command guard untouched.
+            if trimmed.starts_with("/provider:status") {
+                bail!("usage: /provider:status");
+            }
+            return Ok(false);
+        }
+
+        let report = self.provider_status_report().await;
+        self.record_event(
+            None,
+            None,
+            "provider_status_viewed",
+            json!({ "report": report.clone() }),
+            report,
+        )?;
+        Ok(true)
+    }
+
+    /// Collect provider runway status via the runtime status service and render
+    /// it with the compact share-safe formatter. Provider discovery, probing,
+    /// timeouts, normalization, and redaction all stay behind `runtime::status`;
+    /// the app layer only triggers the bounded service and delivers the result.
+    async fn provider_status_report(&self) -> String {
+        let service = crate::runtime::status::ProviderStatusService::from_config(&self.config);
+        let statuses = service.collect_status().await;
+        crate::runtime::status::render_provider_status(&statuses)
     }
 
     async fn handle_queue_command(&mut self, prompt: &str) -> Result<bool> {
@@ -1262,7 +1414,9 @@ impl App {
     /// run-creation path used by `submit_prompt` for ordinary prompts.
     fn build_follow_up_run(&mut self, prompt: String) -> Result<RunDriveContext> {
         let compiled_prompt = compile_app_prompt(&self.config.working_directory, &prompt)?;
-        let visible_prompt = compiled_prompt.user_prompt.clone();
+        // Keep `/skill:` references visible in the replayed prompt (matches
+        // `submit_prompt`); `run_prompt` stays stripped for the runtime.
+        let visible_prompt = compiled_prompt.submitted_prompt.clone();
         let run_prompt = compiled_prompt.user_prompt.clone();
         let submitted_prompt = compiled_prompt.submitted_prompt.clone();
 
@@ -1279,6 +1433,11 @@ impl App {
             json!({
                 "prompt": visible_prompt.clone(),
                 "submitted_prompt": submitted_prompt.clone(),
+                // A queued follow-up is a user-typed prompt that was deferred, so its
+                // provenance is `Fresh` — mirroring `submit_prompt` so replayed events
+                // carry the same schema and stay distinguishable from legacy
+                // pre-`PromptSource` events (which read back as `Fresh` by default).
+                "source": PromptSource::Fresh.as_str(),
             }),
             user_event_display(&visible_prompt),
         )?;
@@ -1433,6 +1592,8 @@ impl App {
             return Ok(None);
         };
         self.state.pending_approval = None;
+        // Keep the explainer flag in sync with approval presence (none pending → false).
+        self.state.show_first_approval_explainer = false;
         self.record_event(
             Some(pending.run_id.clone()),
             Some(pending.step_id.clone()),
@@ -1602,6 +1763,8 @@ impl App {
             self.state.live_step = None;
             self.state.live_steps.clear();
             self.state.pending_approval = None;
+            // Keep the explainer flag in sync with approval presence (none pending → false).
+            self.state.show_first_approval_explainer = false;
             self.state.pending_clarification = None;
             self.pending_approval = None;
             self.pending_clarification = None;
@@ -1969,6 +2132,8 @@ impl App {
                     interrupted = true;
                     self.state.run_state = RunState::Interrupted;
                     self.state.pending_approval = None;
+                    // Keep the explainer flag in sync with approval presence (none pending → false).
+                    self.state.show_first_approval_explainer = false;
                     approval_queue.clear();
                     self.record_step_cancelled_if_active()?;
                     self.record_event(
@@ -1995,7 +2160,7 @@ impl App {
                         approval.sequence,
                     ));
                     if let Some(pending) = approval_queue.pop_front() {
-                        self.publish_parallel_approval_head(&approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
                         if let Some(child) = children.get_mut(&pending.step_id) {
                             if child.terminal_result.is_none() {
                                 self.resolve_parallel_approval(
@@ -2009,14 +2174,14 @@ impl App {
                             }
                         }
                         self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
-                        self.publish_parallel_approval_head(&approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
                     }
                     continue;
                 }
                 _ = limit_tick.tick() => {
                     if self.apply_parallel_limit_checks(run, &mut children, &cancellation)? {
                         self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
-                        self.publish_parallel_approval_head(&approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
                     }
                     continue;
                 }
@@ -2078,7 +2243,7 @@ impl App {
                             {
                                 continue;
                             }
-                            self.publish_parallel_approval_head(&approval_queue);
+                            self.publish_parallel_approval_head(&approval_queue)?;
                         }
                         Ok(RuntimeOutput::ParseError {
                             agent,
@@ -2167,6 +2332,8 @@ impl App {
             self.clear_active_step(&child.step_id);
         }
         self.state.pending_approval = None;
+        // Keep the explainer flag in sync with approval presence (none pending → false).
+        self.state.show_first_approval_explainer = false;
         self.sync_chat_items();
         self.publish_state();
         if interrupted {
@@ -2520,7 +2687,30 @@ impl App {
         Ok(())
     }
 
-    fn publish_parallel_approval_head(&mut self, queue: &VecDeque<PendingParallelApproval>) {
+    /// Apply the ADR-004 first-approval explainer latch: show the one-line
+    /// explainer the first time any approval becomes pending for this user, then
+    /// persist the latch so every later approval suppresses it. A latch write
+    /// failure propagates rather than silently re-showing. Shared by the serial and
+    /// parallel approval paths so the two cannot diverge.
+    fn apply_first_approval_explainer_latch(&mut self) -> Result<()> {
+        if !self.history.first_approval_explainer_shown() {
+            self.history.mark_first_approval_explainer_shown()?;
+            self.state.show_first_approval_explainer = true;
+        } else {
+            self.state.show_first_approval_explainer = false;
+        }
+        Ok(())
+    }
+
+    fn publish_parallel_approval_head(
+        &mut self,
+        queue: &VecDeque<PendingParallelApproval>,
+    ) -> Result<()> {
+        let prev_step = self
+            .state
+            .pending_approval
+            .as_ref()
+            .map(|pending| pending.step_id.clone());
         self.state.pending_approval = queue.front().map(|pending| PendingApprovalView {
             run_id: pending.run_id.clone(),
             group_id: Some(pending.group_id.clone()),
@@ -2530,8 +2720,26 @@ impl App {
             summary: action_requested_display(&pending.action_request).to_string(),
             diagnostic: pending.reason.clone(),
         });
+        // First-approval explainer (ADR-004), mirroring the serial path: consult the
+        // persisted latch only when the *surfaced* approval changes (a new head, not a
+        // re-publish of the same one), so a user whose first approval is a parallel
+        // child still sees the one-line explainer exactly once. Re-publishing the same
+        // head (e.g. when another child enqueues) leaves the flag untouched.
+        let new_step = self
+            .state
+            .pending_approval
+            .as_ref()
+            .map(|pending| pending.step_id.clone());
+        if new_step != prev_step {
+            if self.state.pending_approval.is_some() {
+                self.apply_first_approval_explainer_latch()?;
+            } else {
+                self.state.show_first_approval_explainer = false;
+            }
+        }
         self.sync_chat_items();
         self.publish_state();
+        Ok(())
     }
 
     fn drop_terminal_parallel_approvals(
@@ -3291,6 +3499,16 @@ impl App {
             .retain(|live_step| live_step.step_id != step_id || live_step.run_id != run_id);
         self.state.live_steps.push(view.clone());
         self.state.live_step = Some(view);
+        // Stamp lifecycle timing for this step (ADR-004). Both timestamps start
+        // equal; keyed by `step_id` so parallel-group peers stay independent.
+        let now = Instant::now();
+        self.step_timings.insert(
+            step_id.to_string(),
+            StepTiming {
+                started_at: now,
+                last_activity: now,
+            },
+        );
         self.sync_chat_items();
         self.set_agent_status(agent, "running");
     }
@@ -3333,6 +3551,10 @@ impl App {
                 self.active_step = self.active_steps.first().cloned();
             }
         }
+        // Drop the timing entry after the step is cleared from `active_steps`
+        // and `live_steps` to prevent unbounded growth (ADR-004). Done
+        // unconditionally so a missed agent lookup above cannot leak an entry.
+        self.step_timings.remove(step_id);
     }
 
     fn set_agent_status(&mut self, agent_id: &str, status: &str) {
@@ -3819,6 +4041,10 @@ impl App {
                             request: request.clone(),
                         });
                         self.state.pending_approval = Some(view);
+                        // Show the one-line first-approval explainer at most once per
+                        // user (ADR-004), consulting the persisted latch exactly when an
+                        // approval becomes pending.
+                        self.apply_first_approval_explainer_latch()?;
                         self.state.run_state = RunState::WaitingForUser;
                         self.record_event(
                             Some(run_id.to_string()),
@@ -4041,8 +4267,10 @@ impl App {
     fn sync_chat_items(&mut self) {
         self.chat_projection
             .apply_live_steps(&self.state.live_steps);
-        self.chat_projection
-            .apply_pending_approval(self.state.pending_approval.as_ref());
+        self.chat_projection.apply_pending_approval(
+            self.state.pending_approval.as_ref(),
+            self.state.show_first_approval_explainer,
+        );
         // The welcome item is prepended (not part of the projection) so it stays
         // first and stable across re-syncs (ADR-005).
         let mut items = Vec::with_capacity(self.chat_projection.items().len() + 1);
@@ -4059,10 +4287,62 @@ impl App {
             .collect();
     }
 
-    fn publish_state(&self) {
+    fn publish_state(&mut self) {
+        // Rebuild the roster view-model centrally so rows never drift from
+        // `agents`/`live_steps` and the renderer stays a pure, clock-free
+        // function of `AppState` (ADR-003).
+        self.rebuild_roster_rows();
+        self.send_state();
+    }
+
+    /// Send the current `AppState` snapshot over the watch channel **without**
+    /// rebuilding the roster. Used by change-gated publishers (e.g.
+    /// `refresh_roster_tick`) that have already prepared `roster_rows`.
+    fn send_state(&self) {
         if let Some(sender) = &self.state_sender {
             let _ = sender.send(self.state.clone());
         }
+    }
+
+    /// Bounded 1 Hz roster refresh (ADR-004). Rebuilds the roster view-model
+    /// with a fresh clock so coarse elapsed advances and a quiet step surfaces
+    /// as `Stalled` even when no stream events arrive, then publishes **only**
+    /// when the rebuilt rows differ — the change gate mirrors `set_git_context`.
+    /// A no-op unless a run is actively working. Returns whether it published.
+    pub(crate) fn refresh_roster_tick(&mut self) -> bool {
+        // Gate to active runs (keep in sync with `tui::work_indicator_active`):
+        // an idle roster never changes, so ticking it would only churn the watch.
+        if !matches!(self.state.run_state, RunState::Planning | RunState::Running) {
+            return false;
+        }
+        let rows = build_roster_rows(
+            &self.state.agents,
+            &self.state.live_steps,
+            &self.step_timings,
+            Instant::now(),
+        );
+        // Rows pre-format elapsed into coarse buckets and carry activity state,
+        // so an unchanged vec means neither the bucket nor the activity moved
+        // (ADR-004 change gate) — suppress the publish.
+        if self.state.roster_rows == rows {
+            return false;
+        }
+        self.state.roster_rows = rows;
+        self.send_state();
+        true
+    }
+
+    /// Rebuild `AppState.roster_rows` from the current agents, live steps, and
+    /// step timing using a fresh wall-clock (ADR-003). Called inside
+    /// `publish_state`; the injected `now` keeps the builder itself testable.
+    fn rebuild_roster_rows(&mut self) {
+        let rows = build_roster_rows(
+            &self.state.agents,
+            &self.state.live_steps,
+            &self.step_timings,
+            Instant::now(),
+        );
+        self.state.roster_rows = rows;
     }
 
     /// Apply a freshly fetched git context, publishing a state update only when
@@ -4259,6 +4539,8 @@ impl App {
         )?;
         self.state.active_run_id = None;
         self.state.pending_approval = None;
+        // Keep the explainer flag in sync with approval presence (none pending → false).
+        self.state.show_first_approval_explainer = false;
         self.state.pending_clarification = None;
         self.pending_approval = None;
         self.pending_clarification = None;
@@ -4337,6 +4619,12 @@ impl App {
         sequence: u32,
         final_delta: bool,
     ) {
+        // Bump activity at the single stream chokepoint (ADR-004) before any
+        // other processing, so stall detection sees the freshest signal even if
+        // the step has no matching live view.
+        if let Some(timing) = self.step_timings.get_mut(step_id) {
+            timing.last_activity = Instant::now();
+        }
         let Some(live_step) = self
             .state
             .live_steps
@@ -4384,11 +4672,23 @@ impl App {
             status,
             LiveStepStatus::Completed | LiveStepStatus::Interrupted | LiveStepStatus::Failed
         );
+        // Bump activity on transitions into the active states where stall
+        // detection matters (ADR-004); terminal/waiting transitions do not.
+        if matches!(status, LiveStepStatus::Running | LiveStepStatus::Streaming) {
+            if let Some(timing) = self.step_timings.get_mut(step_id) {
+                timing.last_activity = Instant::now();
+            }
+        }
         live_step.status = status;
         if final_delta {
             for stream in &mut live_step.streams {
                 stream.final_delta = true;
             }
+        }
+        if final_delta {
+            // A finished step no longer needs timing: drop it so the agent
+            // classifies as `Idle` and the map doesn't leak entries (ADR-004).
+            self.step_timings.remove(step_id);
         }
         self.state.live_step = self.state.live_steps.first().cloned();
         self.sync_chat_items();
@@ -4982,6 +5282,139 @@ fn build_agent_views(
             .cmp(&(agent_roster_rank(&right.id), right.id.as_str()))
     });
     views
+}
+
+/// Format a coarse, whole-second elapsed duration for an active roster row
+/// (ADR-002/ADR-004). Sub-minute renders as `"8s"`, minutes as `"1m 20s"`
+/// (the seconds remainder is dropped when zero, e.g. `"1m"`), and hours as
+/// `"1h 5m"`. The returned string is pre-formatted into [`RosterRow::elapsed`]
+/// so the renderer never touches a clock.
+fn format_coarse_elapsed(elapsed: Duration) -> String {
+    let total = elapsed.as_secs();
+    if total < 60 {
+        return format!("{total}s");
+    }
+    if total < 3600 {
+        let minutes = total / 60;
+        let seconds = total % 60;
+        if seconds == 0 {
+            return format!("{minutes}m");
+        }
+        return format!("{minutes}m {seconds}s");
+    }
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    if minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {minutes}m")
+    }
+}
+
+/// Pure roster builder (ADR-003): joins canonical agents with their live steps,
+/// classifies each row's [`ActivityState`], assigns a canonical-order
+/// `accent_index` immune to the pin-sort (ADR-005), pre-formats elapsed on
+/// active rows, and floats `NeedsInput` rows to the top via a stable pin-sort.
+///
+/// `agents` must already be in canonical order (orchestrator-first then
+/// alphabetical, as [`build_agent_views`] yields); `accent_index` is taken from
+/// that order *before* the pin so reordering never recolors an agent. `now` is
+/// injected for determinism — production passes `Instant::now()`, tests a fixed
+/// `Instant`.
+pub(crate) fn build_roster_rows(
+    agents: &[AgentView],
+    live_steps: &[LiveStepView],
+    timing: &BTreeMap<String, StepTiming>,
+    now: Instant,
+) -> Vec<RosterRow> {
+    let mut rows: Vec<(usize, RosterRow)> = agents
+        .iter()
+        .enumerate()
+        .map(|(accent_index, agent)| {
+            // Join: an agent's live step is the one whose `agent` matches its id.
+            let live_step = live_steps.iter().find(|step| step.agent == agent.id);
+
+            let (activity, current_step, elapsed) = match live_step {
+                Some(step) => classify_step(step, timing, now),
+                None => (ActivityState::Idle, None, None),
+            };
+
+            let row = RosterRow {
+                agent_id: agent.id.clone(),
+                name: agent.name.clone(),
+                accent_index,
+                activity,
+                runtime_model: format!("{}/{}", agent.runtime, agent.model),
+                effort: agent.effort.clone(),
+                thinking: agent.thinking,
+                current_step,
+                elapsed,
+                // Terminal/idle rows keep their existing status label; only the
+                // activity-driven states carry their own meaning via `activity`.
+                status: agent.status.clone(),
+            };
+            (accent_index, row)
+        })
+        .collect();
+
+    // The single permitted reorder: stable pin-sort floating `NeedsInput` rows
+    // to the top (pin_rank 0) while every other row keeps its canonical order
+    // (pin_rank 1). `accent_index` was assigned above, so the pin never moves a
+    // color. The secondary key preserves canonical order within each rank.
+    rows.sort_by_key(|(canonical_order, row)| {
+        let pin_rank = if row.activity == ActivityState::NeedsInput {
+            0
+        } else {
+            1
+        };
+        (pin_rank, *canonical_order)
+    });
+
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// Classify a joined live step into an [`ActivityState`] plus the pre-formatted
+/// `current_step`/`elapsed` shown on active rows. Terminal statuses collapse to
+/// `Idle` with no step/elapsed; their label survives on `RosterRow::status`.
+fn classify_step(
+    step: &LiveStepView,
+    timing: &BTreeMap<String, StepTiming>,
+    now: Instant,
+) -> (ActivityState, Option<String>, Option<String>) {
+    match step.status {
+        LiveStepStatus::WaitingForApproval | LiveStepStatus::WaitingForAction => {
+            (ActivityState::NeedsInput, None, None)
+        }
+        LiveStepStatus::Starting
+        | LiveStepStatus::Running
+        | LiveStepStatus::Streaming
+        | LiveStepStatus::Cancelling => {
+            let entry = timing.get(&step.step_id);
+            let stalled = entry
+                .is_some_and(|t| now.saturating_duration_since(t.last_activity) >= STALL_THRESHOLD);
+            let activity = if stalled {
+                ActivityState::Stalled
+            } else {
+                ActivityState::Active
+            };
+            let elapsed =
+                entry.map(|t| format_coarse_elapsed(now.saturating_duration_since(t.started_at)));
+            let current_step = Some(step_display_label(step));
+            (activity, current_step, elapsed)
+        }
+        // Terminal statuses: Idle, label preserved from `agent.status`.
+        LiveStepStatus::Completed | LiveStepStatus::Failed | LiveStepStatus::Interrupted => {
+            (ActivityState::Idle, None, None)
+        }
+    }
+}
+
+/// Resolve the step label shown on an active row, falling back to the step id
+/// when the label is absent.
+fn step_display_label(step: &LiveStepView) -> String {
+    step.step_label
+        .clone()
+        .unwrap_or_else(|| step.step_id.clone())
 }
 
 fn build_config_status(
@@ -6067,7 +6500,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn fake_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -6391,6 +6824,41 @@ runtime = "fake"
             assert!(!prompt.contains("<Skill:"));
             assert!(!prompt.contains("SENTINEL_DERIVED_SKILL_BODY_PRIVATE"));
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_submitted_keeps_skill_reference_in_visible_prompt() {
+        // A `/skill:` prompt must render in chat as the user typed it — the
+        // reference stays visible. Only the runtime prompt is stripped.
+        let dir = tempdir().unwrap();
+        write_project_skill(
+            dir.path(),
+            "reviewer",
+            Some("reviewer"),
+            "SENTINEL_VISIBLE_SKILL_BODY_PRIVATE",
+        );
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("/skill:reviewer inspect README")
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let submitted = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .expect("prompt_submitted recorded");
+        // Display keeps the reference; the full skill body never leaks into it.
+        assert_eq!(
+            submitted.payload["prompt"], "/skill:reviewer inspect README",
+            "displayed prompt must keep the /skill: reference"
+        );
+        assert_eq!(
+            submitted.payload["submitted_prompt"],
+            "/skill:reviewer inspect README"
+        );
+        let displayed = submitted.payload["prompt"].as_str().unwrap();
+        assert!(!displayed.contains("SENTINEL_VISIBLE_SKILL_BODY_PRIVATE"));
     }
 
     #[tokio::test]
@@ -7107,7 +7575,7 @@ runtime = "fake"
     }
 
     fn fake_parallel_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -7163,7 +7631,7 @@ runtime = "fake"
     }
 
     fn fake_parallel_normal_approval_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -7206,7 +7674,7 @@ runtime = "fake"
     }
 
     fn fake_parallel_low_agent_step_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -7248,7 +7716,7 @@ runtime = "fake"
     }
 
     fn fake_parallel_reviewer_parse_error_config(dir: &std::path::Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -7295,7 +7763,7 @@ runtime = "fake"
         security_prompt: &str,
         reviewer_prompt: &str,
     ) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             format!(
@@ -7403,7 +7871,7 @@ prompt = "{reviewer_prompt}"
         assert!(history_events
             .iter()
             .any(|event| event.kind == "runtime_stream_delta"));
-        assert!(dir.path().join(".multiagent/runs").exists());
+        assert!(dir.path().join(".atelier/runs").exists());
     }
 
     #[tokio::test]
@@ -7428,6 +7896,102 @@ prompt = "{reviewer_prompt}"
             prompt_idx < run_started_idx,
             "prompt_submitted ({prompt_idx}) must precede run_started ({run_started_idx})"
         );
+    }
+
+    #[test]
+    fn prompt_source_is_copy_and_comparable() {
+        let fresh = PromptSource::Fresh;
+        // Copy: `fresh` is still usable after the bind below (no move).
+        let copied = fresh;
+        assert_eq!(copied, fresh);
+        assert_eq!(PromptSource::Recalled, PromptSource::Recalled);
+        assert_ne!(PromptSource::Fresh, PromptSource::Recalled);
+    }
+
+    #[test]
+    fn prompt_submitted_event_carries_and_exposes_source() {
+        let event = AppEvent::PromptSubmitted("x".to_string(), PromptSource::Recalled);
+        match event {
+            AppEvent::PromptSubmitted(prompt, source) => {
+                assert_eq!(prompt, "x");
+                assert_eq!(source, PromptSource::Recalled);
+            }
+            other => panic!("expected PromptSubmitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_source_payload_roundtrip_and_missing_defaults_fresh() {
+        assert_eq!(PromptSource::Fresh.as_str(), "fresh");
+        assert_eq!(PromptSource::Recalled.as_str(), "recalled");
+        assert_eq!(
+            PromptSource::from_payload_value(Some(&json!("recalled"))),
+            PromptSource::Recalled
+        );
+        assert_eq!(
+            PromptSource::from_payload_value(Some(&json!("fresh"))),
+            PromptSource::Fresh
+        );
+        // A missing or unrecognized value (older events) reads as Fresh.
+        assert_eq!(PromptSource::from_payload_value(None), PromptSource::Fresh);
+        assert_eq!(
+            PromptSource::from_payload_value(Some(&json!("bogus"))),
+            PromptSource::Fresh
+        );
+    }
+
+    #[tokio::test]
+    async fn recalled_submission_persists_source_in_payload() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt_with_source("create a feature", PromptSource::Recalled)
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .expect("prompt_submitted recorded");
+        assert_eq!(event.payload["source"], "recalled");
+        assert_eq!(
+            PromptSource::from_payload_value(event.payload.get("source")),
+            PromptSource::Recalled
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_submission_persists_fresh_source_in_payload() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        // The default submit path (and all non-recall callers) is Fresh.
+        app.submit_prompt("create a feature").await.unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .expect("prompt_submitted recorded");
+        assert_eq!(event.payload["source"], "fresh");
+    }
+
+    #[tokio::test]
+    async fn project_prompt_history_recalls_fake_runtime_submissions_newest_first() {
+        // End-to-end: two prompts submitted through a real fake run land in the
+        // event log; the projection surfaces them newest-first (ADR-001).
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("alpha").await.unwrap();
+        app.submit_prompt("beta").await.unwrap();
+
+        let history = crate::history::project_prompt_history(&dir.path().join(".atelier"), 10);
+        assert_eq!(history, vec!["beta", "alpha"]);
     }
 
     #[tokio::test]
@@ -8549,9 +9113,12 @@ prompt = "{reviewer_prompt}"
 
         // Switch branch outside the app, then submit a prompt.
         run_git(dir.path(), &["checkout", "-b", "feat/two"]);
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.git_context.as_ref().unwrap().branch, "feat/two");
     }
@@ -8571,9 +9138,12 @@ prompt = "{reviewer_prompt}"
         app.handle_event(AppEvent::InputBackspace).await.unwrap();
         assert_eq!(app.state.input, "x");
 
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert!(app.state.input.is_empty());
         assert_eq!(app.state.run_state, RunState::Completed);
@@ -8617,7 +9187,7 @@ prompt = "{reviewer_prompt}"
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("agents")).unwrap();
         fs::write(dir.path().join("agents/explorer.md"), "secret prompt body").unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -8680,6 +9250,173 @@ instructions_file = "agents/explorer.md"
         assert!(!events
             .iter()
             .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+    }
+
+    fn fake_with_zai_config(dir: &std::path::Path) -> EffectiveConfig {
+        // Most agents use the deterministic fake runtime; one agent uses a Z.ai
+        // runtime whose api_key_env points at a guaranteed-unset, uniquely
+        // named variable. That resolves to a deterministic Unauthenticated
+        // status in any environment (the var is never set), exercising the
+        // partial-failure / share-safe path of `/provider:status`.
+        let config_path = dir.join("atelier.toml");
+        fs::write(
+            &config_path,
+            r#"
+[runtimes.fake]
+type = "fake"
+
+[runtimes.zai]
+type = "zai"
+api_key_env = "MULTIAGENT_TEST_PROVIDER_STATUS_NO_KEY"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "zai"
+
+[agents.consul]
+runtime = "fake"
+
+[council.presets.default.architect]
+runtime = "fake"
+
+[council.presets.default.security]
+runtime = "fake"
+
+[council.presets.default.reviewer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn provider_status_command_renders_one_row_for_each_used_provider() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/provider:status").await.unwrap();
+
+        let display = app.state.events.join("\n");
+        assert!(display.contains("Provider status"), "{display}");
+        assert!(display.contains("Fake"), "{display}");
+        assert!(display.contains("ready"), "{display}");
+        assert_eq!(app.state.run_state, RunState::Idle);
+        assert!(app.state.active_run_id.is_none());
+
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "provider_status_viewed"));
+        // No agent run was started — this is a read-only command.
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "run_started" || event.kind == "prompt_submitted"));
+    }
+
+    #[tokio::test]
+    async fn provider_status_command_tolerates_surrounding_whitespace() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("   /provider:status   ").await.unwrap();
+
+        assert!(app.state.events.join("\n").contains("Provider status"));
+        assert_eq!(app.state.run_state, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn provider_status_handler_only_claims_the_exact_command() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        // The exact command is handled.
+        assert!(app
+            .handle_provider_status_command("/provider:status")
+            .await
+            .unwrap());
+        // An ordinary prompt is not intercepted.
+        assert!(!app
+            .handle_provider_status_command("just a normal prompt")
+            .await
+            .unwrap());
+        // A different namespaced command is not intercepted (falls through to
+        // the existing unknown-command guard).
+        assert!(!app
+            .handle_provider_status_command("/provider:unknown")
+            .await
+            .unwrap());
+        // A malformed provider-status call with trailing args is rejected.
+        assert!(app
+            .handle_provider_status_command("/provider:status extra")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_unknown_command_keeps_existing_unknown_behavior() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let error = app.submit_prompt("/provider:unknown").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown command /provider:unknown"),
+            "{error}"
+        );
+        assert_eq!(app.state.run_state, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn provider_status_command_renders_failing_provider_share_safely() {
+        let dir = tempdir().unwrap();
+        let config = fake_with_zai_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/provider:status").await.unwrap();
+
+        let display = app.state.events.join("\n");
+        // Healthy and failing providers both appear, independently.
+        assert!(display.contains("Fake"), "{display}");
+        assert!(display.contains("ready"), "{display}");
+        assert!(display.contains("Z.ai"), "{display}");
+        assert!(display.contains("unauthenticated"), "{display}");
+        assert_eq!(app.state.run_state, RunState::Idle);
+
+        // The full recorded payload is share-safe: no env var values or
+        // credential material, only the share-safe config message.
+        let events = app.history.read_events().unwrap();
+        let payload = events
+            .iter()
+            .find(|event| event.kind == "provider_status_viewed")
+            .unwrap()
+            .payload
+            .to_string();
+        assert!(!payload.contains("sk-"), "{payload}");
+        assert!(
+            !payload.contains('@'),
+            "leaked an email/account id: {payload}"
+        );
     }
 
     #[test]
@@ -8831,9 +9568,12 @@ instructions_file = "agents/explorer.md"
     }
 
     async fn queue_via_event(app: &mut App, message: &str) {
-        app.handle_event(AppEvent::PromptSubmitted(format!("/queue {message}")))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            format!("/queue {message}"),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
     }
 
     fn replay_started_prompts(app: &App) -> Vec<String> {
@@ -8847,7 +9587,7 @@ instructions_file = "agents/explorer.md"
     }
 
     fn approval_mode_config(dir: &Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -8878,7 +9618,7 @@ runtime = "fake"
     }
 
     fn single_agent_step_limit_config(dir: &Path) -> EffectiveConfig {
-        let config_path = dir.join("multiagent.toml");
+        let config_path = dir.join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -8910,15 +9650,21 @@ runtime = "fake"
         let mut app = App::new(config).await.unwrap();
 
         queue_via_event(&mut app, "first follow up").await;
-        app.handle_event(AppEvent::PromptSubmitted("/q second follow up".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "/q second follow up".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
         assert_eq!(app.state.queued_follow_ups.len(), 2);
 
         // A clean completed Run drains both queued items oldest-first.
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         assert!(app.state.queued_follow_ups.is_empty());
@@ -8950,9 +9696,12 @@ runtime = "fake"
         queue_via_event(&mut app, "needs clarification create a feature").await;
         queue_via_event(&mut app, "second follow up").await;
 
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::WaitingForUser);
         assert!(app.state.pending_clarification.is_some());
@@ -8986,9 +9735,12 @@ runtime = "fake"
             QueuedFollowUpStatus::Cancelled
         );
 
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
@@ -9014,6 +9766,7 @@ runtime = "fake"
         // A clarification-waiting Run pauses the queue.
         app.handle_event(AppEvent::PromptSubmitted(
             "needs clarification create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
@@ -9074,9 +9827,12 @@ runtime = "fake"
         let mut app = App::new(config).await.unwrap();
 
         queue_via_event(&mut app, "replay me").await;
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         let events = app.history.read_events().unwrap();
         let replay_started = events
@@ -9091,6 +9847,9 @@ runtime = "fake"
             })
             .unwrap();
         assert!(replay_submitted.run_id.is_some());
+        // The replayed follow-up carries explicit `Fresh` provenance, matching the
+        // main submit path so the event conforms to the same schema (F3).
+        assert_eq!(replay_submitted.payload["source"], "fresh");
         let original_submitted = events
             .iter()
             .find(|event| {
@@ -9110,9 +9869,12 @@ runtime = "fake"
         let mut app = App::new(config).await.unwrap();
 
         queue_via_event(&mut app, "deferred work").await;
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
@@ -9146,9 +9908,12 @@ runtime = "fake"
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
 
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
         assert_eq!(app.state.run_state, RunState::Completed);
 
         // The run has already finished when the queued follow-up arrives.
@@ -9175,6 +9940,7 @@ runtime = "fake"
         queue_via_event(&mut app, "queued doc update").await;
         app.handle_event(AppEvent::PromptSubmitted(
             "needs clarification create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
@@ -9203,6 +9969,7 @@ runtime = "fake"
         queue_via_event(&mut app, "post-approval work").await;
         app.handle_event(AppEvent::PromptSubmitted(
             "approval action create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
@@ -9219,6 +9986,52 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn first_approval_shows_explainer_and_latches_then_suppresses() {
+        let dir = tempdir().unwrap();
+
+        // Fresh install, first approval: the explainer flag is set and the
+        // projected approval body carries the one-line explainer.
+        let mut first = App::new(approval_mode_config(dir.path())).await.unwrap();
+        first
+            .handle_event(AppEvent::PromptSubmitted(
+                "approval action create a feature".to_string(),
+                PromptSource::Fresh,
+            ))
+            .await
+            .unwrap();
+        assert!(first.state.pending_approval.is_some());
+        assert!(first.state.show_first_approval_explainer);
+        assert!(first.state.chat_items.iter().any(|item| item
+            .body
+            .iter()
+            .any(|line| line.text == crate::app::chat::FIRST_APPROVAL_EXPLAINER)));
+        // The latch is persisted at the workspace root.
+        assert!(first.history.first_approval_explainer_shown());
+
+        // Resolving the approval clears the flag so it never lingers true while no
+        // approval is pending — the flag stays in sync with approval state (F1).
+        first.resolve_pending_approval(false).await.unwrap();
+        assert!(first.state.pending_approval.is_none());
+        assert!(!first.state.show_first_approval_explainer);
+
+        // A later session (latch persisted on disk) suppresses the explainer.
+        let mut later = App::new(approval_mode_config(dir.path())).await.unwrap();
+        later
+            .handle_event(AppEvent::PromptSubmitted(
+                "approval action create a feature".to_string(),
+                PromptSource::Fresh,
+            ))
+            .await
+            .unwrap();
+        assert!(later.state.pending_approval.is_some());
+        assert!(!later.state.show_first_approval_explainer);
+        assert!(later.state.chat_items.iter().all(|item| item
+            .body
+            .iter()
+            .all(|line| line.text != crate::app::chat::FIRST_APPROVAL_EXPLAINER)));
+    }
+
+    #[tokio::test]
     async fn parse_error_run_does_not_replay_queued_items() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
@@ -9227,6 +10040,7 @@ runtime = "fake"
         queue_via_event(&mut app, "post-failure work").await;
         app.handle_event(AppEvent::PromptSubmitted(
             "always parse error create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
@@ -9246,9 +10060,12 @@ runtime = "fake"
         let mut app = App::new(config).await.unwrap();
 
         queue_via_event(&mut app, "post-limit work").await;
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::LimitReached);
         assert!(replay_started_prompts(&app).is_empty());
@@ -9269,6 +10086,7 @@ runtime = "fake"
 
         app.handle_event(AppEvent::PromptSubmitted(
             "always parse error create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
@@ -9301,7 +10119,7 @@ runtime = "fake"
         assert!(app.state.active_run_id.is_none());
         let events = app.history.read_events().unwrap();
         assert_no_workflow_run_start_events(&events);
-        let runs_dir = dir.path().join(".multiagent/runs");
+        let runs_dir = dir.path().join(".atelier/runs");
         assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
     }
 
@@ -9324,7 +10142,7 @@ runtime = "fake"
         assert!(app.state.active_run_id.is_none());
         let events = app.history.read_events().unwrap();
         assert_no_workflow_run_start_events(&events);
-        let runs_dir = dir.path().join(".multiagent/runs");
+        let runs_dir = dir.path().join(".atelier/runs");
         assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
     }
 
@@ -9409,7 +10227,7 @@ runtime = "fake"
             .any(|event| event.kind == "orchestrator_decision"));
 
         let run_record =
-            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+            fs::read_to_string(dir.path().join(format!(".atelier/runs/{run_id}.json"))).unwrap();
         assert!(
             run_record.contains("\"submitted_prompt\": \"/workflow parallel create a feature\"")
         );
@@ -9436,7 +10254,7 @@ runtime = "fake"
             .find(|event| event.kind == "run_started")
             .and_then(|event| event.payload["run_id"].as_str())
             .unwrap();
-        let record_path = dir.path().join(format!(".multiagent/runs/{run_id}.json"));
+        let record_path = dir.path().join(format!(".atelier/runs/{run_id}.json"));
         let record: Value =
             serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
         let ledger = record["workflow"]["target_ledger"].as_object().unwrap();
@@ -9688,7 +10506,7 @@ runtime = "fake"
             .find(|event| event.kind == "run_started")
             .and_then(|event| event.payload["run_id"].as_str())
             .unwrap();
-        let record_path = dir.path().join(format!(".multiagent/runs/{run_id}.json"));
+        let record_path = dir.path().join(format!(".atelier/runs/{run_id}.json"));
         let record: Value =
             serde_json::from_str(&fs::read_to_string(record_path).unwrap()).unwrap();
         let ledger = record["workflow"]["target_ledger"].as_object().unwrap();
@@ -9821,12 +10639,14 @@ runtime = "fake"
             .iter()
             .find(|event| event.kind == "prompt_submitted")
             .unwrap();
+        // The displayed prompt keeps the `/skill:` reference so chat shows what
+        // the user typed; only the runtime prompt is stripped.
         assert_eq!(
             prompt
                 .payload
                 .get("prompt")
                 .and_then(serde_json::Value::as_str),
-            Some("inspect README")
+            Some("/skill:reviewer inspect README")
         );
         assert_eq!(
             prompt
@@ -9870,7 +10690,7 @@ runtime = "fake"
                 && event.kind != "prompt_submitted"
                 && event.kind != "skills_loaded"
         }));
-        let runs_dir = dir.path().join(".multiagent/runs");
+        let runs_dir = dir.path().join(".atelier/runs");
         assert_eq!(fs::read_dir(runs_dir).unwrap().count(), 0);
     }
 
@@ -9917,7 +10737,9 @@ runtime = "fake"
             .iter()
             .find(|event| event.kind == "prompt_submitted")
             .unwrap();
-        assert_eq!(prompt.payload["prompt"], "please use here");
+        // Display keeps the mid-prompt reference as typed; the runtime prompt
+        // (normalized to "please use here") is stripped separately.
+        assert_eq!(prompt.payload["prompt"], "please use /skill:reviewer here");
         assert_eq!(
             events
                 .iter()
@@ -9944,13 +10766,15 @@ runtime = "fake"
         let skills = skills_loaded.payload["skills"].as_array().unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0]["requested_names"], json!(["a"]));
+        // Display shows the prompt as typed (both references kept); only the
+        // runtime prompt is normalized to "do x".
         assert_eq!(
             events
                 .iter()
                 .find(|event| event.kind == "prompt_submitted")
                 .unwrap()
                 .payload["prompt"],
-            "do x"
+            "/skill:a do x /skill:a"
         );
     }
 
@@ -9981,9 +10805,9 @@ runtime = "fake"
 
         let events_jsonl =
             fs::read_to_string(app.history.session_dir().join("events.jsonl")).unwrap();
-        let debug_log = fs::read_to_string(dir.path().join(".multiagent/debug.log")).unwrap();
+        let debug_log = fs::read_to_string(dir.path().join(".atelier/debug.log")).unwrap();
         let run_record =
-            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+            fs::read_to_string(dir.path().join(format!(".atelier/runs/{run_id}.json"))).unwrap();
         let chat_projection = serde_json::to_string(&app.state.chat_items).unwrap();
         let skill_item = app
             .state
@@ -10098,7 +10922,7 @@ runtime = "fake"
             .unwrap();
         let record_path = dir
             .path()
-            .join(".multiagent")
+            .join(".atelier")
             .join("runs")
             .join(format!("{run_id}.json"));
         let record: serde_json::Value =
@@ -10175,7 +10999,7 @@ runtime = "fake"
         );
         let run_id = subtask_started.run_id.as_ref().unwrap();
         let run_record =
-            fs::read_to_string(dir.path().join(format!(".multiagent/runs/{run_id}.json"))).unwrap();
+            fs::read_to_string(dir.path().join(format!(".atelier/runs/{run_id}.json"))).unwrap();
         assert!(run_record.contains("\"request\": \"inspect README\""));
         assert!(run_record.contains("\"submitted_request\": \"/skill:reviewer inspect README\""));
         assert!(!run_record.contains("Review workflow guidance."));
@@ -10200,7 +11024,7 @@ runtime = "fake"
             .iter()
             .all(|event| event.kind != "subtask_started" && event.kind != "skills_loaded"));
         assert_eq!(
-            fs::read_dir(dir.path().join(".multiagent/runs"))
+            fs::read_dir(dir.path().join(".atelier/runs"))
                 .unwrap()
                 .count(),
             0
@@ -10273,7 +11097,7 @@ runtime = "fake"
             .unwrap();
         let record_path = dir
             .path()
-            .join(".multiagent")
+            .join(".atelier")
             .join("runs")
             .join(format!("{run_id}.json"));
         let record: serde_json::Value =
@@ -10292,7 +11116,7 @@ runtime = "fake"
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());
         let _app = App::new_with_debug(config, true).await.unwrap();
-        let debug_log = dir.path().join(".multiagent/debug.log");
+        let debug_log = dir.path().join(".atelier/debug.log");
         let contents = fs::read_to_string(debug_log).unwrap();
         assert!(contents.contains("\"kind\":\"session_started\""));
     }
@@ -10334,7 +11158,7 @@ runtime = "fake"
     #[tokio::test]
     async fn fake_runtime_respects_agent_step_limit() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10382,7 +11206,7 @@ runtime = "fake"
     #[tokio::test]
     async fn run_driver_stops_when_wall_clock_limit_elapsed() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10432,7 +11256,7 @@ runtime = "fake"
     #[tokio::test]
     async fn step_time_limit_stops_resumed_step() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10566,7 +11390,7 @@ runtime = "fake"
     #[tokio::test]
     async fn review_fix_cycle_limit_stops_before_extra_fixer_pass() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10665,7 +11489,7 @@ runtime = "fake"
     #[tokio::test]
     async fn tool_policy_denials_are_recorded_as_durable_events() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10822,7 +11646,7 @@ runtime = "fake"
     async fn step_action_limit_allows_final_response_after_last_allowed_action() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("README.md"), "action context\n").unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -10861,7 +11685,7 @@ runtime = "fake"
     #[tokio::test]
     async fn normal_approval_mode_pauses_run_with_pending_approval() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -11344,7 +12168,7 @@ runtime = "fake"
     #[tokio::test]
     async fn normal_prompt_cannot_answer_pending_approval() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -11389,7 +12213,7 @@ runtime = "fake"
     #[tokio::test]
     async fn interrupting_pending_approval_records_step_cancellation() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -11449,7 +12273,7 @@ runtime = "fake"
         assert!(events.iter().any(|event| event.kind == "run_interrupted"));
         let run_record_path = dir
             .path()
-            .join(".multiagent")
+            .join(".atelier")
             .join("runs")
             .join(format!("{run_id}.json"));
         let run_record: serde_json::Value =
@@ -11463,7 +12287,7 @@ runtime = "fake"
     #[tokio::test]
     async fn resolving_pending_approval_denial_resumes_and_completes_run() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("multiagent.toml");
+        let config_path = dir.path().join("atelier.toml");
         fs::write(
             &config_path,
             r#"
@@ -11552,7 +12376,7 @@ runtime = "fake"
             .and_then(|artifact| artifact.get("path"))
             .and_then(serde_json::Value::as_str)
             .unwrap();
-        assert!(dir.path().join(".multiagent").join(artifact_path).exists());
+        assert!(dir.path().join(artifact_path).exists());
     }
 
     #[tokio::test]
@@ -11618,7 +12442,7 @@ runtime = "fake"
             .and_then(|artifact| artifact.get("path"))
             .and_then(serde_json::Value::as_str)
             .unwrap();
-        assert!(dir.path().join(".multiagent").join(artifact_path).exists());
+        assert!(dir.path().join(artifact_path).exists());
     }
 
     #[tokio::test]
@@ -11854,5 +12678,721 @@ runtime = "fake"
             .contains("waiting for clarification"));
         assert!(app.pending_clarification.is_some());
         assert_eq!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    fn sample_roster_row() -> RosterRow {
+        RosterRow {
+            agent_id: "explorer".to_string(),
+            name: "Explorer".to_string(),
+            accent_index: 2,
+            activity: ActivityState::Active,
+            runtime_model: "fake/default".to_string(),
+            effort: "medium".to_string(),
+            thinking: true,
+            current_step: Some("scan the workspace".to_string()),
+            elapsed: Some("1m 20s".to_string()),
+            status: "running".to_string(),
+        }
+    }
+
+    #[test]
+    fn activity_state_serializes_active() {
+        let json = serde_json::to_string(&ActivityState::Active).unwrap();
+        assert_eq!(json, "\"active\"");
+        let parsed: ActivityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ActivityState::Active);
+    }
+
+    #[test]
+    fn activity_state_serializes_needs_input() {
+        let json = serde_json::to_string(&ActivityState::NeedsInput).unwrap();
+        assert_eq!(json, "\"needs_input\"");
+        let parsed: ActivityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ActivityState::NeedsInput);
+    }
+
+    #[test]
+    fn activity_state_serializes_stalled() {
+        let json = serde_json::to_string(&ActivityState::Stalled).unwrap();
+        assert_eq!(json, "\"stalled\"");
+        let parsed: ActivityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ActivityState::Stalled);
+    }
+
+    #[test]
+    fn activity_state_serializes_idle() {
+        let json = serde_json::to_string(&ActivityState::Idle).unwrap();
+        assert_eq!(json, "\"idle\"");
+        let parsed: ActivityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ActivityState::Idle);
+    }
+
+    #[test]
+    fn roster_row_serializes_with_all_fields() {
+        let row = sample_roster_row();
+        let json = serde_json::to_string(&row).unwrap();
+        let parsed: RosterRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, row);
+    }
+
+    #[test]
+    fn roster_row_serializes_with_optional_nones() {
+        let row = RosterRow {
+            current_step: None,
+            elapsed: None,
+            activity: ActivityState::Idle,
+            ..sample_roster_row()
+        };
+        let value: Value = serde_json::to_value(&row).unwrap();
+        assert!(value["current_step"].is_null());
+        assert!(value["elapsed"].is_null());
+        let parsed: RosterRow = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, row);
+    }
+
+    #[tokio::test]
+    async fn app_state_after_construction_has_roster_row_per_agent() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+        // Construction publishes once, so `roster_rows` is rebuilt to one row per
+        // canonical agent (ADR-003); with no live steps every row is Idle.
+        assert_eq!(app.state().roster_rows.len(), app.state().agents.len());
+        assert!(app
+            .state()
+            .roster_rows
+            .iter()
+            .all(|row| row.activity == ActivityState::Idle));
+    }
+
+    #[tokio::test]
+    async fn publish_state_carries_roster_rows_through_watch() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let (sender, mut receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        // `publish_state` rebuilds `roster_rows` from agents/live_steps (ADR-003),
+        // so any manually-set rows are replaced by the freshly built canonical set.
+        app.state_mut().roster_rows = vec![sample_roster_row()];
+        app.publish_state();
+
+        let state = receiver.borrow_and_update();
+        // With no live steps every row is Idle and the orchestrator sorts first
+        // (canonical order); the row count tracks the agent count.
+        assert_eq!(state.roster_rows.len(), state.agents.len());
+        assert_eq!(state.roster_rows[0].agent_id, "orchestrator");
+        assert!(state
+            .roster_rows
+            .iter()
+            .all(|row| row.activity == ActivityState::Idle));
+    }
+
+    // --- task_04: publish_state hook + refresh_roster_tick (ADR-003/004) ------
+
+    #[tokio::test]
+    async fn publish_state_marks_active_agent_from_live_step() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.state_mut().live_steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Streaming,
+        )];
+        app.step_timings
+            .insert("step-1".to_string(), timing_entry(Instant::now(), 5, 0));
+
+        app.publish_state();
+
+        let row = app
+            .state()
+            .roster_rows
+            .iter()
+            .find(|row| row.agent_id == "explorer")
+            .expect("explorer row");
+        assert_eq!(row.activity, ActivityState::Active);
+    }
+
+    #[tokio::test]
+    async fn refresh_roster_tick_is_noop_when_idle() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        assert_eq!(app.state().run_state, RunState::Idle);
+        // Idle runs never change the roster, so the tick gate short-circuits.
+        assert!(!app.refresh_roster_tick());
+    }
+
+    #[tokio::test]
+    async fn refresh_roster_tick_publishes_on_elapsed_bucket_change() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.state_mut().run_state = RunState::Running;
+        app.state_mut().live_steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Running,
+        )];
+        app.step_timings.insert(
+            "step-1".to_string(),
+            StepTiming {
+                started_at: Instant::now() - Duration::from_secs(15),
+                last_activity: Instant::now(),
+            },
+        );
+        app.publish_state();
+        let before = app
+            .state()
+            .roster_rows
+            .iter()
+            .find(|row| row.agent_id == "explorer")
+            .and_then(|row| row.elapsed.clone());
+        assert_eq!(before.as_deref(), Some("15s"));
+
+        // Simulate elapsed advancing across a coarse bucket by aging started_at.
+        app.step_timings.get_mut("step-1").unwrap().started_at =
+            Instant::now() - Duration::from_secs(35);
+        assert!(app.refresh_roster_tick(), "bucket moved -> should publish");
+
+        let after = app
+            .state()
+            .roster_rows
+            .iter()
+            .find(|row| row.agent_id == "explorer")
+            .and_then(|row| row.elapsed.clone());
+        assert_eq!(after.as_deref(), Some("35s"));
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn refresh_roster_tick_suppresses_identical_rebuild() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.state_mut().run_state = RunState::Running;
+        app.state_mut().live_steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Running,
+        )];
+        // Sit mid-bucket so two back-to-back ticks render the same coarse elapsed.
+        app.step_timings.insert(
+            "step-1".to_string(),
+            StepTiming {
+                started_at: Instant::now() - Duration::from_millis(8_200),
+                last_activity: Instant::now(),
+            },
+        );
+
+        assert!(app.refresh_roster_tick(), "first tick publishes the change");
+        assert!(
+            !app.refresh_roster_tick(),
+            "identical rebuild must be change-gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_cleared_on_terminal_status() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.state_mut().live_steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Running,
+        )];
+        app.step_timings
+            .insert("step-1".to_string(), timing_entry(Instant::now(), 5, 0));
+        assert!(app.step_timings.contains_key("step-1"));
+
+        app.set_live_step_status("step-1", LiveStepStatus::Completed);
+
+        assert!(
+            !app.step_timings.contains_key("step-1"),
+            "a finished step must drop its timing entry"
+        );
+    }
+
+    // --- build_roster_rows builder (task_03, ADR-003/004/005) -----------------
+
+    fn roster_agent(id: &str, name: &str) -> AgentView {
+        AgentView {
+            id: id.to_string(),
+            name: name.to_string(),
+            runtime: "fake".to_string(),
+            model: "default".to_string(),
+            effort: "medium".to_string(),
+            thinking: false,
+            capabilities: Vec::new(),
+            availability: None,
+            status: "idle".to_string(),
+        }
+    }
+
+    fn roster_live_step(agent: &str, step_id: &str, status: LiveStepStatus) -> LiveStepView {
+        LiveStepView {
+            run_id: "run-1".to_string(),
+            group_id: None,
+            step_id: step_id.to_string(),
+            step_label: Some(format!("{agent} step")),
+            file_scope: None,
+            agent: agent.to_string(),
+            status,
+            streams: Vec::new(),
+        }
+    }
+
+    /// A timing entry stamped `started_secs` ago, last active `idle_secs` ago,
+    /// relative to the `now` the test will pass to `build_roster_rows`.
+    fn timing_entry(now: Instant, started_secs: u64, idle_secs: u64) -> StepTiming {
+        StepTiming {
+            started_at: now - Duration::from_secs(started_secs),
+            last_activity: now - Duration::from_secs(idle_secs),
+        }
+    }
+
+    #[test]
+    fn classify_active_within_threshold() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Streaming,
+        )];
+        let mut timing = BTreeMap::new();
+        timing.insert("step-1".to_string(), timing_entry(now, 5, 0));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::Active);
+        assert_eq!(rows[0].elapsed.as_deref(), Some("5s"));
+        assert_eq!(rows[0].current_step.as_deref(), Some("explorer step"));
+    }
+
+    #[test]
+    fn classify_stalled_at_exactly_threshold() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Running,
+        )];
+        let mut timing = BTreeMap::new();
+        // started 30s ago, last activity exactly 30s ago -> stalled, not active.
+        timing.insert("step-1".to_string(), timing_entry(now, 30, 30));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::Stalled);
+        // Elapsed still shown on stalled rows.
+        assert_eq!(rows[0].elapsed.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn classify_stalled_after_threshold() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Streaming,
+        )];
+        let mut timing = BTreeMap::new();
+        timing.insert("step-1".to_string(), timing_entry(now, 35, 35));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::Stalled);
+        assert_eq!(rows[0].elapsed.as_deref(), Some("35s"));
+    }
+
+    #[test]
+    fn classify_needs_input_from_waiting_for_approval() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::WaitingForApproval,
+        )];
+        let timing = BTreeMap::new();
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::NeedsInput);
+        assert_eq!(rows[0].elapsed, None);
+        assert_eq!(rows[0].current_step, None);
+    }
+
+    #[test]
+    fn classify_needs_input_from_waiting_for_action() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::WaitingForAction,
+        )];
+        let timing = BTreeMap::new();
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::NeedsInput);
+    }
+
+    #[test]
+    fn classify_idle_when_no_step() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let rows = build_roster_rows(&agents, &[], &BTreeMap::new(), now);
+
+        assert_eq!(rows[0].activity, ActivityState::Idle);
+        assert_eq!(rows[0].elapsed, None);
+        assert_eq!(rows[0].current_step, None);
+    }
+
+    #[test]
+    fn classify_terminal_status_preserves_label() {
+        let now = Instant::now();
+        let mut agent = roster_agent("explorer", "Explorer");
+        agent.status = "completed".to_string();
+        let agents = vec![agent];
+        let steps = vec![roster_live_step(
+            "explorer",
+            "step-1",
+            LiveStepStatus::Completed,
+        )];
+        let timing = BTreeMap::new();
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].activity, ActivityState::Idle);
+        assert_eq!(rows[0].status, "completed");
+        assert_eq!(rows[0].elapsed, None);
+        assert_eq!(rows[0].current_step, None);
+    }
+
+    #[test]
+    fn elapsed_formatter_edge_cases() {
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(8)), "8s");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(60)), "1m");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(80)), "1m 20s");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(120)), "2m");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(3900)), "1h 5m");
+        // Sub-minute remainder under an hour boundary collapses cleanly.
+        assert_eq!(format_coarse_elapsed(Duration::from_secs(3661)), "1h 1m");
+    }
+
+    #[test]
+    fn needs_input_pin_preserves_canonical_accent_index() {
+        let now = Instant::now();
+        // Canonical order: [explorer, fixer] (alphabetical, no orchestrator here).
+        let agents = vec![
+            roster_agent("explorer", "Explorer"),
+            roster_agent("fixer", "Fixer"),
+        ];
+        let steps = vec![
+            roster_live_step("explorer", "step-e", LiveStepStatus::Streaming),
+            roster_live_step("fixer", "step-f", LiveStepStatus::WaitingForApproval),
+        ];
+        let mut timing = BTreeMap::new();
+        timing.insert("step-e".to_string(), timing_entry(now, 5, 0));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        // fixer (NeedsInput) pins to the top...
+        assert_eq!(rows[0].agent_id, "fixer");
+        assert_eq!(rows[1].agent_id, "explorer");
+        // ...but keeps its canonical accent_index of 1 (not 0).
+        assert_eq!(rows[0].accent_index, 1);
+        assert_eq!(rows[1].accent_index, 0);
+    }
+
+    #[test]
+    fn parallel_group_multiple_active_rows_each_correct() {
+        let now = Instant::now();
+        let agents = vec![
+            roster_agent("explorer", "Explorer"),
+            roster_agent("fixer", "Fixer"),
+        ];
+        let mut explorer_step = roster_live_step("explorer", "step-e", LiveStepStatus::Running);
+        explorer_step.group_id = Some("group-1".to_string());
+        let mut fixer_step = roster_live_step("fixer", "step-f", LiveStepStatus::Streaming);
+        fixer_step.group_id = Some("group-1".to_string());
+        let steps = vec![explorer_step, fixer_step];
+
+        let mut timing = BTreeMap::new();
+        timing.insert("step-e".to_string(), timing_entry(now, 10, 0));
+        timing.insert("step-f".to_string(), timing_entry(now, 80, 0));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        // No NeedsInput, so canonical order is preserved with stable accents.
+        assert_eq!(rows[0].agent_id, "explorer");
+        assert_eq!(rows[0].accent_index, 0);
+        assert_eq!(rows[0].activity, ActivityState::Active);
+        assert_eq!(rows[0].elapsed.as_deref(), Some("10s"));
+
+        assert_eq!(rows[1].agent_id, "fixer");
+        assert_eq!(rows[1].accent_index, 1);
+        assert_eq!(rows[1].activity, ActivityState::Active);
+        assert_eq!(rows[1].elapsed.as_deref(), Some("1m 20s"));
+    }
+
+    #[test]
+    fn missing_step_label_falls_back_to_step_id() {
+        let now = Instant::now();
+        let agents = vec![roster_agent("explorer", "Explorer")];
+        let mut step = roster_live_step("explorer", "step-1", LiveStepStatus::Streaming);
+        step.step_label = None;
+        let steps = vec![step];
+        let mut timing = BTreeMap::new();
+        timing.insert("step-1".to_string(), timing_entry(now, 5, 0));
+
+        let rows = build_roster_rows(&agents, &steps, &timing, now);
+
+        assert_eq!(rows[0].current_step.as_deref(), Some("step-1"));
+    }
+
+    #[test]
+    fn build_roster_rows_preserves_canonical_order_without_pin() {
+        let now = Instant::now();
+        let agents = vec![
+            roster_agent("orchestrator", "Orchestrator"),
+            roster_agent("explorer", "Explorer"),
+            roster_agent("fixer", "Fixer"),
+        ];
+        let rows = build_roster_rows(&agents, &[], &BTreeMap::new(), now);
+
+        let order: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
+        assert_eq!(order, vec!["orchestrator", "explorer", "fixer"]);
+        for (idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.accent_index, idx);
+        }
+    }
+
+    // --- StepTiming lifecycle (task_02, ADR-004) ------------------------------
+
+    #[tokio::test]
+    async fn step_timing_stamped_on_registration() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+
+        let timing = app
+            .step_timings
+            .get("step-1")
+            .expect("registering an active step stamps a timing entry");
+        // Both timestamps start equal at registration time.
+        assert_eq!(timing.started_at, timing.last_activity);
+    }
+
+    #[tokio::test]
+    async fn step_timing_bumped_on_stream_keeps_started_at() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        // Backdate the entry so the bump is observably later than `started_at`.
+        let backdated = Instant::now() - Duration::from_secs(10);
+        {
+            let timing = app.step_timings.get_mut("step-1").unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        app.push_live_stream_content("step-1", "stdout".to_string(), "hi".to_string(), 1, false);
+
+        let timing = app.step_timings.get("step-1").unwrap();
+        assert_eq!(
+            timing.started_at, backdated,
+            "stream arrival must not move started_at"
+        );
+        assert!(
+            timing.last_activity > timing.started_at,
+            "stream arrival must advance last_activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_bumped_on_active_status_transition() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        let backdated = Instant::now() - Duration::from_secs(10);
+        {
+            let timing = app.step_timings.get_mut("step-1").unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        app.set_live_step_status("step-1", LiveStepStatus::Running);
+
+        let timing = app.step_timings.get("step-1").unwrap();
+        assert_eq!(timing.started_at, backdated);
+        assert!(
+            timing.last_activity > timing.started_at,
+            "Running transition must advance last_activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_not_bumped_on_terminal_status_transition() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        let backdated = Instant::now() - Duration::from_secs(10);
+        {
+            let timing = app.step_timings.get_mut("step-1").unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        // Terminal/waiting transitions are not active states, so they must not
+        // refresh the stall signal (the entry persists until clear_active_step).
+        app.set_live_step_status("step-1", LiveStepStatus::WaitingForApproval);
+
+        let timing = app.step_timings.get("step-1").unwrap();
+        assert_eq!(
+            timing.last_activity, backdated,
+            "non-active status transition must leave last_activity untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_cleared_on_step_end() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        assert!(app.step_timings.contains_key("step-1"));
+
+        app.clear_active_step("step-1");
+
+        assert!(
+            !app.step_timings.contains_key("step-1"),
+            "clearing a step must remove its timing entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_parallel_steps_tracked_independently() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        // Two concurrent steps in a parallel group, keyed by distinct step_ids.
+        app.set_active_step_with_metadata(
+            "run-1",
+            Some("group-1".to_string()),
+            "step-a",
+            None,
+            None,
+            "explorer",
+        );
+        app.set_active_step_with_metadata(
+            "run-1",
+            Some("group-1".to_string()),
+            "step-b",
+            None,
+            None,
+            "fixer",
+        );
+
+        // Backdate both to a common baseline, then bump only step-a.
+        let backdated = Instant::now() - Duration::from_secs(10);
+        for step_id in ["step-a", "step-b"] {
+            let timing = app.step_timings.get_mut(step_id).unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        app.push_live_stream_content("step-a", "stdout".to_string(), "tick".to_string(), 1, false);
+
+        let a = *app.step_timings.get("step-a").unwrap();
+        let b = *app.step_timings.get("step-b").unwrap();
+        assert!(
+            a.last_activity > b.last_activity,
+            "streaming step-a must not touch step-b's timing"
+        );
+        assert_eq!(
+            b.last_activity, backdated,
+            "the quiet peer keeps its original last_activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_timing_multi_step_lifecycle_through_app_layer() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step_with_metadata(
+            "run-1",
+            Some("group-1".to_string()),
+            "step-a",
+            None,
+            None,
+            "explorer",
+        );
+        app.set_active_step_with_metadata(
+            "run-1",
+            Some("group-1".to_string()),
+            "step-b",
+            None,
+            None,
+            "fixer",
+        );
+
+        let backdated = Instant::now() - Duration::from_secs(10);
+        for step_id in ["step-a", "step-b"] {
+            let timing = app.step_timings.get_mut(step_id).unwrap();
+            timing.started_at = backdated;
+            timing.last_activity = backdated;
+        }
+
+        // Stream to the first, status-transition the second: both advance, each
+        // independently from its own baseline.
+        app.push_live_stream_content("step-a", "stdout".to_string(), "a".to_string(), 1, false);
+        app.set_live_step_status("step-b", LiveStepStatus::Running);
+
+        assert!(app.step_timings.get("step-a").unwrap().last_activity > backdated);
+        assert!(app.step_timings.get("step-b").unwrap().last_activity > backdated);
+
+        // Clearing one leaves the other intact.
+        app.clear_active_step("step-a");
+        assert!(!app.step_timings.contains_key("step-a"));
+        assert!(app.step_timings.contains_key("step-b"));
+    }
+
+    #[tokio::test]
+    async fn step_timing_never_leaks_into_serialized_state() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.set_active_step("run-1", "step-1", "explorer");
+        app.push_live_stream_content("step-1", "stdout".to_string(), "hi".to_string(), 1, false);
+
+        let json = serde_json::to_string(app.state()).unwrap();
+        assert!(
+            !json.contains("step_timings"),
+            "the timing map must not be serialized onto AppState"
+        );
+        assert!(
+            !json.contains("last_activity") && !json.contains("started_at"),
+            "internal timing fields must not leak into serialized state (ADR-004)"
+        );
     }
 }

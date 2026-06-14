@@ -20,11 +20,12 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Directory names pruned from the walk regardless of `.gitignore` — VCS
 /// metadata plus build/dependency noise. Mirrors `codemap`'s `EXCLUDED_DIRS`
-/// (the task requires at minimum `.multiagent`, `target`, and `node_modules`).
+/// (the task requires at minimum `.atelier`, `target`, and `node_modules`).
 const FORCE_EXCLUDED_DIRS: &[&str] = &[
     ".git",
     ".hg",
-    ".multiagent",
+    ".atelier",
+    ".multiagent", // legacy data root pre-rename; keep old session logs out of the picker
     ".next",
     ".pytest_cache",
     ".ruff_cache",
@@ -384,6 +385,23 @@ mod tests {
         let paths = rel_paths(&FileIndex::walk(dir.path()));
         assert!(!paths.iter().any(|p| p.starts_with("target")));
         assert!(!paths.iter().any(|p| p.starts_with("node_modules")));
+    }
+
+    #[test]
+    fn walk_excludes_atelier_private_dir() {
+        // `.atelier` is the harness's private, durable session-history dir; it must
+        // never surface in the file index (FORCE_EXCLUDED_DIRS). Guards the exclusion
+        // against accidental removal from the list.
+        let dir = tempdir().unwrap();
+        seed_tree(dir.path());
+        fs::create_dir_all(dir.path().join(".atelier/sessions/abc")).unwrap();
+        fs::write(
+            dir.path().join(".atelier/sessions/abc/events.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        let paths = rel_paths(&FileIndex::walk(dir.path()));
+        assert!(!paths.iter().any(|p| p.starts_with(".atelier")));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "TuiUiState recall fields and async history loader"
 type: frontend
 complexity: medium
@@ -34,11 +34,11 @@ walk) that runs `project_prompt_history` off-thread and delivers the result over
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Add the three fields and update constructors/`Default`/test builders.
-- [ ] 4.2 Add the `watch` channel in `run_tui` and thread the receiver into `run_loop`.
-- [ ] 4.3 Spawn the detached loader after the first render, gated on the toggle.
-- [ ] 4.4 Sync received history into `TuiUiState` each loop tick.
-- [ ] 4.5 Test that the ring populates from a delivered value and stays empty when disabled.
+- [x] 4.1 Add the three fields and update constructors/`Default`/test builders.
+- [x] 4.2 Add the `watch` channel in `run_tui` and thread the receiver into `run_loop`.
+- [x] 4.3 Spawn the detached loader after the first render, gated on the toggle.
+- [x] 4.4 Sync received history into `TuiUiState` each loop tick.
+- [x] 4.5 Test that the ring populates from a delivered value and stays empty when disabled.
 
 ## Implementation Details
 

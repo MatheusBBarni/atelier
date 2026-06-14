@@ -96,7 +96,7 @@ impl Runtime for ClaudeRuntime {
                 runtime_id: self.config.id.clone(),
                 status: RuntimeAvailabilityStatus::Unavailable,
                 message: "claude command is not configured".to_string(),
-                remediation: Some("Set [runtimes.claude].command in multiagent.toml.".to_string()),
+                remediation: Some("Set [runtimes.claude].command in atelier.toml.".to_string()),
             };
         };
 
