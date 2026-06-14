@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Submission provenance tagging at submit"
 type: backend
 complexity: medium
@@ -34,11 +34,11 @@ makes "recall adoption" measurable directly from the event log.
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Determine `source` from cursor state in the TUI `Dispatch(PromptSubmitted)` handler.
-- [ ] 6.2 Thread `source` through `submit_prompt` into `record_event`.
-- [ ] 6.3 Add the `"source"` field to the `prompt_submitted` payload.
-- [ ] 6.4 Prepend the submitted prompt to the ring (dedup + cap) and reset the cursor.
-- [ ] 6.5 Test the tagging and the in-session prepend.
+- [x] 6.1 Determine `source` from cursor state in the TUI `Dispatch(PromptSubmitted)` handler.
+- [x] 6.2 Thread `source` through `submit_prompt` into `record_event`.
+- [x] 6.3 Add the `"source"` field to the `prompt_submitted` payload.
+- [x] 6.4 Prepend the submitted prompt to the ring (dedup + cap) and reset the cursor.
+- [x] 6.5 Test the tagging and the in-session prepend.
 
 ## Implementation Details
 

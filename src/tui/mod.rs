@@ -297,6 +297,12 @@ struct TuiUiState {
     /// The in-progress draft saved while browsing history, restored when ↓ steps
     /// back past the newest entry (task_05).
     prompt_history_draft: String,
+    /// Whether recall is enabled (config `ui.prompt_history_enabled`). Gates the
+    /// in-session prepend so a disabled session never builds a recallable ring.
+    prompt_history_enabled: bool,
+    /// Upper bound on the in-memory ring (config `ui.prompt_history_max`); the
+    /// in-session prepend truncates to this after adding a submission.
+    prompt_history_max: usize,
     agent_selection_index: usize,
     skill_suggestions: Vec<SkillSuggestion>,
     skill_selection_index: usize,
@@ -349,6 +355,8 @@ impl Default for TuiUiState {
             prompt_history: Vec::new(),
             prompt_history_cursor: 0,
             prompt_history_draft: String::new(),
+            prompt_history_enabled: true,
+            prompt_history_max: 200,
             agent_selection_index: 0,
             skill_suggestions: Vec::new(),
             skill_selection_index: 0,
@@ -508,6 +516,8 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let mut ui_state = TuiUiState::with_skill_suggestions(working_directory, Vec::new());
     ui_state.theme = theme;
     ui_state.hide_banner = hide_banner;
+    ui_state.prompt_history_enabled = prompt_history_enabled;
+    ui_state.prompt_history_max = prompt_history_max;
     let result = run_loop(
         &mut terminal,
         state_receiver,
@@ -714,6 +724,22 @@ async fn execute_tui_command_with_interrupt(
                 clear_input(state, ui_state);
                 return Ok(true);
             }
+            // Finalize submission provenance and maintain the in-session recall
+            // ring here, where `ui_state.prompt_history_cursor` is visible
+            // (ADR-003/004): tag `Recalled` iff the composition originated from
+            // the ring, then prepend the prompt so it is recallable this session.
+            // `clear_input` (below) resets the cursor to a fresh draft.
+            let event = if let AppEvent::PromptSubmitted(prompt, _) = event {
+                let source = if ui_state.prompt_history_cursor != 0 {
+                    PromptSource::Recalled
+                } else {
+                    PromptSource::Fresh
+                };
+                record_in_session_prompt(ui_state, &prompt);
+                AppEvent::PromptSubmitted(prompt, source)
+            } else {
+                event
+            };
             let clears_input = matches!(
                 event,
                 AppEvent::PromptSubmitted(_, _) | AppEvent::ApprovalAnswered(_)
@@ -1416,8 +1442,9 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
             ..
         } => Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
             state.input.clone(),
-            // Provenance is computed from recall cursor state in task_06; until
-            // then every submission is Fresh, preserving current behavior.
+            // Placeholder: this routing layer has no `ui_state`, so the real
+            // provenance (Recalled iff the composition came from the ring) is
+            // finalized in the `Dispatch` arm of `execute_tui_command`.
             PromptSource::Fresh,
         ))),
         KeyEvent {
@@ -1519,6 +1546,12 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     ui_state.input_cursor = removed_char_index;
     ui_state.input_preferred_col = None;
     ui_state.status_message = None;
+    // Backspacing a recalled composition all the way to empty returns to a fresh
+    // live draft, so a delete-all-then-retype is tagged Fresh (ADR-003).
+    if state.input.is_empty() {
+        ui_state.prompt_history_cursor = 0;
+        ui_state.prompt_history_draft.clear();
+    }
     clear_command_dropdown_dismissal(ui_state);
     clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
@@ -1646,6 +1679,26 @@ fn set_recalled_input(ui_state: &mut TuiUiState, state: &mut AppState, text: Str
     clear_command_dropdown_dismissal(ui_state);
     clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
+}
+
+/// Keep the in-session recall ring current by prepending a just-submitted prompt
+/// (ADR-004), so this session's prompts are recallable without a disk reload:
+/// newest-first, consecutive-deduped, capped to `prompt_history_max`. A no-op
+/// when recall is disabled (so a disabled session never builds a recallable
+/// ring), for empty submissions, and for leading-space prompts (the secrets
+/// escape hatch — matching the projection's filters).
+fn record_in_session_prompt(ui_state: &mut TuiUiState, prompt: &str) {
+    if !ui_state.prompt_history_enabled || prompt.trim().is_empty() || prompt.starts_with(' ') {
+        return;
+    }
+    // Consecutive-dedup: don't stack an identical prompt on the current front.
+    if ui_state.prompt_history.first().map(String::as_str) == Some(prompt) {
+        return;
+    }
+    ui_state.prompt_history.insert(0, prompt.to_string());
+    ui_state
+        .prompt_history
+        .truncate(ui_state.prompt_history_max);
 }
 
 fn scroll_events(ui_state: &mut TuiUiState, command: EventScrollCommand) {
@@ -9778,6 +9831,180 @@ runtime = "fake"
         // Submitting cleared the composer and reset recall to a fresh draft.
         assert!(state.input.is_empty());
         assert_eq!(ui_state.prompt_history_cursor, 0);
+    }
+
+    // ── prompt-history provenance + in-session ring (task_06) ──
+
+    #[test]
+    fn in_session_prepend_dedups_caps_and_skips_disabled_and_leading_space() {
+        let mut ui_state = TuiUiState {
+            prompt_history_max: 2,
+            ..TuiUiState::default()
+        };
+        record_in_session_prompt(&mut ui_state, "a");
+        record_in_session_prompt(&mut ui_state, "b");
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["b".to_string(), "a".to_string()]
+        );
+
+        // A consecutive duplicate of the front is ignored.
+        record_in_session_prompt(&mut ui_state, "b");
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["b".to_string(), "a".to_string()]
+        );
+
+        // Cap respected (max 2): adding "c" drops the oldest "a".
+        record_in_session_prompt(&mut ui_state, "c");
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["c".to_string(), "b".to_string()]
+        );
+
+        // Leading-space and empty submissions never enter the ring.
+        record_in_session_prompt(&mut ui_state, " secret");
+        record_in_session_prompt(&mut ui_state, "   ");
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["c".to_string(), "b".to_string()]
+        );
+
+        // Disabled recall → no prepend, the ring stays empty.
+        let mut disabled = TuiUiState {
+            prompt_history_enabled: false,
+            ..TuiUiState::default()
+        };
+        record_in_session_prompt(&mut disabled, "x");
+        assert!(disabled.prompt_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_from_recall_tags_recalled() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("a", false);
+        let mut ui_state = TuiUiState {
+            prompt_history: vec!["a".to_string(), "b".to_string()],
+            prompt_history_cursor: 2, // composition originated from the ring
+            input_cursor: 1,
+            ..TuiUiState::default()
+        };
+
+        let submit = TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+            "a".to_string(),
+            PromptSource::Fresh, // placeholder; the handler finalizes provenance
+        ));
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(p, PromptSource::Recalled)) if p == "a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_freshly_typed_tags_fresh() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("typed", false);
+        // cursor 0 → a fresh live draft.
+        let mut ui_state = ui_state_with_cursor_at_end("typed");
+
+        let submit = TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+            "typed".to_string(),
+            PromptSource::Fresh,
+        ));
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(p, PromptSource::Fresh)) if p == "typed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn recall_then_clear_to_empty_then_retype_tags_fresh() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]);
+
+        // ↑ recalls "b" (cursor → 1).
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::MoveInputCursor(InputCursorCommand::Up),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ui_state.prompt_history_cursor, 1);
+
+        // Backspacing the recalled text to empty resets the cursor to a draft.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::InputBackspace,
+        )
+        .await
+        .unwrap();
+        assert!(state.input.is_empty());
+        assert_eq!(ui_state.prompt_history_cursor, 0);
+
+        // Type fresh text and submit → Fresh (only the submit reaches the worker).
+        for ch in "new".chars() {
+            execute_tui_command(
+                &mut state,
+                &mut ui_state,
+                &sender,
+                TuiCommand::InputCharacter(ch),
+            )
+            .await
+            .unwrap();
+        }
+        let submit = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(p, PromptSource::Fresh)) if p == "new"
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_prepends_to_in_session_ring_and_resets_cursor() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("gamma", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]);
+        ui_state.input_cursor = input_char_count("gamma");
+
+        let submit = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        // "gamma" is prepended newest-first; the cursor resets and input clears.
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["gamma".to_string(), "b".to_string(), "a".to_string()]
+        );
+        assert_eq!(ui_state.prompt_history_cursor, 0);
+        assert!(state.input.is_empty());
     }
 
     // ── task_05 TUI file-index state and consumer ──

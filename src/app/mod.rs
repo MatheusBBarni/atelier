@@ -265,6 +265,26 @@ pub enum PromptSource {
     Recalled,
 }
 
+impl PromptSource {
+    /// Wire string written to the `prompt_submitted` payload `source` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptSource::Fresh => "fresh",
+            PromptSource::Recalled => "recalled",
+        }
+    }
+
+    /// Read a payload `source` value back into a `PromptSource`. A missing or
+    /// unrecognized value (events written before this field existed) defaults to
+    /// `Fresh`, keeping the change backward-compatible (ADR-003).
+    pub fn from_payload_value(value: Option<&Value>) -> Self {
+        match value.and_then(Value::as_str) {
+            Some("recalled") => PromptSource::Recalled,
+            _ => PromptSource::Fresh,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
     PromptSubmitted(String, PromptSource),
@@ -913,15 +933,13 @@ impl App {
 
     pub async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
         match event {
-            // Provenance (`source`) is threaded into the payload in task_06; for
-            // now every submission is recorded as today (Fresh-equivalent).
-            AppEvent::PromptSubmitted(prompt, _) => {
+            AppEvent::PromptSubmitted(prompt, source) => {
                 self.state.input.clear();
                 // Refresh git before the run so the footer/welcome reflect the
                 // branch the prompt actually runs against (ADR-006).
                 self.refresh_git_context().await;
                 self.publish_state();
-                self.submit_prompt(prompt).await
+                self.submit_prompt_with_source(prompt, source).await
             }
             AppEvent::ApprovalAnswered(approved) => {
                 self.state.input.clear();
@@ -990,6 +1008,18 @@ impl App {
     }
 
     pub async fn submit_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
+        // Non-recall entry points (queued-follow-up replays, programmatic and
+        // test submits) are Fresh; the TUI recall path tags provenance by
+        // calling `submit_prompt_with_source` directly (ADR-003).
+        self.submit_prompt_with_source(prompt, PromptSource::Fresh)
+            .await
+    }
+
+    pub async fn submit_prompt_with_source(
+        &mut self,
+        prompt: impl Into<String>,
+        source: PromptSource,
+    ) -> Result<()> {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
             return Ok(());
@@ -1063,6 +1093,7 @@ impl App {
             json!({
                 "prompt": visible_prompt.clone(),
                 "submitted_prompt": submitted_prompt.clone(),
+                "source": source.as_str(),
             }),
             user_event_display(&visible_prompt),
         )?;
@@ -7839,6 +7870,65 @@ prompt = "{reviewer_prompt}"
             }
             other => panic!("expected PromptSubmitted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prompt_source_payload_roundtrip_and_missing_defaults_fresh() {
+        assert_eq!(PromptSource::Fresh.as_str(), "fresh");
+        assert_eq!(PromptSource::Recalled.as_str(), "recalled");
+        assert_eq!(
+            PromptSource::from_payload_value(Some(&json!("recalled"))),
+            PromptSource::Recalled
+        );
+        assert_eq!(
+            PromptSource::from_payload_value(Some(&json!("fresh"))),
+            PromptSource::Fresh
+        );
+        // A missing or unrecognized value (older events) reads as Fresh.
+        assert_eq!(PromptSource::from_payload_value(None), PromptSource::Fresh);
+        assert_eq!(
+            PromptSource::from_payload_value(Some(&json!("bogus"))),
+            PromptSource::Fresh
+        );
+    }
+
+    #[tokio::test]
+    async fn recalled_submission_persists_source_in_payload() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt_with_source("create a feature", PromptSource::Recalled)
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .expect("prompt_submitted recorded");
+        assert_eq!(event.payload["source"], "recalled");
+        assert_eq!(
+            PromptSource::from_payload_value(event.payload.get("source")),
+            PromptSource::Recalled
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_submission_persists_fresh_source_in_payload() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        // The default submit path (and all non-recall callers) is Fresh.
+        app.submit_prompt("create a feature").await.unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == "prompt_submitted")
+            .expect("prompt_submitted recorded");
+        assert_eq!(event.payload["source"], "fresh");
     }
 
     #[tokio::test]
