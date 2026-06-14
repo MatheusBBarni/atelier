@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Generate and validate Compozy task artifacts
 type: chore
 complexity: low
@@ -82,3 +82,26 @@ The PRD, TechSpec, ADRs, task list, and implementation task files define the def
 ## Residual Risk
 
 This task validates planning artifact structure, not the future Rust implementation. Implementation correctness is covered by the dependent implementation and test tasks.
+
+## Completion Notes
+
+Validated the `default-agent-prompts` task bundle; no artifact fixes were required.
+
+- All files present: `_tasks.md` plus `task_01.md` … `task_05.md`.
+- `_tasks.md` lists exactly the approved five tasks, with titles, complexity, and
+  dependencies matching the breakdown in this task's Implementation Steps.
+- Every task file carries the required frontmatter fields (`status`, `title`, `type`,
+  `complexity`, `dependencies`).
+- Dependencies match the approved sequence: 01 → none; 02 → 01; 03 → 02; 04 → 02, 03;
+  05 → 01, 02, 03, 04.
+- Statuses at validation time: 01–04 `completed`, 05 completing in this step.
+
+Note (non-blocking, left as-is): `task_02.md` and `task_04.md` frontmatter titles use Title
+Case while `_tasks.md` uses sentence case. The `compozy tasks validate` metadata-v2 schema
+accepts this (validation passed), so no change was made — out of scope to restyle.
+
+### Verification evidence
+
+- CLI available: `compozy version 0.2.8`.
+- `compozy tasks validate --name default-agent-prompts` → `all tasks valid (5 scanned)`,
+  exit code 0.
