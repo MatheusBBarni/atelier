@@ -105,3 +105,19 @@ to Task 03, and drift/role-boundary tests to Task 04, per the approved sequence.
 - `rtk cargo test --lib config` → 56 passed, 0 failed (crate compiles; existing config
   defaults/starter tests unaffected). Prompt-content/alignment assertions are added in
   Task 04.
+
+### Review follow-up (capability accuracy)
+
+A post-implementation adversarial review flagged that the harness-action lines for the
+read-only roles named actions those roles cannot request. `explorer` (Read), `oracle`
+(Read+Answer), and `consul` (Read+Challenge) have no `Capability::Command`, yet their
+harness-action sentences mentioned "command"/"verification" requests — which would be denied
+at the capability gate, the exact contract-violation class ADR-002 targets.
+
+Fix: narrowed those three harness-action *request* lines to "file read / search /
+inspection" only. The techspec-mandated boundary wording was left intact (e.g. `explorer`
+still says "Do not run modifying commands" per techspec). `fixer` and `reviewer` keep their
+command/verification wording because they actually hold `Capability::Command`/`Verify`, and
+`orchestrator` keeps its delegation wording (it routes such work to capable agents rather
+than requesting it). All drift/role-boundary tests still pass and the built-in↔starter
+alignment is unaffected (both surfaces share the same constants).

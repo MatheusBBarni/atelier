@@ -649,7 +649,7 @@ Do: request read, list, search, or safe inspection harness actions when reposito
 \n\
 Do not: edit files, run modifying commands, or present unverified conclusions as facts.\n\
 \n\
-Harness actions: you have no direct tool access. Obtain any file read, command output, or inspection result by requesting the matching harness action; never claim to have run it yourself.\n\
+Harness actions: you have no direct tool access. Obtain any file read, search, or inspection result by requesting the matching harness action; never claim to have run it yourself.\n\
 \n\
 Blockers: report a blocker that names the missing file, permission, action result, or context. Stop when discovery for the assigned step is complete or blocked.";
 
@@ -688,7 +688,7 @@ Do: answer the narrow question using provided context and any requested reads or
 \n\
 Do not: pretend to have unseen repository, web, or command data; edit files or execute implementation steps; overrule runtime constraints.\n\
 \n\
-Harness actions: obtain any file, command, or search result you rely on by requesting the matching harness action rather than assuming it; you have no direct tool access.\n\
+Harness actions: obtain any file or search result you rely on by requesting the matching harness action rather than assuming it; you have no direct tool access.\n\
 \n\
 Blockers: report a blocker that names the missing evidence, context, or decision required to answer. Stop when the question is answered or blocked.";
 
@@ -701,7 +701,7 @@ Do: challenge plans, risks, and assumptions; identify decision trade-offs and fa
 \n\
 Do not: edit files, execute the plan, or add process overhead when the path is already clear and low risk.\n\
 \n\
-Harness actions: request any file, command, or verification evidence you need to ground a critique as a harness action; you have no direct tool access and do not implement the work.\n\
+Harness actions: request any file or search result you need to ground a critique as a harness action; you have no direct tool access and do not implement the work.\n\
 \n\
 Blockers: report a blocker that names the missing plan detail, evidence, or decision required to critique. Stop when the critique of the assigned plan is complete or blocked.";
 
@@ -3158,7 +3158,12 @@ api_key_env = "sk-secret"
         assert!(rendered.contains("effort = \"high\""));
         assert!(rendered.contains("thinking = true"));
         assert!(rendered.contains("prompt_source = \"inline_redacted\""));
-        assert!(!rendered.contains("Own the run plan"));
+        // Sentinel: the inline prompt body must never leak into the redacted output.
+        // Key it to the live orchestrator default (not a hard-coded phrase) so a future
+        // prompt rewrite cannot silently make this assertion vacuous.
+        let orchestrator_body = config.agents["orchestrator"].instructions.as_str();
+        assert!(!orchestrator_body.is_empty());
+        assert!(!rendered.contains(orchestrator_body));
         assert!(!rendered.contains("Bearer"));
     }
 
