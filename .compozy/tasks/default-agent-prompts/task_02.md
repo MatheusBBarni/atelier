@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Implement Role-Contract Default Prompts
 type: refactor
 complexity: medium
@@ -68,3 +68,40 @@ Task 01 should establish the canonical source shape for these prompt bodies. Thi
 - Run `cargo fmt --check` or the repository's wrapper equivalent.
 - Run the focused config tests if already available after Task 04, or defer full test verification to Task 05 if tests have not been added yet.
 - Record any command failure as a blocker with the failing command and relevant error summary.
+
+## Completion Notes
+
+Added six module-level canonical prompt constants in `src/config/mod.rs` immediately
+before `impl MergedConfig` (the single Rust source of truth required by the TechSpec):
+
+- `DEFAULT_ORCHESTRATOR_INSTRUCTIONS`
+- `DEFAULT_EXPLORER_INSTRUCTIONS`
+- `DEFAULT_FIXER_INSTRUCTIONS`
+- `DEFAULT_REVIEWER_INSTRUCTIONS`
+- `DEFAULT_ORACLE_INSTRUCTIONS`
+- `DEFAULT_CONSUL_INSTRUCTIONS`
+
+Each constant is a concise role contract covering: role ownership, role boundaries
+(forbidden behavior), harness-action discipline, result discipline, blocker handling,
+and a stop condition. Every prompt contains the shared contract language
+("structured output contract", "no prose outside the requested JSON envelope",
+"harness action", a lowercase "blocker" reporting clause, and a "Stop …" condition)
+plus a role-defining boundary phrase (orchestrator: no repository inspection / edits /
+commands; explorer: read-only; fixer: verification evidence or specific blocker;
+reviewer: no edits / no implementation takeover; oracle: do not pretend to have unseen
+data; consul: do not execute the plan).
+
+The six core `insert_builtin_agent(...)` calls now reference these constants instead of
+inline literals. Capabilities, models, runtimes, effort, thinking, and `enabled` state
+were left byte-for-byte unchanged. The disabled `librarian` and `designer` agents and all
+runtime schemas, action contracts, parser, scheduler, and permission logic are untouched.
+
+Starter instruction file alignment (`starter_instruction_files`) is deliberately deferred
+to Task 03, and drift/role-boundary tests to Task 04, per the approved sequence.
+
+### Verification evidence
+
+- `rtk cargo fmt --check` → exit 0 (no formatting changes needed).
+- `rtk cargo test --lib config` → 56 passed, 0 failed (crate compiles; existing config
+  defaults/starter tests unaffected). Prompt-content/alignment assertions are added in
+  Task 04.
