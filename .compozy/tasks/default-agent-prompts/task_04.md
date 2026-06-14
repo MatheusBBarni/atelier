@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add Prompt Drift And Role-Boundary Tests
 type: chore
 complexity: medium
@@ -68,3 +68,43 @@ If the repository requires the local `rtk` wrapper, run the same commands throug
 - Do not change JSON schemas, action request shapes, result shapes, or orchestrator decision shapes.
 - Do not standardize disabled or non-core bundled agents.
 - Do not rewrite existing project-owned starter instruction files outside generated test fixtures.
+
+## Completion Notes
+
+Added three focused tests plus a shared role list and two helpers to the existing
+`#[cfg(test)] mod tests` block in `src/config/mod.rs` (no production code changed):
+
+- `CORE_PROMPT_ROLES: [&str; 6]` — explicit list of the six core roles. Adding/removing a
+  role forces an intentional test edit; `core_prompts_assert_role_boundaries` also asserts
+  `boundaries.len() == CORE_PROMPT_ROLES.len()`.
+- `builtin_defaults()` — loads the built-in `EffectiveConfig` from an empty
+  `schema_version = 1` config (same pattern as `builtin_config_resolves_without_files`).
+- `starter_instruction(role)` — looks up the generated starter body from
+  `starter_instruction_files()`.
+- `core_builtin_and_starter_prompts_stay_aligned` — asserts, for each core role, that the
+  built-in default `config.agents[role].instructions` exactly equals the generated starter
+  instruction body. Reads both real surfaces (not the constant directly), so it fails on any
+  future drift.
+- `core_prompts_contain_contract_first_language` — each core prompt contains
+  `"structured output contract"`, `"JSON envelope"`, `"harness action"`, `"blocker"`, and
+  `"Stop "`.
+- `core_prompts_assert_role_boundaries` — each role contains its defining boundary phrase
+  (orchestrator: `inspect the repository` / `edit files`; explorer: `read-only` /
+  `edit files`; fixer: `verification evidence or a specific blocker`; reviewer:
+  `take over implementation`; oracle: `pretend to have unseen`; consul: `execute the plan`).
+
+Out-of-scope rules honored: no broad eval suite, no schema/contract changes, no
+disabled/non-core agent standardization, no rewriting of project-owned files.
+
+### Verification evidence
+
+- `rtk cargo test --lib config` → 59 passed (3 new tests), 0 failed.
+- Negative control: temporarily set the starter `reviewer` tuple to literal drift text →
+  `core_builtin_and_starter_prompts_stay_aligned` FAILED with the expected
+  "prompts drifted for `reviewer`" message; reverted (diff is additive-only afterward).
+- `rtk cargo fmt --check` → exit 0.
+- `rtk cargo test --lib -- --test-threads=1` → 864 passed (whole library). Note: a parallel
+  `cargo test --lib` run showed 2 failures in pre-existing `runtime::cursor` availability
+  tests; those pass in isolation and single-threaded, confirming a known env-var
+  (`CURSOR_API_KEY`) test-isolation race documented in CLAUDE.md — unrelated to this
+  config-only change.

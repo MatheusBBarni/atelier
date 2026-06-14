@@ -3341,4 +3341,91 @@ instructions_file = "agents/fixer.md"
             .unwrap()
             .contains("do not use for backend-only"));
     }
+
+    /// The six core structured-runtime roles whose default prompts must stay
+    /// aligned between built-in defaults and generated starter instruction files.
+    /// Listing them explicitly means adding or removing a core role requires an
+    /// intentional update to these drift tests.
+    const CORE_PROMPT_ROLES: [&str; 6] = [
+        "orchestrator",
+        "explorer",
+        "fixer",
+        "reviewer",
+        "oracle",
+        "consul",
+    ];
+
+    fn builtin_defaults() -> EffectiveConfig {
+        load_from_temp("schema_version = 1\n").unwrap()
+    }
+
+    fn starter_instruction(role: &str) -> &'static str {
+        starter_instruction_files()
+            .into_iter()
+            .find(|(name, _)| *name == role)
+            .unwrap_or_else(|| panic!("missing starter instruction file for {role}"))
+            .1
+    }
+
+    #[test]
+    fn core_builtin_and_starter_prompts_stay_aligned() {
+        let config = builtin_defaults();
+        for role in CORE_PROMPT_ROLES {
+            let builtin = config
+                .agents
+                .get(role)
+                .unwrap_or_else(|| panic!("missing built-in agent {role}"))
+                .instructions
+                .as_str();
+            assert_eq!(
+                builtin,
+                starter_instruction(role),
+                "built-in default and generated starter prompts drifted for `{role}`"
+            );
+        }
+    }
+
+    #[test]
+    fn core_prompts_contain_contract_first_language() {
+        let config = builtin_defaults();
+        for role in CORE_PROMPT_ROLES {
+            let prompt = config.agents[role].instructions.as_str();
+            for phrase in [
+                "structured output contract",
+                "JSON envelope",
+                "harness action",
+                "blocker",
+                "Stop ",
+            ] {
+                assert!(
+                    prompt.contains(phrase),
+                    "`{role}` prompt is missing required contract phrase {phrase:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn core_prompts_assert_role_boundaries() {
+        let config = builtin_defaults();
+        let boundaries: [(&str, &[&str]); 6] = [
+            ("orchestrator", &["inspect the repository", "edit files"]),
+            ("explorer", &["read-only", "edit files"]),
+            ("fixer", &["verification evidence or a specific blocker"]),
+            ("reviewer", &["take over implementation"]),
+            ("oracle", &["pretend to have unseen"]),
+            ("consul", &["execute the plan"]),
+        ];
+        // Every core role must carry an explicit boundary case.
+        assert_eq!(boundaries.len(), CORE_PROMPT_ROLES.len());
+        for (role, phrases) in boundaries {
+            let prompt = config.agents[role].instructions.as_str();
+            for phrase in phrases {
+                assert!(
+                    prompt.contains(phrase),
+                    "`{role}` prompt is missing role-boundary phrase {phrase:?}"
+                );
+            }
+        }
+    }
 }
