@@ -198,9 +198,27 @@ pub struct Features {
     pub parallel_step_groups: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct UiConfig {
     pub hide_banner: bool,
+    /// Enable shell-style ↑/↓ recall of this project's past prompts. On by
+    /// default (ADR-002); set `[ui] prompt_history_enabled = false` to disable
+    /// the background loader and recall entirely.
+    pub prompt_history_enabled: bool,
+    /// Upper bound on how many past prompts are retained for recall (ADR-004's
+    /// bounded projection). Defaults to 200.
+    pub prompt_history_max: usize,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            hide_banner: false,
+            prompt_history_enabled: true,
+            prompt_history_max: 200,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -436,6 +454,8 @@ struct RawFeatures {
 #[serde(deny_unknown_fields)]
 struct RawUiConfig {
     hide_banner: Option<bool>,
+    prompt_history_enabled: Option<bool>,
+    prompt_history_max: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -840,6 +860,12 @@ impl MergedConfig {
         if let Some(ui) = raw.ui {
             if let Some(value) = ui.hide_banner {
                 self.ui.hide_banner = value;
+            }
+            if let Some(value) = ui.prompt_history_enabled {
+                self.ui.prompt_history_enabled = value;
+            }
+            if let Some(value) = ui.prompt_history_max {
+                self.ui.prompt_history_max = value;
             }
         }
 
@@ -2089,9 +2115,11 @@ approval_mode = "yolo"
 [features]
 parallel_step_groups = false
 
-# Optional UI tweaks. Uncomment to suppress the welcome banner.
+# Optional UI tweaks. Uncomment to adjust the input experience.
 # [ui]
-# hide_banner = true
+# hide_banner = true             # suppress the welcome banner
+# prompt_history_enabled = true  # ↑/↓ recall of past prompts (on by default)
+# prompt_history_max = 200       # how many past prompts to keep for recall
 
 [runtimes.codex]
 type = "codex"
@@ -2440,6 +2468,98 @@ hide_banner = true
         .unwrap();
 
         assert!(config.ui.hide_banner);
+    }
+
+    #[test]
+    fn ui_prompt_history_defaults_on_with_cap_200() {
+        // Omitted keys → recall on by default, capped at 200 (ADR-002 / ADR-004).
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+
+        assert!(config.ui.prompt_history_enabled);
+        assert_eq!(config.ui.prompt_history_max, 200);
+    }
+
+    #[test]
+    fn ui_prompt_history_can_be_disabled() {
+        let config = load_from_temp(
+            r#"
+[ui]
+prompt_history_enabled = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.ui.prompt_history_enabled);
+        // The cap keeps its default when only the toggle is set.
+        assert_eq!(config.ui.prompt_history_max, 200);
+    }
+
+    #[test]
+    fn ui_prompt_history_max_override() {
+        let config = load_from_temp(
+            r#"
+[ui]
+prompt_history_max = 50
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.ui.prompt_history_max, 50);
+        // The toggle keeps its default when only the cap is set.
+        assert!(config.ui.prompt_history_enabled);
+    }
+
+    #[test]
+    fn ui_prompt_history_local_overrides_home() {
+        // Layer precedence (built-in → home → local): home disables recall, the
+        // project file re-enables it; local wins.
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(
+            &home_path,
+            "schema_version = 1\n[ui]\nprompt_history_enabled = false\n",
+        )
+        .unwrap();
+
+        let local_dir = tempdir().unwrap();
+        fs::write(
+            local_dir.path().join("atelier.toml"),
+            "[ui]\nprompt_history_enabled = true\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: local_dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        assert!(config.ui.prompt_history_enabled);
+    }
+
+    #[test]
+    fn ui_prompt_history_max_flows_from_project_toml() {
+        // Integration: a project-level multiagent.toml [ui] override reaches the
+        // effective config. A hermetic empty home config keeps the developer's
+        // real ~/.config out of the result.
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(&home_path, "schema_version = 1\n").unwrap();
+
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("multiagent.toml"),
+            "[ui]\nprompt_history_max = 10\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        assert_eq!(config.ui.prompt_history_max, 10);
     }
 
     #[test]
