@@ -1,4 +1,5 @@
 /target/
+/.atelier/
 /.multiagent/
 npm/node_modules/
 target/npm-dist/
