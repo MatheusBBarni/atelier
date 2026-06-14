@@ -613,6 +613,15 @@ fn command_has_prefix(lower_command: &str, prefix: &str) -> bool {
 pub fn validate_model_path(path: &str, extra_roots: &[PathBuf]) -> Result<PathBuf> {
     let candidate = Path::new(path);
     if candidate.is_absolute() {
+        // Reject `..` traversal even for an authorized absolute path, so a scoped
+        // root prefix (e.g. `/workspace`) cannot be escaped via `/workspace/../secret`
+        // once the OS resolves the path.
+        if candidate
+            .components()
+            .any(|component| component == Component::ParentDir)
+        {
+            bail!("path traversal is not allowed: {path}");
+        }
         // `read_roots()` returns the filesystem-root sentinel (`MAIN_SEPARATOR_STR`)
         // to mean "any absolute path" under `allow_unrestricted_reads`. On Unix that
         // root (`/`) already `starts_with`-matches every absolute path, but on Windows
@@ -1525,6 +1534,21 @@ mod tests {
             matches!(allowed, ActionDecision::Allowed),
             "got {allowed:?}"
         );
+    }
+
+    #[test]
+    fn validate_model_path_rejects_parent_traversal_in_absolute_path() {
+        // A scoped read root must not be escapable via `..`: `/workspace/../secret`
+        // resolves outside `/workspace`, so it is rejected before authorization even
+        // though it shares the root prefix.
+        let roots = [PathBuf::from("/workspace")];
+        let err = validate_model_path("/workspace/../secret", &roots).unwrap_err();
+        assert!(
+            err.to_string().contains("path traversal is not allowed"),
+            "{err}"
+        );
+        // An in-scope absolute path without traversal is still allowed.
+        assert!(validate_model_path("/workspace/sub/file.rs", &roots).is_ok());
     }
 
     #[test]

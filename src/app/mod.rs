@@ -2674,6 +2674,21 @@ impl App {
         Ok(())
     }
 
+    /// Apply the ADR-004 first-approval explainer latch: show the one-line
+    /// explainer the first time any approval becomes pending for this user, then
+    /// persist the latch so every later approval suppresses it. A latch write
+    /// failure propagates rather than silently re-showing. Shared by the serial and
+    /// parallel approval paths so the two cannot diverge.
+    fn apply_first_approval_explainer_latch(&mut self) -> Result<()> {
+        if !self.history.first_approval_explainer_shown() {
+            self.history.mark_first_approval_explainer_shown()?;
+            self.state.show_first_approval_explainer = true;
+        } else {
+            self.state.show_first_approval_explainer = false;
+        }
+        Ok(())
+    }
+
     fn publish_parallel_approval_head(
         &mut self,
         queue: &VecDeque<PendingParallelApproval>,
@@ -2704,12 +2719,7 @@ impl App {
             .map(|pending| pending.step_id.clone());
         if new_step != prev_step {
             if self.state.pending_approval.is_some() {
-                if !self.history.first_approval_explainer_shown() {
-                    self.history.mark_first_approval_explainer_shown()?;
-                    self.state.show_first_approval_explainer = true;
-                } else {
-                    self.state.show_first_approval_explainer = false;
-                }
+                self.apply_first_approval_explainer_latch()?;
             } else {
                 self.state.show_first_approval_explainer = false;
             }
@@ -4018,18 +4028,10 @@ impl App {
                             request: request.clone(),
                         });
                         self.state.pending_approval = Some(view);
-                        // Show the one-line first-approval explainer at most once
-                        // per user (ADR-004): consult the persisted latch exactly
-                        // when an approval becomes pending, and latch it on first
-                        // sight. Subsequent approvals see the latch set and never
-                        // re-show. A latch write failure must not block the run, so
-                        // we only flag the explainer once the latch is persisted.
-                        if !self.history.first_approval_explainer_shown() {
-                            self.history.mark_first_approval_explainer_shown()?;
-                            self.state.show_first_approval_explainer = true;
-                        } else {
-                            self.state.show_first_approval_explainer = false;
-                        }
+                        // Show the one-line first-approval explainer at most once per
+                        // user (ADR-004), consulting the persisted latch exactly when an
+                        // approval becomes pending.
+                        self.apply_first_approval_explainer_latch()?;
                         self.state.run_state = RunState::WaitingForUser;
                         self.record_event(
                             Some(run_id.to_string()),
