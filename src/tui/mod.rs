@@ -4,7 +4,7 @@ use crate::app::chat::{
 use crate::app::git::GitContext;
 use crate::app::{
     ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, InterruptHandle,
-    PendingClarificationView, QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
+    PendingClarificationView, PromptSource, QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
@@ -677,7 +677,7 @@ async fn execute_tui_command_with_interrupt(
             }
             let clears_input = matches!(
                 event,
-                AppEvent::PromptSubmitted(_) | AppEvent::ApprovalAnswered(_)
+                AppEvent::PromptSubmitted(_, _) | AppEvent::ApprovalAnswered(_)
             );
             if let AppEvent::ApprovalAnswered(approved) = &event {
                 if let (Some(approval_handle), Some(pending)) =
@@ -711,7 +711,7 @@ async fn execute_tui_command_with_interrupt(
 }
 
 fn matches_help_command(event: &AppEvent) -> bool {
-    matches!(event, AppEvent::PromptSubmitted(prompt) if prompt.trim() == "/help")
+    matches!(event, AppEvent::PromptSubmitted(prompt, _) if prompt.trim() == "/help")
 }
 
 fn reload_skills(state: &mut AppState, ui_state: &mut TuiUiState) {
@@ -1310,6 +1310,9 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
             ..
         } => Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
             state.input.clone(),
+            // Provenance is computed from recall cursor state in task_06; until
+            // then every submission is Fresh, preserving current behavior.
+            PromptSource::Fresh,
         ))),
         KeyEvent {
             code: KeyCode::Backspace,
@@ -5450,7 +5453,8 @@ mod tests {
         assert_eq!(
             key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "build this".to_string()
+                "build this".to_string(),
+                PromptSource::Fresh
             )))
         );
     }
@@ -5465,7 +5469,10 @@ mod tests {
             &mut state,
             &mut ui_state,
             &sender,
-            TuiCommand::Dispatch(AppEvent::PromptSubmitted("slow prompt".to_string())),
+            TuiCommand::Dispatch(AppEvent::PromptSubmitted(
+                "slow prompt".to_string(),
+                PromptSource::Fresh,
+            )),
         )
         .await
         .unwrap();
@@ -5475,7 +5482,7 @@ mod tests {
         assert_eq!(ui_state.input_cursor, 0);
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            AppWorkerCommand::Event(AppEvent::PromptSubmitted(prompt)) if prompt == "slow prompt"
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(prompt, _)) if prompt == "slow prompt"
         ));
     }
 
@@ -6466,7 +6473,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "hello world".to_string()
+                "hello world".to_string(),
+                PromptSource::Fresh
             )))
         );
     }
@@ -6485,7 +6493,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "/goal ship v2".to_string()
+                "/goal ship v2".to_string(),
+                PromptSource::Fresh
             )))
         );
     }
@@ -6601,7 +6610,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "/goal ship v2".to_string()
+                "/goal ship v2".to_string(),
+                PromptSource::Fresh
             )))
         );
         // Nothing was dispatched during acceptance or typing.
@@ -6698,7 +6708,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "/config".to_string()
+                "/config".to_string(),
+                PromptSource::Fresh
             )))
         );
     }
@@ -6921,7 +6932,8 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(TuiCommand::Dispatch(AppEvent::PromptSubmitted(
-                "/agent:fixer inspect docs".to_string()
+                "/agent:fixer inspect docs".to_string(),
+                PromptSource::Fresh
             )))
         );
     }

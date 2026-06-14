@@ -256,9 +256,18 @@ pub struct ClarificationAnswer {
     pub answer_source: String,
 }
 
+/// Provenance of a submitted prompt for the recall-adoption KPI (ADR-003): a
+/// composition seeded from a recalled history entry is `Recalled`; anything
+/// freshly typed is `Fresh`. The payload tag is written in task_06.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptSource {
+    Fresh,
+    Recalled,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
-    PromptSubmitted(String),
+    PromptSubmitted(String, PromptSource),
     ApprovalAnswered(bool),
     ClarificationAnswered(ClarificationAnswer),
     FollowUpCancelled(String),
@@ -904,7 +913,9 @@ impl App {
 
     pub async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
         match event {
-            AppEvent::PromptSubmitted(prompt) => {
+            // Provenance (`source`) is threaded into the payload in task_06; for
+            // now every submission is recorded as today (Fresh-equivalent).
+            AppEvent::PromptSubmitted(prompt, _) => {
                 self.state.input.clear();
                 // Refresh git before the run so the footer/welcome reflect the
                 // branch the prompt actually runs against (ADR-006).
@@ -7808,6 +7819,28 @@ prompt = "{reviewer_prompt}"
         );
     }
 
+    #[test]
+    fn prompt_source_is_copy_and_comparable() {
+        let fresh = PromptSource::Fresh;
+        // Copy: `fresh` is still usable after the bind below (no move).
+        let copied = fresh;
+        assert_eq!(copied, fresh);
+        assert_eq!(PromptSource::Recalled, PromptSource::Recalled);
+        assert_ne!(PromptSource::Fresh, PromptSource::Recalled);
+    }
+
+    #[test]
+    fn prompt_submitted_event_carries_and_exposes_source() {
+        let event = AppEvent::PromptSubmitted("x".to_string(), PromptSource::Recalled);
+        match event {
+            AppEvent::PromptSubmitted(prompt, source) => {
+                assert_eq!(prompt, "x");
+                assert_eq!(source, PromptSource::Recalled);
+            }
+            other => panic!("expected PromptSubmitted, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn project_prompt_history_recalls_fake_runtime_submissions_newest_first() {
         // End-to-end: two prompts submitted through a real fake run land in the
@@ -8942,9 +8975,12 @@ prompt = "{reviewer_prompt}"
 
         // Switch branch outside the app, then submit a prompt.
         run_git(dir.path(), &["checkout", "-b", "feat/two"]);
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.git_context.as_ref().unwrap().branch, "feat/two");
     }
@@ -8964,9 +9000,12 @@ prompt = "{reviewer_prompt}"
         app.handle_event(AppEvent::InputBackspace).await.unwrap();
         assert_eq!(app.state.input, "x");
 
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert!(app.state.input.is_empty());
         assert_eq!(app.state.run_state, RunState::Completed);
@@ -9391,9 +9430,12 @@ runtime = "fake"
     }
 
     async fn queue_via_event(app: &mut App, message: &str) {
-        app.handle_event(AppEvent::PromptSubmitted(format!("/queue {message}")))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            format!("/queue {message}"),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
     }
 
     fn replay_started_prompts(app: &App) -> Vec<String> {
@@ -9470,15 +9512,21 @@ runtime = "fake"
         let mut app = App::new(config).await.unwrap();
 
         queue_via_event(&mut app, "first follow up").await;
-        app.handle_event(AppEvent::PromptSubmitted("/q second follow up".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "/q second follow up".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
         assert_eq!(app.state.queued_follow_ups.len(), 2);
 
         // A clean completed Run drains both queued items oldest-first.
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         assert!(app.state.queued_follow_ups.is_empty());
@@ -9510,9 +9558,12 @@ runtime = "fake"
         queue_via_event(&mut app, "needs clarification create a feature").await;
         queue_via_event(&mut app, "second follow up").await;
 
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::WaitingForUser);
         assert!(app.state.pending_clarification.is_some());
@@ -9546,9 +9597,12 @@ runtime = "fake"
             QueuedFollowUpStatus::Cancelled
         );
 
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
@@ -9574,6 +9628,7 @@ runtime = "fake"
         // A clarification-waiting Run pauses the queue.
         app.handle_event(AppEvent::PromptSubmitted(
             "needs clarification create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
@@ -9634,9 +9689,12 @@ runtime = "fake"
         let mut app = App::new(config).await.unwrap();
 
         queue_via_event(&mut app, "replay me").await;
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         let events = app.history.read_events().unwrap();
         let replay_started = events
@@ -9670,9 +9728,12 @@ runtime = "fake"
         let mut app = App::new(config).await.unwrap();
 
         queue_via_event(&mut app, "deferred work").await;
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::Completed);
         let events = app.history.read_events().unwrap();
@@ -9706,9 +9767,12 @@ runtime = "fake"
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
 
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
         assert_eq!(app.state.run_state, RunState::Completed);
 
         // The run has already finished when the queued follow-up arrives.
@@ -9735,6 +9799,7 @@ runtime = "fake"
         queue_via_event(&mut app, "queued doc update").await;
         app.handle_event(AppEvent::PromptSubmitted(
             "needs clarification create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
@@ -9763,6 +9828,7 @@ runtime = "fake"
         queue_via_event(&mut app, "post-approval work").await;
         app.handle_event(AppEvent::PromptSubmitted(
             "approval action create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
@@ -9788,6 +9854,7 @@ runtime = "fake"
         first
             .handle_event(AppEvent::PromptSubmitted(
                 "approval action create a feature".to_string(),
+                PromptSource::Fresh,
             ))
             .await
             .unwrap();
@@ -9805,6 +9872,7 @@ runtime = "fake"
         later
             .handle_event(AppEvent::PromptSubmitted(
                 "approval action create a feature".to_string(),
+                PromptSource::Fresh,
             ))
             .await
             .unwrap();
@@ -9825,6 +9893,7 @@ runtime = "fake"
         queue_via_event(&mut app, "post-failure work").await;
         app.handle_event(AppEvent::PromptSubmitted(
             "always parse error create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
@@ -9844,9 +9913,12 @@ runtime = "fake"
         let mut app = App::new(config).await.unwrap();
 
         queue_via_event(&mut app, "post-limit work").await;
-        app.handle_event(AppEvent::PromptSubmitted("create a feature".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(app.state.run_state, RunState::LimitReached);
         assert!(replay_started_prompts(&app).is_empty());
@@ -9867,6 +9939,7 @@ runtime = "fake"
 
         app.handle_event(AppEvent::PromptSubmitted(
             "always parse error create a feature".to_string(),
+            PromptSource::Fresh,
         ))
         .await
         .unwrap();
