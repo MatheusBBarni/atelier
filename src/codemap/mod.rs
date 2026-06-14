@@ -13,6 +13,7 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".git",
     ".hg",
     ".atelier",
+    ".multiagent", // legacy data root pre-rename; keep old session logs out of the codemap
     ".next",
     ".pytest_cache",
     ".ruff_cache",

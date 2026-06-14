@@ -13,6 +13,10 @@ use tokio::time::timeout;
 const DEFAULT_SEARCH_EXCLUDED_DIRS: &[&str] = &[
     ".git",
     ".atelier",
+    // Legacy data root from before the `multiagent` -> `atelier` rename: an
+    // upgraded workspace can still have `.multiagent/sessions/` event logs
+    // (prior prompts and action output), so keep them out of model searches too.
+    ".multiagent",
     "target",
     "node_modules",
     ".next",
