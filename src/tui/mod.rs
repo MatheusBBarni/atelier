@@ -287,6 +287,16 @@ struct TuiUiState {
     input_cursor: usize,
     input_preferred_col: Option<usize>,
     input_width: usize,
+    /// Recall ring: this project's past prompts, newest-first, deduped and
+    /// capped (ADR-001/004). Seeded once off-thread at startup over a `watch`
+    /// channel; empty until that load lands, or when recall is disabled.
+    prompt_history: Vec<String>,
+    /// Recall cursor: `0` = the live draft; `N` = the Nth-newest entry. Drives
+    /// the `Fresh`/`Recalled` provenance tag (task_05/06).
+    prompt_history_cursor: usize,
+    /// The in-progress draft saved while browsing history, restored when ↓ steps
+    /// back past the newest entry (task_05).
+    prompt_history_draft: String,
     agent_selection_index: usize,
     skill_suggestions: Vec<SkillSuggestion>,
     skill_selection_index: usize,
@@ -336,6 +346,9 @@ impl Default for TuiUiState {
             input_cursor: 0,
             input_preferred_col: None,
             input_width: 1,
+            prompt_history: Vec::new(),
+            prompt_history_cursor: 0,
+            prompt_history_draft: String::new(),
             agent_selection_index: 0,
             skill_suggestions: Vec::new(),
             skill_selection_index: 0,
@@ -451,6 +464,8 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
 
     let working_directory = config.working_directory.clone();
     let hide_banner = config.ui.hide_banner;
+    let prompt_history_enabled = config.ui.prompt_history_enabled;
+    let prompt_history_max = config.ui.prompt_history_max;
     let theme = Theme::resolve(TerminalCaps::detect());
     let mut app = App::new_with_debug(config, debug_enabled).await?;
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
@@ -462,6 +477,10 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     // working directory off-thread and publishes the latest `Vec<FileEntry>`
     // here; the render loop consumes it.
     let (file_index_sender, file_index_receiver) = watch::channel(Vec::<FileEntry>::new());
+    // One-time recall load → TUI channel (ADR-004). The loader (spawned below,
+    // gated on the toggle) projects `prompt_submitted` history off-thread and
+    // publishes the ring once; the render loop syncs it into `TuiUiState`.
+    let (prompt_history_sender, prompt_history_receiver) = watch::channel(Vec::<String>::new());
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -474,6 +493,14 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
         file_index_sender,
         Some(working_directory.clone()),
     ));
+    // Detached recall load: never blocks the first paint, and skipped entirely
+    // when recall is disabled so the ring stays empty (ADR-004).
+    maybe_spawn_prompt_history_load(
+        prompt_history_enabled,
+        Some(working_directory.clone()),
+        prompt_history_max,
+        prompt_history_sender,
+    );
 
     // No loading interstitial: the main UI (with the branded welcome item)
     // renders on the first frame, and skill scanning happens behind it inside
@@ -488,6 +515,7 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
         interrupt_handle,
         approval_handle,
         file_index_receiver,
+        prompt_history_receiver,
         ui_state,
     )
     .await;
@@ -509,6 +537,11 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     shutdown_result
 }
 
+// The render loop legitimately wires together every long-lived TUI channel and
+// handle (state, commands, interrupt/approval, the two background-load
+// receivers, and the UI state); bundling them into a struct would only move the
+// same fields behind one more indirection.
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut state_receiver: watch::Receiver<AppState>,
@@ -516,6 +549,7 @@ async fn run_loop(
     interrupt_handle: InterruptHandle,
     approval_handle: ApprovalHandle,
     mut file_index_receiver: watch::Receiver<Vec<FileEntry>>,
+    mut prompt_history_receiver: watch::Receiver<Vec<String>>,
     mut ui_state: TuiUiState,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
@@ -529,6 +563,7 @@ async fn run_loop(
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
         sync_file_index(&mut ui_state, &mut file_index_receiver);
+        sync_prompt_history(&mut ui_state, &mut prompt_history_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
         terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
 
@@ -746,6 +781,73 @@ fn sync_file_index(
 ) {
     if file_index_receiver.has_changed().unwrap_or(false) {
         ui_state.file_mention_entries = file_index_receiver.borrow_and_update().clone();
+    }
+}
+
+/// Project this project's recall list off the render thread and publish it to
+/// the TUI (ADR-004). `project_prompt_history` is synchronous file I/O, so it
+/// runs inside `spawn_blocking`; a join error (panic) or a closed receiver
+/// simply leaves the ring unchanged. No-op without a working directory.
+async fn refresh_prompt_history(
+    working_directory: Option<&Path>,
+    max: usize,
+    prompt_history_sender: &watch::Sender<Vec<String>>,
+) {
+    let Some(working_directory) = working_directory.map(Path::to_path_buf) else {
+        return;
+    };
+    // Recall reads the `.atelier` data root (mirrors `HistoryStore::create`),
+    // not the workspace root itself.
+    let data_root = working_directory.join(".atelier");
+    if let Ok(history) =
+        tokio::task::spawn_blocking(move || crate::history::project_prompt_history(&data_root, max))
+            .await
+    {
+        let _ = prompt_history_sender.send(history);
+    }
+}
+
+/// Kick off the one-time recall load on a detached task (mirrors
+/// `spawn_file_index_refresh`). Unlike the file-index walk this fires once at
+/// startup: recall is seeded from disk and then maintained in memory (ADR-004),
+/// so there is no periodic re-scan and the cold read never blocks the first
+/// paint.
+fn spawn_prompt_history_load(
+    working_directory: Option<PathBuf>,
+    max: usize,
+    prompt_history_sender: watch::Sender<Vec<String>>,
+) {
+    tokio::spawn(async move {
+        refresh_prompt_history(working_directory.as_deref(), max, &prompt_history_sender).await;
+    });
+}
+
+/// Spawn the recall load only when the toggle is on, returning whether it
+/// spawned. Disabled → no load and the ring stays empty (ADR-004). Split from
+/// `run_tui` so the gate is unit-testable without a terminal.
+fn maybe_spawn_prompt_history_load(
+    enabled: bool,
+    working_directory: Option<PathBuf>,
+    max: usize,
+    prompt_history_sender: watch::Sender<Vec<String>>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    spawn_prompt_history_load(working_directory, max, prompt_history_sender);
+    true
+}
+
+/// Adopt the latest published recall list into UI state (mirrors
+/// `sync_file_index`). The load publishes once at startup; later in-session
+/// submissions mutate the ring directly (task_06), and the channel does not
+/// change again, so this never clobbers them after the initial delivery.
+fn sync_prompt_history(
+    ui_state: &mut TuiUiState,
+    prompt_history_receiver: &mut watch::Receiver<Vec<String>>,
+) {
+    if prompt_history_receiver.has_changed().unwrap_or(false) {
+        ui_state.prompt_history = prompt_history_receiver.borrow_and_update().clone();
     }
 }
 
@@ -9264,6 +9366,108 @@ runtime = "fake"
             .borrow()
             .iter()
             .any(|entry| entry.rel_path == "second.rs"));
+    }
+
+    // ── task_04 prompt-history recall load ──
+
+    fn write_prompt_history_session(root: &Path, session: &str, prompts: &[(&str, &str)]) {
+        // Write a `.atelier/sessions/<session>/events.jsonl` of prompt_submitted
+        // events with explicit (timestamp, prompt), as a real run records them.
+        let dir = root.join(".atelier/sessions").join(session);
+        fs::create_dir_all(&dir).unwrap();
+        let mut contents = String::new();
+        for (timestamp, prompt) in prompts {
+            let mut event = HistoryEvent::new(
+                "session",
+                None,
+                None,
+                "prompt_submitted",
+                json!({ "prompt": prompt }),
+            );
+            event.timestamp = (*timestamp).to_string();
+            contents.push_str(&serde_json::to_string(&event).unwrap());
+            contents.push('\n');
+        }
+        fs::write(dir.join("events.jsonl"), contents).unwrap();
+    }
+
+    #[test]
+    fn default_ui_state_initializes_prompt_history_fields() {
+        let ui_state = TuiUiState::default();
+        assert!(ui_state.prompt_history.is_empty());
+        assert_eq!(ui_state.prompt_history_cursor, 0);
+        assert!(ui_state.prompt_history_draft.is_empty());
+    }
+
+    #[test]
+    fn sync_prompt_history_adopts_published_ring() {
+        let (sender, mut receiver) = watch::channel(Vec::<String>::new());
+        let mut ui_state = TuiUiState::default();
+        sender.send(vec!["b".to_string(), "a".to_string()]).unwrap();
+
+        sync_prompt_history(&mut ui_state, &mut receiver);
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["b".to_string(), "a".to_string()]
+        );
+    }
+
+    #[test]
+    fn disabled_recall_skips_load_and_leaves_ring_empty() {
+        // Gate off: nothing is spawned, the channel never publishes, and the ring
+        // stays empty after a sync tick (a closed channel reads as "no change").
+        let (sender, mut receiver) = watch::channel(Vec::<String>::new());
+        let spawned = maybe_spawn_prompt_history_load(
+            false,
+            Some(PathBuf::from("/nonexistent")),
+            200,
+            sender,
+        );
+        assert!(!spawned);
+
+        let mut ui_state = TuiUiState::default();
+        sync_prompt_history(&mut ui_state, &mut receiver);
+        assert!(ui_state.prompt_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_prompt_history_publishes_recall_newest_first() {
+        // Integration: two prompt_submitted events on disk → the load publishes
+        // them newest-first, and a sync tick adopts them into the ring.
+        let dir = tempdir().unwrap();
+        write_prompt_history_session(
+            dir.path(),
+            "s",
+            &[
+                ("2026-06-06T00:00:01.000Z", "alpha"),
+                ("2026-06-06T00:00:02.000Z", "beta"),
+            ],
+        );
+
+        let (sender, mut receiver) = watch::channel(Vec::<String>::new());
+        refresh_prompt_history(Some(dir.path()), 200, &sender).await;
+
+        let mut ui_state = TuiUiState::default();
+        sync_prompt_history(&mut ui_state, &mut receiver);
+        assert_eq!(
+            ui_state.prompt_history,
+            vec!["beta".to_string(), "alpha".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_recall_load_spawns_and_publishes_ring() {
+        let dir = tempdir().unwrap();
+        write_prompt_history_session(dir.path(), "s", &[("2026-06-06T00:00:01.000Z", "alpha")]);
+
+        let (sender, mut receiver) = watch::channel(Vec::<String>::new());
+        let spawned =
+            maybe_spawn_prompt_history_load(true, Some(dir.path().to_path_buf()), 200, sender);
+        assert!(spawned);
+
+        // The detached load publishes exactly once; await that and assert it landed.
+        receiver.changed().await.unwrap();
+        assert_eq!(*receiver.borrow(), vec!["alpha".to_string()]);
     }
 
     // ── task_05 TUI file-index state and consumer ──
