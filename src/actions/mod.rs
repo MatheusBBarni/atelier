@@ -628,11 +628,19 @@ pub fn validate_model_path(path: &str, extra_roots: &[PathBuf]) -> Result<PathBu
         // a bare separator never matches a drive-rooted path (`C:\…`), so match the
         // sentinel explicitly to keep the opt-in working cross-platform.
         let fs_root = Path::new(std::path::MAIN_SEPARATOR_STR);
-        if extra_roots
-            .iter()
-            .any(|root| root.as_path() == fs_root || candidate.starts_with(root))
-        {
-            return Ok(candidate.to_path_buf());
+        for root in extra_roots {
+            if root.as_path() == fs_root {
+                // Unrestricted-reads sentinel: every absolute path is authorized.
+                return Ok(candidate.to_path_buf());
+            }
+            // A lexical prefix match is necessary but not sufficient: an in-root
+            // symlink (e.g. `/workspace/link` -> `/etc`) would let `/workspace/link/x`
+            // pass `starts_with` while the OS resolves it to `/etc/x`. Resolve
+            // symlinks and confirm the real target still lands inside the root before
+            // authorizing, so a symlink cannot escape the authorized boundary.
+            if candidate.starts_with(root) && canonical_path_within_root(candidate, root) {
+                return Ok(candidate.to_path_buf());
+            }
         }
         bail!("absolute paths are not allowed for model-requested actions: {path}");
     }
@@ -647,6 +655,44 @@ pub fn validate_model_path(path: &str, extra_roots: &[PathBuf]) -> Result<PathBu
         }
     }
     Ok(candidate.to_path_buf())
+}
+
+/// Confirm the symlink-resolved form of `candidate` still lands inside `root`.
+///
+/// `candidate` is already a lexical prefix match for `root`; this resolves
+/// symlinks so an in-root link pointing outside the authorized boundary cannot be
+/// used to escape it. Write targets may not exist yet, so the deepest *existing*
+/// ancestor is canonicalized and the not-yet-created tail is re-appended (a
+/// symlink must itself exist to redirect, so any link in the path lives within
+/// that existing prefix). When nothing along the path exists on disk there is no
+/// symlink to resolve and the caller's lexical verdict is preserved (`true`).
+///
+/// The check only ever tightens authorization: it can reject a lexical match
+/// whose real target escapes, but never authorizes a path the prefix match
+/// already rejected.
+fn canonical_path_within_root(candidate: &Path, root: &Path) -> bool {
+    // Walk up to the deepest ancestor that exists so symlinked prefixes resolve
+    // even when the leaf is a not-yet-created write target.
+    let mut existing = candidate;
+    let canonical_prefix = loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            break resolved;
+        }
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => return true, // nothing on disk to resolve; keep the lexical verdict
+        }
+    };
+    // Re-attach the components below the resolved prefix.
+    let Ok(suffix) = candidate.strip_prefix(existing) else {
+        return true;
+    };
+    let resolved = canonical_prefix.join(suffix);
+    // Compare against the canonical form of the root too: a symlinked root (e.g.
+    // macOS `/tmp` -> `/private/tmp`) must match the resolved candidate, or a
+    // legitimately in-root path would be wrongly rejected.
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    resolved.starts_with(&canonical_root)
 }
 
 fn required_capability(kind: &ActionKind) -> Option<Capability> {
@@ -1549,6 +1595,44 @@ mod tests {
         );
         // An in-scope absolute path without traversal is still allowed.
         assert!(validate_model_path("/workspace/sub/file.rs", &roots).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_model_path_rejects_in_root_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        // A symlink *inside* an authorized root that points outside it must not
+        // grant access to the link target: `<root>/link -> <outside>` cannot be
+        // used to reach `<outside>/secret` via `<root>/link/secret`, even though
+        // that spelled path lexically `starts_with` the root.
+        let root_dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+        fs::write(outside_dir.path().join("secret"), "TOP_SECRET").unwrap();
+        symlink(outside_dir.path(), root_dir.path().join("link")).unwrap();
+        let roots = [root_dir.path().to_path_buf()];
+
+        let escape = root_dir.path().join("link/secret");
+        let err = validate_model_path(escape.to_str().unwrap(), &roots).unwrap_err();
+        assert!(
+            err.to_string().contains("absolute paths are not allowed"),
+            "{err}"
+        );
+
+        // Real files genuinely inside the root stay authorized, and a not-yet-
+        // existing write target inside the root is still allowed (the symlink
+        // resolution must not reject paths whose leaf does not exist yet). This
+        // also exercises a symlinked root prefix (macOS tempdirs live under the
+        // `/var` -> `/private/var` link), proving both sides are canonicalized.
+        fs::write(root_dir.path().join("real.rs"), "fn main() {}").unwrap();
+        assert!(
+            validate_model_path(root_dir.path().join("real.rs").to_str().unwrap(), &roots).is_ok()
+        );
+        assert!(validate_model_path(
+            root_dir.path().join("new_dir/file.rs").to_str().unwrap(),
+            &roots
+        )
+        .is_ok());
     }
 
     #[test]
