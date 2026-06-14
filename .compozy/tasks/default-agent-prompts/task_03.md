@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Align generated starter instruction files
 type: refactor
 complexity: medium
@@ -61,4 +61,34 @@ If the repository requires the `rtk` wrapper, run the same commands through `rtk
 
 ## Completion Notes
 
-Report the changed files, the starter generation surface that now reuses the canonical constants, and any verification blocker if tests cannot be run.
+Changed file: `src/config/mod.rs` only.
+
+The six core-role tuples in `starter_instruction_files()` now reference the canonical
+prompt constants introduced by Task 02 instead of separate inline literals:
+
+- `("orchestrator", DEFAULT_ORCHESTRATOR_INSTRUCTIONS)`
+- `("explorer", DEFAULT_EXPLORER_INSTRUCTIONS)`
+- `("oracle", DEFAULT_ORACLE_INSTRUCTIONS)`
+- `("consul", DEFAULT_CONSUL_INSTRUCTIONS)`
+- `("fixer", DEFAULT_FIXER_INSTRUCTIONS)`
+- `("reviewer", DEFAULT_REVIEWER_INSTRUCTIONS)`
+
+Because both the built-in defaults (`insert_builtin_agent`) and the generated starter
+instruction files now reference the same `&'static str` constants, the two prompt surfaces
+share one source of truth and cannot drift for any core role.
+
+Preserved unchanged:
+- Starter file names / paths: each tuple's first element is still the role name and the
+  init loop still writes `<config_dir>/agents/{role}.md` (consumer loop untouched).
+- The out-of-scope tuples `librarian`, `designer`, `council-architect`, `council-security`,
+  and `council-reviewer` keep their existing inline text.
+- `write_private_file_if_missing` still skips already-existing files, so user-edited
+  project-owned instruction files are never overwritten or migrated.
+- No runtime schema, action contract, permission, scheduling, parsing, validation, or
+  retry behavior was modified — only instruction-text wiring.
+
+### Verification evidence
+
+- `rtk cargo fmt --check` → exit 0 (no formatting changes needed).
+- `rtk cargo test --lib config` → 56 passed, 0 failed (crate compiles; existing
+  config/init tests unaffected). Dedicated alignment + drift tests are added in Task 04.

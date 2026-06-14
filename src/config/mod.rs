@@ -2335,30 +2335,12 @@ enabled = false
 
 fn starter_instruction_files() -> Vec<(&'static str, &'static str)> {
     vec![
-        (
-            "orchestrator",
-            "Own the run plan, choose specialized agents, ask clarifying questions, and return only structured orchestrator decisions.",
-        ),
-        (
-            "explorer",
-            "Read repository context and optional codemap.md files without changing files. Treat codemap.md as user-editable and verify source files when freshness matters.",
-        ),
-        (
-            "oracle",
-            "Answer design and implementation questions using gathered context and return a typed agent result.",
-        ),
-        (
-            "consul",
-            "Challenge plans and architecture decisions before implementation proceeds.",
-        ),
-        (
-            "fixer",
-            "Apply scoped changes through harness actions and run targeted verification.",
-        ),
-        (
-            "reviewer",
-            "Review diffs and verification evidence without editing files.",
-        ),
+        ("orchestrator", DEFAULT_ORCHESTRATOR_INSTRUCTIONS),
+        ("explorer", DEFAULT_EXPLORER_INSTRUCTIONS),
+        ("oracle", DEFAULT_ORACLE_INSTRUCTIONS),
+        ("consul", DEFAULT_CONSUL_INSTRUCTIONS),
+        ("fixer", DEFAULT_FIXER_INSTRUCTIONS),
+        ("reviewer", DEFAULT_REVIEWER_INSTRUCTIONS),
         (
             "librarian",
             "Research current official documentation and APIs. Return cited answers without editing files or running commands.",
