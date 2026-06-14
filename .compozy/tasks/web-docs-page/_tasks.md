@@ -9,7 +9,7 @@
 | 03 | Scaffold the docs content collection, layout, nav, and styles | completed | medium | task_02 |
 | 04 | Write the Quickstart page | completed | medium | task_03 |
 | 05 | Write the Concepts page | completed | low | task_03 |
-| 06 | Write the Governance and Safety page | pending | medium | task_03 |
+| 06 | Write the Governance and Safety page | completed | medium | task_03 |
 | 07 | Emit machine-readable surfaces (llms.txt, twins, sitemap) | completed | medium | task_03, task_04, task_05, task_06 |
 | 08 | Add the web-checks PR workflow with link checking | completed | medium | task_07 |
 | 09 | Refactor the redacted-config builder for reuse | completed | medium | — |
