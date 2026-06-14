@@ -59,6 +59,10 @@ const FILE_MENTION_PREFIX: &str = "@";
 const RELOAD_SKILLS_COMMAND: &str = "/reload:skills";
 const DROPDOWN_MAX_ITEMS: usize = 6;
 const WORK_HINT: &str = "/help";
+/// Contextual hint shown in place of `WORK_HINT` when recall is available
+/// (input empty, history loaded, no active work). Advertises ↑/↓ recall while
+/// keeping `/help` discoverable; concise like `QUEUE_HINT` (ADR-002, task_07).
+const HISTORY_HINT: &str = "↑ recall · /help";
 const WORK_INDICATOR_HEIGHT: u16 = 1;
 /// Ambient status footer line (repo·branch · run state · agents), below the
 /// work-indicator/hint line.
@@ -2600,7 +2604,13 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     )
     .scroll((input_layout.scroll.min(usize::from(u16::MAX)) as u16, 0));
     frame.render_widget(input, input_areas.input);
-    render_input_status(frame, input_areas.status, ui_state, work_active);
+    render_input_status(
+        frame,
+        input_areas.status,
+        ui_state,
+        work_active,
+        state.input.is_empty(),
+    );
     render_footer(frame, input_areas.footer, state, &theme);
     // Dropdown precedence mirrors key routing: agent, then skill, then the
     // `@` file mention, then the top-level command dropdown. Help takes over the
@@ -3729,6 +3739,7 @@ fn keys_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
         Line::from("Enter                submit prompt or answer approval"),
         Line::from("Ctrl-L               show or hide Agent Roster"),
         Line::from("Arrow keys           move input cursor"),
+        Line::from("↑/↓ at input edges   recall recent prompts"),
         Line::from("PageUp/PageDown     scroll Chat by page"),
         Line::from("Mouse wheel         scroll Chat by line"),
         Line::from("Home/End            jump Chat to top/latest"),
@@ -4278,6 +4289,7 @@ fn render_input_status(
     status_area: Rect,
     ui_state: &mut TuiUiState,
     work_active: bool,
+    input_empty: bool,
 ) {
     if status_area.width == 0 || status_area.height == 0 {
         return;
@@ -4300,7 +4312,14 @@ fn render_input_status(
     } else {
         0
     };
-    let hint_width = WORK_HINT.chars().count();
+    // Advertise ↑/↓ recall only when it can actually fire: no active work, an
+    // empty composer, and a non-empty ring. Otherwise keep the plain /help hint.
+    let hint = if !work_active && input_empty && !ui_state.prompt_history.is_empty() {
+        HISTORY_HINT
+    } else {
+        WORK_HINT
+    };
+    let hint_width = hint.chars().count();
     let mut spans = Vec::new();
     if work_active {
         let spinner = WORK_SPINNER_FRAMES[ui_state.work_spinner_frame % WORK_SPINNER_FRAMES.len()];
@@ -4329,7 +4348,7 @@ fn render_input_status(
             " ".repeat(line_width.saturating_sub(left_width + hint_width)),
         ));
         spans.push(Span::styled(
-            WORK_HINT,
+            hint,
             Style::default()
                 .fg(theme.text_muted)
                 .add_modifier(Modifier::BOLD),
@@ -10005,6 +10024,55 @@ runtime = "fake"
         );
         assert_eq!(ui_state.prompt_history_cursor, 0);
         assert!(state.input.is_empty());
+    }
+
+    // ── prompt-history discoverability hint + help (task_07) ──
+
+    #[test]
+    fn recall_hint_shows_with_empty_input_and_history() {
+        let state = state_with_input("", false); // Idle → work not active
+        let ui_state = ui_state_with_history(&["b", "a"]);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(text.contains("↑ recall"));
+    }
+
+    #[test]
+    fn recall_hint_hidden_with_nonempty_input() {
+        let state = state_with_input("typing", false);
+        let ui_state = ui_state_with_history(&["b", "a"]);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(!text.contains("↑ recall"));
+        assert!(text.contains("/help"));
+    }
+
+    #[test]
+    fn recall_hint_hidden_with_empty_history() {
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState::default(); // empty ring
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(!text.contains("↑ recall"));
+        assert!(text.contains("/help"));
+    }
+
+    #[test]
+    fn recall_hint_suppressed_while_work_active() {
+        let mut state = state_with_input("", false);
+        state.run_state = RunState::Running; // the work indicator wins
+        let ui_state = ui_state_with_history(&["b", "a"]);
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 24);
+        assert!(!text.contains("↑ recall"));
+    }
+
+    #[test]
+    fn help_overlay_documents_recall_keys() {
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Keys,
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
+        assert!(text.contains("recall recent prompts"));
     }
 
     // ── task_05 TUI file-index state and consumer ──

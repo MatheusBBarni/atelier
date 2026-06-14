@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Recall discoverability hint line and help entry"
 type: frontend
 complexity: low
@@ -32,10 +32,10 @@ a recall entry to the `/help` overlay (PRD discoverability decision). No new col
 </requirements>
 
 ## Subtasks
-- [ ] 7.1 Add a recall hint constant and select it in `render_input_status` under the right condition.
-- [ ] 7.2 Add a recall line/entry to the help overlay.
-- [ ] 7.3 Confirm no new color literals; use theme tokens.
-- [ ] 7.4 Test the hint visibility conditions and the help entry presence.
+- [x] 7.1 Add a recall hint constant and select it in `render_input_status` under the right condition.
+- [x] 7.2 Add a recall line/entry to the help overlay.
+- [x] 7.3 Confirm no new color literals; use theme tokens.
+- [x] 7.4 Test the hint visibility conditions and the help entry presence.
 
 ## Implementation Details
 
