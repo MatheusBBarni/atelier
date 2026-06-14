@@ -283,6 +283,102 @@ pub fn read_events_from_path(path: &Path) -> Result<Vec<HistoryEvent>> {
     Ok(events)
 }
 
+/// Enumerate every session's event log under `<root>/sessions/*/events.jsonl`.
+///
+/// `root` is the `.atelier` data root. Returns an empty list (not an error) when
+/// the `sessions/` directory is absent — a fresh project simply has no history
+/// yet. Paths are sorted for determinism; the recall ordering itself is decided
+/// later by event timestamp in [`project_prompt_history`]. This is the one new
+/// reader primitive, reusable by future Ctrl-R / scope-cycling / outcome views
+/// (ADR-004).
+pub fn list_session_event_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let sessions_dir = root.join("sessions");
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(&sessions_dir)
+        .with_context(|| format!("failed to read {}", sessions_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", sessions_dir.display()))?;
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let events_path = entry.path().join("events.jsonl");
+        if events_path.is_file() {
+            paths.push(events_path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Project a per-project prompt-recall list from the event log (ADR-001, ADR-004).
+///
+/// Reads every session log under `root`, keeps `prompt_submitted` events, drops
+/// prompts beginning with a leading space (the secrets escape hatch), sorts by
+/// event `timestamp` descending (RFC3339 millis are lexically sortable),
+/// collapses *consecutive* duplicates, and truncates to `max`. Pure and
+/// read-only — it adds no persistence.
+///
+/// Tolerant by construction: a single unreadable or legacy-schema file is
+/// skipped (`read_events_from_path` errors on `schema_version != 1`), so one bad
+/// file can never empty the whole projection. A missing `sessions/` directory
+/// yields an empty list. Memory is kept proportional to the prompt count rather
+/// than the full event log — only `(timestamp, prompt)` pairs are retained past
+/// each per-file fold, and the result is capped to `max`.
+pub fn project_prompt_history(root: &Path, max: usize) -> Vec<String> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let paths = match list_session_event_paths(root) {
+        Ok(paths) => paths,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for path in paths {
+        // Per-file tolerance: skip a file that fails to read or carries an
+        // unsupported schema_version, rather than failing the whole projection.
+        let Ok(events) = read_events_from_path(&path) else {
+            continue;
+        };
+        for event in events {
+            if event.kind != "prompt_submitted" {
+                continue;
+            }
+            let Some(prompt) = event.payload.get("prompt").and_then(Value::as_str) else {
+                continue;
+            };
+            // Leading-space-skip: a prompt beginning with a space is the secrets
+            // escape hatch and never surfaces in recall (the durable event log is
+            // unchanged — this is a filter, not a deletion).
+            if prompt.starts_with(' ') {
+                continue;
+            }
+            entries.push((event.timestamp, prompt.to_string()));
+        }
+    }
+
+    // Newest first by event timestamp (lexical sort is valid for RFC3339 millis).
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut history: Vec<String> = Vec::with_capacity(entries.len().min(max));
+    for (_, prompt) in entries {
+        // Consecutive-dedup: collapse an immediately repeated prompt; a
+        // non-consecutive repeat (a different prompt in between) is preserved.
+        if history.last().map(String::as_str) == Some(prompt.as_str()) {
+            continue;
+        }
+        history.push(prompt);
+        if history.len() >= max {
+            break;
+        }
+    }
+    history
+}
+
 pub fn clean_sessions(working_directory: &Path) -> Result<Vec<PathBuf>> {
     let root = working_directory.join(".atelier");
     let targets = [root.join("sessions"), root.join("runs")];
@@ -436,6 +532,196 @@ mod tests {
         fs::write(&flag_path, "not json").unwrap();
         // A corrupt flag file must not panic or error — it reads as not-yet-shown.
         assert!(!store.first_approval_explainer_shown());
+    }
+
+    fn prompt_event(timestamp: &str, prompt: &str) -> HistoryEvent {
+        let mut event = HistoryEvent::new(
+            "session",
+            None,
+            None,
+            "prompt_submitted",
+            json!({ "prompt": prompt }),
+        );
+        event.timestamp = timestamp.to_string();
+        event
+    }
+
+    fn write_session(root: &Path, session_id: &str, events: &[HistoryEvent]) {
+        let dir = root.join("sessions").join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let mut contents = String::new();
+        for event in events {
+            contents.push_str(&serde_json::to_string(event).unwrap());
+            contents.push('\n');
+        }
+        fs::write(dir.join("events.jsonl"), contents).unwrap();
+    }
+
+    #[test]
+    fn lists_session_event_paths_and_empty_when_sessions_absent() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+
+        // No sessions/ yet → empty, no error.
+        assert!(list_session_event_paths(&root).unwrap().is_empty());
+
+        write_session(
+            &root,
+            "a",
+            &[prompt_event("2026-06-06T00:00:00.000Z", "one")],
+        );
+        write_session(
+            &root,
+            "b",
+            &[prompt_event("2026-06-06T00:00:01.000Z", "two")],
+        );
+        // A session directory without an events.jsonl is ignored.
+        fs::create_dir_all(root.join("sessions").join("c")).unwrap();
+
+        let paths = list_session_event_paths(&root).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths
+            .iter()
+            .all(|path| path.file_name().unwrap() == "events.jsonl"));
+    }
+
+    #[test]
+    fn projects_prompts_newest_first_across_sessions() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        write_session(
+            &root,
+            "a",
+            &[
+                prompt_event("2026-06-06T00:00:00.000Z", "one"),
+                prompt_event("2026-06-06T00:00:02.000Z", "two"),
+            ],
+        );
+        write_session(
+            &root,
+            "b",
+            &[prompt_event("2026-06-06T00:00:01.000Z", "three")],
+        );
+
+        let history = project_prompt_history(&root, 10);
+        assert_eq!(history, vec!["two", "three", "one"]);
+    }
+
+    #[test]
+    fn collapses_consecutive_duplicates_but_keeps_non_consecutive() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        // Sorted newest-first: x(t4), x(t3), y(t2), x(t1).
+        write_session(
+            &root,
+            "a",
+            &[
+                prompt_event("2026-06-06T00:00:01.000Z", "x"),
+                prompt_event("2026-06-06T00:00:02.000Z", "y"),
+                prompt_event("2026-06-06T00:00:03.000Z", "x"),
+                prompt_event("2026-06-06T00:00:04.000Z", "x"),
+            ],
+        );
+
+        // The consecutive x/x collapses to one; the earlier x (with y between) stays.
+        assert_eq!(project_prompt_history(&root, 10), vec!["x", "y", "x"]);
+    }
+
+    #[test]
+    fn truncates_to_max_keeping_newest() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        write_session(
+            &root,
+            "a",
+            &[
+                prompt_event("2026-06-06T00:00:01.000Z", "p1"),
+                prompt_event("2026-06-06T00:00:02.000Z", "p2"),
+                prompt_event("2026-06-06T00:00:03.000Z", "p3"),
+                prompt_event("2026-06-06T00:00:04.000Z", "p4"),
+                prompt_event("2026-06-06T00:00:05.000Z", "p5"),
+            ],
+        );
+
+        assert_eq!(project_prompt_history(&root, 2), vec!["p5", "p4"]);
+    }
+
+    #[test]
+    fn excludes_leading_space_prompts() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        write_session(
+            &root,
+            "a",
+            &[
+                prompt_event("2026-06-06T00:00:01.000Z", "visible"),
+                prompt_event("2026-06-06T00:00:02.000Z", " secret"),
+            ],
+        );
+
+        assert_eq!(project_prompt_history(&root, 10), vec!["visible"]);
+    }
+
+    #[test]
+    fn skips_unreadable_or_legacy_files_without_emptying_result() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        write_session(
+            &root,
+            "good",
+            &[prompt_event("2026-06-06T00:00:01.000Z", "valid")],
+        );
+        // A future schema version errors in read_events_from_path → file skipped.
+        fs::create_dir_all(root.join("sessions").join("legacy")).unwrap();
+        fs::write(
+            root.join("sessions").join("legacy").join("events.jsonl"),
+            r#"{"schema_version":2,"event_id":"e","session_id":"s","run_id":null,"step_id":null,"timestamp":"2026-06-06T00:00:09.000Z","kind":"prompt_submitted","payload":{"prompt":"from-future"}}"#,
+        )
+        .unwrap();
+        // A malformed line also fails its file's read → file skipped.
+        fs::create_dir_all(root.join("sessions").join("garbage")).unwrap();
+        fs::write(
+            root.join("sessions").join("garbage").join("events.jsonl"),
+            "not json at all\n",
+        )
+        .unwrap();
+
+        // The bad files are skipped; the valid prompt still surfaces.
+        assert_eq!(project_prompt_history(&root, 10), vec!["valid"]);
+    }
+
+    #[test]
+    fn ignores_non_prompt_events_and_missing_prompt_field() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        let mut other = HistoryEvent::new("session", None, None, "run_started", json!({}));
+        other.timestamp = "2026-06-06T00:00:09.000Z".to_string();
+        let mut no_prompt = HistoryEvent::new(
+            "session",
+            None,
+            None,
+            "prompt_submitted",
+            json!({ "other": 1 }),
+        );
+        no_prompt.timestamp = "2026-06-06T00:00:08.000Z".to_string();
+        write_session(
+            &root,
+            "a",
+            &[
+                other,
+                no_prompt,
+                prompt_event("2026-06-06T00:00:01.000Z", "real"),
+            ],
+        );
+
+        assert_eq!(project_prompt_history(&root, 10), vec!["real"]);
+    }
+
+    #[test]
+    fn missing_sessions_dir_projects_empty() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        assert!(project_prompt_history(&root, 10).is_empty());
     }
 
     #[test]

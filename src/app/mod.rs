@@ -7809,6 +7809,21 @@ prompt = "{reviewer_prompt}"
     }
 
     #[tokio::test]
+    async fn project_prompt_history_recalls_fake_runtime_submissions_newest_first() {
+        // End-to-end: two prompts submitted through a real fake run land in the
+        // event log; the projection surfaces them newest-first (ADR-001).
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("alpha").await.unwrap();
+        app.submit_prompt("beta").await.unwrap();
+
+        let history = crate::history::project_prompt_history(&dir.path().join(".atelier"), 10);
+        assert_eq!(history, vec!["beta", "alpha"]);
+    }
+
+    #[tokio::test]
     async fn fake_runtime_executes_parallel_group_and_synthesizes_result() {
         let dir = tempdir().unwrap();
         let config = fake_parallel_config(dir.path());

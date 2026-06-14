@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | History reader and prompt projection | pending | medium | — |
+| 01 | History reader and prompt projection | completed | medium | — |
 | 02 | UI config: prompt-history enable flag and size cap | pending | low | — |
 | 03 | PromptSource enum and AppEvent::PromptSubmitted extension | pending | medium | — |
 | 04 | TuiUiState recall fields and async history loader | pending | medium | task_01, task_02 |
