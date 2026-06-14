@@ -653,7 +653,11 @@ async fn execute_tui_command_with_interrupt(
             Ok(true)
         }
         TuiCommand::MoveInputCursor(command) => {
-            move_input_cursor(ui_state, &state.input, command);
+            // ↑/↓ walk the recall ring at the input's top/bottom boundary;
+            // otherwise (and for ←/→) they move the cursor as before.
+            if !try_recall_history(ui_state, state, command) {
+                move_input_cursor(ui_state, &state.input, command);
+            }
             Ok(true)
         }
         TuiCommand::AgentDropdown(command) => {
@@ -1465,6 +1469,10 @@ fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
     state.input.clear();
     ui_state.input_cursor = 0;
     ui_state.input_preferred_col = None;
+    // Clearing returns the composer to a fresh live draft, so recall starts over
+    // from the newest entry and the next submission is Fresh (ADR-003).
+    ui_state.prompt_history_cursor = 0;
+    ui_state.prompt_history_draft.clear();
     clear_command_dropdown_dismissal(ui_state);
     clear_file_mention_dropdown_dismissal(ui_state);
     reset_dropdown_selections(ui_state);
@@ -1556,6 +1564,88 @@ fn move_input_cursor_vertically(
     let line_end = line_start.saturating_add(width).min(input_len);
     ui_state.input_cursor = line_start.saturating_add(preferred_col).min(line_end);
     ui_state.input_preferred_col = Some(preferred_col);
+}
+
+/// Walk the recall ring in response to ↑/↓ at the input's top/bottom visual-row
+/// boundary, returning whether the key was consumed (the caller falls back to
+/// ordinary cursor navigation on `false`). ADR-001/003:
+///
+/// - Recall fires only at the boundary (`current_line == 0` for ↑, the last
+///   visual row for ↓), reusing the same row math as
+///   `move_input_cursor_vertically`. Inside a wrapped draft or recalled entry,
+///   ↑/↓ keep moving the cursor — this gate is what avoids the #1 competitor
+///   bug (multi-line collision).
+/// - The live draft is saved when entering history (cursor `0 → 1`) and restored
+///   when ↓ steps back past the newest entry (cursor `1 → 0`).
+/// - Each step replaces `state.input` and parks the cursor at the end of the
+///   recalled text; `prompt_history_cursor` tracks depth (`0` = live draft,
+///   `N` = Nth-newest entry).
+///
+/// Yields entirely when the ring is empty (which also covers the disabled case,
+/// since the loader never populates it). Dropdown / queue / clarification
+/// precedence is handled upstream in `key_event_to_tui_command_with_ui`, so this
+/// is only ever reached for plain-input ↑/↓.
+fn try_recall_history(
+    ui_state: &mut TuiUiState,
+    state: &mut AppState,
+    command: InputCursorCommand,
+) -> bool {
+    if ui_state.prompt_history.is_empty() {
+        return false;
+    }
+    clamp_input_cursor(ui_state, &state.input);
+    let width = ui_state.input_width.max(1);
+    let input_len = input_char_count(&state.input);
+    let current_line = ui_state.input_cursor / width;
+    let last_line = input_len / width;
+    match command {
+        InputCursorCommand::Up => {
+            if current_line != 0 {
+                return false; // mid-draft: let the cursor move up a visual row
+            }
+            if ui_state.prompt_history_cursor >= ui_state.prompt_history.len() {
+                return true; // already at the oldest entry — consume, no change
+            }
+            if ui_state.prompt_history_cursor == 0 {
+                ui_state.prompt_history_draft = state.input.clone();
+            }
+            ui_state.prompt_history_cursor += 1;
+            let entry = ui_state.prompt_history[ui_state.prompt_history_cursor - 1].clone();
+            set_recalled_input(ui_state, state, entry);
+            true
+        }
+        InputCursorCommand::Down => {
+            if current_line != last_line {
+                return false; // mid-draft: let the cursor move down a visual row
+            }
+            if ui_state.prompt_history_cursor == 0 {
+                return false; // on the live draft — nothing newer to recall
+            }
+            ui_state.prompt_history_cursor -= 1;
+            let text = if ui_state.prompt_history_cursor == 0 {
+                // Stepped past the newest entry → restore the saved live draft.
+                ui_state.prompt_history_draft.clone()
+            } else {
+                ui_state.prompt_history[ui_state.prompt_history_cursor - 1].clone()
+            };
+            set_recalled_input(ui_state, state, text);
+            true
+        }
+        InputCursorCommand::Left | InputCursorCommand::Right => false,
+    }
+}
+
+/// Replace the composer with a recalled entry (or the restored draft): set the
+/// text, park the cursor at its end, and run the same dropdown/status
+/// housekeeping as ordinary input edits so discovery re-activates cleanly.
+fn set_recalled_input(ui_state: &mut TuiUiState, state: &mut AppState, text: String) {
+    ui_state.input_cursor = input_char_count(&text);
+    ui_state.input_preferred_col = None;
+    ui_state.status_message = None;
+    state.input = text;
+    clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
+    reset_dropdown_selections(ui_state);
 }
 
 fn scroll_events(ui_state: &mut TuiUiState, command: EventScrollCommand) {
@@ -9468,6 +9558,226 @@ runtime = "fake"
         // The detached load publishes exactly once; await that and assert it landed.
         receiver.changed().await.unwrap();
         assert_eq!(*receiver.borrow(), vec!["alpha".to_string()]);
+    }
+
+    // ── prompt-history recall interaction (task_05) ──
+
+    fn ui_state_with_history(history: &[&str]) -> TuiUiState {
+        TuiUiState {
+            prompt_history: history.iter().map(|s| (*s).to_string()).collect(),
+            // Wide so single-word entries stay on one visual row (cursor on the
+            // top/bottom boundary), isolating recall from cursor-nav.
+            input_width: 80,
+            ..TuiUiState::default()
+        }
+    }
+
+    #[test]
+    fn up_down_walk_recall_ring_newest_first() {
+        let mut state = state_with_input("", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]); // newest-first
+
+        // ↑ → newest "b", cursor parked at the end, depth 1.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "b");
+        assert_eq!(ui_state.input_cursor, 1);
+        assert_eq!(ui_state.prompt_history_cursor, 1);
+
+        // ↑ again → older "a".
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "a");
+
+        // ↓ → newer "b".
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Down
+        ));
+        assert_eq!(state.input, "b");
+    }
+
+    #[test]
+    fn up_at_oldest_entry_is_consumed_noop() {
+        let mut state = state_with_input("", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]);
+        try_recall_history(&mut ui_state, &mut state, InputCursorCommand::Up); // "b"
+        try_recall_history(&mut ui_state, &mut state, InputCursorCommand::Up); // "a" (oldest)
+        assert_eq!(state.input, "a");
+
+        // A further ↑ is consumed (so it never moves the cursor) but is a no-op.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "a");
+        assert_eq!(ui_state.prompt_history_cursor, 2);
+    }
+
+    #[test]
+    fn draft_is_saved_on_entry_and_restored_past_newest() {
+        let mut state = state_with_input("draft", false);
+        let mut ui_state = TuiUiState {
+            prompt_history: vec!["b".to_string()],
+            input_width: 80,
+            input_cursor: input_char_count("draft"),
+            ..TuiUiState::default()
+        };
+
+        // ↑ saves the in-progress draft and shows the newest entry.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "b");
+        assert_eq!(ui_state.prompt_history_draft, "draft");
+
+        // ↓ past the newest entry restores the exact draft and cursor.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Down
+        ));
+        assert_eq!(state.input, "draft");
+        assert_eq!(ui_state.prompt_history_cursor, 0);
+        assert_eq!(ui_state.input_cursor, input_char_count("draft"));
+    }
+
+    #[test]
+    fn wrapped_draft_moves_cursor_before_recalling_at_top_row() {
+        // width 5, "abcdefgh" wraps to two rows: row 0 "abcde", row 1 "fgh".
+        let mut state = state_with_input("abcdefgh", false);
+        let mut ui_state = TuiUiState {
+            prompt_history: vec!["recalled".to_string()],
+            input_width: 5,
+            input_cursor: 7, // col 2 of row 1
+            ..TuiUiState::default()
+        };
+
+        // On row 1, ↑ is NOT recall — it yields so the cursor moves up a row.
+        assert!(!try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "abcdefgh"); // draft untouched
+        move_input_cursor(&mut ui_state, &state.input, InputCursorCommand::Up);
+        assert_eq!(ui_state.input_cursor / 5, 0); // now on the top row
+
+        // Only at the top row does a further ↑ recall.
+        assert!(try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "recalled");
+        assert_eq!(ui_state.prompt_history_draft, "abcdefgh");
+    }
+
+    #[test]
+    fn empty_ring_does_not_recall() {
+        // No history (e.g. recall disabled → loader never populated the ring).
+        let mut state = state_with_input("hello", false);
+        let mut ui_state = TuiUiState {
+            input_cursor: input_char_count("hello"),
+            input_width: 80,
+            ..TuiUiState::default()
+        };
+        assert!(!try_recall_history(
+            &mut ui_state,
+            &mut state,
+            InputCursorCommand::Up
+        ));
+        assert_eq!(state.input, "hello");
+    }
+
+    #[test]
+    fn up_drives_queue_not_recall_when_queue_focused() {
+        // Empty input + a queued follow-up → queue focus owns ↑ (precedence),
+        // even though the ring is non-empty, so recall is never reached.
+        let mut state = state_with_queue(vec![queue_view(
+            "q1",
+            "do it",
+            QueuedFollowUpStatus::Pending,
+            None,
+        )]);
+        state.input.clear();
+        let ui_state = ui_state_with_history(&["b", "a"]);
+
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            command,
+            Some(TuiCommand::QueueSelection(QueueSelectionCommand::Previous))
+        );
+    }
+
+    #[test]
+    fn up_drives_command_dropdown_not_recall_when_open() {
+        // "/g" is a single slash-word → the command dropdown owns ↑ (precedence).
+        let state = state_with_input("/g", false);
+        let ui_state = TuiUiState {
+            prompt_history: vec!["b".to_string(), "a".to_string()],
+            input_cursor: 2,
+            ..TuiUiState::default()
+        };
+        assert!(command_dropdown(&state, &ui_state).is_some());
+
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        );
+        assert!(matches!(command, Some(TuiCommand::CommandDropdown(_))));
+    }
+
+    #[tokio::test]
+    async fn recall_then_enter_submits_recalled_text_to_worker() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("", false);
+        let mut ui_state = ui_state_with_history(&["b", "a"]);
+
+        // ↑ through the real command handler recalls the newest entry.
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::MoveInputCursor(InputCursorCommand::Up),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "b");
+
+        // Enter routes to a submit of the recalled text.
+        let submit = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        execute_tui_command(&mut state, &mut ui_state, &sender, submit)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::PromptSubmitted(prompt, _)) if prompt == "b"
+        ));
+        // Submitting cleared the composer and reset recall to a fresh draft.
+        assert!(state.input.is_empty());
+        assert_eq!(ui_state.prompt_history_cursor, 0);
     }
 
     // ── task_05 TUI file-index state and consumer ──
