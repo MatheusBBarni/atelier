@@ -1433,6 +1433,11 @@ impl App {
             json!({
                 "prompt": visible_prompt.clone(),
                 "submitted_prompt": submitted_prompt.clone(),
+                // A queued follow-up is a user-typed prompt that was deferred, so its
+                // provenance is `Fresh` — mirroring `submit_prompt` so replayed events
+                // carry the same schema and stay distinguishable from legacy
+                // pre-`PromptSource` events (which read back as `Fresh` by default).
+                "source": PromptSource::Fresh.as_str(),
             }),
             user_event_display(&visible_prompt),
         )?;
@@ -1587,6 +1592,8 @@ impl App {
             return Ok(None);
         };
         self.state.pending_approval = None;
+        // Keep the explainer flag in sync with approval presence (none pending → false).
+        self.state.show_first_approval_explainer = false;
         self.record_event(
             Some(pending.run_id.clone()),
             Some(pending.step_id.clone()),
@@ -1756,6 +1763,8 @@ impl App {
             self.state.live_step = None;
             self.state.live_steps.clear();
             self.state.pending_approval = None;
+            // Keep the explainer flag in sync with approval presence (none pending → false).
+            self.state.show_first_approval_explainer = false;
             self.state.pending_clarification = None;
             self.pending_approval = None;
             self.pending_clarification = None;
@@ -2123,6 +2132,8 @@ impl App {
                     interrupted = true;
                     self.state.run_state = RunState::Interrupted;
                     self.state.pending_approval = None;
+                    // Keep the explainer flag in sync with approval presence (none pending → false).
+                    self.state.show_first_approval_explainer = false;
                     approval_queue.clear();
                     self.record_step_cancelled_if_active()?;
                     self.record_event(
@@ -2321,6 +2332,8 @@ impl App {
             self.clear_active_step(&child.step_id);
         }
         self.state.pending_approval = None;
+        // Keep the explainer flag in sync with approval presence (none pending → false).
+        self.state.show_first_approval_explainer = false;
         self.sync_chat_items();
         self.publish_state();
         if interrupted {
@@ -4526,6 +4539,8 @@ impl App {
         )?;
         self.state.active_run_id = None;
         self.state.pending_approval = None;
+        // Keep the explainer flag in sync with approval presence (none pending → false).
+        self.state.show_first_approval_explainer = false;
         self.state.pending_clarification = None;
         self.pending_approval = None;
         self.pending_clarification = None;
@@ -9832,6 +9847,9 @@ runtime = "fake"
             })
             .unwrap();
         assert!(replay_submitted.run_id.is_some());
+        // The replayed follow-up carries explicit `Fresh` provenance, matching the
+        // main submit path so the event conforms to the same schema (F3).
+        assert_eq!(replay_submitted.payload["source"], "fresh");
         let original_submitted = events
             .iter()
             .find(|event| {
@@ -9989,6 +10007,12 @@ runtime = "fake"
             .any(|line| line.text == crate::app::chat::FIRST_APPROVAL_EXPLAINER)));
         // The latch is persisted at the workspace root.
         assert!(first.history.first_approval_explainer_shown());
+
+        // Resolving the approval clears the flag so it never lingers true while no
+        // approval is pending — the flag stays in sync with approval state (F1).
+        first.resolve_pending_approval(false).await.unwrap();
+        assert!(first.state.pending_approval.is_none());
+        assert!(!first.state.show_first_approval_explainer);
 
         // A later session (latch persisted on disk) suppresses the explainer.
         let mut later = App::new(approval_mode_config(dir.path())).await.unwrap();
