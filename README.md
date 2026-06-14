@@ -166,7 +166,7 @@ Configuration is merged in this order:
 3. Local override: `./atelier.toml`
 4. CLI flags (`--config` or `--cwd`)
 
-You can also set `MULTIAGENT_CONFIG` to choose the home config path.
+You can also set `ATELIER_CONFIG` to choose the home config path (the legacy `MULTIAGENT_CONFIG` is still honored for back-compat).
 
 Important values:
 

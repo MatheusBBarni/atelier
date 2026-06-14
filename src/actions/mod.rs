@@ -613,7 +613,16 @@ fn command_has_prefix(lower_command: &str, prefix: &str) -> bool {
 pub fn validate_model_path(path: &str, extra_roots: &[PathBuf]) -> Result<PathBuf> {
     let candidate = Path::new(path);
     if candidate.is_absolute() {
-        if extra_roots.iter().any(|root| candidate.starts_with(root)) {
+        // `read_roots()` returns the filesystem-root sentinel (`MAIN_SEPARATOR_STR`)
+        // to mean "any absolute path" under `allow_unrestricted_reads`. On Unix that
+        // root (`/`) already `starts_with`-matches every absolute path, but on Windows
+        // a bare separator never matches a drive-rooted path (`C:\…`), so match the
+        // sentinel explicitly to keep the opt-in working cross-platform.
+        let fs_root = Path::new(std::path::MAIN_SEPARATOR_STR);
+        if extra_roots
+            .iter()
+            .any(|root| root.as_path() == fs_root || candidate.starts_with(root))
+        {
             return Ok(candidate.to_path_buf());
         }
         bail!("absolute paths are not allowed for model-requested actions: {path}");

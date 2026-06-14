@@ -12,6 +12,7 @@ on:
       - "src/cli.rs"
       - "src/config/**"
       - "src/slash_commands.rs"
+      - "src/docgen/**"
       - ".github/workflows/web-checks.yml"
   workflow_dispatch:
 

@@ -28,8 +28,10 @@ mkdirSync(generatedDir, { recursive: true });
 // Prefer a prebuilt binary (CI) when ATELIER_BIN is set; otherwise build+run via
 // cargo from the repo root (local dev).
 const atelierBin = process.env.ATELIER_BIN;
+// Resolve config from the same root (repoRoot) in both branches so a committed
+// repo-root atelier.toml is honored identically in CI and locally (no doc drift).
 const [command, baseArgs, cwd] = atelierBin
-  ? [atelierBin, [], webDir]
+  ? [atelierBin, [], repoRoot]
   : ["cargo", ["run", "--quiet", "--bin", "atelier", "--"], repoRoot];
 
 const args = [...baseArgs, "--emit-docs", generatedDir];

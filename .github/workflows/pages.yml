@@ -14,6 +14,7 @@ on:
       - "src/cli.rs"
       - "src/config/**"
       - "src/slash_commands.rs"
+      - "src/docgen/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 

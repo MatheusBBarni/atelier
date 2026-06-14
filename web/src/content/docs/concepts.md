@@ -130,6 +130,6 @@ the subject of the next page.
 - [Governance &amp; Safety](../governance/) — the trust detail: mediated actions,
   read vs. write roots, capabilities vs. approval mode, limits, and the durable
   replayable record.
-- [Configuration](../configuration/) — every `multiagent.toml` section: the agent
+- [Configuration](../configuration/) — every `atelier.toml` section: the agent
   profiles, runtimes, models and fallbacks, council, limits, and UI options
   referenced conceptually here.

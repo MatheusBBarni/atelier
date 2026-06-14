@@ -387,6 +387,23 @@ mod tests {
     }
 
     #[test]
+    fn walk_excludes_atelier_private_dir() {
+        // `.atelier` is the harness's private, durable session-history dir; it must
+        // never surface in the file index (FORCE_EXCLUDED_DIRS). Guards the exclusion
+        // against accidental removal from the list.
+        let dir = tempdir().unwrap();
+        seed_tree(dir.path());
+        fs::create_dir_all(dir.path().join(".atelier/sessions/abc")).unwrap();
+        fs::write(
+            dir.path().join(".atelier/sessions/abc/events.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        let paths = rel_paths(&FileIndex::walk(dir.path()));
+        assert!(!paths.iter().any(|p| p.starts_with(".atelier")));
+    }
+
+    #[test]
     fn walk_excludes_secret_files_and_dirs() {
         let dir = tempdir().unwrap();
         seed_tree(dir.path());

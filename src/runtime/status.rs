@@ -572,20 +572,10 @@ fn classify_unavailable(
     .to_lowercase();
     let mentions = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
 
+    // Check auth/credential signals before configuration signals: an auth error can
+    // also contain a generic config word like "not found" (e.g. "api key not found"),
+    // which must still classify as Unauthenticated rather than Misconfigured.
     if mentions(&[
-        "not configured",
-        "not found",
-        "install",
-        "path",
-        "base_url",
-        "command",
-    ]) {
-        (
-            ProviderRunwayState::Misconfigured,
-            ReasonCode::Misconfigured,
-            ProviderNextAction::FixConfiguration,
-        )
-    } else if mentions(&[
         "not set",
         "api key",
         "login",
@@ -598,6 +588,19 @@ fn classify_unavailable(
             ProviderRunwayState::Unauthenticated,
             ReasonCode::AuthRequired,
             ProviderNextAction::Authenticate,
+        )
+    } else if mentions(&[
+        "not configured",
+        "not found",
+        "install",
+        "path",
+        "base_url",
+        "command",
+    ]) {
+        (
+            ProviderRunwayState::Misconfigured,
+            ReasonCode::Misconfigured,
+            ProviderNextAction::FixConfiguration,
         )
     } else {
         (
@@ -951,14 +954,30 @@ fn redact_token(token: &str) -> String {
 fn redact_segments(token: &str) -> String {
     let mut out = String::with_capacity(token.len());
     let mut segment_start = 0;
+    // Track whether the previous segment was a sensitive key (e.g. `token=`,
+    // `authorization:`) so its value is redacted even when the value looks
+    // innocuous and follows the first key/value pair in a compound token (e.g.
+    // `client_id=ok&token=hunter2`). `redact_token` only inspects the first split.
+    let mut prev_key_sensitive = false;
     for (index, ch) in token.char_indices() {
         if is_segment_delimiter(ch) {
-            out.push_str(&redact_segment(&token[segment_start..index]));
+            let segment = &token[segment_start..index];
+            if prev_key_sensitive && !segment.is_empty() {
+                out.push_str("[redacted]");
+            } else {
+                out.push_str(&redact_segment(segment));
+            }
             out.push(ch);
+            prev_key_sensitive = matches!(ch, '=' | ':') && key_is_sensitive(segment);
             segment_start = index + ch.len_utf8();
         }
     }
-    out.push_str(&redact_segment(&token[segment_start..]));
+    let last = &token[segment_start..];
+    if prev_key_sensitive && !last.is_empty() {
+        out.push_str("[redacted]");
+    } else {
+        out.push_str(&redact_segment(last));
+    }
     out
 }
 
@@ -1624,6 +1643,23 @@ mod tests {
         let out = redact_secrets("Authorization:Bearer ghp_abcd1234EFGH5678ijkl done");
         assert!(!out.contains("ghp_abcd1234EFGH5678ijkl"), "{out}");
         assert!(out.contains("done"));
+    }
+
+    #[test]
+    fn redaction_catches_innocuous_value_after_sensitive_key_in_compound_token() {
+        // A sensitive key (`token=`) makes its value secret even when the value
+        // looks innocuous AND follows a non-sensitive first pair in one glued token
+        // (a query string). The first-split check in `redact_token` misses this, so
+        // `redact_segments` must redact the value of any sensitive key segment.
+        let out = redact_secrets("auth failed at https://h/cb?client_id=ok123&token=hunter2&ok=1");
+        assert!(
+            !out.contains("hunter2"),
+            "sensitive-keyed value leaked: {out}"
+        );
+        assert!(out.contains("[redacted]"), "{out}");
+        // Non-sensitive pairs and surrounding structure survive.
+        assert!(out.contains("client_id=ok123"), "{out}");
+        assert!(out.contains("ok=1"), "{out}");
     }
 
     fn status(

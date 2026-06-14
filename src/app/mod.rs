@@ -2149,7 +2149,7 @@ impl App {
                         approval.sequence,
                     ));
                     if let Some(pending) = approval_queue.pop_front() {
-                        self.publish_parallel_approval_head(&approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
                         if let Some(child) = children.get_mut(&pending.step_id) {
                             if child.terminal_result.is_none() {
                                 self.resolve_parallel_approval(
@@ -2163,14 +2163,14 @@ impl App {
                             }
                         }
                         self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
-                        self.publish_parallel_approval_head(&approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
                     }
                     continue;
                 }
                 _ = limit_tick.tick() => {
                     if self.apply_parallel_limit_checks(run, &mut children, &cancellation)? {
                         self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
-                        self.publish_parallel_approval_head(&approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
                     }
                     continue;
                 }
@@ -2232,7 +2232,7 @@ impl App {
                             {
                                 continue;
                             }
-                            self.publish_parallel_approval_head(&approval_queue);
+                            self.publish_parallel_approval_head(&approval_queue)?;
                         }
                         Ok(RuntimeOutput::ParseError {
                             agent,
@@ -2674,7 +2674,15 @@ impl App {
         Ok(())
     }
 
-    fn publish_parallel_approval_head(&mut self, queue: &VecDeque<PendingParallelApproval>) {
+    fn publish_parallel_approval_head(
+        &mut self,
+        queue: &VecDeque<PendingParallelApproval>,
+    ) -> Result<()> {
+        let prev_step = self
+            .state
+            .pending_approval
+            .as_ref()
+            .map(|pending| pending.step_id.clone());
         self.state.pending_approval = queue.front().map(|pending| PendingApprovalView {
             run_id: pending.run_id.clone(),
             group_id: Some(pending.group_id.clone()),
@@ -2684,8 +2692,31 @@ impl App {
             summary: action_requested_display(&pending.action_request).to_string(),
             diagnostic: pending.reason.clone(),
         });
+        // First-approval explainer (ADR-004), mirroring the serial path: consult the
+        // persisted latch only when the *surfaced* approval changes (a new head, not a
+        // re-publish of the same one), so a user whose first approval is a parallel
+        // child still sees the one-line explainer exactly once. Re-publishing the same
+        // head (e.g. when another child enqueues) leaves the flag untouched.
+        let new_step = self
+            .state
+            .pending_approval
+            .as_ref()
+            .map(|pending| pending.step_id.clone());
+        if new_step != prev_step {
+            if self.state.pending_approval.is_some() {
+                if !self.history.first_approval_explainer_shown() {
+                    self.history.mark_first_approval_explainer_shown()?;
+                    self.state.show_first_approval_explainer = true;
+                } else {
+                    self.state.show_first_approval_explainer = false;
+                }
+            } else {
+                self.state.show_first_approval_explainer = false;
+            }
+        }
         self.sync_chat_items();
         self.publish_state();
+        Ok(())
     }
 
     fn drop_terminal_parallel_approvals(
