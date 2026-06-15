@@ -1,0 +1,14 @@
+# Sub-task DAG Execution — Task List
+
+## Tasks
+
+| # | Title | Status | Complexity | Dependencies |
+|---|-------|--------|------------|--------------|
+| 01 | Config execution_graph feature flag | pending | low | — |
+| 02 | DAG decision schema, types, validation, and prompt guidance | pending | high | task_01 |
+| 03 | DAG events, graph_id, and ExecutionGraphResult | pending | medium | task_02 |
+| 04 | Ready-set scheduler with fail-closed admission | pending | critical | task_02, task_03 |
+| 05 | Whole-plan approval gate (normal mode) | pending | high | task_03, task_04 |
+| 06 | Single evolving Plan chat projection | pending | high | task_03 |
+| 07 | Surface DAG state in /config | pending | low | task_01 |
+| 08 | Fake-runtime DAG harness and integration suite | pending | high | task_04, task_05, task_06 |

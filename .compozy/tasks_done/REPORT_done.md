@@ -1,53 +1,28 @@
 # Completed Tasks Report
 
-Generated: 2026-06-11
+Generated: 2026-06-15
 
-These task groups had all tasks at `completed` status and were archived to `.compozy/tasks_done/`.
-
----
-
-## agent-question-tool — Clarification Select UI
-
-All 8 tasks completed.
-
-| # | Title | Status |
-|---|-------|--------|
-| 01 | Add Clarification Option Schema Fields | completed |
-| 02 | Validate Clarification Options And Fake Runtime Fixture | completed |
-| 03 | Update Runtime Prompt Contracts | completed |
-| 04 | Expose Pending Clarification View And Request Lifecycle | completed |
-| 05 | Add Structured Clarification Answer Path | completed |
-| 06 | Add Clarification Chat Semantics And Projection | completed |
-| 07 | Add TUI Clarification Selection Key Handling | completed |
-| 08 | Render Clarification Composer Layout | completed |
+Task groups whose tasks are all at `completed` status, archived under
+`.compozy/tasks_done/`. See `../TASKS_REPORT.md` for the combined remaining + archived report.
 
 ---
 
-## skill-prompt-loading — Skill Prompt Loading
+## All archived features
 
-All 6 tasks completed.
+| Feature | Title | Tasks | Archived |
+|---------|-------|-------|----------|
+| agent-question-tool | Clarification Select UI | 8/8 | earlier |
+| agent-roster-tui | Live-Activity-First Agent Roster | 7/7 | 2026-06-15 |
+| at-mention-file-dropdown | @-Mention File Dropdown | 10/10 | earlier |
+| atelier-tui-redesign | Atelier TUI Visual Identity | 9/9 | earlier |
+| default-agent-prompts | Default Agent Prompts | 5/5 | 2026-06-15 |
+| help-modal-tabs | Tabbed Help Modal | 10/10 | 2026-06-15 |
+| prompt-history | Prompt History (↑/↓ Recall) | 7/7 | 2026-06-15 |
+| provider-usage-status | Provider Usage Status | 6/6 | 2026-06-15 |
+| queued-follow-up-inputs | Queued Follow-Up Inputs | 5/5 | earlier |
+| skill-prompt-loading | Skill Prompt Loading | 6/6 | earlier |
+| slash-command-dropdown | Slash Command Dropdown | 7/7 | earlier |
+| web-docs-page | Atelier Documentation Site (`/docs`) | 12/12 | 2026-06-15 |
+| workflow-command | Workflow Command | 7/7 | earlier |
 
-| # | Title | Status |
-|---|-------|--------|
-| 01 | Add Shared Skill Discovery And Parsing Foundation | completed |
-| 02 | Add Skill Resolver, Dedupe, Diagnostics, And Renderer | completed |
-| 03 | Integrate Normal Prompt Skill Loading In App | completed |
-| 04 | Render Skill Context For Runtime And Derived Prompts | completed |
-| 05 | Route TUI Skill Suggestions Through Shared Module | completed |
-| 06 | Project Skill-Loaded Feedback And Update Help Text | completed |
-
----
-
-## workflow-command — Workflow Command
-
-All 7 tasks completed.
-
-| # | Title | Status |
-|---|-------|--------|
-| 01 | Add Workflow Command Parsing And Preflight | completed |
-| 02 | Start Workflow Runs With Prompt Envelope And Start Event | completed |
-| 03 | Add App-Owned Workflow Target Ledger | completed |
-| 04 | Emit Workflow Completion Evidence | completed |
-| 05 | Project Workflow Events In Chat | completed |
-| 06 | Extend Fake Runtime Workflow Fixtures And Integration Coverage | completed |
-| 07 | Add TUI Help For Workflow Command | completed |
+**Totals:** 13 features, 99 completed tasks. Six features (49 tasks) were moved on 2026-06-15.
