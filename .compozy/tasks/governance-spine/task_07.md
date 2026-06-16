@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Governance outcome proxy and calibration metrics in doctor
 type: backend
 complexity: medium
@@ -29,10 +29,10 @@ Surface whether governance is working, honestly. Add a `--doctor --json` check t
 </requirements>
 
 ## Subtasks
-- [ ] 7.1 Add `governance_metrics_check` and register it in `run_doctor`.
-- [ ] 7.2 Derive the outcome proxy from `governance_decision_*` + run-outcome events.
-- [ ] 7.3 Compute intervention rate (dual-alarm band), early-abort catch rate, gate precision.
-- [ ] 7.4 Emit the figures in the check `context`, with the proxy clearly labeled.
+- [x] 7.1 Add `governance_metrics_check` and register it in `run_doctor`.
+- [x] 7.2 Derive the outcome proxy from `governance_decision_*` + run-outcome events.
+- [x] 7.3 Compute intervention rate (dual-alarm band), early-abort catch rate, gate precision.
+- [x] 7.4 Emit the figures in the check `context`, with the proxy clearly labeled.
 
 ## Implementation Details
 Modify `src/doctor/mod.rs` (`run_doctor` ~55, new `governance_metrics_check`). Read events via the history store (`HistoryEvent.kind`/`payload`). Reference TechSpec "Monitoring and Observability" and ADR-005; do not reproduce the metric formulas verbatim.
@@ -55,12 +55,12 @@ Modify `src/doctor/mod.rs` (`run_doctor` ~55, new `governance_metrics_check`). R
 
 ## Tests
 - Unit tests:
-  - [ ] A completed governed run with no corrective re-prompt counts as kept; an early-abort reject and an abort-after-accept each count against the proxy.
-  - [ ] Intervention rate raises the dual-alarm when near-zero with reverts present, and when above the high band.
-  - [ ] Early-abort catch rate = rejects ÷ early-aborts fired; gate precision excludes trivial/read-only runs.
-  - [ ] An empty event log yields zeros/None without panicking.
+  - [x] A completed governed run with no corrective re-prompt counts as kept; an early-abort reject and an abort-after-accept each count against the proxy.
+  - [x] Intervention rate raises the dual-alarm when near-zero with reverts present, and when above the high band.
+  - [x] Early-abort catch rate = rejects ÷ early-aborts fired; gate precision excludes trivial/read-only runs.
+  - [x] An empty event log yields zeros/None without panicking.
 - Integration tests:
-  - [ ] `--doctor --json` after a session containing governance events includes the metrics check with the labeled proxy and the calibration figures in `context`.
+  - [x] `--doctor --json` after a session containing governance events includes the metrics check with the labeled proxy and the calibration figures in `context`.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -69,3 +69,10 @@ Modify `src/doctor/mod.rs` (`run_doctor` ~55, new `governance_metrics_check`). R
 - Test coverage >=80%
 - `--doctor --json` reports the outcome proxy (labeled) + exact calibration metrics, derived locally with no telemetry.
 - `cargo fmt --check` and `cargo clippy --all-targets` are clean.
+
+## Completion Notes
+- `governance.metrics` DoctorCheck registered in `run_doctor`, reading all `.atelier/sessions/*/events.jsonl` via the existing `list_session_event_paths` + `read_events_from_path` primitives (local-only, no network). Aggregation lives in the pure `governance_metrics_from_events(&[HistoryEvent])` (unit-testable; empty stream → all zeros, `None` ratios, no panic).
+- **Metric definitions** (documented in code): `trusted_outcome_rate_proxy` = kept ÷ governed runs (labeled a proxy via `trusted_outcome_rate_is_proxy: true` + a note); `early_abort_catch_rate` = rejects ÷ early-aborts fired; `intervention_rate` = early-aborts fired ÷ all runs; `gate_precision` = aborts on write-intent runs ÷ all fired aborts (read-only runs that never fired are excluded from the denominator). Proxy classification: a governed run is *kept* if accepted+completed+not-reverted, *against* if rejected or accepted-then-interrupted/failed.
+- **Dual-alarm** (`raises_alarm`): Warn when `intervention_rate > 0.5` (high band — gate fires on too many runs) OR when no aborts fired while reverts exist (near-zero with problems present — gate is missing them). Idle log (no aborts, no reverts) is `Ok` "no governance activity".
+- "corrective re-prompt" is approximated by the abort/interrupt-after-accept signal (atelier has no first-class revert/re-prompt event — ADR-005); the figure is clearly labeled a proxy and the exact calibration metrics anchor decisions.
+- Verified: `cargo test --lib doctor::tests` (16 passed: 8 new governance + 8 existing, incl. the `--doctor --json` integration test), `cargo fmt --check` clean, `cargo clippy --all-targets` clean (0 warnings). Full `cargo test --lib` = 912 passed / 12 failed; the 12 are exactly the pre-existing skill tests (proven on the clean task_01 commit). Zero failures attributable to this task.

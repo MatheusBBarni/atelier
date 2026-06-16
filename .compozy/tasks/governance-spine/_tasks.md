@@ -10,7 +10,7 @@
 | 04 | TUI governance decision card and key routing | completed | medium | task_02, task_03 |
 | 05 | Early-abort gate in the drive loop with feature flag | completed | high | task_02, task_03 |
 | 06 | Orchestrator prompt nudge for turn-one intent | completed | low | task_05 |
-| 07 | Governance outcome proxy and calibration metrics in doctor | pending | medium | task_05 |
+| 07 | Governance outcome proxy and calibration metrics in doctor | completed | medium | task_05 |
 | 08 | Sibling conformance contract and test | pending | low | task_01 |
 
 ## Build Waves
