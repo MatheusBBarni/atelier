@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -436,6 +436,25 @@ pub struct EffectiveConfig {
     pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
     pub agents: BTreeMap<String, AgentProfile>,
+}
+
+impl EffectiveConfig {
+    /// Runtime ids whose unavailability is a hard error: the runtimes guaranteed
+    /// to run on every prompt-driven run (ADR-003). V1 is exactly the orchestrator
+    /// agent's primary runtime — the only runtime the orchestrator chain resolves
+    /// unconditionally. Council, inactive-preset, and model-fallback runtimes are
+    /// deliberately excluded (their absence does not guarantee a failed run).
+    ///
+    /// Pure: reads only the already-merged config (no I/O, no availability probe).
+    /// An absent `orchestrator` agent yields an empty set rather than panicking.
+    /// The set may broaden in V2 (e.g. model-fallback / selected-preset coverage).
+    pub fn required_runtime_ids(&self) -> BTreeSet<&str> {
+        self.agents
+            .get("orchestrator")
+            .map(|agent| agent.runtime.as_str())
+            .into_iter()
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -2825,6 +2844,31 @@ prompt_history_max = 50
             !message.contains("did you mean"),
             "a wild typo must not get a suggestion, got: {message}"
         );
+    }
+
+    // ---- required_runtime_ids (task_03) -------------------------------
+
+    #[test]
+    fn required_runtime_ids_default_is_exactly_orchestrator_runtime() {
+        // Guardrail: the elevated set is exactly the orchestrator's runtime and
+        // must not broaden silently (ADR-003).
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+        assert_eq!(config.required_runtime_ids(), BTreeSet::from(["zai"]));
+    }
+
+    #[test]
+    fn required_runtime_ids_follows_orchestrator_runtime_override() {
+        let config =
+            load_from_temp("schema_version = 1\n[agents.orchestrator]\nruntime = \"codex\"\n")
+                .unwrap();
+        assert_eq!(config.required_runtime_ids(), BTreeSet::from(["codex"]));
+    }
+
+    #[test]
+    fn required_runtime_ids_is_empty_when_orchestrator_absent() {
+        let mut config = load_from_temp("schema_version = 1\n").unwrap();
+        config.agents.remove("orchestrator");
+        assert!(config.required_runtime_ids().is_empty());
     }
 
     #[test]

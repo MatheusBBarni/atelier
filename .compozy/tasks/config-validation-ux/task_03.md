@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add EffectiveConfig required_runtime_ids with guardrail test"
 type: backend
 complexity: low
@@ -28,9 +28,9 @@ Add an owned derivation on `EffectiveConfig` that returns the set of runtime ids
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Implement `required_runtime_ids()` reading the orchestrator agent's runtime.
-- [ ] 3.2 Handle the orchestrator-agent-absent case gracefully (empty set, no panic).
-- [ ] 3.3 Add a guardrail unit test pinning the default-config result.
+- [x] 3.1 Implement `required_runtime_ids()` reading the orchestrator agent's runtime.
+- [x] 3.2 Handle the orchestrator-agent-absent case gracefully (empty set, no panic).
+- [x] 3.3 Add a guardrail unit test pinning the default-config result.
 
 ## Implementation Details
 See TechSpec "Implementation Design → Core Interfaces" (the `required_runtime_ids` block) and ADR-003. The orchestrator is identified by the well-known id `"orchestrator"`; `AgentProfile.runtime` is the primary runtime id. Place the method on the `EffectiveConfig` impl near its definition.
@@ -52,11 +52,11 @@ See TechSpec "Implementation Design → Core Interfaces" (the `required_runtime_
 
 ## Tests
 - Unit tests:
-  - [ ] On the default config, `required_runtime_ids()` equals exactly `{"zai"}` (the default orchestrator runtime) — the guardrail.
-  - [ ] With the orchestrator agent's runtime overridden to `codex`, the set equals `{"codex"}`.
-  - [ ] A config whose `orchestrator` agent is absent yields an empty set (no panic).
+  - [x] On the default config, `required_runtime_ids()` equals exactly `{"zai"}` (the default orchestrator runtime) — the guardrail.
+  - [x] With the orchestrator agent's runtime overridden to `codex`, the set equals `{"codex"}`.
+  - [x] A config whose `orchestrator` agent is absent yields an empty set (no panic).
 - Integration tests:
-  - [ ] A config loaded via `load_effective_config` returns the orchestrator runtime from `required_runtime_ids()`.
+  - [x] A config loaded via `load_effective_config` returns the orchestrator runtime from `required_runtime_ids()`.
 - Test coverage target: >=80%
 - All tests must pass
 
