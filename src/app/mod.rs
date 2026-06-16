@@ -12491,6 +12491,25 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn early_abort_card_carries_a_legible_intent_and_approach() {
+        // The orchestrator prompt nudges turn-one reason/plan (task_06); with a
+        // well-formed decision the gate's card shows a non-empty intent and at
+        // least one approach bullet.
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+
+        let view = &app.state.pending_governance_decision.as_ref().unwrap().view;
+        assert!(!view.intent.trim().is_empty(), "intent must be legible");
+        assert!(
+            !view.approach.is_empty(),
+            "the card must show at least one approach bullet"
+        );
+    }
+
+    #[tokio::test]
     async fn interrupt_clears_pending_clarification_state() {
         let dir = tempdir().unwrap();
         let config = fake_config(dir.path());

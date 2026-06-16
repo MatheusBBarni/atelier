@@ -719,6 +719,7 @@ pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
         "- Set recommended_option_id to the strongest option id, or leave it null when no option stands out.".to_string(),
         "- Set multi_select to true only when the user can sensibly pick several of the clarifying_options at once; otherwise leave it false (single choice).".to_string(),
         "- Do not add a custom, other, or free-text option; the app always provides its own custom text answer path.".to_string(),
+        "- On the first turn, write `reason` as a one-line restatement of your interpreted goal for this run, and `plan` as a short list of concrete approach bullets; the user may see this as an intent confirmation before any file is changed.".to_string(),
         "- Mark the run complete only when the original user request is satisfied.".to_string(),
     ]);
     if config.features.parallel_step_groups && config.limits.max_parallel_agent_steps > 0 {
@@ -1574,6 +1575,24 @@ orchestrator_description = "Use for official documentation and API lookup."
         assert!(prompt.contains("the app always provides its own custom text answer path"));
         assert!(!prompt.contains("question tool"));
         assert!(!prompt.contains("ask_user"));
+    }
+
+    #[test]
+    fn generated_orchestrator_prompt_includes_turn_one_intent_nudge() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        let prompt = build_orchestrator_prompt(&config);
+
+        assert!(prompt.contains("On the first turn, write `reason` as a one-line restatement"));
+        assert!(prompt.contains("`plan` as a short list of concrete approach bullets"));
+        // The nudge is additive — the other routing rules are untouched.
+        assert!(prompt
+            .contains("Mark the run complete only when the original user request is satisfied."));
     }
 
     #[test]
