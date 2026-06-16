@@ -1096,16 +1096,20 @@ fn key_event_to_tui_command_with_ui(
     ui_state: &TuiUiState,
     key: KeyEvent,
 ) -> Option<TuiCommand> {
+    // Reserved-key chokepoint (ADR-004): Ctrl-C is the interrupt/quit kill-switch.
+    // It is enforced here — before the modal cascade, normal routing, and (task_04)
+    // any user-keymap lookup — so no context or future config can shadow it. This is
+    // the single runtime definition of the reserved binding; the bindable allowlist
+    // (`keybindings::is_portable`) excludes Ctrl-C on the validation side.
+    if is_reserved_interrupt(&key) {
+        return Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested));
+    }
+
     if ui_state.help_visible {
         match key {
             KeyEvent {
                 code: KeyCode::Esc, ..
             } => Some(TuiCommand::ToggleHelp),
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
             // Tab navigation is handled entirely within the help-visible branch so
             // these keys never leak to the base handler. Right/Tab advance; Left/
             // Shift-Tab retreat. Shift-Tab is distinguished by the SHIFT modifier.
@@ -1153,23 +1157,11 @@ fn key_event_to_tui_command_with_ui(
             _ => None,
         }
     } else if state.pending_clarification.is_some() {
-        clarification_key_command(state, ui_state, key).or(match key {
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
-            _ => None,
-        })
+        // Ctrl-C is handled by the reserved-key guard above.
+        clarification_key_command(state, ui_state, key)
     } else if state.pending_governance_decision.is_some() {
-        governance_decision_key_command(state, key).or(match key {
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
-            _ => None,
-        })
+        // Ctrl-C is handled by the reserved-key guard above.
+        governance_decision_key_command(state, key)
     } else if state.pending_approval.is_some() {
         key_event_to_tui_command(state, key)
     } else if agent_dropdown(state, ui_state).is_some() {
@@ -1494,13 +1486,24 @@ fn governance_decision_key_command(state: &AppState, key: KeyEvent) -> Option<Tu
     }
 }
 
-fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiCommand> {
-    match key {
+/// The reserved interrupt/quit chord: `Ctrl-C`. Matched at the single chokepoint in
+/// `key_event_to_tui_command_with_ui` so it can never be shadowed by a modal context
+/// or a user keymap. Structurally non-bindable (excluded from `keybindings::is_portable`).
+fn is_reserved_interrupt(key: &KeyEvent) -> bool {
+    matches!(
+        key,
         KeyEvent {
             code: KeyCode::Char('c'),
             modifiers: KeyModifiers::CONTROL,
             ..
-        } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
+        }
+    )
+}
+
+fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiCommand> {
+    match key {
+        // Ctrl-C (interrupt/quit) is owned by the reserved-key guard in
+        // `key_event_to_tui_command_with_ui`; it never reaches this handler in prod.
         KeyEvent {
             code: KeyCode::Char('l'),
             modifiers: KeyModifiers::CONTROL,
@@ -8235,12 +8238,109 @@ mod tests {
             key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             None
         );
+        // Ctrl-C is now owned by the single reserved-key guard in the wrapper, not the
+        // base handler — assert it via the real entry point.
         assert_eq!(
-            key_event_to_tui_command(
+            key_event_to_tui_command_with_ui(
                 &state,
+                &TuiUiState::default(),
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
             ),
             Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_in_every_context() {
+        let ctrl_c = key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let interrupt = Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested));
+
+        // help visible
+        let help_state = state_with_input("", false);
+        let help_ui = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&help_state, &help_ui, ctrl_c),
+            interrupt,
+            "help context"
+        );
+
+        // clarification pending
+        let mut clar_state = state_with_input("draft", false);
+        clar_state.pending_clarification = Some(clarification_view(vec![clarification_option(
+            "opt1", "Option 1",
+        )]));
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&clar_state, &TuiUiState::default(), ctrl_c),
+            interrupt,
+            "clarification context"
+        );
+
+        // governance decision pending
+        let gov_state = state_with_governance_decision("draft");
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&gov_state, &TuiUiState::default(), ctrl_c),
+            interrupt,
+            "governance context"
+        );
+
+        // approval pending
+        let appr_state = state_with_input("", true);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&appr_state, &TuiUiState::default(), ctrl_c),
+            interrupt,
+            "approval context"
+        );
+
+        // plain normal input
+        let normal_state = state_with_input("typing", false);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&normal_state, &TuiUiState::default(), ctrl_c),
+            interrupt,
+            "normal context"
+        );
+    }
+
+    #[test]
+    fn non_ctrl_c_keys_route_normally_in_each_context() {
+        // help: Esc still toggles the modal
+        let help_state = state_with_input("", false);
+        let help_ui = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&help_state, &help_ui, key(KeyCode::Esc)),
+            Some(TuiCommand::ToggleHelp),
+            "help Esc"
+        );
+
+        // normal: a plain char still inserts
+        let normal_state = state_with_input("", false);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &normal_state,
+                &TuiUiState::default(),
+                key(KeyCode::Char('q'))
+            ),
+            Some(TuiCommand::InputCharacter('q')),
+            "normal char"
+        );
+
+        // clarification: Up still cycles options (unaffected by the reserved guard)
+        let mut clar_state = state_with_input("", false);
+        clar_state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("opt1", "Option 1"),
+            clarification_option("opt2", "Option 2"),
+        ]));
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&clar_state, &TuiUiState::default(), key(KeyCode::Up)),
+            Some(TuiCommand::Clarification(
+                ClarificationCommand::PreviousOption
+            )),
+            "clarification Up"
         );
     }
 
