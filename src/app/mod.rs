@@ -5,7 +5,7 @@ use self::chat::{ChatItemView, ChatProjection};
 use self::git::{fetch_git_context, GitContext};
 use crate::actions::{
     execute_action_request, is_vcs_mutation, vcs_action_explicitly_requested, ActionDecision,
-    ActionExecutionContext, ActionKind, ActionRequest, ActionResult, ActionStatus,
+    ActionExecutionContext, ActionKind, ActionRequest, ActionResult, ActionStatus, TrustTarget,
 };
 use crate::config::{
     AgentProfile, AgentPromptMetadata, ApprovalMode, Capability, CouncilExecutionMode,
@@ -37,10 +37,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::env;
 use std::future::{pending, Future};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -356,6 +357,64 @@ pub struct App {
     interrupt_receiver: watch::Receiver<u64>,
     approval_sender: watch::Sender<ApprovalSignal>,
     approval_receiver: watch::Receiver<ApprovalSignal>,
+    /// Session-scoped trust list (ADR-004): in-memory only, never persisted, and
+    /// gone when the process exits. A `Vec` preserves grant order so the `/trust`
+    /// listing and 1-based `revoke_index` line up.
+    trust_store: TrustStore,
+}
+
+/// In-memory, session-scoped allow-list of exact trust targets (ADR-004). Granted
+/// via `ApproveAndTrust` (task_05), managed by `/trust` (task_08), and snapshotted
+/// into each `ActionExecutionContext` so the enforcement matrix can auto-approve a
+/// repeat of an already-trusted target.
+#[derive(Clone, Debug, Default)]
+pub struct TrustStore {
+    entries: Vec<TrustTarget>,
+}
+
+impl TrustStore {
+    pub fn contains(&self, target: &TrustTarget) -> bool {
+        self.entries.iter().any(|entry| entry == target)
+    }
+
+    /// Insert a target if absent. Returns `true` when it was newly granted.
+    pub fn grant(&mut self, target: TrustTarget) -> bool {
+        if self.contains(&target) {
+            false
+        } else {
+            self.entries.push(target);
+            true
+        }
+    }
+
+    /// Remove the entry at a 1-based index from the most recent listing order.
+    /// Returns the removed target, or `None` for an out-of-range index (the store
+    /// is left unchanged).
+    pub fn revoke_index(&mut self, one_based: usize) -> Option<TrustTarget> {
+        if one_based == 0 || one_based > self.entries.len() {
+            return None;
+        }
+        Some(self.entries.remove(one_based - 1))
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// The trusted targets in grant order (the order `/trust` lists and
+    /// `revoke_index` addresses).
+    pub fn list(&self) -> &[TrustTarget] {
+        &self.entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// A cheap, shareable snapshot for one action's `ActionExecutionContext`.
+    pub fn snapshot(&self) -> Arc<HashSet<TrustTarget>> {
+        Arc::new(self.entries.iter().cloned().collect())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -914,6 +973,7 @@ impl App {
             interrupt_receiver,
             approval_sender,
             approval_receiver,
+            trust_store: TrustStore::default(),
         };
         app.record_event(
             None,
@@ -2699,7 +2759,7 @@ impl App {
             user_prompt: Some(run.prompt.clone()),
             action_scope: crate::actions::ActionScope::ParallelFileScope(child.file_scope.clone()),
             floor: self.config.approval.floor,
-            trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
+            trusted_targets: self.trust_store.snapshot(),
         };
         self.record_command_started_if_executable_with_group(
             &run.run_id,
@@ -4212,7 +4272,7 @@ impl App {
                         user_prompt: Some(run.prompt.clone()),
                         action_scope: crate::actions::ActionScope::Unrestricted,
                         floor: self.config.approval.floor,
-                        trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
+                        trusted_targets: self.trust_store.snapshot(),
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -12018,6 +12078,138 @@ runtime = "fake"
             .unwrap();
         assert_eq!(approval_item.status, ChatItemStatus::WaitingApproval);
         assert_eq!(approval_item.severity, ChatSeverity::Warning);
+    }
+
+    // ---- Session TrustStore (task_04) ---------------------------------
+
+    #[test]
+    fn trust_store_grant_contains_and_dedupes() {
+        let mut store = TrustStore::default();
+        let target = TrustTarget::Command("echo trusted-run".to_string());
+        assert!(store.grant(target.clone()));
+        assert!(store.contains(&target));
+        // A second grant of the same target is a no-op.
+        assert!(!store.grant(target.clone()));
+        assert_eq!(store.list().len(), 1);
+        // A different target is not trusted.
+        assert!(!store.contains(&TrustTarget::Command("ls".to_string())));
+    }
+
+    #[test]
+    fn trust_store_revoke_index_is_one_based_and_order_preserving() {
+        let mut store = TrustStore::default();
+        let first = TrustTarget::Command("cargo build".to_string());
+        let second = TrustTarget::WritePath(PathBuf::from("/tmp/x.rs"));
+        store.grant(first.clone());
+        store.grant(second.clone());
+
+        // Out-of-range indices return None and leave the store unchanged.
+        assert_eq!(store.revoke_index(0), None);
+        assert_eq!(store.revoke_index(3), None);
+        assert_eq!(store.list().len(), 2);
+
+        // 1-based removal of the first-listed entry.
+        assert_eq!(store.revoke_index(1), Some(first));
+        assert_eq!(store.list(), &[second]);
+    }
+
+    #[test]
+    fn trust_store_clear_and_snapshot_reflect_entries() {
+        let mut store = TrustStore::default();
+        let target = TrustTarget::Command("cargo build".to_string());
+        store.grant(target.clone());
+        let snapshot = store.snapshot();
+        assert!(snapshot.contains(&target));
+
+        store.clear();
+        assert!(store.is_empty());
+        // The earlier snapshot is independent of later mutations.
+        assert!(snapshot.contains(&target));
+        assert!(store.snapshot().is_empty());
+    }
+
+    fn yolo_enforce_fake_config(dir: &Path) -> EffectiveConfig {
+        let config_path = dir.join("atelier.toml");
+        fs::write(
+            &config_path,
+            r#"
+approval_mode = "yolo"
+
+[approval]
+floor = "enforce"
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn untrusted_gray_area_command_raises_pending_approval() {
+        // Control case: with nothing trusted, the gray-area command pauses.
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        let pending = app.state.pending_approval.as_ref().unwrap();
+        assert_eq!(pending.agent, "fixer");
+    }
+
+    #[tokio::test]
+    async fn trusted_gray_area_command_auto_runs_without_pending_approval() {
+        // Pre-grant the exact command the fixer will emit; the enforcement matrix
+        // returns AllowedByTrust, so the run completes with no modal.
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("echo trusted-run".to_string()));
+
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_approval.is_none());
+        assert_ne!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    #[tokio::test]
+    async fn enforce_floor_from_config_makes_gray_area_prompt_under_yolo() {
+        // Proves config.approval.floor flows into the per-action context: under
+        // Yolo a gray-area command would normally warn-and-run, but floor=enforce
+        // turns it into a pending approval.
+        let dir = tempdir().unwrap();
+        let config = yolo_enforce_fake_config(dir.path());
+        assert_eq!(config.approval.floor, crate::config::FloorPolicy::Enforce);
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_approval.is_some());
     }
 
     #[tokio::test]
