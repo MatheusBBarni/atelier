@@ -8,6 +8,7 @@ use crate::app::{
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
+use crate::governance::{GovernanceAnswer, GovernanceDecisionView};
 use crate::orchestrator::RunState;
 use crate::skills::{
     self, SkillSourceTag, SkillSuggestion, SKILL_DISCOVERY_MAX_DEPTH, SKILL_FILE_NAME,
@@ -87,6 +88,8 @@ const CLARIFICATION_HINT_SINGLE: &str =
     "↑/↓ or 1-9 move · type for custom · Enter confirm · Ctrl-C interrupt";
 const CLARIFICATION_HINT_MULTI: &str =
     "↑/↓ or 1-9 move · Space toggle · type for custom · Enter confirm · Ctrl-C interrupt";
+const GOVERNANCE_DECISION_HINT: &str =
+    "Ctrl-Y accept · Esc reject · type a redirect then Enter to reject with guidance · Ctrl-C interrupt";
 const QUEUE_VISIBLE_MAX: usize = 6;
 const QUEUE_SELECTED_MARKER: &str = "> ";
 const QUEUE_UNSELECTED_MARKER: &str = "  ";
@@ -1123,6 +1126,15 @@ fn key_event_to_tui_command_with_ui(
             } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
             _ => None,
         })
+    } else if state.pending_governance_decision.is_some() {
+        governance_decision_key_command(state, key).or(match key {
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
+            _ => None,
+        })
     } else if state.pending_approval.is_some() {
         key_event_to_tui_command(state, key)
     } else if agent_dropdown(state, ui_state).is_some() {
@@ -1152,6 +1164,7 @@ fn queue_control_active(state: &AppState, ui_state: &TuiUiState) -> bool {
         && !state.queued_follow_ups.is_empty()
         && !ui_state.help_visible
         && state.pending_clarification.is_none()
+        && state.pending_governance_decision.is_none()
         && state.pending_approval.is_none()
 }
 
@@ -1380,6 +1393,67 @@ fn clarification_key_command(
             ..
         } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
             Some(TuiCommand::ClarificationInputCharacter(ch))
+        }
+        _ => None,
+    }
+}
+
+/// Key routing while a governance decision is pending. Accept is deliberately a
+/// Ctrl-modified key so it can never be hit by accident (or while composing a
+/// redirect); the safe default keys (Enter on an empty line, unknown keys) never
+/// accept. A redirect is composed in the normal input line and sent with Enter;
+/// Esc rejects/aborts outright.
+fn governance_decision_key_command(state: &AppState, key: KeyEvent) -> Option<TuiCommand> {
+    let decision_id = state
+        .pending_governance_decision
+        .as_ref()?
+        .decision_id
+        .clone();
+    match key {
+        // Explicit, deliberate accept — Ctrl-modified so it cannot collide with
+        // typed redirect text or be triggered accidentally.
+        KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+            decision_id,
+            GovernanceAnswer::Accept,
+        ))),
+        // Esc rejects/aborts the run (any composed redirect is discarded).
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        } => Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+            decision_id,
+            GovernanceAnswer::Reject { redirect: None },
+        ))),
+        // Enter rejects *with* the composed redirect when one was typed; with an
+        // empty line it is a no-op, so the default key never accepts.
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        } => {
+            let redirect = state.input.trim();
+            (!redirect.is_empty()).then(|| {
+                TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                    decision_id,
+                    GovernanceAnswer::Reject {
+                        redirect: Some(redirect.to_string()),
+                    },
+                ))
+            })
+        }
+        // Compose the optional redirect in the normal input line.
+        KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        } => Some(TuiCommand::InputBackspace),
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            ..
+        } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            Some(TuiCommand::InputCharacter(ch))
         }
         _ => None,
     }
@@ -2583,6 +2657,22 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
             render_help_modal(frame, state, ui_state, &theme);
         } else {
             set_clarification_cursor(frame, areas.input, clarification, ui_state);
+        }
+        return;
+    }
+
+    if let Some(pending) = &state.pending_governance_decision {
+        let areas = clarification_input_areas(composer_area);
+        render_governance_decision_composer(
+            frame,
+            areas.input,
+            &pending.view,
+            &state.input,
+            ui_state,
+        );
+        render_governance_decision_status(frame, areas.status, &theme);
+        if ui_state.help_visible {
+            render_help_modal(frame, state, ui_state, &theme);
         }
         return;
     }
@@ -4552,12 +4642,20 @@ fn clarification_inner_width(area: Rect) -> u16 {
 }
 
 fn composer_height(state: &AppState, ui_state: &TuiUiState, area: Rect, reserved_rows: u16) -> u16 {
-    let Some(clarification) = &state.pending_clarification else {
+    let inner_width = clarification_inner_width(area);
+    let content_rows = if let Some(clarification) = &state.pending_clarification {
+        let layout = clarification_layout(clarification, ui_state, &ui_state.theme);
+        wrapped_event_line_count(&layout.lines, inner_width)
+    } else if let Some(pending) = &state.pending_governance_decision {
+        // Mirror the lines the governance composer renders (card + redirect echo)
+        // so the composer is tall enough to show the decision.
+        let mut lines = governance_decision_card_lines(&pending.view, &ui_state.theme);
+        lines.push(Line::from(String::new()));
+        lines.push(Line::from(format!("Redirect (optional): {}", state.input)));
+        wrapped_event_line_count(&lines, inner_width)
+    } else {
         return INPUT_COMPOSER_HEIGHT;
     };
-    let inner_width = clarification_inner_width(area);
-    let layout = clarification_layout(clarification, ui_state, &ui_state.theme);
-    let content_rows = wrapped_event_line_count(&layout.lines, inner_width);
     // borders (2) + wrapped content + status hint line.
     let desired = content_rows
         .saturating_add(2)
@@ -4835,6 +4933,140 @@ fn render_clarification_status(
     );
 }
 
+/// Build the governance decision card body: the headline, the interpreted
+/// intent, the approach bullets, the responsible agent, the write-scope, and the
+/// plain-language risk label. Risk is an explicit text label (words, never color
+/// alone) so it stays legible under monochrome / `NO_COLOR`.
+fn governance_decision_card_lines(
+    view: &GovernanceDecisionView,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    // The headline, a spacer, the interpreted intent, and the risk label are
+    // always present. Risk sits right after the intent — an explicit text label,
+    // not color alone, so it reads under NO_COLOR and survives the body cap on
+    // short terminals.
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            view.title.clone(),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(String::new()),
+        Line::from(vec![
+            Span::styled("Intent: ", Style::default().fg(theme.text_muted)),
+            Span::styled(view.intent.clone(), Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("Risk: ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                view.risk_label.clone(),
+                Style::default()
+                    .fg(theme.status_warn)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+
+    if !view.approach.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Approach:".to_string(),
+            Style::default().fg(theme.text_muted),
+        )));
+        for bullet in &view.approach {
+            lines.push(Line::from(Span::styled(
+                format!("  - {bullet}"),
+                Style::default().fg(theme.text_dim),
+            )));
+        }
+    }
+
+    if let Some(agent) = view
+        .agent
+        .as_deref()
+        .filter(|agent| !agent.trim().is_empty())
+    {
+        lines.push(Line::from(vec![
+            Span::styled("Agent: ", Style::default().fg(theme.text_muted)),
+            Span::styled(agent.to_string(), Style::default().fg(theme.text)),
+        ]));
+    }
+
+    if !view.write_scope.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Write scope: ", Style::default().fg(theme.text_muted)),
+            Span::styled(view.write_scope.join(", "), Style::default().fg(theme.text)),
+        ]));
+    }
+
+    lines
+}
+
+fn render_governance_decision_composer(
+    frame: &mut Frame,
+    area: Rect,
+    view: &GovernanceDecisionView,
+    input: &str,
+    ui_state: &TuiUiState,
+) {
+    let theme = ui_state.theme;
+    let mut lines = governance_decision_card_lines(view, &theme);
+    // Echo the redirect being composed so the user sees what Enter will send.
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Redirect (optional): ",
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(input.to_string(), Style::default().fg(theme.text)),
+    ]));
+
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    // When the user is composing a redirect, keep the redirect line (the last
+    // line) visible; otherwise show the decision content from the top so the
+    // intent and risk are never scrolled away.
+    let focus_line = if input.is_empty() {
+        0
+    } else {
+        lines.len().saturating_sub(1)
+    };
+    let scroll = clarification_scroll_offset(
+        &lines,
+        focus_line,
+        clarification_inner_width(area),
+        inner_height,
+    );
+    let composer = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll.min(usize::from(u16::MAX)) as u16, 0))
+        .block(
+            Block::default()
+                .title(" Confirm intent · governance ")
+                .title_style(Style::default().fg(theme.accent))
+                .border_style(Style::default().fg(theme.accent))
+                .borders(Borders::ALL),
+        );
+    frame.render_widget(composer, area);
+}
+
+fn render_governance_decision_status(frame: &mut Frame, status_area: Rect, theme: &Theme) {
+    if status_area.width == 0 || status_area.height == 0 {
+        return;
+    }
+    let line_area = Rect {
+        x: status_area.x + 1,
+        y: status_area.y,
+        width: status_area.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(Clear, status_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            GOVERNANCE_DECISION_HINT,
+            Style::default().fg(theme.text_muted),
+        ))),
+        line_area,
+    );
+}
+
 fn set_clarification_cursor(
     frame: &mut Frame,
     area: Rect,
@@ -4928,9 +5160,10 @@ mod tests {
     use crate::app::chat::ChatProjection;
     use crate::app::{
         AgentView, ConfigStatusView, LiveStepStatus, LiveStepView, LiveStreamView,
-        PendingClarificationView,
+        PendingClarificationView, PendingGovernanceDecisionView,
     };
     use crate::config::{load_effective_config, ConfigLoadOptions};
+    use crate::governance::GovernanceKind;
     use crate::history::HistoryEvent;
     use crate::orchestrator::{ClarificationOption, RunState};
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
@@ -7901,6 +8134,173 @@ mod tests {
             input: input.to_string(),
             git_context: None,
         }
+    }
+
+    fn governance_decision_view(decision_id: &str) -> GovernanceDecisionView {
+        GovernanceDecisionView {
+            run_id: "run".to_string(),
+            decision_id: decision_id.to_string(),
+            kind: GovernanceKind::EarlyAbort,
+            title: "Confirm intent before this run edits files".to_string(),
+            intent: "Refactor the config loader".to_string(),
+            approach: vec!["Split the loader".to_string()],
+            agent: Some("fixer".to_string()),
+            write_scope: vec!["src/config".to_string()],
+            risk_label: "High - edits source files".to_string(),
+            plan: None,
+        }
+    }
+
+    fn state_with_governance_decision(input: &str) -> AppState {
+        let mut state = state_with_input(input, false);
+        state.run_state = RunState::WaitingForUser;
+        state.active_run_id = Some("run".to_string());
+        state.pending_governance_decision = Some(PendingGovernanceDecisionView {
+            run_id: "run".to_string(),
+            decision_id: "gov-1".to_string(),
+            view: governance_decision_view("gov-1"),
+        });
+        state
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn governance_accept_key_routes_to_resolve_accept() {
+        let state = state_with_governance_decision("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                "gov-1".to_string(),
+                GovernanceAnswer::Accept
+            )))
+        );
+    }
+
+    #[test]
+    fn governance_reject_key_routes_to_resolve_reject() {
+        let state = state_with_governance_decision("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                "gov-1".to_string(),
+                GovernanceAnswer::Reject { redirect: None }
+            )))
+        );
+    }
+
+    #[test]
+    fn governance_reject_redirect_comes_from_the_input_line() {
+        let state = state_with_governance_decision("focus on tests");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                "gov-1".to_string(),
+                GovernanceAnswer::Reject {
+                    redirect: Some("focus on tests".to_string())
+                }
+            )))
+        );
+    }
+
+    #[test]
+    fn governance_enter_on_empty_line_never_accepts() {
+        let state = state_with_governance_decision("");
+        let ui = TuiUiState::default();
+        let cmd = key_event_to_tui_command_with_ui(
+            &state,
+            &ui,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        // The safe default must never land on Accept; an empty line is a no-op.
+        assert_ne!(
+            cmd,
+            Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                "gov-1".to_string(),
+                GovernanceAnswer::Accept
+            )))
+        );
+        assert_eq!(cmd, None);
+    }
+
+    #[test]
+    fn governance_typing_routes_to_the_input_line() {
+        let state = state_with_governance_decision("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::InputCharacter('x'))
+        );
+    }
+
+    #[test]
+    fn queue_control_inactive_during_pending_governance_decision() {
+        let mut state = state_with_governance_decision("");
+        state.queued_follow_ups = vec![QueuedFollowUpView {
+            id: "q1".to_string(),
+            prompt: "later".to_string(),
+            created_at: "t".to_string(),
+            status: QueuedFollowUpStatus::Pending,
+            pause_reason: None,
+        }];
+        // A pending governance decision suppresses queue keys even with an empty
+        // composer and queued items present.
+        assert!(!queue_control_active(&state, &TuiUiState::default()));
+    }
+
+    #[test]
+    fn governance_decision_card_lines_show_intent_agent_scope_and_risk() {
+        let theme = TuiUiState::default().theme;
+        let lines = governance_decision_card_lines(&governance_decision_view("gov-1"), &theme);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Refactor the config loader"));
+        assert!(text.contains("Split the loader"));
+        assert!(text.contains("fixer"));
+        assert!(text.contains("src/config"));
+        // Risk is an explicit tier word, not color alone.
+        assert!(text.contains("Risk:"));
+        assert!(text.contains("High"));
+    }
+
+    #[test]
+    fn governance_decision_card_renders_in_frame_under_no_color() {
+        let state = state_with_governance_decision("");
+        let no_color_ui = TuiUiState {
+            theme: Theme::resolve(TerminalCaps {
+                no_color: true,
+                truecolor: false,
+            }),
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &no_color_ui, 100, 24);
+        assert!(text.contains("Refactor the config loader"));
+        assert!(text.contains("fixer"));
+        assert!(text.contains("src/config"));
+        assert!(text.contains("High"));
     }
 
     fn render_to_text(state: &AppState, width: u16, height: u16) -> String {

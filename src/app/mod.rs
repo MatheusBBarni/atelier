@@ -302,6 +302,10 @@ pub enum AppEvent {
     PromptSubmitted(String, PromptSource),
     ApprovalAnswered(bool),
     ClarificationAnswered(ClarificationAnswer),
+    /// Resolve the pending governance decision `decision_id` with `answer`
+    /// (governance spine, ADR-003). The `decision_id` lets the resolver reject a
+    /// stale answer that does not match the pending decision.
+    GovernanceDecisionResolved(String, GovernanceAnswer),
     FollowUpCancelled(String),
     FollowUpResumeRequested(String),
     InputCharacter(char),
@@ -974,6 +978,12 @@ impl App {
                 self.state.input.clear();
                 self.publish_state();
                 self.resolve_pending_clarification(answer).await
+            }
+            AppEvent::GovernanceDecisionResolved(decision_id, answer) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resolve_pending_governance_decision(&decision_id, answer)
+                    .await
             }
             AppEvent::FollowUpCancelled(id) => {
                 self.state.input.clear();

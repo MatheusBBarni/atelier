@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: TUI governance decision card and key routing
 type: frontend
 complexity: medium
@@ -30,10 +30,10 @@ Make the governance decision interactive in the terminal: render the decision ca
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Add the governance branch to the key-routing cascade (between clarification and approval).
-- [ ] 4.2 Implement `governance_decision_key_command` (accept/reject/redirect).
-- [ ] 4.3 Render the decision card from the pending view.
-- [ ] 4.4 Update `queue_control_active` to exclude a pending governance decision.
+- [x] 4.1 Add the governance branch to the key-routing cascade (between clarification and approval).
+- [x] 4.2 Implement `governance_decision_key_command` (accept/reject/redirect).
+- [x] 4.3 Render the decision card from the pending view.
+- [x] 4.4 Update `queue_control_active` to exclude a pending governance decision.
 
 ## Implementation Details
 Modify `src/tui/mod.rs`. Add the branch in the cascade (~1117), a `governance_decision_key_command` modeled on `clarification_key_command` (~1317), a card render modeled on the approval/clarification cards, and the `queue_control_active` exclusion (~1150). All color via `src/tui/theme.rs` tokens (the `colors_live_only_in_theme_module` guard test forbids inline `Color::`). Reference TechSpec "User Experience" for card content.
@@ -59,11 +59,11 @@ Modify `src/tui/mod.rs`. Add the branch in the cascade (~1117), a `governance_de
 
 ## Tests
 - Unit tests:
-  - [ ] With `pending_governance_decision` set, the cascade routes the accept key to a resolve-Accept dispatch and the reject key to a resolve-Reject dispatch (precedence over approval/input).
-  - [ ] `queue_control_active()` returns false while a governance decision is pending.
-  - [ ] The default/Enter key does not resolve to Accept (no accidental approve).
+  - [x] With `pending_governance_decision` set, the cascade routes the accept key to a resolve-Accept dispatch and the reject key to a resolve-Reject dispatch (precedence over approval/input).
+  - [x] `queue_control_active()` returns false while a governance decision is pending.
+  - [x] The default/Enter key does not resolve to Accept (no accidental approve).
 - Integration tests:
-  - [ ] Rendering a `PendingGovernanceDecisionView` produces card lines containing the intent, agent, write-scope, and an explicit risk-tier word; the render holds under `NO_COLOR`.
+  - [x] Rendering a `PendingGovernanceDecisionView` produces card lines containing the intent, agent, write-scope, and an explicit risk-tier word; the render holds under `NO_COLOR`.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -72,3 +72,10 @@ Modify `src/tui/mod.rs`. Add the branch in the cascade (~1117), a `governance_de
 - Test coverage >=80%
 - A pending governance decision is visible and answerable from the TUI with correct precedence; legible under monochrome.
 - `cargo fmt --check`, `cargo clippy --all-targets`, and the `colors_live_only_in_theme_module` guard pass.
+
+## Completion Notes
+- **Key map:** `Ctrl-Y` = Accept (Ctrl-modified so it can't be hit while composing a redirect or by accident); `Esc` = Reject{None} (abort, discards any composed redirect); `Enter` = Reject{Some(input)} only when the input line is non-empty, else a no-op — so the safe default never accepts. Printable chars / Backspace edit the normal composer (`InputCharacter`/`InputBackspace`) to compose the optional redirect. The redirect is sourced from `state.input` (the "input line").
+- **Plumbing:** added `AppEvent::GovernanceDecisionResolved(String /*decision_id*/, GovernanceAnswer)` and its `handle_event` arm (calls task_03's `resolve_pending_governance_decision(&decision_id, answer)`). This is how task_03's threaded `decision_id` reaches the resolver from the TUI.
+- **Render:** `governance_decision_card_lines(view, theme)` builds the card with theme tokens only (no `Color::` literals — the `colors_live_only_in_theme_module` guard passes). Card order is title → intent → **risk** → approach → agent → write-scope, so the critical intent+risk survive the body cap on short terminals. `composer_height` was extended to size the composer to fit the governance card (it previously only resized for clarification); the composer scrolls from the top when no redirect is typed and to the redirect echo line while typing.
+- **Dropdowns:** `command_dropdown`/`file_mention_dropdown` are already suppressed during a governance pause via their existing `RunState::WaitingForUser` guard, so no change was needed there.
+- Verified: `cargo test --lib governance` (31 passed, incl. 13 new tui tests), `colors_live_only_in_theme_module` guard passes, `cargo fmt --check` clean, `cargo clippy --all-targets` clean (0 warnings). Full `cargo test --lib` = 887 passed / 12 failed; the 12 are the pre-existing skill tests (proven on the clean task_01 commit). Zero failures attributable to this task.
