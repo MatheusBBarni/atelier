@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add doctor strict flag, exit gate, and discovery nudge"
 type: backend
 complexity: medium
@@ -30,10 +30,10 @@ Add an opt-in `--strict` flag that makes `atelier --doctor` exit non-zero when t
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Add the `strict` flag to `Cli`.
-- [ ] 5.2 Add the `--strict requires --doctor` validation bail.
-- [ ] 5.3 Gate the doctor dispatch: `--strict` + errors → `Err`; else errors → stderr nudge.
-- [ ] 5.4 Add integration tests for every exit-code path.
+- [x] 5.1 Add the `strict` flag to `Cli`.
+- [x] 5.2 Add the `--strict requires --doctor` validation bail.
+- [x] 5.3 Gate the doctor dispatch: `--strict` + errors → `Err`; else errors → stderr nudge.
+- [x] 5.4 Add integration tests for every exit-code path.
 
 ## Implementation Details
 See TechSpec "Implementation Design → Core Interfaces" (the CLI gate + nudge block) and "API Endpoints" (the exit-code table). The dispatch is cli.rs ~156-164; validation bails are at ~62; `main.rs` maps any `Err`→`exit(1)`. Emitting a distinct exit code `2` is explicitly out of scope (ADR-001) — V1 returns `0` or a generic non-zero. For the healthy-path test, configure the orchestrator on an always-available runtime (e.g. `fake`); for the failure path, point it at a runtime whose command is missing.
@@ -59,13 +59,13 @@ See TechSpec "Implementation Design → Core Interfaces" (the CLI gate + nudge b
 
 ## Tests
 - Unit tests:
-  - [ ] `run_cli_with` rejects `--strict` without `--doctor` with the expected message.
+  - [x] `run_cli_with` rejects `--strict` without `--doctor` with the expected message.
 - Integration tests (`tests/cli.rs`, `assert_cmd`):
-  - [ ] `--doctor --strict` on a healthy temp config (orchestrator on `fake`) → `.success()` (exit 0).
-  - [ ] `--doctor --strict` on a config whose orchestrator runtime command is missing → `.failure()` (non-zero).
-  - [ ] Plain `--doctor` with errors → `.success()` and stderr contains `--strict`.
-  - [ ] `--strict` without `--doctor` → `.failure()` with the bail message on stderr.
-  - [ ] `--doctor --strict --json` on errors → stdout parses as JSON; exit is non-zero.
+  - [x] `--doctor --strict` on a healthy temp config (orchestrator on `fake`) → `.success()` (exit 0).
+  - [x] `--doctor --strict` on a config whose orchestrator runtime command is missing → `.failure()` (non-zero).
+  - [x] Plain `--doctor` with errors → `.success()` and stderr contains `--strict`.
+  - [x] `--strict` without `--doctor` → `.failure()` with the bail message on stderr.
+  - [x] `--doctor --strict --json` on errors → stdout parses as JSON; exit is non-zero.
 - Test coverage target: >=80%
 - All tests must pass
 

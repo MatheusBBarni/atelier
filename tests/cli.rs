@@ -2,6 +2,96 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+/// Orchestrator on the always-available `fake` runtime → a healthy doctor report.
+const HEALTHY_CONFIG: &str = "schema_version = 1\n\
+     [runtimes.fake]\ntype = \"fake\"\n\
+     [agents.orchestrator]\nruntime = \"fake\"\n";
+
+/// Orchestrator pointed at a codex runtime whose command does not exist →
+/// the required runtime is Unavailable → the report has an error.
+const ORCHESTRATOR_DOWN_CONFIG: &str = "schema_version = 1\n\
+     [runtimes.codex]\ncommand = \"atelier-nonexistent-binary-xyz-12345\"\n\
+     [agents.orchestrator]\nruntime = \"codex\"\n";
+
+fn write_config(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("atelier.toml");
+    std::fs::write(&path, contents).unwrap();
+    (dir, path)
+}
+
+#[test]
+fn doctor_strict_succeeds_on_healthy_config() {
+    let (work, config) = write_config(HEALTHY_CONFIG);
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .current_dir(work.path())
+        .args(["--doctor", "--strict", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+}
+
+#[test]
+fn doctor_strict_fails_when_orchestrator_runtime_unavailable() {
+    let (work, config) = write_config(ORCHESTRATOR_DOWN_CONFIG);
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .current_dir(work.path())
+        .args(["--doctor", "--strict", "--config"])
+        .arg(&config)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn plain_doctor_with_errors_exits_zero_and_nudges_on_stderr() {
+    let (work, config) = write_config(ORCHESTRATOR_DOWN_CONFIG);
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .current_dir(work.path())
+        .args(["--doctor", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("--strict"));
+}
+
+#[test]
+fn strict_without_doctor_fails_with_bail_message() {
+    let (work, config) = write_config(HEALTHY_CONFIG);
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .current_dir(work.path())
+        .args(["--strict", "--config"])
+        .arg(&config)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--strict is only valid with --doctor",
+        ));
+}
+
+#[test]
+fn doctor_strict_json_keeps_stdout_clean_and_exits_nonzero() {
+    let (work, config) = write_config(ORCHESTRATOR_DOWN_CONFIG);
+    let output = Command::cargo_bin("atelier")
+        .unwrap()
+        .current_dir(work.path())
+        .args(["--doctor", "--strict", "--json", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "strict + errors must exit non-zero"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be clean JSON");
+    assert_eq!(parsed["schema_version"], 1);
+}
+
 #[test]
 fn atelier_version_prints_cargo_package_version() {
     Command::cargo_bin("atelier")
