@@ -1,0 +1,279 @@
+{
+  "summary": "PRD-focused research: approval-mode UX, verify-command discoverability, competitor auto-verify UX, success benchmarks",
+  "agentCount": 4,
+  "logs": [],
+  "result": {
+    "approvalUx": {
+      "area": "approval-ux",
+      "findings": [
+        {
+          "point": "In normal mode a RunCommand DOES surface an approval prompt — but only for commands the built-in classifier rates 'Approve'. The flow is: execute_action_request -> validate_action_request -> decision_for_command -> classify_command. A RequiresApproval decision becomes ActionStatus::ApprovalRequired, which the streaming step turns into a pending approval that pauses the run (RunState::WaitingForUser, LiveStepStatus::WaitingForApproval) and emits an 'approval_requested' event.",
+          "evidence": "decision_for_command at src/actions/mod.rs:356-369 returns ApprovalMode::Normal => RequiresApproval. execute_action_request returns ActionStatus::ApprovalRequired at src/actions/mod.rs:299-307. The app captures it and pauses at src/app/mod.rs:4019-4056 (sets pending_approval, RunState::WaitingForUser, records 'approval_requested', returns StepOutcome::Paused).",
+          "ux_implication": "A grader's command only interrupts the run when the command is NOT on the built-in read-only allowlist. The PRD must distinguish 'gated command' from 'auto-allowed command' rather than assuming every RunCommand prompts."
+        },
+        {
+          "point": "What the user SEES and DOES: the run pauses and the chat transcript shows a warning item titled 'Approval required for <agent>' plus the diagnostic line 'command requires action approval: <command>'. There is NO modal/dialog and NO dedicated hotkey — the user must TYPE a reply into the normal input box and press Enter. approval_input_is_yes treats only 'y' | 'yes' | 'approve' | 'approved' (case-insensitive) as approve; ANY other text (including empty/Enter) is a DENY.",
+          "evidence": "Render path src/tui/mod.rs:2765-2785 prints 'Approval required for {agent} action {action_id}.' + diagnostic. Enter routing src/tui/mod.rs:1438-1443 dispatches AppEvent::ApprovalAnswered(approval_input_is_yes(&state.input)); approval_input_is_yes at src/tui/mod.rs:1492-1497. Chat projection item ChatItemKind::Approval / WaitingApproval at src/app/chat/projection.rs:222-239. The very first time ever, a one-line muted explainer is shown at most once: 'First approval: an agent wants to run a gated action — reply y to approve or n to deny.' (src/app/chat/projection.rs:14-15, gated by show_first_approval_explainer latch).",
+          "ux_implication": "Onboarding gap: there is no visible y/n prompt label or footer hint in the composer for RETURNING users — only the first-ever approval shows the 'reply y' explainer. A grader-driven approval that appears later in a session gives the user just 'Approval required…' with no inline instruction, and a stray Enter silently DENIES. The PRD/onboarding should surface the y/n affordance on every prompt, not just the first."
+        },
+        {
+          "point": "There is NO user-configurable allowlist / trusted-command / auto_approve / pre-approved-command concept. The only 'allowlist' is a hardcoded read-only command classifier, is_default_read_only_command, which auto-rates common build/test/lint/VCS-read commands as 'Allow' so they bypass approval in BOTH modes. cargo test, cargo check, cargo build, cargo fmt, cargo clippy, git status/diff/log/show, rg, ls, grep, find etc. are on it.",
+          "evidence": "is_default_read_only_command at src/actions/mod.rs:443-484 — allow_prefixes includes 'cargo test','cargo check','cargo build','cargo fmt','cargo clippy' (lines 449-453). classify_command returns CommandClassification::Allow for these (src/actions/mod.rs:404-406), and decision_for_command returns ActionDecision::Allowed regardless of approval_mode (src/actions/mod.rs:358). Repo-wide search for allowlist/trusted/auto_approve/whitelist/safe_command found only a tool-vs-capability allowlist and test names — no command allowlist config field (config has no such field; the only command-related config is per-runtime 'command' binary and limits.max_command_minutes).",
+          "ux_implication": "Good news for graders running STANDARD commands: a bare 'cargo test' / 'cargo clippy --all-targets' / 'cargo build' / 'cargo fmt --check' is auto-approved every time, even in normal mode — no prompt ever. But this is fixed and not extensible: a user CANNOT add their own recurring command (e.g. 'make test', 'pnpm test', a custom script) to a trusted list. The PRD should call out that the trusted set is hardcoded and recommend graders use canonical cargo invocations."
+        },
+        {
+          "point": "Critical gotcha: any shell-control syntax (&&, |, ;, >, <, backticks, subshells, redirects) disqualifies a command from the read-only allowlist via has_shell_control_syntax, dropping it to 'Approve'. So the project's own full pre-commit gate 'cargo fmt --check && cargo clippy --all-targets && cargo test --locked' as a SINGLE compound command is NOT auto-allowed and WOULD prompt in normal mode; 'cargo test 2>&1 | tee log' likewise prompts.",
+          "evidence": "is_default_read_only_command first calls has_shell_control_syntax and returns false (not read-only) if it finds control chars (src/actions/mod.rs:443-446); has_shell_control_syntax flags '\\n ; & | > < ` ( )' and '$(' at src/actions/mod.rs:486-521. Such a command then falls through classify_command to the default CommandClassification::Approve (src/actions/mod.rs:440) -> RequiresApproval in Normal mode.",
+          "ux_implication": "A grader that chains lint+test with && (the natural one-liner from CLAUDE.md) will be PROMPTED in normal mode, while the same checks run as separate RunCommand actions would not. The PRD/onboarding should instruct graders to issue each check as a separate, plain command (no &&/pipes/redirects) to stay on the silent path."
+        },
+        {
+          "point": "Approvals are per-action-instance and have NO memory: there is no 'approve all', no 'always allow this command', and no run-scoped escalation. Approving a pending action only flips the approval_mode to Yolo on that single cloned context for that one re-execution; the next gated command starts a fresh approval.",
+          "evidence": "resolve_pending_approval sets pending.context.approval_mode = ApprovalMode::Yolo at src/app/mod.rs:1627-1628 — on the moved-out pending's own context only, then re-runs that one action. No persistence of the approved command string anywhere; pending_approval is a single Option, replaced per action (src/app/mod.rs:4031-4043).",
+          "ux_implication": "If a grader runs a NON-allowlisted test command on every Edit step in normal mode, the user is prompted EVERY single time with no way to remember the decision — approval fatigue. This is the strongest argument in the PRD for either (a) keeping graders on canonical cargo commands, (b) running graders in yolo mode, or (c) proposing a future trusted-command/'remember this' feature (which does not exist today)."
+        },
+        {
+          "point": "Yolo is the DEFAULT mode and runs commands without prompting — confirmed. In yolo, classify_command 'Allow' and 'Approve' both resolve to ActionDecision::Allowed; only the hardcoded 'Deny' set (rm -rf /, mkfs, dd if=, fork bomb, chmod 777, chown -R, sudo, su -, curl/wget piped to sh, reading ~/.ssh//.config, etc.) is blocked. A separate gate also denies VCS mutations (git commit/push/reset/...) unless explicitly requested in the user prompt, regardless of mode.",
+          "evidence": "ApprovalMode default = Yolo (src/config/mod.rs:18-24 #[default] Yolo; default config sets approval_mode: ApprovalMode::Yolo at src/config/mod.rs:896). decision_for_command: CommandClassification::Approve + Yolo => Allowed (src/actions/mod.rs:362-363). Deny patterns at src/actions/mod.rs:378-402. VCS gate: is_vcs_mutation && !vcs_action_explicitly_requested => Denied at src/actions/mod.rs:321-331. Help text confirms: 'yolo (default): agents act without asking' (src/tui/mod.rs:3786-3787).",
+          "ux_implication": "Out of the box a grader runs all test/lint commands with zero prompts (only outright-dangerous commands are blocked). The PRD onboarding can state that the default experience is friction-free for grading; the prompt-per-command concern only arises when a user has deliberately switched to normal mode."
+        }
+      ],
+      "surprises": [
+        "The 'allowlist' that makes graders work smoothly in normal mode is invisible and undocumented in the help text — the Approvals help tab says 'normal: every write or command pauses for your approval' and only adds 'Read-only actions still proceed', which understates that cargo test/build/clippy/fmt (clearly NOT read-only) are also silently allowed (src/tui/mod.rs:3788-3789 vs src/actions/mod.rs:449-453).",
+        "Shell-control syntax silently changes the gating: 'cargo test' is auto-allowed but 'cargo test && cargo clippy' (or with a pipe/redirect) requires approval — the exact compound command CLAUDE.md recommends for the pre-commit gate would prompt in normal mode.",
+        "Approval input is free-text, not a hotkey: pressing Enter on an empty/typo input DENIES the action, and there is no per-prompt y/n hint for returning users (only a once-ever first-approval explainer)."
+      ]
+    },
+    "config": {
+      "area": "config-discoverability",
+      "findings": [
+        {
+          "point": "Config is a layered Option-merge with a strict Raw mirror; a new `[grading]` section must be wired through BOTH the effective struct and a Raw struct or it will hard-fail to parse.",
+          "evidence": "`EffectiveConfig` holds every section (`ui`, `limits`, `features`, `council`, `workspace`, `runtimes`, `agents`) at src/config/mod.rs:402-415. Each has a `Raw*` deserialization mirror inside `RawConfig` (src/config/mod.rs:417-431), and `RawConfig` carries `#[serde(deny_unknown_fields)]` (line 418). `apply_raw` (src/config/mod.rs:909) merges field-by-field with the `if let Some(value) = ... { self.x = value }` pattern (ui 944-954, limits 956-978). `load_effective_config` (1647) layers built-in defaults -> home `~/.config/.atelier/atelier.toml` (default path 1705-1711) -> local `./atelier.toml` (1681) -> CLI flags.",
+          "ux_implication": "A `[grading]` block belongs as a sibling of `[ui]`/`[limits]`: add `grading: GradingConfig` to EffectiveConfig, a `RawGradingConfig` to RawConfig, and a merge arm in apply_raw. Because of deny_unknown_fields, shipping docs that mention `[grading]` before the Raw struct exists would turn any user's config into a parse error -- the flag and its parser must land together. Users opt in identically from home (global) or local (per-repo) atelier.toml; local wins, so per-project verify commands override a global default cleanly."
+        },
+        {
+          "point": "An `enabled = false` opt-in default has two established precedents to copy verbatim.",
+          "evidence": "`Features { parallel_step_groups: bool }` derives `Default` (false) at src/config/mod.rs:196-199 and is gated behind a single bool -- the exact shape for an opt-in toggle. Separately, built-in agents `librarian` and `designer` ship `enabled: false` (src/config/mod.rs:871, 888) and surface that as `enabled = false` in the init-config TOML scaffold (line 2321). Agent enablement defaults to true via `enabled: agent.enabled.unwrap_or(true)` (line 1462), so disabled-by-default is the explicit opt-in form.",
+          "ux_implication": "Model `[grading] enabled = false` on the `Features` precedent (Default-derived bool, off until a user sets it). This gives a one-line opt-in that costs nothing for users who don't want it and never changes default run behavior -- the safest discoverability story for the PRD."
+        },
+        {
+          "point": "There is NO existing verify-command resolution, default test/build command, or cargo/npm project-type detection anywhere in built-in flows -- this is greenfield.",
+          "evidence": "`Capability::Verify` (src/config/mod.rs:35) is only a permission gate, it carries no command. Concrete `cargo test`/`cargo build`/`cargo clippy` strings exist in just three non-executing places: (a) the auto-approval read-only allowlist `is_default_read_only_command` at src/actions/mod.rs:448-478 (safety classification, not a runner); (b) display categorization in src/app/chat/command_summary.rs:80-84; (c) JSON-contract *examples* (\"e.g. cargo test\") in runtime adapter briefs (src/runtime/codex.rs:329-330, src/runtime/claude.rs:1010-1011, src/runtime/cursor.rs:1042-1043). The harness never runs a verify command itself: agents emit `ActionRequest::RunCommand` (src/actions/mod.rs), and agent-reported evidence lands as free-text in `verification: Vec<String>` (src/orchestrator/mod.rs:157). `codemap` (src/codemap/mod.rs) is a file-tree mapper with no project detection (\"build\" at line 24 is just an ignored dir), and `doctor` checks runtime CLIs, prompt files, roots, fallbacks -- never a test command (src/doctor/mod.rs:55-107).",
+          "ux_implication": "The PRD's verify-command feature has nothing to reuse for resolution -- there is no `[verify]` key, no `cargo`-vs-`npm` sniffing to extend. But execution plumbing already exists: a resolved verify command should run through `ActionRequest::RunCommand`, where it automatically inherits the `cargo test`/`build`/`clippy` auto-approval allowlist (actions/mod.rs:448) and the `max_command_minutes` timeout (config limits, line 177). So the new work is config + resolution + injection; do NOT build a new command executor."
+        },
+        {
+          "point": "Reviewer and Fixer tell the agent to verify, but never name a command -- verification today is agent-discovered, not config-driven.",
+          "evidence": "Defaults are embedded Rust consts `DEFAULT_FIXER_INSTRUCTIONS` (src/config/mod.rs:656-667) and `DEFAULT_REVIEWER_INSTRUCTIONS` (669-680). Fixer is told to \"request commands for formatting, tests, or verification\" and to \"report ... verification evidence\"; Reviewer reviews \"verification gaps\" -- neither string contains `cargo test` or any specific command. `default_delegation_guidance` is equally generic (\"verify them through harness-owned actions\", src/orchestrator/mod.rs:766-779). Instructions are overridable per agent via `instructions` / `instructions_file` (RawAgentProfile, src/config/mod.rs:518-519; scaffold points fixer/reviewer at `agents/fixer.md`/`agents/reviewer.md`, lines 2304/2312). The structured contract asks for a `verification` array with only an example value (\"cargo test passed\", codex.rs:330).",
+          "ux_implication": "Because the test command is guessed by the model rather than asserted by config, two runs can verify differently (or skip verification with a plausible-sounding blocker). A configured verify command is the lever to make verification authoritative: inject the resolved command into the Fixer/Reviewer prompt or the prompt envelope so 'did cargo test pass' becomes a checkable instruction instead of an example. This directly motivates the opt-in flag + verify-command pair."
+        },
+        {
+          "point": "Both `--doctor` and `/config` are extend-by-append surfaces, so a grading toggle and its verify command can be made discoverable WITHOUT adding a new slash command (which is frozen).",
+          "evidence": "`run_doctor` pushes a flat `Vec<DoctorCheck>` (id/title/status/severity/message/remediation/context) and is trivially extended with one more `checks.push(...)` (src/doctor/mod.rs:55-107); human+JSON renderers already exist (render_human 222, render_json 241; invoked cli.rs:156-164). `/config` is the app command `handle_config_command` (src/app/mod.rs:1196) rendering `ConfigStatusView` from `build_config_status` (5420), whose summary line is \"Config: sources=N preset=X warnings=N\" (5437) and whose warnings come from `config_warning_messages` (5451, currently only flags missing model_fallbacks). The slash catalog is explicitly frozen against additions absent a PRD scope change (src/slash_commands.rs:40-47); `/config` is described as \"show config files, preset, warnings\" (70-76).",
+          "ux_implication": "Surface grading inside the existing surfaces: add a doctor check like 'grading enabled but no verify command configured / verify command not found on PATH', and a `/config` warning + a line in ConfigStatusView when grading is on. This gives users a discoverable, actionable signal (with remediation text) the moment they flip the flag, reusing two channels they already consult -- and avoids the frozen-catalog cost of a brand-new command."
+        }
+      ],
+      "surprises": [
+        "`Capability::Verify` already exists and is assigned to fixer/reviewer, but it is purely a permission gate with no associated command -- the name suggests verify-running infrastructure that does not exist.",
+        "The reviewer/fixer prompts and the runtime JSON contracts both literally mention 'cargo test' but only as illustrative examples ('e.g. cargo test'), so the codebase looks like it has a verify command when grepped, yet nothing actually resolves or runs one.",
+        "`RawConfig` uses `#[serde(deny_unknown_fields)]`, so any documentation or example that references a `[grading]` section before the parser ships would convert every affected user's atelier.toml into a hard load error -- the flag cannot be soft-launched via docs first.",
+        "codemap sounds like it might do project-type detection but is purely a file-tree structure mapper; the only project signal anywhere (cargo vs npm) is the auto-approval command allowlist in actions/mod.rs, which is cargo-centric and hardcoded."
+      ]
+    },
+    "competitorUx": {
+      "angle": "competitor-ux",
+      "findings": [
+        {
+          "point": "Claude Code 2.1 surfaces verification through hooks, not a dedicated UI: PostToolUse hooks run lint/type checks after each Write/Edit and print results inline, while a Stop hook runs the full test suite at task completion",
+          "detail": "The red-then-green transition is driven by hook exit codes: a hook exiting with code 2 feeds the failure text back and prompts Claude to keep working and self-correct. There is no separate 'iteration N of M' counter — the user reads the loop from the streamed tool/hook output. Verification step selection is heuristic (inspects package.json scripts, linter/typechecker configs, test-runner configs). Reported that native autoVerify defaults to false (opt-in).",
+          "source": "https://www.sitepoint.com/claude-code-21-the-complete-xhigh-and-autoverification-guide-2026/ ; https://www.woutergerrits.com/blog/claude-code-hooks-auto-format-lint-test",
+          "confidence": "medium"
+        },
+        {
+          "point": "Aider has the clearest, most explicit verify-and-fix UX of the cohort: --test-cmd + --auto-test runs the user's test command after every edit, pastes failures back to the model, and loops until exit code 0",
+          "detail": "Which command ran is fully user-controlled and visible. Users can also drive it manually with the in-chat /test <cmd> command ('aider will try and fix any errors if the command returns a non-zero exit code') and /run to execute arbitrary code and optionally share output. Linting is on by default via built-in per-language linters; configurable with --lint-cmd / --lint 'lang: cmd' and disabled with --no-auto-lint. The red-to-green loop is shown as failure output pasted into the chat transcript followed by the model's fix attempt.",
+          "source": "https://aider.chat/docs/usage/lint-test.html ; https://aider.chat/docs/config/options.html",
+          "confidence": "high"
+        },
+        {
+          "point": "Aider's answer to 'no tests exist' is manual, not generative: there is no auto-skip/auto-generate in the core loop — users fall back to /run to execute code and hand the output to the model, or follow the documented 'add a black-box test case' workflow to create one first",
+          "detail": "This matters for the PRD: Aider does not detect-and-warn or offer-to-generate when --auto-test is set but no command is configured; the loop simply does nothing test-wise. Community feature requests (#499 add a test-command CLI param, #680 allow arguments in test-cmd) show users wanted richer, arg-aware configuration of the verify command.",
+          "source": "https://aider.chat/examples/add-test.html ; https://github.com/Aider-AI/aider/issues/680 ; https://github.com/paul-gauthier/aider/issues/499",
+          "confidence": "high"
+        },
+        {
+          "point": "Cursor surfaces verification as inline terminal execution plus a per-file lint pass after each edit, gated by an opt-in 'lint check' setting users must discover and enable",
+          "detail": "With Agent/auto-run mode, commands stream live in the terminal and the agent checks linter errors at each step and fixes them right after generating changes. Key UX limitation users hit: lint is per-file, so a change that breaks a reference in another file is not caught. Cursor 1.3 improved visibility by letting the agent use the native terminal and surfacing a background terminal session to the foreground with one click to monitor or take over. Discoverability gap is explicit in user reports: the 'lint check' self-checking setting is off by default and praised once found ('real productivity booster... would be even better if it were recursive').",
+          "source": "https://x.com/VoloBuilds/status/1862642592229269940 ; https://egghead.io/ai-yolo-sit-back-and-watch-cursor-automatically-run-terminal-commands~4fg1i ; https://alternativeto.net/news/2025/7/cursor-1-3-adds-agent-terminal-sharing-faster-edits-and-enterprise-controls",
+          "confidence": "medium"
+        },
+        {
+          "point": "Cline runs the verify loop fully inline (write -> run in terminal -> read output -> edit -> re-run) with no formal iteration counter; long-running auto-approved commands are surfaced via an OS notification at the 30-second mark",
+          "detail": "Cline 'still shows what it's doing — watch the terminal and file changes,' i.e. progress is read from the live stream rather than a dedicated red/green widget. The documented example IS the verify-fix loop: 'If npm test fails, Cline sees the error output and edits the relevant file before running the tests again.' Auto-approve/YOLO is opt-in and toggle-based (safe-commands vs all-commands, read/edit scoping) rather than an explicit allowlist; the model self-tags each command with a requires_approval flag. Checkpoints + Git are the recommended rollback safety net.",
+          "source": "https://docs.cline.bot/features/auto-approve ; https://www.deployhq.com/guides/cline",
+          "confidence": "high"
+        },
+        {
+          "point": "Devin frames verification as a quality gate, not an interactive loop: it runs tests, linters, scanners, and CI until they pass BEFORE opening a PR, and broadcasts progress and PR status to Slack rather than a terminal",
+          "detail": "The headline UX value is removing re-prompting: Devin 'automatically fixes CI failures until tests pass, eliminating the need for additional requests like \"Please fix the CI issues.\"' Progress surfacing is asynchronous/notification-based (Slack updates, PR status) suited to its background-agent model. Devin can also be directed to write tests and keep iterating until CI is green. Default-on vs opt-in specifics for the verify gate were not clearly documented in sources.",
+          "source": "https://cognition.ai/blog/testing-development ; https://docs.devin.ai/get-started/devin-intro ; https://dev.to/tonkotsuboy_com/how-to-let-devin-ai-write-tests-and-work-until-ci-passes-1jf2",
+          "confidence": "medium"
+        },
+        {
+          "point": "The dominant cross-tool complaint is runaway / infinite loops on the verify-fix cycle, and it is both a UX and a cost problem — directly relevant to needing a visible iteration cap and a 'stuck' affordance",
+          "detail": "Cursor users report the agent 'repeatedly executes the same terminal command' without recognizing it already ran. Cline docs warn a run that 'loops on the same file because the test keeps failing in a way the agent does not understand can cost real money in real-time.' These argue for the PRD to (a) show iteration count explicitly, (b) cap retries, and (c) detect repeated identical failures.",
+          "source": "https://forum.cursor.com/t/ai-agent-stuck-in-infinite-loop-repeatedly-executes-same-terminal-command/113820 ; https://docs.cline.bot/features/auto-approve",
+          "confidence": "high"
+        },
+        {
+          "point": "Second complaint cluster: terminal output going dark / stalling, which breaks the grader's ability to read results and the user's trust",
+          "detail": "Multiple Cursor bug reports describe agentic-mode terminals that hang, stall forever, or fail to display output, blocking the agent from continuing. Implication for an externally-grounded grader: it must robustly capture stdout/stderr/exit-code and time out cleanly, and the UI must show when a verify command is hung vs. genuinely running (Cline's 30s notification is one precedent).",
+          "source": "https://forum.cursor.com/t/terminal-getting-stuck-hangs-stalls-forever-not-displaying-output-in-windows-auto-run-agentic-mode/117747 ; https://docs.cline.bot/features/auto-approve",
+          "confidence": "medium"
+        },
+        {
+          "point": "Third complaint cluster: wrong/over-broad command auto-execution and per-file blind spots; users want a safe allowlist plus easy rollback, not blanket YOLO",
+          "detail": "Reported pattern: agent is mostly correct (~85%) but ~15% of the time does something destructive (deletes still-needed code), requiring manual cleanup. Community guidance converges on auto-approving reads + a small allowlist of safe verify commands (npm test, npm run lint, build) while requiring approval for writes and dependency installs. Cursor's per-file linter missing cross-file breakage is a concrete false-green risk for a grader.",
+          "source": "https://stack.convex.dev/6-tips-for-improving-your-cursor-composer-and-convex-workflow ; https://docs.cline.bot/features/auto-approve ; https://x.com/VoloBuilds/status/1862642592229269940",
+          "confidence": "medium"
+        },
+        {
+          "point": "Verification features skew opt-in and suffer from discoverability problems across the cohort — a default-off setting users must find dilutes adoption",
+          "detail": "Claude Code's autoVerify reportedly defaults false; Cursor's self-checking 'lint check' is off until toggled and only praised once discovered; Cline's auto-approve/YOLO is an explicitly dangerous opt-in. The recurring theme: the verify-and-fix capability exists but is buried in settings. For the PRD, this argues for a sensible default-on-with-safe-allowlist posture, first-run onboarding that names the detected test/lint command, and a visible status line so the feature is self-evident rather than configuration-gated.",
+          "source": "https://www.sitepoint.com/claude-code-21-the-complete-xhigh-and-autoverification-guide-2026/ ; https://docs.cline.bot/features/auto-approve ; https://x.com/VoloBuilds/status/1862642592229269940",
+          "confidence": "medium"
+        },
+        {
+          "point": "None of the surveyed tools cleanly 'offer to generate tests' as the default response to a missing test command inside the edit loop; generation is a separate, user-initiated flow",
+          "detail": "Aider points users to /run and an add-test example; Devin can be told to write tests until CI passes but that is an instruction, not an automatic no-tests fallback in the inline loop. This is whitespace the PRD can own: when the grader finds no test/lint command, the best-in-class UX would be to (1) detect and report it, (2) skip-but-warn rather than silently pass, and (3) optionally offer to scaffold a test — a behavior competitors do not provide by default.",
+          "source": "https://aider.chat/examples/add-test.html ; https://dev.to/tonkotsuboy_com/how-to-let-devin-ai-write-tests-and-work-until-ci-passes-1jf2",
+          "confidence": "medium"
+        }
+      ],
+      "benchmarks": [
+        {
+          "metric": "Cline long-running auto-approved command notification threshold",
+          "value": "OS notification fires at 30 seconds",
+          "source": "https://docs.cline.bot/features/auto-approve"
+        },
+        {
+          "metric": "Cursor agent correctness vs catastrophic-action anecdote",
+          "value": "~85% mostly-correct, ~15% can do something catastrophic (e.g. delete needed code)",
+          "source": "https://stack.convex.dev/6-tips-for-improving-your-cursor-composer-and-convex-workflow"
+        },
+        {
+          "metric": "Claude Code native autoVerify default state",
+          "value": "defaults to false (opt-in); hook exit code 2 = continue/self-correct",
+          "source": "https://www.sitepoint.com/claude-code-21-the-complete-xhigh-and-autoverification-guide-2026/"
+        },
+        {
+          "metric": "Aider verify-fix loop termination condition",
+          "value": "loops running --test-cmd after each edit until exit code 0",
+          "source": "https://aider.chat/docs/usage/lint-test.html"
+        },
+        {
+          "metric": "Devin verification gate placement",
+          "value": "runs tests/linters/scanners/CI until pass BEFORE opening the PR; status pushed to Slack",
+          "source": "https://cognition.ai/blog/testing-development"
+        }
+      ]
+    },
+    "benchmarks": {
+      "angle": "success-benchmarks",
+      "findings": [
+        {
+          "point": "Bounded verify-and-fix loops report credible pass@1 gains of roughly +5 to +13 absolute percentage points on code benchmarks, but the bulk of the gain comes from the FIRST grounded iteration and then saturates.",
+          "detail": "Reflexion reached 91% pass@1 on HumanEval vs GPT-4's 80% baseline (+11pp). Self-Refine improved strong code models (Codex/code-davinci-002) by up to +13% absolute. OpenHands' trained critic moved SWE-bench Verified from 60.6% (single rollout) to 66.4% (best-of-5 with critic selection), a +5.8pp gain that scaled log-linearly with attempts. These bracket a defensible single-pass target band: a well-grounded verify pass can credibly claim a high-single-digit to low-double-digit absolute lift, not a 2x improvement. Self-repair rates decrease with each iteration and saturate, so a bounded (1-pass) loop captures most of the available headroom while controlling cost.",
+          "source": "https://arxiv.org/html/2303.11366 ; https://openreview.net/pdf?id=S37hOerQLB ; https://www.openhands.dev/blog/sota-on-swe-bench-verified-with-inference-time-scaling-and-critic-model",
+          "confidence": "high"
+        },
+        {
+          "point": "External execution/test grounding is a materially stronger verification signal than LLM self-judgment; a verify loop should anchor on tests/regression checks, not LLM-as-judge alone.",
+          "detail": "Self-repair research finds models 'lack the nuanced ability to consistently diagnose and correct their errors' and hinge heavily on feedback quality; execution feedback provides stronger supervision for functional correctness than next-token likelihood or chain-of-thought. OpenHands explicitly filtered patches that failed regression and reproduction tests before critic scoring. Decomposing generate/test/debug reduces error accumulation versus monolithic self-repair. Implication for the PRD: a verify-and-fix loop grounded in real execution signals (build, tests, regression) is the credible lever; ungrounded LLM critique alone risks false passes and can introduce regressions, semantic drift, or new security flaws.",
+          "source": "https://www.emergentmind.com/papers/2306.09896 ; https://arxiv.org/pdf/2506.11442 ; https://arxiv.org/pdf/2603.23633",
+          "confidence": "high"
+        },
+        {
+          "point": "LLM-as-judge precision/recall is highly prompt- and task-dependent (false passes are the main risk), so the loop should treat the judge as a recall-first triage and defer the pass/fail gate to tests.",
+          "detail": "Reported LLM-judge numbers span a wide range: validation studies confirm ~89-95% precision on sampled assessments, and tightly-scoped ground-truth setups hit very high precision/recall (~98.9% precision, ~0.9% false-positive rate) — but those are best-case, narrow tasks. Prompt design trades off sharply: 'General Summary achieves high recall but low precision' while other prompts invert this. For agent code review specifically, guidance is to prioritize RECALL at the scan layer (catch cross-file bugs) and let CI/tests be the source-of-truth gate. So a realistic claim is: LLM judge for broad defect detection, test-grounded verification for the merge gate; do not claim a single LLM judge eliminates escaped defects.",
+          "source": "https://www.evidentlyai.com/llm-guide/llm-as-a-judge ; https://www.augmentcode.com/guides/deep-code-review-recall-vs-precision ; https://www.emergentmind.com/topics/competitor-validating-llm-as-a-judge-agent",
+          "confidence": "medium"
+        },
+        {
+          "point": "Self-repair is only cost-effective under specific conditions; the strongest claim a single-pass externally-grounded loop can make is reducing escaped regressions/rework, not a guaranteed quality jump.",
+          "detail": "The self-repair literature finds repair is cost-effective primarily when the feedback signal is stronger than the generator (e.g., a stronger model or, better, real execution feedback) — naive self-feedback often is not worth the extra tokens. Automated program-repair systems (e.g., AlphaRepair-class) show repair success of ~45% to >70% on benchmark suites, defined as patches passing all unit+integration tests without regressions. For a PRD, the honest success framing is: (a) catch a meaningful fraction of regressions/defects before merge (measured as bug-escape-rate reduction), and (b) reduce rework loops, with the verify pass grounded in tests so the gate is trustworthy. Avoid promising large absolute pass-rate jumps as the headline metric.",
+          "source": "https://www.emergentmind.com/papers/2306.09896 ; https://count.co/metric/bug-escape-rate ; https://arxiv.org/pdf/2504.20093",
+          "confidence": "medium"
+        },
+        {
+          "point": "Cost/latency framing: agentic verify loops realistically cost 5-30x the tokens of a single generation, so a single bounded verify pass (~roughly 2x cost for generate+verify) is the tolerable sweet spot to advertise.",
+          "detail": "Reported agentic workflows consume 5-30x more tokens per task than a plain query (a 24x multiplier observed in one analysis); every retry, tool call, and context reload compounds. Inference-time scaling (test-time compute / best-of-N) buys accuracy but raises the bill roughly linearly with attempts — OpenHands' gain was log-linear in attempts, i.e. diminishing returns past the first few. Latency mitigations like caching successful plans cut repeat latency from ~30s to ~300ms. PRD guidance: frame the verify pass as a bounded single retry (cost ~2x a bare generation, not 10-30x), justify it by rework/defect-escape savings, and cap attempts to avoid the cost-explosion tail. Discriminative/hybrid verifiers beat generative verification under tight latency budgets.",
+          "source": "https://www.stevens.edu /online.stevens.edu/blog/hidden-economics-ai-agents-token-costs-latency/ ; https://towardsdatascience.com/inference-scaling-test-time-compute-why-reasoning-models-raise-your-compute-bill/ ; https://arxiv.org/pdf/2510.14913",
+          "confidence": "medium"
+        },
+        {
+          "point": "Recommended PRD success metrics: bug-escape-rate (defects reaching production) and first-try/repair pass rate are the established, measurable targets for this kind of loop.",
+          "detail": "Industry metric guides treat 'bug escape rate' and 'defect density/escape rate' as the standard production-quality KPIs, and repair systems are measured by 'repair success rate' = % of AI-generated patches passing all unit+integration tests without introducing regressions. A defensible PRD metric set: (1) escaped-defect reduction (pre/post the verify loop), (2) first-pass acceptance / repair success rate against the test gate, and (3) rework-loop reduction. Target magnitudes should be stated as relative reductions validated by an internal baseline rather than importing benchmark deltas wholesale, since the +5 to +13pp figures above are from HumanEval/SWE-bench, not arbitrary production codebases.",
+          "source": "https://count.co/metric/bug-escape-rate ; https://daily.dev/blog/defect-density-and-escape-rate-agile-metrics-guide-2024/ ; https://www.emergentmind.com/papers/2306.09896",
+          "confidence": "medium"
+        }
+      ],
+      "benchmarks": [
+        {
+          "metric": "Reflexion pass@1 on HumanEval (vs GPT-4 baseline)",
+          "value": "91% vs 80% (+11 absolute points)",
+          "source": "https://arxiv.org/html/2303.11366"
+        },
+        {
+          "metric": "Self-Refine absolute improvement on strong code model (Codex / code-davinci-002)",
+          "value": "up to +13% absolute",
+          "source": "https://openreview.net/pdf?id=S37hOerQLB"
+        },
+        {
+          "metric": "OpenHands trained critic on SWE-bench Verified (single rollout -> best-of-5 with critic)",
+          "value": "60.6% -> 66.4% (+5.8pp; log-linear scaling with attempts)",
+          "source": "https://www.openhands.dev/blog/sota-on-swe-bench-verified-with-inference-time-scaling-and-critic-model"
+        },
+        {
+          "metric": "CodeTree (critic-agent guided) pass@1 on CodeContests (competition-level)",
+          "value": "43.0% pass@1 (+22.4% relative gain over resampling baseline)",
+          "source": "https://aclanthology.org/2025.naacl-long.189.pdf"
+        },
+        {
+          "metric": "Automated program-repair (AlphaRepair-class) repair success rate",
+          "value": "~45% to >70% of patches pass all unit+integration tests without regressions",
+          "source": "https://www.emergentmind.com/papers/2306.09896"
+        },
+        {
+          "metric": "LLM-as-judge precision (validation / manual-sampled studies)",
+          "value": "~89.3% accuracy on sampled assessments; ~92-95% confirmed precision on exhaustive analysis",
+          "source": "https://www.evidentlyai.com/llm-guide/llm-as-a-judge"
+        },
+        {
+          "metric": "LLM-as-judge best-case (narrow ground-truth task) precision / recall / false-positive",
+          "value": "98.89% precision, 100% recall, 0.90% false-positive rate (best-case, narrow scope)",
+          "source": "https://www.emergentmind.com/topics/competitor-validating-llm-as-a-judge-agent"
+        },
+        {
+          "metric": "LLM-as-judge prompt-dependent precision/recall tradeoff",
+          "value": "High recall + low precision vs high precision + low recall depending on prompt; balanced prompt needed",
+          "source": "https://www.evidentlyai.com/llm-guide/llm-as-a-judge"
+        },
+        {
+          "metric": "Agentic-workflow token multiplier vs single chatbot query",
+          "value": "5-30x more tokens per task (24x observed in one analysis)",
+          "source": "https://www.techaheadcorp.com/blog/inference-cost-explosion/"
+        },
+        {
+          "metric": "Plan-cache latency mitigation for repeated agent work",
+          "value": "~30s -> ~300ms, cost to near zero on cache hit",
+          "source": "https://online.stevens.edu/blog/hidden-economics-ai-agents-token-costs-latency/"
+        },
+        {
+          "metric": "Self-repair iteration behavior",
+          "value": "Repair success decreases per iteration and saturates; only cost-effective when feedback signal stronger than generator",
+          "source": "https://www.emergentmind.com/papers/2306.09896"
+        }
+      ]
+    }
+  }
+}

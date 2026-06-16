@@ -1,0 +1,1070 @@
+{
+  "summary": "Research the self-grading verify-and-retry loop idea: codebase fit + market/competitive, adversarially verified",
+  "agentCount": 14,
+  "logs": [],
+  "result": {
+    "synth": {
+      "codebase_findings": [
+        "REFUTED IDEA CLAIM: the roadmap label that max_review_fix_cycles is 'validated-but-unused' / 'no code path consumes it' is FALSE. It is already wired to a live reviewer->fixer circuit-breaker: review_fix_cycle_limit_reached (src/app/mod.rs:3704-3710) reads self.config.limits.max_review_fix_cycles and compares against review_fix_cycle_count (src/app/mod.rs:6019-6033, counts reviewer->fixer transitions); stop_for_review_fix_cycle_limit (src/app/mod.rs:3712-3724) halts with RunState::LimitReached + a run_limit_reached event keyed 'max_review_fix_cycles'. Enforced from both decision paths: handle_single_agent_decision (src/app/mod.rs:1977-1980) and handle_parallel_group_decision (src/app/mod.rs:1993-1998). Covered end-to-end by review_fix_cycle_limit_stops_before_extra_fixer_pass (src/app/mod.rs:11391) and unit test review_fix_cycle_count_skips_initial_fixer_pass (src/app/mod.rs:11321).",
+        "TRUE GAP (the actual kernel of the feature): what does NOT exist is an automatic self-grading loop that programmatically grades a just-completed step and re-dispatches the SAME agent with the critique. The existing cycle is orchestrator-DISCRETIONARY (the LLM chooses to route reviewer then fixer), not auto-injected after an Edit. Roadmap refs: docs/feature-roadmap.md:148-151, plans/AUDIT-and-ROADMAP-2026-06-14.md:326.",
+        "max_review_fix_cycles is type Limit (enum Value(u32)|Unlimited) at src/config/mod.rs:178, default Limit::Value(2) at :190; semantics is_reached_by uses value>=limit (src/config/mod.rs:74-99). The LimitVisitor rejects 0 (src/config/mod.rs:131-135), so max_review_fix_cycles=0 fails to parse; minimum effective value is 1. No dedicated/cross-field validation exists for limits (validators at :1749-1798 only cover models/env/runtime args).",
+        "Council is the existing virtual-routing-target template a grader sentinel would copy. Sentinel const COUNCIL_WORKFLOW_AGENT_ID='council' (src/orchestrator/mod.rs:9). Validation short-circuits the real agent lookup in validate_agent_reference (src/orchestrator/mod.rs:637-670) before config.agents.get(). VERIFICATION CAVEAT: dispatch, execution, and synthesis all live in src/app/mod.rs (drive loop), NOT in src/orchestrator/ — the orchestrator module only VALIDATES the virtual id and emits a prompt routing line (src/orchestrator/mod.rs:700-723). Dispatch branch: handle_single_agent_decision src/app/mod.rs:1960; executor run_council_workflow src/app/mod.rs:3155-3323; synthesis synthesize_council_decision src/app/mod.rs:5557-5626 + council_agent_result :5628-5699.",
+        "There is NO generic virtual-target registry: council is hardcoded `if agent_id == COUNCIL_WORKFLOW_AGENT_ID` string-equality at 3 sites (src/orchestrator/mod.rs:642 validation, src/app/mod.rs:1960 dispatch, src/orchestrator/mod.rs:704 prompt). A grader sentinel would replicate this bespoke shape (new const + validation branch + dispatch branch + prompt line + executor/synthesis fns), not plug into an extension point — so 'clean reuse' is a template-copy, not a plugin seam.",
+        "AgentResult struct is at src/orchestrator/mod.rs:147-160 (idea's cite of 154-158 points at individual fields). It has NO machine-parsable pass/fail verdict field. The only machine verdict is status: AgentResultStatus (enum Completed/Blocked/Failed/Cancelled/ParseError/LimitReached/ApprovalDenied/NoChanges, src/orchestrator/mod.rs:124-135), which carries OPERATIONAL meaning (NoChanges, ApprovalDenied), not a quality judgment. findings/verification/blocker (Vec<String>/Option<String>) are free-text SELF-attested by the agent's JSON contract (parse_agent_result :297-299; schema brief src/runtime/codex.rs:320-333, duplicated in claude.rs/cursor.rs). 'verification' is the agent grading ITSELF, so it cannot serve as an external verdict. A clean grader contract needs a NEW field/schema.",
+        "Capability enum is at src/config/mod.rs:26-37 (idea hinted actions/mod.rs, which only defines ActionKind/ToolName + the mapping). Capability::Verify and Capability::Review are NON-gating — only Read/Command/Edit map to harness actions (src/config/mod.rs:64-71, src/actions/mod.rs:702-709). A grader profile needs Read (+Command to run real checks) and must NOT have Edit; Verify/Review only shape orchestrator routing guidance (src/orchestrator/mod.rs:766-780) and decision validation (:661-668).",
+        "An existing grader-shaped profile already ships: built-in reviewer (enabled by default) has caps Read/Command/Verify/Review, no Edit, instructions 'risk-first review of completed work ... do not edit files' (src/config/mod.rs:837-855, DEFAULT_REVIEWER_INSTRUCTIONS :669-675). fixer is Read/Edit/Command/Verify (:817-836). So a grader could be the reviewer profile (or a clone with a strict verdict contract).",
+        "Primary auto-grader interception point: the AgentResult arm of run_agent_step at src/app/mod.rs:3083-3094, where the producing agent's profile is already in scope (fetched at :3052), so one can check agent.has_capability(&Capability::Edit) + result.changed_files non-empty before pushing RunStepResult::Agent onto run.previous_results. Note run_agent_step returns AgentStepOutcome::Completed even when result.status is Blocked/Failed — 'step completed' means 'agent produced a result', not 'work succeeded'. Whole-run completion is a separate orchestrator call (DecisionStatus::Complete -> RunState::Completed at src/app/mod.rs:1927).",
+        "Per-step limit duplication CONFIRMED but recounted: the fully-duplicated set-state+run_limit_reached-event+return block for max_agent_steps appears 4x (src/app/mod.rs:2399, 2895, 3040, 3208), with a 5th predicate call at :3772; the broader per-step time/action re-checks span 6 distinct methods (9 step-time stop sites, 2 step-action). Dedicated stop_for_* helpers exist for every OTHER limit (wall-clock :3648, step-time :3666, step-action :3685, review-fix :3712, parallel-group :2357) but NOT for per-step max_agent_steps. A naive grader step widens this to a 5th/6th copy unless refactored first.",
+        "Events are stringly-typed: HistoryEvent.kind is a free-form String (src/history/mod.rs:12-26); there is no enum registry. record_event/record_event_with_group (src/app/mod.rs:4164-4241) is the single chokepoint (durable JSONL append + chat projection feed + state publish). The projection dispatch (src/app/chat/projection.rs:58-111) has a catch-all `_ => {}` at :110, so a new 'grade_round' kind is durably persisted but INVISIBLE in chat until an apply_* arm is added. Precedent asymmetry: step_limit_reached events have no projection arm (invisible) while run_limit_reached IS projected.",
+        "WaitingForUser is a reusable pause/resume transport but currently has NO accept/retry/abort routing. Pause: handle_orchestrator_decision WaitingForUser arm captures the full RunDriveContext into pending_clarification, mints a question_id, records clarification_requested (src/app/mod.rs:1895-1926). Resume: resolve_pending_clarification (src/app/mod.rs:1689-1736) just APPENDS the answer to run.prompt and re-drives the orchestrator — there is no branch interpreting a tri-state choice. Today exhausted grade cycles hard-stop (RunState::LimitReached) rather than escalating, so user escalation is a behavior change at one site (stop_for_review_fix_cycle_limit).",
+        "Rendering N grade/retry rounds as ONE evolving chat item requires a stable ChatLifecycleKey shared across rounds (new GradeCycle{run_id} variant or reuse Run{run_id}) plus an apply_grade_round arm that accumulates cumulative body lines itself (upsert replaces in place, src/app/chat/projection.rs:1339-1383), capped by MAX_BODY_LINES=12 (:19). Council is the cautionary counter-example: it does NOT collapse — each councillor is a separate Step item and council markers are keyless diagnostics (lifecycle_key:None)."
+      ],
+      "market_findings": [
+        "The idea's framing that 'a built-in critic loop is exactly the self-correction larger agent frameworks charge for' is LARGELY FALSE/imprecise. Two realities: (1) every major OSS framework gives the loop away free as an assemble-it-yourself primitive (LangGraph reflection/reflexion, CrewAI guardrails+retry, AutoGen/AG2 critic agent, MS Agent Framework LLM-as-judge, OpenAI Agents SDK guardrails); (2) paid products (Devin, Cursor BugBot, Qodo) bundle the loop into a whole product and charge for compute/packaging (cloud VMs, autofix, ensemble validation, observability), never itemizing the loop as a gated SKU. No one sells 'a critic loop' standalone.",
+        "CrewAI task guardrails are the closest prior art to the proposed design and are free/OSS: a guardrail validates output right after the agent finishes (function-based or LLM/natural-language) and on failure routes the error message back to the SAME agent to retry, with a configurable retry cap (~2 extra attempts by default). This is almost exactly 'grader judges pass/fail, re-run same agent with critique appended, bounded by max cycles'.",
+        "Built-in self-correction is becoming TABLE STAKES, not a USP. Claude Code 2.1 (the harness's direct competitor) promotes auto-verification to a native workflow: generate -> run lint/type/test -> evaluate vs pass criteria -> self-correct/retry/confirm. Community patterns add a fresh-model verification SUBAGENT and Stop/PostToolUse hooks gating completion. Cursor and Devin ship automatic run-and-fix loops bundled in the product.",
+        "Two productized monetization lines exist around grading: (1) eval/LLM-as-judge platforms sold to AI builders (DeepEval/Confident AI, Braintrust, Galileo, Evidently, LangSmith, Arize, Ragas); (2) in-product reviewers/verifiers sold to developers (Cursor BugBot, Qodo, Greptile, Devin). A self-grading critic loop sits at their intersection as an INTERNAL verifier, not a separable product.",
+        "Re-running the SAME agent that was graded is a known weak spot. Claude Code's verification subagent and AG2's critic deliberately use a SEPARATE/fresh-context model to grade so the worker isn't its own judge. atelier already separates grader (reviewer) from implementer, which is the right instinct — but the design must ensure the grader is a distinct agent/context, not implementer self-grading.",
+        "Unbounded self-correction is a documented, expensive failure mode: Devin users report the agent 'gets stuck in expensive loops, racking up compute while failing to deliver working code', and LangGraph reflexion makes the max-cycle termination an explicit conditional edge. This validates the proposed bounded-cycle guardrail (which atelier already has via max_review_fix_cycles) as core, not an afterthought.",
+        "Market demand for automated code verification is real and growing: AI-generated code now ~46% of new code, turning human-only review into a bottleneck, and rework costs are rising sharply post-AI-adoption — the concrete pain a verify loop targets. But the credible value story must tie the grade to external signals (compile/test/lint), the very signals that demonstrably work.",
+        "Economics favor a per-step grader IF it cuts rework: a single LLM-judge pass costs ~$0.001-0.003 (GPT-4o-mini) to ~$0.015-0.045 (Claude Sonnet), far below the $30-40/dev/mo willingness-to-pay seen for in-product reviewers (Cursor BugBot ~$40 add-on, Qodo ~$30). Verifier reranking research shows higher accuracy at lower k than self-consistency using 1-3x fewer tokens, and Self-Truncation Best-of-N matches full Best-of-N at 75-80% lower cost — so a bounded single verification pass is a small, tunable multiplier."
+      ],
+      "differentiators": [
+        "Automatic-by-default + opinionated + bounded is the honest differentiator: convenience/batteries-included UX, NOT unlocking a paywalled capability. OSS frameworks make you assemble the loop; atelier would ship it wired and config-bounded out of the box. Position it as that, not as 'what others charge for'.",
+        "atelier ALREADY structurally separates grader (reviewer, Read/Command/Verify/Review, no Edit) from implementer (fixer, has Edit), avoiding the same-agent self-grading bias that plagues naive reflection loops — provided the grader runs in a distinct agent/context. Most OSS examples and CrewAI default to re-running the SAME agent, so a clean grader/implementer split is a genuine (if modest) edge.",
+        "The defensible design — and the one the evidence demands — grounds the grade in EXTERNAL execution (compile/test/lint), not pure LLM self-grade. atelier already has the primitives: Capability::Command + the RunCommand action let a grader actually run tests and feed real failure locators back. Few terminal harnesses make external-signal grounding a first-class, config-driven default; that, not the loop pattern itself, is where atelier can stand apart.",
+        "atelier already owns the bounding guardrail infrastructure (max_review_fix_cycles wired live, RunState::LimitReached, cycle-count loop detection) that competitors had to bolt on — so it can ship a converging, non-runaway loop without new safety machinery, only new routing.",
+        "SKEPTICAL NOTE: 'terminal-native, single-binary, config-driven' are real atelier traits but are NOT loop-specific differentiators — every coding agent now ships some self-verify loop (Claude Code 2.1, Cursor, Devin, Cline). The loop alone is commoditized; the only durable edge is (a) external-signal grounding by default, (b) clean grader/implementer separation, and (c) bounded+observable cycles surfaced transparently in the TUI transcript."
+      ],
+      "competitors": [
+        {
+          "name": "Anthropic evaluator-optimizer",
+          "what": "Canonical reference pattern (optimizer generates, evaluator critiques, loop to quality bar) — free blog + runnable cookbook notebook, not a product."
+        },
+        {
+          "name": "LangGraph reflection/reflexion",
+          "what": "Graph-based generate->reflect->regenerate loop with bounded revision via a conditional edge; free OSS primitive you wire yourself (not on by default)."
+        },
+        {
+          "name": "CrewAI task guardrails",
+          "what": "Closest prior art: validates output after the agent finishes and auto-routes the error back to the SAME agent to retry with a ~2 cap; free OSS, automatic once a guardrail is attached."
+        },
+        {
+          "name": "AutoGen / AG2",
+          "what": "Critic/reviewer AssistantAgent evaluates another agent's output and returns feedback; nested chats + SocietyOfMind embed inner critique; free OSS, manual to compose."
+        },
+        {
+          "name": "OpenAI Agents SDK",
+          "what": "Guardrails run input/output validation in parallel and fail-fast (safety tripwire, not a regenerate loop); LLM-as-judge evals live on the paid platform surface."
+        },
+        {
+          "name": "Microsoft Agent Framework",
+          "what": "LLM-as-judge implemented as a separate agent with a stricter rubric prompt; free OSS, post-execution scoring you build."
+        },
+        {
+          "name": "Claude Code",
+          "what": "Direct competitor; 2.1 makes auto-verification native (lint/type/test -> evaluate vs criteria -> self-correct); community adds fresh-model verification subagent + Stop/PostToolUse gating; bundled, no upcharge."
+        },
+        {
+          "name": "Cursor (Agent / BugBot)",
+          "what": "Automatic run-and-fix loop once Auto-run/lint-check enabled; BugBot is a ~$40/mo add-on reviewer with autofix; loop bundled in paid product, not itemized."
+        },
+        {
+          "name": "Devin (Cognition)",
+          "what": "Autonomous VM agent that runs tests, reads logs, and iterates/fixes; loop bundled, billed by ACU compute, not as a separate critic SKU."
+        },
+        {
+          "name": "Cline",
+          "what": "Open-source VS Code agent that plans, executes, runs tests, reads stacks, edits, and re-runs until pass; free/BYO-key, you pay only model costs."
+        },
+        {
+          "name": "Qodo (ex-CodiumAI)",
+          "what": "Quality platform: pre-merge PR review + Qodo Cover test-gen, ~$30/dev/mo — verification-as-a-paid-feature, the closest 'grading as product'."
+        },
+        {
+          "name": "DeepEval / Confident AI",
+          "what": "OSS LLM-as-judge eval framework + hosted platform ($0/$39 seat/mo); canonical 'judge-as-a-product' for AI builders."
+        }
+      ],
+      "integration_points": [
+        "src/app/mod.rs:3083-3094 — AgentResult arm of run_agent_step (producing agent profile in scope at :3052). Primary auto-grader interception: after a step returns RuntimeOutput::AgentResult, check agent.has_capability(&Capability::Edit) + result.changed_files before pushing RunStepResult::Agent, then synthesize/route a grader step. Alt one level up: handle_single_agent_decision after run_agent_step returns Completed (src/app/mod.rs:1981).",
+        "src/orchestrator/mod.rs:9 (COUNCIL_WORKFLOW_AGENT_ID) + src/orchestrator/mod.rs:637-670 (validate_agent_reference short-circuit) + src/app/mod.rs:1954-1985 (handle_single_agent_decision dispatch branch) + src/orchestrator/mod.rs:700-723 (build_orchestrator_prompt 'Available harness workflows') — the 3-point sentinel template a GRADER_WORKFLOW_AGENT_ID would copy (new const + validation arm + dispatch arm + prompt line). Without the validation arm, a new sentinel is rejected as 'unknown agent'.",
+        "src/app/mod.rs:3155-3323 (run_council_workflow) — reference executor for a synthesized virtual workflow: serial loop consulting wall_clock_limit_reached (:3204) and limit_reached(max_agent_steps, run.step_count) (:3208) with run.step_count += 1 (:3221), per-member timeout, then push RunStepResult::Agent into run.previous_results (:3321) and return Ok(true). A grader loop mirrors this.",
+        "src/app/mod.rs:3704-3724 (review_fix_cycle_limit_reached / stop_for_review_fix_cycle_limit) + src/app/mod.rs:6019-6033 (review_fix_cycle_count) + limits.max_review_fix_cycles — the existing bounded-cycle guard a grader/retry loop should extend or mirror to cap regrading; both decision paths (:1977, :1993) already call it.",
+        "src/orchestrator/mod.rs:147-160 (AgentResult) — to emit a structured verdict, add a NEW field (verdict/score + critique) rather than overloading status (which means 'finished', not 'correct') or self-attested verification. The agent-facing schema brief that must be updated lives at src/runtime/codex.rs:320-333 (+ claude.rs/cursor.rs).",
+        "src/config/mod.rs:26-37 (Capability) + gating map src/config/mod.rs:64-71 + src/actions/mod.rs:702-709 — a grader profile needs Read (+Command for real checks) and must lack Edit; Verify/Review are non-gating routing signals only. Reuse the built-in reviewer profile (src/config/mod.rs:837-855) or clone it with a strict verdict contract.",
+        "src/app/mod.rs:4164-4241 (record_event / record_event_with_group) + src/app/chat/projection.rs:58-111 (apply_history_event dispatch, catch-all at :110) — emit a 'grade_round'/'retry_round' kind here and add a matching arm to make it visible. Free-form JSON payload, schema_version stays 1.",
+        "src/app/chat/projection.rs:1339-1383 (upsert) + src/app/chat/mod.rs:115-144 (ChatLifecycleKey) — to render N rounds as one evolving item, add a GradeCycle{run_id} variant (or reuse Run{run_id}) and have apply_grade_round accumulate cumulative body lines (read prior item via self.index like apply_clarification_answered), within MAX_BODY_LINES=12 (:19); extend is_terminal_run_conclusion (:1421-1434) to chronologically pin the concluded item.",
+        "src/app/mod.rs:1895-1926 (WaitingForUser pause) + src/app/mod.rs:1689-1736 (resolve_pending_clarification resume) + src/orchestrator/mod.rs:64-73 (clarifying_options/recommended_option_id) — reusable transport to escalate accept/retry/abort on cycle exhaustion. Requires NEW wiring: a branch on answer.selected_option_id BEFORE the prompt-append/re-drive (abort->Failed, retry->reset cycle + drive, accept->Complete), replacing the current hard-stop at stop_for_review_fix_cycle_limit.",
+        "Refactor target before adding a grader: src/app/mod.rs:2399/2895/3040/3208 (4 duplicated max_agent_steps stop blocks, +predicate at :3772). Introduce a shared stop_for_agent_step_limit helper (none exists today, unlike the other limits) so the grader step does not add a 5th/6th copy; also fix the step_limit_reached projection gap (src/app/chat/projection.rs)."
+      ],
+      "stats": [
+        "Reflexion (arXiv:2303.11366, NeurIPS 2023): ~8% absolute boost from self-reflection over an episodic-memory baseline; 91% pass@1 on HumanEval vs 80% GPT-4 baseline — but feedback is EXTERNAL (unit tests / env reward), not pure self-grade.",
+        "Self-Refine (arXiv:2303.17651): ~20% average improvement over single-pass across 7 tasks (GPT-3.5/ChatGPT/GPT-4); gains plateau fast and depend on critique specificity, not round count.",
+        "CRITIC (arXiv:2305.11738, ICLR 2024): pure self-evaluation verifies its own answers at only ~54% on HotpotQA (near random) and self-critique scored WORSE than the original output on TriviaQA — tool feedback is what drives correction.",
+        "Self-Preference Bias (arXiv:2410.21819): LLMs (GPT-4 strongest) over-rate their own outputs vs humans; measured self-preference roughly -38% to +90% on ArenaHard, correlated with low perplexity (familiarity).",
+        "OpenHands (Apr 2025): a TRAINED critic lifts SWE-Bench Verified from 60.6% (single trajectory) to 66.4% (5 attempts), and the trained critic beats prompt-based reranking; DeepSWE 42.2%->59% and CWM 53.9%->65.8% with test-time scaling.",
+        "CrewAI task guardrails auto-retry the same agent up to ~2 additional times by default (configurable) — closest analog to the proposed design (docs.crewai.com).",
+        "LLM-judge cost per pass: ~$0.001-0.003 (GPT-4o-mini) or ~$0.015-0.045 (Claude Sonnet) — far below the $30-40/dev/mo willingness-to-pay for in-product reviewers (confident-ai.com).",
+        "In-product reviewer pricing: Cursor BugBot ~$40/mo add-on on a ~$20/mo base; Qodo ~$30/developer/mo. Devin: Pro $20/mo, Max $200/mo, Teams $80/mo, Enterprise historically ~$500/mo, billed by ACU compute.",
+        "Verifier reranking reaches higher accuracy at lower k than self-consistency using 1-3x fewer tokens; Self-Truncation Best-of-N matches full Best-of-N at 75-80% lower cost (openreview/Satori-SWE/SWE-Gym).",
+        "AI code-tools market ~$7.65B (2025) -> ~$9.46B (2026) at ~23.7% CAGR, ~$22.2B by 2030; AI code-review tool slice ~$750M (2025); ~46% of new code is AI-generated and ~40% of AI-generated code is reported to carry security vulnerabilities.",
+        "Rework rises 30-60% within 6 months of heavy AI tool adoption (for every 10 hrs saved, 4-6 go to rework); GitClear (211M LOC) found churn rose 5.5% (2020) -> ~7.9% (2024) and duplicated blocks rose ~8x; DORA 2024 estimated a 7.2% drop in delivery stability per 25% increase in AI adoption.",
+        "Security Degradation in Iterative AI Code Generation (arXiv:2506.11022): more refinement rounds accumulated MORE security vulnerabilities — direct evidence that unbounded auto-retry has downside risk, not just diminishing returns."
+      ],
+      "contradictions": [
+        "IDEA vs CODE (refuted): the roadmap calls max_review_fix_cycles 'validated-but-unused'; it is actually a live consumer bounding the orchestrator's reviewer->fixer cycle (src/app/mod.rs:3704-3724, tests at :11391/:11321). The real gap is the absence of an AUTOMATIC self-grade->re-dispatch loop, a different mechanism — not absence of enforcement.",
+        "IDEA vs MARKET (largely false): 'a built-in critic loop is exactly the self-correction larger agent frameworks charge for'. OSS frameworks give the loop away free as a primitive; paid products charge for surrounding compute/packaging (cloud VMs, autofix, ensemble validation, observability), never the loop as a gated SKU. The verification verdict 'holds' only in the weak sense that 'some products sell critic-loop features'.",
+        "IDEA vs EVIDENCE (uncertain core premise): 'automatic self-critique reliably improves coding output'. True ONLY when grounded in EXTERNAL feedback (tests/compiler/linter/oracle). Pure intrinsic self-grade is unreliable and can DEGRADE output: Huang et al. (arXiv:2310.01798) show intrinsic self-correction flips correct answers to wrong; Kamoi et al. (arXiv:2406.01297) find no prior work shows successful self-correction from prompted-LLM self-feedback except exceptionally-suited tasks; Olausson et al. (Is Self-Repair a Silver Bullet?) found human feedback yielded 1.58x more passing fixes than GPT-4 self-feedback.",
+        "IDEA vs CODE (count off): '~5 scattered per-step checks'. The fully-duplicated max_agent_steps stop block appears 4x (src/app/mod.rs:2399/2895/3040/3208) with a 5th predicate at :3772; the broader per-step time/action re-checks span 6 methods. Roughly right but imprecise, and the lack of a shared stop_for_agent_step_limit helper is the actionable gap.",
+        "IDEA vs CODE (location wrong): the idea hinted the Capability enum lives in actions/mod.rs; it is in src/config/mod.rs:26-37 (actions/mod.rs only maps ActionKind->Capability). Also Verify/Review are non-gating, contrary to the implicit assumption that a grader needs them.",
+        "IDEA vs CODE (cite off): AgentResult was cited at 154-158; the struct spans src/orchestrator/mod.rs:147-160. More important, there is NO machine verdict field — 'verification' is agent self-attestation, so it cannot be repurposed as an external grader verdict."
+      ],
+      "risks": [
+        "Same-agent self-grading is biased: self-preference bias (arXiv:2410.21819) means a model over-rates its own buggy code, producing false 'pass' grades and missed defects. Mitigation: grader must be a distinct agent/context (atelier's reviewer/fixer split helps) AND grounded in external execution, not self-judgment.",
+        "Value-premise risk: a PURE self-grade loop is unlikely to improve quality and can degrade it (Huang et al.; CRITIC; Kamoi et al.). If the grade is not wired to real compile/test/lint signals, expect a multiplied token/latency bill (~Nx) for flat or negative accuracy.",
+        "Iteration risk: unbounded loops are an expensive, documented failure mode (Devin cost loops) and more rounds can accumulate security flaws (arXiv:2506.11022). Hard caps + convergence/state-hash dedup + an off-ramp are required, not optional.",
+        "Implementation risk: naively adding a grader step widens existing per-step limit duplication (4 copied max_agent_steps blocks) to a 5th/6th copy; and a new grade_round event is durably persisted but INVISIBLE in chat unless a projection arm is added (the step_limit_reached gap is precedent for silently-invisible events).",
+        "Schema risk: reusing AgentResult.status as pass/fail conflates 'agent finished' (NoChanges/ApprovalDenied) with 'work is correct'; a clean verdict needs a new field/schema and a synchronized update to all three runtime schema briefs (codex/claude/cursor).",
+        "Market/positioning risk: built-in self-correction is fast becoming table stakes (Claude Code 2.1 native auto-verification, Cursor, Devin, Cline). The loop alone is not a defensible USP; over-claiming 'unlocks what others paywall' is inaccurate and easy to refute.",
+        "Behavior-change risk: escalating exhausted cycles to the user via WaitingForUser is a change from today's hard-stop (RunState::LimitReached); the resume path only appends text + re-drives the orchestrator, so accept/retry/abort needs new selected_option_id routing in resolve_pending_clarification or it silently no-ops.",
+        "Budget-interaction risk: if a grader step consumes run.step_count like council does, a multi-round grade/retry sequence can exhaust max_agent_steps mid-loop and emit run_limit_reached before converging — the grader may need an off-budget or separately-capped accounting."
+      ],
+      "open_questions": [
+        "Will the grade be grounded in external execution (run tests/lint via Capability::Command + RunCommand) or be a pure LLM self-grade? The evidence makes this the single most decisive design choice — external grounding is what works; self-grade alone is unreliable.",
+        "Mechanism choice: extend the EXISTING orchestrator-driven reviewer->fixer cycle (make the orchestrator auto-route reviewer after Edits) vs a NEW auto-injected grader sentinel force-injected at src/app/mod.rs:3083? These are distinct paths with different blast radius.",
+        "Grader identity: reuse the built-in reviewer profile, or a new grader sentinel modeled on council? If a sentinel, does it opt out of the council_route_allowed-style scope gate, and does it consume run.step_count budget?",
+        "Verdict contract: add a new structured verdict/score+critique field to AgentResult (and update the codex/claude/cursor schema briefs), or overload status+findings? A machine-parsable verdict is needed to gate retries deterministically.",
+        "On cycle exhaustion: keep the current hard-stop (RunState::LimitReached), or escalate to the user via a WaitingForUser accept/retry/abort gate (requiring new selected_option_id routing in resolve_pending_clarification)? Which is the default?",
+        "Should the per-step max_agent_steps duplication be refactored into a shared stop_for_agent_step_limit helper BEFORE the grader lands, to avoid adding a 5th/6th copy and to fix the step_limit_reached projection asymmetry?",
+        "Chat UX: render grade/retry rounds as ONE evolving item (new GradeCycle{run_id} lifecycle key, cumulative body within MAX_BODY_LINES=12) or as discrete per-round items like council? The collapsing approach needs an apply_grade_round that reads prior body and an is_terminal_run_conclusion extension.",
+        "Cost/latency budget: what is the acceptable token/wall-clock multiplier per step, and should grading be reserved for high-risk/Edit-producing steps only (vs every step) to keep ROI positive given the flat-accuracy risk of ungrounded loops?",
+        "Default-on vs opt-in: given the loop is the differentiator only as 'automatic-by-default', is it enabled by default (and on which agents), and how does that interact with ApprovalMode (yolo vs normal) and the existing limits?"
+      ]
+    },
+    "cbFindings": [
+      {
+        "area": "limits",
+        "claims": [
+          {
+            "claim": "max_review_fix_cycles exists in the Limits struct as type `Limit` (an enum Value(u32)|Unlimited), defaulting to Limit::Value(2).",
+            "status": "confirmed",
+            "evidence": "src/config/mod.rs:178 (field decl `pub max_review_fix_cycles: Limit`), src/config/mod.rs:190 (default `Limit::Value(2)`), src/config/mod.rs:74-99 (enum Limit + is_reached_by where `value >= limit`)",
+            "notes": "The idea cited ~172-190; the struct is at 172-180, Default impl at 182-193, so the citation is accurate."
+          },
+          {
+            "claim": "max_review_fix_cycles has no dedicated/cross-field validation; the only validation is the generic Limit deserializer that rejects 0 and non-positive values and requires the literal string \"unlimited\".",
+            "status": "confirmed",
+            "evidence": "src/config/mod.rs:113-168 (LimitVisitor: visit_u64 rejects 0 at :131-135, visit_i64 rejects <=0 at :145-147, visit_str only accepts \"unlimited\" at :157-163). RawLimits.max_review_fix_cycles is Optional and merged verbatim at src/config/mod.rs:469,972-974. No `fn validate` touches limits (validators at :1749-1798 cover models/env/runtime args only).",
+            "notes": "So `max_review_fix_cycles = 0` fails to parse; min effective value is 1."
+          },
+          {
+            "claim": "max_review_fix_cycles is actually WIRED to enforcement, not defined-but-unused: it gates a real reviewer->fixer circuit-breaker. The roadmap's 'validated-but-unused' framing is only partly accurate.",
+            "status": "partial",
+            "evidence": "Read site: src/app/mod.rs:3704-3710 `review_fix_cycle_limit_reached` calls `limit_reached(&self.config.limits.max_review_fix_cycles, review_fix_cycle_count(&run.previous_results))` gated on `next_agent_id == \"fixer\"`. Called at src/app/mod.rs:1977-1980 (single-agent decision path) and src/app/mod.rs:1993-1998 (parallel-group decision path), both calling `stop_for_review_fix_cycle_limit` (src/app/mod.rs:3712-3724) which sets RunState::LimitReached and emits a `run_limit_reached` event. Cycle counter at src/app/mod.rs:6019-6033 counts reviewer->fixer transitions.",
+            "notes": "'reviewer' and 'fixer' are real default agents (src/config/mod.rs:820,840) and the orchestrator can route to them (src/orchestrator/mod.rs:803,1328,1338 fixer; :1410 reviewer), so the guard CAN fire. The accurate nuance: the limit caps an orchestrator-DISCRETIONARY reviewer->fixer sequence; there is no AUTOMATIC grade->fix loop that drives the limit (that is exactly what docs/feature-roadmap.md:148-151 proposes to add). So 'unused' is too strong (it is a wired circuit-breaker), but 'no automatic loop wired to it' is correct."
+          },
+          {
+            "claim": "max_review_fix_cycles is read in exactly ONE enforcement location (plus the config-merge site); both decision paths funnel through that one helper.",
+            "status": "confirmed",
+            "evidence": "Field reads: src/config/mod.rs:972-973 (merge from RawLimits) and src/app/mod.rs:3707 (inside review_fix_cycle_limit_reached). Only callers of the helper: src/app/mod.rs:1977 and src/app/mod.rs:1993.",
+            "notes": "Unlike the per-step limits, the review/fix limit is already centralized in a single guard method, so it is the LEAST duplicated of the limit checks."
+          },
+          {
+            "claim": "Per-step limit re-checks ARE duplicated across the run loop: the step-time and step-action limits are re-checked in 6 distinct methods, not a single shared guard.",
+            "status": "confirmed",
+            "evidence": "(1) resolve_pending_approval (src/app/mod.rs:1587): wall_clock @1612, step_time @1619, await_with_step_limit @1641 (stop @1648). (2) handle_parallel_child_action (:2449): max_step_actions @2458-2466, await_with_step_limit @2495 (stop @2502). (3) resolve_parallel_approval (:2574): wall_clock @2598, step_time @2608, await_with_step_limit @2634 (stop @2641). (4) apply_parallel_limit_checks (:2757): wall_clock @2764, step_time sweep @2780-2799. (5) drive_runtime_step_streaming (:3835): time_limit @3843 (stop @3844) + select! limit_reached branch @3905 (stop @3910). (6) execute_runtime_step_with_actions (:3935): max_step_actions @3968-3978 + await_with_step_limit @4005 (stop @4014).",
+            "notes": "Count by stop-call: stop_for_step_time_limit appears 9x (lines 1620,1648,2502,2609,2641,2799,3844,3910,4014) and stop_for_step_action_limit 2x (lines 2459,3972). Count by distinct method/block: 6. The idea's '~5 scattered places' slightly UNDERCOUNTS; the real figure is 6 methods (9 step-time + 2 step-action re-check/stop sites). A shared per-step guard could subsume all of these."
+          },
+          {
+            "claim": "Run-level limits (max_agent_steps, max_wall_clock_minutes) are ALSO re-checked in many scattered places, compounding the duplication.",
+            "status": "confirmed",
+            "evidence": "wall_clock_limit_reached/stop_for_wall_clock_limit pairs at src/app/mod.rs:1612,2012,2598,2764,2888,3033,3161,3204; max_agent_steps via limit_reached at :2351-2369,2399,2895,3040,3208,3772 (and parallel-group variant parallel_group_exceeds_agent_step_limit at :2016/2346).",
+            "notes": "These are run/group level rather than per-step, but share the same 'check-then-stop_for_* and unwind' shape, so a unified guard abstraction would likely cover them too."
+          }
+        ],
+        "integration_points": [
+          {
+            "name": "Limits struct + Limit type",
+            "location": "src/config/mod.rs:74-99,172-194",
+            "how": "Add/keep fields here; the Limit enum's is_reached_by (value>=limit) and the LimitVisitor (rejects 0) are the shared validation/semantics any new limit or shared guard would reuse."
+          },
+          {
+            "name": "review_fix_cycle_limit_reached / stop_for_review_fix_cycle_limit",
+            "location": "src/app/mod.rs:3704-3724",
+            "how": "The single existing guard for max_review_fix_cycles. An automatic grade->fix feature would extend review_fix_cycle_count (src/app/mod.rs:6019) and reuse this guard; both decision paths (:1977,:1993) already call it."
+          },
+          {
+            "name": "step_time_limit_reached / stop_for_step_time_limit / stop_for_step_action_limit",
+            "location": "src/app/mod.rs:3662-3702",
+            "how": "The per-step check+stop primitives that are currently invoked from 6 different methods. A shared per-step guard would wrap these and replace the scattered call sites at 1619/1641, 2458/2495, 2608/2634, 2780-2799, 3843/3905, 3968/4005."
+          },
+          {
+            "name": "await_with_step_limit helper",
+            "location": "src/app/mod.rs:5754 (decl), used at 1641,2495,2634,4005",
+            "how": "The async race that enforces max_step_minutes around a single action; each use is paired with a manual stop_for_step_time_limit else-branch. A shared guard could fold the else-branch unwinding."
+          },
+          {
+            "name": "limit_reached / time_limit_reached / wall_clock_limit_reached free fns",
+            "location": "src/app/mod.rs:5492-5494,5737-5752",
+            "how": "Thin wrappers over Limit::is_reached_by and remaining_limit_duration; the building blocks a consolidated guard would call."
+          },
+          {
+            "name": "RawLimits merge",
+            "location": "src/config/mod.rs:463-469,956-977",
+            "how": "Where each [limits.*] TOML field is folded into the resolved Limits; any new limit must be added in both RawLimits and the merge block."
+          }
+        ],
+        "surprises": [
+          "max_review_fix_cycles is NOT dead code as the roadmap's 'validated-but-unused' label implies: it is wired to a working reviewer->fixer circuit-breaker (src/app/mod.rs:3704-3710) reachable from both the single-agent and parallel-group decision paths. The accurate gap is the absence of an AUTOMATIC grade->fix loop to drive it, not absence of enforcement.",
+          "review_fix_cycle_count only counts a cycle when a 'reviewer' result is followed by a 'fixer' result (src/app/mod.rs:6019-6033); an initial 'fixer' pass with no preceding 'reviewer' is NOT counted (test at :11321 confirms). So the limit specifically bounds review->fix oscillation, not raw fixer invocations.",
+          "The per-step limit re-check is duplicated MORE than the idea's '~5' estimate: 6 distinct methods, with 9 step-time stop sites and 2 step-action stop sites. Several methods re-check the same limit twice (a pre-execution gate AND an await_with_step_limit wrapper), e.g. resolve_pending_approval at 1619 and 1641.",
+          "The step-time-limit stops emit a `step_limit_reached` event (src/app/mod.rs:3676,3695) which, per plans/AUDIT-and-ROADMAP-2026-06-14.md:110, currently has NO projection arm in src/app/chat/projection.rs and is invisible in chat -- whereas the sibling review/fix and wall-clock stops emit `run_limit_reached` which IS projected. A shared guard refactor should be careful not to lose (or should fix) this event-kind asymmetry."
+        ]
+      },
+      {
+        "area": "routing",
+        "claims": [
+          {
+            "claim": "COUNCIL_WORKFLOW_AGENT_ID sentinel const is defined in orchestrator/mod.rs (idea's ~line 9 is exact).",
+            "status": "confirmed",
+            "evidence": "src/orchestrator/mod.rs:9 `pub const COUNCIL_WORKFLOW_AGENT_ID: &str = \"council\";`"
+          },
+          {
+            "claim": "The 'virtual' routing target is resolved at VALIDATION time by short-circuiting the normal agent lookup: validate_agent_reference special-cases the council sentinel and returns Ok before ever calling config.agents.get(). 'council' is never a real entry in config.agents.",
+            "status": "confirmed",
+            "evidence": "src/orchestrator/mod.rs:637-670 — `if agent_id == COUNCIL_WORKFLOW_AGENT_ID { ...checks council.presets non-empty... return Ok(()); }` then the normal path does `config.agents.get(agent_id).ok_or_else(|| anyhow!(\"decision references unknown agent {agent_id}\"))`",
+            "notes": "This is the only validation chokepoint for single-agent routes: validate_single_agent_step_plan (496-501) calls straight into validate_agent_reference. Any sentinel not handled here is rejected as 'unknown agent'."
+          },
+          {
+            "claim": "An OrchestratorDecision routes to council vs a normal agent via a string comparison in the dispatch seam handle_single_agent_decision, which branches on the sentinel before falling through to run_agent_step.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:1954-1985 — `if next_agent_id == COUNCIL_WORKFLOW_AGENT_ID { ... return self.run_council_workflow(run, decision).await; }` ... else `self.run_agent_step(run, next_agent_id, None).await`",
+            "notes": "Reached only for Continue decisions: handle_orchestrator_decision (app/mod.rs:1873-1893) calls decision.normalized_next_step() and matches DecisionNextStep::SingleAgent(plan) -> handle_single_agent_decision(run,&decision,&plan.agent). ParallelGroup takes a separate arm."
+          },
+          {
+            "claim": "Both schema v1 (next_agent string) and v2 (next_step) decisions funnel every single-agent route through the same DecisionNextStep::SingleAgent path, so the sentinel dispatch is hit uniformly.",
+            "status": "confirmed",
+            "evidence": "src/orchestrator/mod.rs:247-275 normalized_next_step() wraps a v1 `next_agent` into `DecisionNextStep::SingleAgent(SingleAgentStepPlan{agent,...})`; OrchestratorDecision fields next_agent/next_step at src/orchestrator/mod.rs:57-60"
+          },
+          {
+            "claim": "Council is advertised to the orchestrator LLM as a 'harness workflow' (not an agent) in the generated routing prompt, separate from the enabled-agents list built from config.agents.",
+            "status": "confirmed",
+            "evidence": "src/orchestrator/mod.rs:700-707 builds 'Available harness workflows:' with `- {COUNCIL_WORKFLOW_AGENT_ID}: serial council review using preset ...`; enabled agents come from config.agents at 685-698"
+          },
+          {
+            "claim": "A keyword scope-gate (council_route_allowed) is enforced at dispatch time before running the council workflow; routing council outside scope marks the run Failed.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:1960-1975 calls council_route_allowed(&run.prompt, session_goal); src/app/mod.rs:5535-5555 keyword list ('council','high-risk','architecture','security','data integrity','migration','rollback',...)"
+          },
+          {
+            "claim": "Council synthesis folds multiple councillor reports into one outcome: partitions reports into successful (Completed/NoChanges) vs failed, derives confidence (blocked/high/partial), picks recommended_action from the first successful summary, and aggregates risks + dissent.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:5557-5626 synthesize_council_decision -> CouncilDecisionEnvelope{confidence,dissent,risks,recommended_action,stop_condition}; struct at src/app/mod.rs:717-725",
+            "notes": "confidence='high' when no failures, 'partial' when mixed, 'blocked' when zero successes; recommended_action falls back to 'Do not proceed until council runtime failures are resolved.' when none succeed."
+          },
+          {
+            "claim": "The synthesized envelope is then wrapped into a single AgentResult (agent = 'council') that re-enters the orchestrator loop as one prior step.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:5628-5699 council_agent_result builds AgentResult{agent: COUNCIL_WORKFLOW_AGENT_ID, status Completed unless zero successes -> Failed, findings = confidence/recommended_action/stop_condition + risk:/dissent: lines, artifacts from per-member reports}; pushed at src/app/mod.rs:3321 `run.previous_results.push(RunStepResult::Agent { result });` and run_council_workflow returns Ok(true) so the drive loop continues"
+          },
+          {
+            "claim": "run_council_workflow runs councillors serially in a loop and consults the per-step limit guard limit_reached(max_agent_steps, run.step_count) plus the wall-clock guard each iteration, incrementing run.step_count per councillor.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:3203-3221 — loop over members: `if self.wall_clock_limit_reached(run) {...}` (3204), `if limit_reached(&self.config.limits.max_agent_steps, run.step_count) { ... run_limit_reached ... return Ok(false); }` (3208-3218), `run.step_count += 1;` (3221). limit_reached at src/app/mod.rs:5492-5494 -> Limit::is_reached_by (src/config/mod.rs:93-98, `value >= limit`)",
+            "notes": "Council also only supports CouncilExecutionMode::Serial (src/app/mod.rs:3165-3178) and applies a per-councillor tokio timeout (3247)."
+          },
+          {
+            "claim": "The cleanest seam to add a NEW sentinel routing target (a 'grader') as a virtual target without a bespoke path is the existing 3-point sentinel pattern: (1) define a GRADER_WORKFLOW_AGENT_ID const, (2) add a short-circuit arm in validate_agent_reference, (3) add an `if next_agent_id == GRADER_WORKFLOW_AGENT_ID` arm in handle_single_agent_decision dispatching to a run_grader_workflow modeled on run_council_workflow; optionally advertise it in build_orchestrator_prompt's 'Available harness workflows' block.",
+            "status": "confirmed",
+            "evidence": "Sentinel const pattern: src/orchestrator/mod.rs:9. Validation short-circuit: src/orchestrator/mod.rs:642-653. Dispatch arm: src/app/mod.rs:1960-1976. Prompt advertisement: src/orchestrator/mod.rs:700-707. Per-step guard to reuse: src/app/mod.rs:3208 limit_reached(&self.config.limits.max_agent_steps, run.step_count)",
+            "notes": "handle_single_agent_decision already takes next_agent_id:&str and string-dispatches before run_agent_step, so a grader slots in as a sibling `if` arm exactly parallel to council — no new enum variant or new decision-loop branch required, because DecisionNextStep::SingleAgent already funnels all single-agent routes here. Reuse run.step_count + limit_reached(max_agent_steps) and wall_clock_limit_reached inside the grader loop, and push the synthesized RunStepResult::Agent into run.previous_results returning Ok(true), mirroring council."
+          }
+        ],
+        "integration_points": [
+          {
+            "name": "COUNCIL_WORKFLOW_AGENT_ID sentinel const",
+            "location": "src/orchestrator/mod.rs:9",
+            "how": "Public const string ('council') used as a virtual agent id. A grader adds a sibling const e.g. GRADER_WORKFLOW_AGENT_ID = \"grader\"."
+          },
+          {
+            "name": "validate_agent_reference (validation short-circuit)",
+            "location": "src/orchestrator/mod.rs:637-670",
+            "how": "Single validation chokepoint for single-agent routes. Special-cases the sentinel (checks council.presets non-empty) and returns Ok before config.agents.get(). A new sentinel MUST get an arm here or it is rejected as 'unknown agent'."
+          },
+          {
+            "name": "handle_single_agent_decision (routing dispatch seam)",
+            "location": "src/app/mod.rs:1954-1985",
+            "how": "Receives next_agent_id:&str and branches: `== COUNCIL_WORKFLOW_AGENT_ID` -> council_route_allowed gate then run_council_workflow; else run_agent_step. This is the cleanest insertion point for a grader sentinel arm — no bespoke path needed elsewhere."
+          },
+          {
+            "name": "handle_orchestrator_decision / normalized_next_step",
+            "location": "src/app/mod.rs:1873-1893 and src/orchestrator/mod.rs:247-275",
+            "how": "Funnels both schema v1 (next_agent) and v2 (next_step) Continue decisions into DecisionNextStep::SingleAgent -> handle_single_agent_decision, so every single-agent route reaches the sentinel dispatch uniformly."
+          },
+          {
+            "name": "run_council_workflow (virtual-target executor template + per-step guard)",
+            "location": "src/app/mod.rs:3155-3323",
+            "how": "Reference implementation for a synthesized workflow: serial member loop consulting wall_clock_limit_reached (3204) and limit_reached(max_agent_steps, run.step_count) (3208) with run.step_count += 1 (3221), per-member timeout, then synthesize + push RunStepResult::Agent into run.previous_results (3321) and return Ok(true)."
+          },
+          {
+            "name": "synthesize_council_decision + council_agent_result (multi-result synthesis)",
+            "location": "src/app/mod.rs:5557-5626 and 5628-5699",
+            "how": "Folds N CouncilMemberReport into one CouncilDecisionEnvelope (confidence/recommended_action/risks/dissent) then wraps into a single AgentResult(agent='council'). A grader would supply analogous synthesis producing one AgentResult."
+          },
+          {
+            "name": "build_orchestrator_prompt 'Available harness workflows'",
+            "location": "src/orchestrator/mod.rs:700-723",
+            "how": "Where the council virtual target is advertised to the orchestrator LLM (separate from config.agents). Add a grader line here so the orchestrator knows it can route to it, plus a routing rule."
+          },
+          {
+            "name": "limit_reached + Limit::is_reached_by (per-step limit guard)",
+            "location": "src/app/mod.rs:5492-5494, src/config/mod.rs:93-98",
+            "how": "The shared guard the workflow loops consult: limit_reached(&self.config.limits.max_agent_steps, run.step_count). A grader loop should reuse this (and wall_clock_limit_reached) and increment run.step_count per sub-step."
+          }
+        ],
+        "surprises": [
+          "The council 'agent' is never registered in config.agents — it exists only as a sentinel string. validate_agent_reference short-circuits the agents lookup, and build_orchestrator_prompt manually appends it under 'Available harness workflows' rather than the enabled-agents list. So a virtual target is purely a string convention enforced at two points (validation + dispatch), not a config object.",
+          "There is a second scope gate beyond validation: council passes orchestrator-schema validation (validate_agent_reference) but is then re-checked at runtime by council_route_allowed (keyword match over prompt+session_goal) in handle_single_agent_decision; failing it marks the whole run Failed rather than just rejecting the step. A grader could opt out of this extra gate or define its own.",
+          "Council deliberately strips action capability: council_member_agent sets tools=Some(empty) and capabilities to Read/Challenge/Review only, and council reports that request actions are converted to a blocked report ('council workflows collect opinions only'). The virtual-target pattern assumes read-only advisory execution.",
+          "run_council_workflow shares the same run.step_count budget as normal agent steps (each councillor consumes one max_agent_steps unit), so a multi-member virtual workflow can exhaust the run's step limit mid-deliberation and emit run_limit_reached before synthesizing."
+        ]
+      },
+      {
+        "area": "agentresult",
+        "claims": [
+          {
+            "claim": "The AgentResult struct lives at src/orchestrator/mod.rs:147-160 (idea's cite of 154-158 points at individual fields, slightly off). Fields: schema_version:u32, agent:String, step_id:String, status:AgentResultStatus, summary:String, findings:Vec<String>, changed_files:Vec<String>, commands:Vec<String>, verification:Vec<String>, blocker:Option<String>, artifacts:Vec<ArtifactReference>.",
+            "status": "confirmed",
+            "evidence": "src/orchestrator/mod.rs:147-160",
+            "notes": "verification (line 157) Vec<String>; findings (154) Vec<String>; blocker (158) Option<String>."
+          },
+          {
+            "claim": "verification/findings/blocker are unstructured free-text populated by the AGENT ITSELF in its JSON contract, not computed by the harness. The runtime parses the agent's output via parse_agent_result -> parse_contract into RuntimeOutput::AgentResult. AgentResult::completed() defaults all three to empty (Vec::new()/None).",
+            "status": "confirmed",
+            "evidence": "src/orchestrator/mod.rs:297-299 (parse_agent_result), 224-244 (completed() defaults); src/runtime/codex.rs:320-333 (schema brief tells the agent: findings=['short factual finding'], verification=['how you confirmed the result, e.g. cargo test passed'], blocker:null, 'each a list of plain strings — never objects')",
+            "notes": "Same brief duplicated in claude.rs and cursor.rs. verification is the agent's SELF-attestation of how it checked its own work, not an independent grade."
+          },
+          {
+            "claim": "There is NO dedicated machine-parsable pass/fail verdict field. The only machine-readable verdict is `status: AgentResultStatus` (enum Completed/Blocked/Failed/Cancelled/ParseError/LimitReached/ApprovalDenied/NoChanges). A grader could overload `status` as coarse pass/fail and put critique into findings/blocker/summary, but those are prose Vec<String>/Option<String>.",
+            "status": "confirmed",
+            "evidence": "src/orchestrator/mod.rs:124-135 (AgentResultStatus enum), 152-158 (status + prose fields)",
+            "notes": "For a clean grader verdict+critique you would add a NEW field (e.g. verdict: pass/fail/score + critique) or a new result schema. status already carries OPERATIONAL meaning (NoChanges, ApprovalDenied) rather than a quality judgment, so reusing it conflates 'agent finished' with 'work is correct'."
+          },
+          {
+            "claim": "The capability enum is `Capability` in src/config/mod.rs:26-37 (NOT actions/mod.rs — that file defines ActionKind/ToolName). Variants: Plan, Read, Answer, Challenge, Edit, Command, Verify, Review. An agent declares them via `capabilities: Vec<Capability>` on AgentProfile; membership checked by AgentProfile::has_capability.",
+            "status": "confirmed",
+            "evidence": "src/config/mod.rs:26-37 (enum), 323 (capabilities field), 368-372 (has_capability)",
+            "notes": "actions/mod.rs:1 imports Capability from config; it only defines required_capability mapping ActionKind->Capability."
+          },
+          {
+            "claim": "Write capability = Capability::Edit, which GATES ApplyPatch/WriteFile actions; Capability::Command gates RunCommand; Capability::Read gates ReadFile/ListFiles/SearchText. Action execution is denied when the agent lacks the required capability.",
+            "status": "confirmed",
+            "evidence": "src/config/mod.rs:64-71 (ToolName::required_capability), src/actions/mod.rs:166-169 + 702-709 (gate: if !agent.has_capability(&required) deny)",
+            "notes": "ApplyPatch|WriteFile -> Edit (config/mod.rs:68, actions/mod.rs:708)."
+          },
+          {
+            "claim": "SURPRISE: Capability::Verify and Capability::Review do NOT gate any harness action — only Read/Command/Edit map to actions. Verify/Review are advisory ROUTING signals only: they shape orchestrator delegation guidance and are validated against a decision's required_capabilities, but a grader's actual checking work is done with Command (run tests) + reporting in the verification field.",
+            "status": "confirmed",
+            "evidence": "src/config/mod.rs:64-71 + src/actions/mod.rs:702-709 (only Read/Command/Edit returned; Verify/Review absent); src/orchestrator/mod.rs:766-780 (default_delegation_guidance branches on Review/Edit/Challenge/Answer/Read), 661-668 (validate_agent_reference enforces required_capabilities subset of agent caps)",
+            "notes": "So a grader does not strictly NEED Verify/Review to function; it needs Read (+Command to run checks) and must NOT have Edit. Review/Verify mainly tell the orchestrator how to route and signal intent."
+          },
+          {
+            "claim": "An existing review/verify-capable profile already exists: the built-in `reviewer` (enabled by default), capabilities = Read, Command, Verify, Review, instructions = 'risk-first review of completed work ... do not edit files'. The `fixer` has Read+Edit+Command+Verify. So reviewer is effectively an existing grader-shaped profile.",
+            "status": "confirmed",
+            "evidence": "src/config/mod.rs:837-855 (reviewer: caps Read/Command/Verify/Review, enabled:true line 854), 669-675 (DEFAULT_REVIEWER_INSTRUCTIONS), 817-836 (fixer: Read/Edit/Command/Verify)",
+            "notes": "designer (883) Read/Edit/Verify; oracle/librarian Read/Answer; consul Read/Challenge."
+          },
+          {
+            "claim": "A runtime step does NOT itself decide semantic 'Completed'. execute_runtime_step_streaming runs the model fallback chain and returns Ok(RuntimeOutput). drive_runtime_step_streaming sets LiveStepStatus::Completed purely on output.is_ok() (Ok vs Err), independent of AgentResultStatus.",
+            "status": "confirmed",
+            "evidence": "src/runtime/mod.rs:467-543 (returns RuntimeOutput); src/app/mod.rs:3885-3892 (LiveStepStatus::Completed if output.is_ok() else Failed)",
+            "notes": "Live status is a UI/coarse signal; the semantic result is the AgentResultStatus inside the returned AgentResult."
+          },
+          {
+            "claim": "The semantic step-completion + result-recording happens in run_agent_step. In the StepOutcome::Output(RuntimeOutput::AgentResult{result}) arm it records the agent_result event and pushes RunStepResult::Agent{result} onto run.previous_results, returning AgentStepOutcome::Completed. This returns Completed regardless of result.status (a Blocked/Failed AgentResult still 'completes' the step; the orchestrator then reacts to it).",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:3026 (fn run_agent_step), 3083-3095 (AgentResult arm: record_event 'agent_result' + run.previous_results.push + Ok(AgentStepOutcome::Completed))",
+            "notes": "Step 'Completed' != success. Whole-run completion is a separate orchestrator decision."
+          },
+          {
+            "claim": "The RUN is judged complete by the orchestrator, not the step: handle_orchestrator_decision maps DecisionStatus::Complete -> RunState::Completed (and records run_completed). The orchestrator reads prior AgentResults from run.previous_results to make that call.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:1927-1938 (DecisionStatus::Complete -> RunState::Completed); 1879-1894 (Continue -> handle_single_agent_decision -> run_agent_step)",
+            "notes": "previous_results (carrying each AgentResult) is passed into the next orchestrator runtime_request (src/app/mod.rs:2923, 3068)."
+          },
+          {
+            "claim": "Best interception point to route a just-completed Edit-capable step to a grader: the AgentResult arm of run_agent_step at src/app/mod.rs:3083-3094. The agent profile is in scope via self.agent(next_agent_id) (fetched at 3052), so one can check agent.has_capability(&Capability::Edit) and result.changed_files non-empty, then synthesize a grader step before returning Completed. An alternative one level up is handle_single_agent_decision at src/app/mod.rs:1981 right after run_agent_step returns Completed (decision + next_agent_id in scope). For parallel children the analogous point is record_parallel_child_result / the push at src/app/mod.rs:2310.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:3052 (agent profile fetch), 3083-3094 (AgentResult arm), 1981-1984 (handle_single_agent_decision call site), 2305-2313 + 2812-2880 (parallel child recording)",
+            "notes": "At 3083 you have both the AgentResult and the producing agent's capabilities — ideal for an Edit-capable check before pushing to previous_results."
+          },
+          {
+            "claim": "The codebase ALREADY has a review->fix loop concept that a grader feature would extend: review_fix_cycle_count counts reviewer->fixer transitions in previous_results, capped by limits.max_review_fix_cycles via review_fix_cycle_limit_reached/stop_for_review_fix_cycle_limit. Currently this routing is orchestrator-driven (the orchestrator chooses to call reviewer then fixer), not auto-injected after edits.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:6019-6033 (review_fix_cycle_count keys on agent=='reviewer'/'fixer'), 3704-3724 (limit gate), 1977-1980 & 1993-1996 (enforced before fixer steps)",
+            "notes": "Precedent for inserting a reviewer/grader between fixer edits exists; an auto-grader could either drive the orchestrator to route reviewer or be force-injected at the 3083 interception point with its own cycle cap."
+          }
+        ],
+        "integration_points": [
+          {
+            "name": "AgentResult struct (verification/findings/blocker + status)",
+            "location": "src/orchestrator/mod.rs:147-160 (struct), 124-135 (AgentResultStatus), 224-244 (completed() defaults), 297-299 (parse_agent_result)",
+            "how": "Graded output today would have to reuse status (coarse pass/fail) + findings/blocker/verification (prose critique). No machine verdict/score field exists; a clean grader contract needs a new field or a new result schema. Schema brief shown to agents: src/runtime/codex.rs:320-333 (+ claude.rs/cursor.rs)."
+          },
+          {
+            "name": "Capability enum",
+            "location": "src/config/mod.rs:26-37; gating map src/config/mod.rs:64-71 + src/actions/mod.rs:166-169,702-709",
+            "how": "A grader profile needs Read (and Command if it runs verification), must NOT have Edit. Review/Verify are non-gating advisory caps used only for orchestrator routing guidance (src/orchestrator/mod.rs:766-780) and decision validation (661-668)."
+          },
+          {
+            "name": "reviewer built-in profile (existing grader-shaped agent)",
+            "location": "src/config/mod.rs:837-855 (profile, enabled by default), 669-675 (DEFAULT_REVIEWER_INSTRUCTIONS)",
+            "how": "Already Read+Command+Verify+Review, no Edit, 'risk-first review of completed work, do not edit files'. A grader could be this profile or a clone with a strict verdict contract."
+          },
+          {
+            "name": "run_agent_step AgentResult arm (primary interception point)",
+            "location": "src/app/mod.rs:3083-3094 (agent profile fetched at 3052)",
+            "how": "After a specialized step returns RuntimeOutput::AgentResult, before/after pushing RunStepResult::Agent onto run.previous_results, check agent.has_capability(&Capability::Edit) and result.changed_files; if so, synthesize a grader step. Alt site: handle_single_agent_decision src/app/mod.rs:1981."
+          },
+          {
+            "name": "Orchestrator run-completion decision",
+            "location": "src/app/mod.rs:1873-1938 (handle_orchestrator_decision; Complete->RunState::Completed at 1927)",
+            "how": "Whole-run 'completed' is an orchestrator DecisionStatus::Complete, fed by previous_results (each AgentResult). A grader verdict would naturally feed back here as another AgentResult the orchestrator reads."
+          },
+          {
+            "name": "review->fix cycle machinery (existing precedent + cap)",
+            "location": "src/app/mod.rs:6019-6033 (review_fix_cycle_count), 3704-3724 (limit gate), limits.max_review_fix_cycles",
+            "how": "Existing loop-detection/cap keyed on reviewer->fixer transitions; a grader/fix loop would extend or mirror this cap to bound regrading."
+          }
+        ],
+        "surprises": [
+          "Capability::Verify and Capability::Review are NON-gating: only Read/Command/Edit map to harness actions (src/config/mod.rs:64-71, src/actions/mod.rs:702-709). Verify/Review are pure routing/advisory signals, so a grader does not strictly need them to operate — it needs Read (and Command), and must lack Edit.",
+          "The Capability enum is in src/config/mod.rs:26-37, not src/actions/mod.rs as the idea hinted — actions/mod.rs only defines ActionKind/ToolName and the ActionKind->Capability mapping.",
+          "run_agent_step returns AgentStepOutcome::Completed even when the AgentResult.status is Blocked/Failed (src/app/mod.rs:3083-3094): step 'completion' means 'the agent produced a result', not 'the work succeeded'. Success/verdict lives in AgentResultStatus and ultimately in the orchestrator's DecisionStatus::Complete.",
+          "There is no independent machine verdict field at all — `verification` is the agent grading ITSELF (self-attested 'how I confirmed'), so it cannot serve as an external grader verdict; a grader would need a new field or to repurpose status+findings.",
+          "An existing reviewer profile + review_fix_cycle_count/max_review_fix_cycles already approximate a grader->fixer loop, but it is orchestrator-routed rather than auto-injected after an Edit-capable step; the idea's auto-grader would be a new force-inject at src/app/mod.rs:3083."
+        ]
+      },
+      {
+        "area": "events",
+        "claims": [
+          {
+            "claim": "Event kinds are NOT a Rust enum — `HistoryEvent.kind` is a free-form `String`. There is no central kind registry; new kinds are added by simply passing a new string literal to `record_event`/`record_event_with_group`. (`AppEvent` at src/app/mod.rs:289 is unrelated — it is the TUI *input* event enum: PromptSubmitted/ApprovalAnswered/ClarificationAnswered/etc., not the durable event kind.)",
+            "status": "confirmed",
+            "evidence": "src/history/mod.rs:12-26 (HistoryEvent struct: schema_version u32, kind String, payload Value); src/app/mod.rs:289-298 (AppEvent input enum)"
+          },
+          {
+            "claim": "`record_event` (src/app/mod.rs:4164) is a thin wrapper over `record_event_with_group` (4215-4241) which performs the full pipeline: build HistoryEvent::new_with_group, durable JSONL append (`history.append_event`), optional debug append, feed the chat projection (`chat_projection.apply_history_event`), `sync_chat_items`, push the human display string to `state.events`, and `publish_state` over the watch channel.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:4164-4173, 4215-4241; src/history/mod.rs:140-150 (append_event JSONL to .atelier/sessions/<id>/events.jsonl)"
+          },
+          {
+            "claim": "The durable schema is versioned by `schema_version` (always written as 1 at history/mod.rs:48); `read_events_from_path` hard-rejects any event with schema_version != 1 (history/mod.rs:274-280). Adding a new *kind* (not version) is forward-compatible: the projection's match has a catch-all `_ => {}` (projection.rs:110) so an unknown kind is persisted durably but silently ignored on render.",
+            "status": "confirmed",
+            "evidence": "src/history/mod.rs:48, 274-280; src/app/chat/projection.rs:59-111 (match with `_ => {}` at 110)"
+          },
+          {
+            "claim": "Adding a 'grade_round'/'retry_round' event kind requires only a producer-side `record_event(Some(run_id), step_id, \"grade_round\", json!({...}), display)` call (no enum to extend, no schema_version bump since payload is free-form JSON). To make it visible in chat you must also add a consumer arm in `apply_history_event` (projection.rs:59) routing the kind to a new `apply_*` method — otherwise it is recorded but invisible. Other projections (e.g. `project_prompt_history`) filter on specific kinds and ignore it by default.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:4164-4241 (record_event signature takes kind:&str); src/app/chat/projection.rs:58-111 (kind dispatch); src/history/mod.rs:347-348 (project_prompt_history filters kind==\"prompt_submitted\")"
+          },
+          {
+            "claim": "The chat projection collapses many events into one evolving item via `upsert` (projection.rs:1339-1383): each apply_* method emits an ItemInput carrying a `lifecycle_key: Option<ChatLifecycleKey>`. `upsert` derives the item id from the key; if `index: BTreeMap<ChatLifecycleKey,usize>` already holds that key it REPLACES the existing item in place (`*existing = ChatItemView{ source, ..item }`) while merging prior event_ids; otherwise it appends and records the index. Items with `lifecycle_key: None` get a `chat:event:<event_id>` fallback id and are never collapsed (always a new item).",
+            "status": "confirmed",
+            "evidence": "src/app/chat/projection.rs:23-30 (ChatProjection.index), 1339-1383 (upsert in-place replace + event_id merge); src/app/chat/mod.rs:206-229 (item_id per key)"
+          },
+          {
+            "claim": "`ChatLifecycleKey` (chat/mod.rs:117-144) has 7 variants — Prompt{run_id}, Run{run_id}, Clarification{run_id,question_id}, Workflow{run_id}, Step{run_id,step_id,item_kind}, Action{run_id,step_id,action_id}, FollowUp{follow_up_id}. The variant + its fields determine which events fuse into one item.",
+            "status": "confirmed",
+            "evidence": "src/app/chat/mod.rs:115-144"
+          },
+          {
+            "claim": "Clarification collapses to ONE evolving item: both `apply_clarification_requested` (projection.rs:1214) and `apply_clarification_answered` (1266) compute the SAME `Clarification{run_id,question_id}` key via `clarification_key` (1820, reads payload question_id), so the asked item (WaitingForUser) is upserted into the answered item (Completed). The answered arm even reads the prior item body through `self.index` to recover the question text (1273-1279).",
+            "status": "confirmed",
+            "evidence": "src/app/chat/projection.rs:1214-1264, 1266-1315, 1820-1825"
+          },
+          {
+            "claim": "Queued-follow-up collapses to ONE evolving item: `apply_follow_up_lifecycle` (projection.rs:1135) handles all five kinds (follow_up_queued/replay_started/replay_paused/replay_resumed/cancelled) all keyed by `FollowUp{follow_up_id}` from payload['id'] (1137), so a single item evolves Pending->Running->Paused->Pending->Skipped.",
+            "status": "confirmed",
+            "evidence": "src/app/chat/projection.rs:1135-1191; src/app/mod.rs:87-91 (kind routing list)"
+          },
+          {
+            "claim": "Council does NOT collapse into a single item. Each councillor result (councillor_result/councillor_agent_result/agent_result) is projected by `apply_agent_result` (885) keyed by `step_key` = `Step{run_id,step_id,AgentResult}` (1812), and councillors run as distinct steps -> one item per councillor. The council-level markers (council_started/council_synthesized/council_completed) route to `apply_diagnostic` (projection.rs:93-109) which sets `lifecycle_key: None` (1107) -> each is a separate keyless item, never fused.",
+            "status": "confirmed",
+            "evidence": "src/app/chat/projection.rs:78-80, 93-109, 885-933, 1089-1130, 1812-1818"
+          },
+          {
+            "claim": "Showing N grade/retry rounds as ONE evolving item needs: (a) a stable lifecycle key shared across rounds — a new variant e.g. `GradeCycle{run_id}` or reuse `Run{run_id}`; (b) an `apply_grade_round` arm that upserts that key, building cumulative body lines itself (upsert replaces in place, so the apply_* method must accumulate round history into the body, as apply_clarification_answered does by reading the prior item); (c) body is capped by `bounded_body`/MAX_BODY_LINES=12 so per-round lines must be compact; (d) to pin it chronologically at conclusion like run summaries, extend `is_terminal_run_conclusion` (1425) to recognize the new key+kind+terminal status.",
+            "status": "confirmed",
+            "evidence": "src/app/chat/projection.rs:19 (MAX_BODY_LINES=12), 1266-1300 (cumulative body via index read), 1339-1383 (in-place replace), 1421-1434 (is_terminal_run_conclusion)"
+          },
+          {
+            "claim": "The clarification pause is driven by the orchestrator returning `DecisionStatus::WaitingForUser` (orchestrator/mod.rs:43-48). The app's WaitingForUser arm (src/app/mod.rs:1895-1926) sets RunState::WaitingForUser, captures the FULL RunDriveContext via `pending_clarification = Some(PendingClarification{ run: run.clone() })`, mints a fresh question_id into a PendingClarificationView, records `clarification_requested`, and returns Ok(false) to stop the drive loop while RETAINING active_run_id.",
+            "status": "confirmed",
+            "evidence": "src/orchestrator/mod.rs:41-48; src/app/mod.rs:1895-1926, 366-369 (PendingClarification{run})"
+          },
+          {
+            "claim": "`drive_run` (src/app/mod.rs:1780-1800) treats WaitingForUser as suspension not conclusion: when WaitingForUser it deliberately skips recording workflow completion AND does NOT clear active_run_id, so the run stays alive and resumable.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:1780-1800 (guards `if !matches!(self.state.run_state, RunState::WaitingForUser)`)"
+          },
+          {
+            "claim": "`resolve_pending_clarification` (src/app/mod.rs:1689-1736) is the resume side: validates a clarification is pending and question_id matches (rejects mismatch/empty), `take()`s the captured RunDriveContext, records `clarification_answered`, then RESUMES by APPENDING the answer to the run prompt (`run.prompt = format!(\"{}\\n\\nUser clarification: {}\", run.prompt, answer.answer)`), sets RunState::Planning, and calls `drive_and_replay(run, None)` which re-drives the SAME run through the orchestrator. There is NO branch that interprets the choice to abort/retry — the answer is just fed back as prompt text.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:1689-1736 (esp. 1727-1734)"
+          },
+          {
+            "claim": "The clarification path IS a reusable pause/resume-to-user transport, and the TUI already supports option lists with a recommended default + free-text custom row, so accept/retry/abort can be modeled as three clarifying_options. BUT resume policy is fixed (answer appended to prompt + re-drive orchestrator); to make 'abort' actually stop or 'retry' re-run, the policy must be added either in the orchestrator (interpret the appended answer) or as a new selected_option_id branch inside resolve_pending_clarification. The transport (capture context, surface options, resume) is reusable as-is; the accept/retry/abort *decision routing* is not built in.",
+            "status": "partial",
+            "evidence": "src/app/mod.rs:1689-1736 (fixed resume = prompt append + re-drive); src/tui/mod.rs:2099-2176 (options + recommended + custom answer builder); src/orchestrator/mod.rs:64-66 (clarifying_question/clarifying_options fields)"
+          },
+          {
+            "claim": "There are TWO parallel escalation transports sharing the same skeleton (capture run context in a pending_* field, set WaitingForUser, retain active_run_id, record request event, on answer record resolved event + call drive_and_replay). Approval (resolve_pending_approval, 1587) is a BINARY y/n gate that resumes the EXACT paused step mid-flight via `StepResume{step:PausedStep, step_started_at, request:RuntimeRequest}` (728-746, 1680-1685). Clarification (resolve_pending_clarification, 1689) is a free-form/multi-option gate that resumes at the RUN level by re-driving the orchestrator. Both feed the follow-up queue pause path (`pause_oldest_pending_for_queue`; `queue_pause_reason` at 1400-1408 distinguishes waiting-for-approval vs waiting-for-clarification).",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:727-746 (StepResume/PausedStep), 1587-1686 (resolve_pending_approval, StepResume resume), 1689-1736 (resolve_pending_clarification), 1395-1411 (queue_pause_reason)"
+          },
+          {
+            "claim": "Today, exhausted grade/review cycles do NOT escalate to the user — they hard-stop. `review_fix_cycle_limit_reached` (src/app/mod.rs:3704) gates on agent==\"fixer\" + `max_review_fix_cycles` limit, and `stop_for_review_fix_cycle_limit` (3712-3724) sets RunState::LimitReached and records `run_limit_reached` with `{limit:\"max_review_fix_cycles\"}`. Cycle count comes from `review_fix_cycle_count` (6019) counting reviewer->fixer transitions. This stop site is the natural integration point to instead emit a WaitingForUser clarification for accept/retry/abort.",
+            "status": "confirmed",
+            "evidence": "src/app/mod.rs:1977-1996 (gate call sites), 3704-3724 (limit reached + stop), 6019-6033 (review_fix_cycle_count)"
+          }
+        ],
+        "integration_points": [
+          {
+            "name": "record_event / record_event_with_group",
+            "location": "src/app/mod.rs:4164-4241",
+            "how": "Single chokepoint to emit a new durable event kind. Call `record_event(Some(run_id), step_id, \"grade_round\", json!({...round payload...}), \"display\")` from inside the run loop. It persists to JSONL, feeds the projection, syncs chat items, and publishes state. No enum to extend; payload is free-form JSON; schema_version stays 1."
+          },
+          {
+            "name": "ChatProjection::apply_history_event dispatch",
+            "location": "src/app/chat/projection.rs:58-111",
+            "how": "Add `\"grade_round\" | \"retry_round\" => self.apply_grade_round(event)` to make the new kind visible. Without an arm it falls through `_ => {}` and is recorded-but-invisible."
+          },
+          {
+            "name": "ChatProjection::upsert + ChatLifecycleKey + index",
+            "location": "src/app/chat/projection.rs:1339-1383; src/app/chat/mod.rs:115-229",
+            "how": "To render N rounds as one evolving item, give every round event the same lifecycle key (new `GradeCycle{run_id}` variant or reuse `Run{run_id}`). upsert replaces the keyed item in place and merges event_ids; the apply_* method must build cumulative body lines itself (read the prior item via self.index like apply_clarification_answered does). Mind MAX_BODY_LINES=12 (projection.rs:19)."
+          },
+          {
+            "name": "is_terminal_run_conclusion",
+            "location": "src/app/chat/projection.rs:1421-1434",
+            "how": "Extend to recognize the new key + RunSummary kind + terminal status so the concluded grade-cycle item is moved to the end (chronological) instead of staying pinned at its first-insert index."
+          },
+          {
+            "name": "handle_orchestrator_decision WaitingForUser arm",
+            "location": "src/app/mod.rs:1895-1926",
+            "how": "Reference template for surfacing an escalation: set RunState::WaitingForUser, store pending_clarification with the full RunDriveContext, build a PendingClarificationView with clarifying_options (e.g. accept/retry/abort) + recommended_option_id, record clarification_requested, return Ok(false). Reusable to escalate when grade cycles are exhausted."
+          },
+          {
+            "name": "resolve_pending_clarification",
+            "location": "src/app/mod.rs:1689-1736",
+            "how": "Resume side of the clarification transport. To turn it into an accept/retry/abort gate, add a branch on `answer.selected_option_id` BEFORE the prompt-append/re-drive (e.g. abort -> set Failed + record run_failed; retry -> reset cycle context + drive; accept -> Complete). Currently it only appends the answer to run.prompt and re-drives the orchestrator."
+          },
+          {
+            "name": "resolve_pending_approval + StepResume/PausedStep",
+            "location": "src/app/mod.rs:727-746, 1587-1686",
+            "how": "The other (binary, step-level) escalation transport. Use as the model if a grade-cycle escalation needs to resume the EXACT paused step rather than re-drive the orchestrator; it carries RuntimeRequest + PausedStep through StepResume."
+          },
+          {
+            "name": "review_fix_cycle limit stop site",
+            "location": "src/app/mod.rs:1977-1996, 3704-3724",
+            "how": "Where exhausted review/fix (grade) cycles currently hard-stop with RunState::LimitReached + run_limit_reached event. Replace/augment stop_for_review_fix_cycle_limit with a WaitingForUser clarification emission to escalate accept/retry/abort to the user instead of terminating."
+          }
+        ],
+        "surprises": [
+          "Event 'kinds' are stringly-typed, not an enum — there is no compile-time registry. The de-facto registry of recognized kinds is the match in projection.rs:59-111; the producer side (src/app/mod.rs) and consumer side share no enforced enum, so a typo'd kind silently becomes an invisible (but durably persisted) event.",
+          "Council is the one multi-round case in the question that does NOT collapse into a single evolving item: councillor results are per-step items and the council_started/synthesized/completed markers are keyless diagnostics (lifecycle_key: None), so a council shows up as several separate chat items, not one.",
+          "Live agent-progress and the final agent-result are DIFFERENT chat items even for the same step: live steps key Step{...,AgentProgress} (transient, removed when the step leaves live_keys) while agent_result keys Step{...,AgentResult} (durable). The item_kind field is part of the lifecycle key, so progress vs result never fuse.",
+          "The clarification resume is implemented by literal string concatenation onto the run prompt ('\\n\\nUser clarification: <answer>') and a full orchestrator re-drive — there is no structured channel back into the run, so an accept/retry/abort gate built on it would rely on the orchestrator re-reading that appended text unless a selected_option_id branch is added in resolve_pending_clarification.",
+          "Two near-identical escalation transports already exist (approval = binary StepResume mid-step; clarification = option/free-form run re-drive). A grade-cycle escalation could reuse either, but neither currently routes a tri-state accept/retry/abort decision — that policy layer is absent.",
+          "Today exhausted grade cycles terminate with RunState::LimitReached (run_limit_reached, limit=max_review_fix_cycles) rather than asking the user anything, so adding user escalation is a behavior change at a single stop site (stop_for_review_fix_cycle_limit)."
+        ]
+      }
+    ],
+    "webFindings": [
+      {
+        "angle": "frameworks — The verify-and-retry / critic loop is NOT a paywalled differentiator: it is a documented, free PATTERN (Anthropic's evaluator-optimizer; the Reflexion / Self-Refine / CRITIC line of work) and a FREE framework primitive in every major open-source agent framework (LangGraph reflection/reflexion, CrewAI guardrails+retry, AutoGen/AG2 critic agent + nested chat + society-of-mind, OpenAI Agents SDK guardrails, Microsoft Agent Framework LLM-as-judge). The commercial autonomous coding products (Devin, Cursor) DO ship an automatic self-verify/fix loop, but they bundle it into a paid product and charge for the product/compute (Devin ACUs, Cursor Pro) — not for the critic loop as a separable SKU. So the idea's claim that 'a built-in critic loop is exactly the self-correction larger agent frameworks charge for' is largely FALSE/imprecise: OSS frameworks give the pattern away for free (you just assemble it), and paid products never itemize the loop. The harness's real, defensible differentiation is that the loop is AUTOMATIC-BY-DEFAULT and OPINIONATED (grader judges pass/fail, re-runs the SAME agent with the critique appended, bounded by max cycles) — convenience and being batteries-included, not unlocking something others gate behind a paywall. CrewAI's task-guardrail→auto-retry is the closest prior art and it is free/OSS. One nuance worth flagging: re-running the SAME implementer that was graded is a known weak spot; several systems (Claude Code's verification subagent, AG2's critic) deliberately use a SEPARATE/fresh model to grade so the worker isn't grading itself.",
+        "findings": [
+          {
+            "claim": "The verify-and-retry/critic loop is a documented, free PATTERN, not a proprietary capability anyone sells standalone",
+            "detail": "Anthropic's 'Building Effective Agents' describes the evaluator-optimizer workflow (one LLM generates, another evaluates and sends back specific feedback in a loop until a quality bar is met) and ships a runnable evaluator_optimizer.ipynb in the public cookbook. The academic lineage (Reflexion = learn via verbal self-feedback; Self-Refine = generate-critic-revise; CRITIC = tool-validated revision) is all open literature. Nobody monetizes 'a critic loop' as a SKU.",
+            "confidence": "high",
+            "source": "anthropic.com/research/building-effective-agents; github.com/anthropics/anthropic-cookbook/blob/main/patterns/agents/evaluator_optimizer.ipynb"
+          },
+          {
+            "claim": "Every major open-source agent framework ships the critic/reflection loop as a FREE primitive you assemble yourself",
+            "detail": "LangGraph: reflection (generate->reflect->regenerate) and reflexion (tool-grounded critique + bounded revision via a conditional edge that returns 'continue'/'end'). AutoGen/AG2: a critic/reviewer AssistantAgent evaluates another agent's output and returns feedback; nested chats and SocietyOfMindAgent embed an inner critique monologue. Microsoft Agent Framework: LLM-as-judge implemented as another agent with a stricter rubric prompt. None of these charge for the pattern — the frameworks are OSS/free SDKs.",
+            "confidence": "high",
+            "source": "langchain.com/blog/reflection-agents; docs.ag2.ai society_of_mind/nested-chat; techcommunity.microsoft.com Agent Framework LLM judge"
+          },
+          {
+            "claim": "CrewAI is the closest prior art to the proposed design and it is free/open-source",
+            "detail": "CrewAI task guardrails run immediately after an agent produces output, validate it (function-based or natural-language/LLM-powered), and on failure auto-route the error message back to the SAME agent to retry — with a configurable retry cap (docs/examples cite up to ~2 additional attempts). This is almost exactly the proposed 'grader judges pass/fail, re-run same agent with critique appended, bounded by max cycles', and it ships as a framework primitive with no upcharge.",
+            "confidence": "high",
+            "source": "docs.crewai.com/en/concepts/tasks; analyticsvidhya.com CrewAI guardrails; github.com/crewAIInc/crewAI PR #1742"
+          },
+          {
+            "claim": "Commercial autonomous coding products bundle an automatic self-verify/fix loop, but charge for the PRODUCT/compute, not the loop as a line item",
+            "detail": "Devin spins up a VM, runs tests, reads error logs, and iterates/fixes autonomously (v3.0 adds dynamic re-planning) — and it is a paid product billed by ACU compute. Cursor's Agent mode runs a run-and-fix loop (runs tests/commands, watches output, iterates) with an opt-in lint-check setting, gated behind a paid Pro subscription. In both, the self-correction is included, never itemized as a premium 'critic loop' add-on.",
+            "confidence": "high",
+            "source": "trickle.so/blog/devin-ai-review; docs.devin.ai/admin/billing; cursor.com test-generation; totalum.app Cursor Auto-review"
+          },
+          {
+            "claim": "ASSESSMENT of the idea's claim: 'a built-in critic loop is exactly the self-correction larger agent frameworks charge for' is largely FALSE / misleading",
+            "detail": "Two-part reality: (1) OSS frameworks (LangGraph, CrewAI, AutoGen/AG2, MS Agent Framework, OpenAI Agents SDK) give the loop away for free as a primitive — you pay nothing for the pattern, you just wire it. (2) Paid products (Devin, Cursor) bundle the loop into a whole agentic product and charge for product/compute, not for the loop itself. So no one 'charges for the critic loop' specifically. A more accurate positioning: the harness makes the loop AUTOMATIC-BY-DEFAULT and OPINIONATED — that is a convenience/UX differentiator (batteries-included), not access to a paywalled capability.",
+            "confidence": "high",
+            "source": "synthesis across LangGraph/CrewAI/AG2/OpenAI/MS docs + Devin/Cursor pricing"
+          },
+          {
+            "claim": "OpenAI Agents SDK and MS Agent Framework split the concern: guardrails (safety/validation) vs LLM-as-judge (post-hoc grading) — neither is a same-agent retry-with-critique loop by default",
+            "detail": "OpenAI Agents SDK guardrails run input/output/tool validation in PARALLEL and fail-fast (more a safety tripwire than a regenerate loop); its eval/trace-grading lives on the paid OpenAI platform surface. Microsoft Agent Framework emphasizes post-execution LLM-as-judge rubric scoring. The proposed feature (grade -> re-run same agent with critique -> bounded cycles) is closer to CrewAI/Reflexion than to these.",
+            "confidence": "high",
+            "source": "openai.github.io/openai-agents-python; developers.openai.com agents guardrails-approvals & agent-evals"
+          },
+          {
+            "claim": "Claude Code (the harness's direct competitor context) now ships native auto-verification plus subagent/hook-based grading",
+            "detail": "Claude Code 2.1 promotes auto-verification to a native workflow: generate code -> run lint/type/test -> evaluate against pass criteria -> self-correct and retry or confirm. Community patterns add a verification SUBAGENT (a fresh model tries to refute the result so the worker isn't grading itself) and Stop/PostToolUse hooks that gate task completion. This is bundled in the product, not an upcharge — and it means 'built-in self-correction' is becoming table stakes, not a unique selling point.",
+            "confidence": "high",
+            "source": "sitepoint.com Claude Code 2.1 auto-verification; code.claude.com/docs best-practices; dev.to self-verification-loop"
+          },
+          {
+            "claim": "Bounding the cycle count is a validated, real need — unbounded self-correction loops are a known failure/cost mode",
+            "detail": "Devin users report the agent frequently 'gets stuck in expensive loops, racking up compute costs while failing to deliver working code.' LangGraph reflexion implementations make the max-cycle termination an explicit conditional edge. This supports the proposed design's 'bounded by a max cycle count' as the right guardrail rather than an afterthought.",
+            "confidence": "medium",
+            "source": "trickle.so/blog/devin-ai-review; langchain.com/blog/reflection-agents"
+          },
+          {
+            "claim": "Re-running the SAME agent that was graded is a deliberate design choice with a known weakness; some competitors use a separate/fresh grader",
+            "detail": "The proposed loop has a separate grader agent judge pass/fail, then re-runs the SAME implementer with the critique. Claude Code's verification subagent and AG2's critic intentionally use a SEPARATE (often fresh-context) model to grade so the producer isn't its own judge. Worth deciding explicitly: the harness already separates grader from implementer (good), but should ensure the grader is a distinct agent/context, not the implementer self-grading.",
+            "confidence": "medium",
+            "source": "dev.to/shipwithaiio self-verification-loop; docs.ag2.ai reflection critic"
+          }
+        ],
+        "competitors": [
+          {
+            "name": "Anthropic 'Building effective agents' — evaluator-optimizer",
+            "what_it_does": "Canonical reference pattern: an optimizer LLM generates, an evaluator LLM critiques with specific feedback, looping until the quality bar is met. Documented in the blog and a runnable cookbook notebook.",
+            "auto_or_manual": "Pattern/recipe, not a product — you implement the loop yourself",
+            "paid": "Free (public blog + open cookbook)"
+          },
+          {
+            "name": "LangGraph (reflection / reflexion)",
+            "what_it_does": "Graph-based generate->reflect->regenerate loop; reflexion adds tool-grounded self-critique, citations, and a bounded revision cycle controlled by a conditional edge (continue/end).",
+            "auto_or_manual": "Manual / opt-in — you wire the nodes and the max-cycle termination edge; not on by default",
+            "paid": "Free / OSS framework primitive (LangGraph Platform / LangSmith hosting is the paid part, not the pattern)"
+          },
+          {
+            "name": "CrewAI (task guardrails + auto-retry)",
+            "what_it_does": "Task-level guardrail validates output right after the agent finishes (function-based or LLM/natural-language), and on failure routes the error message back to the SAME agent to retry. Closest analog to the proposed design.",
+            "auto_or_manual": "Automatic once a guardrail is attached to a task (attaching is opt-in); configurable retry cap (~2 extra attempts default)",
+            "paid": "Free / OSS framework primitive"
+          },
+          {
+            "name": "AutoGen / AG2 (critic agent, nested chat, society-of-mind)",
+            "what_it_does": "A critic/reviewer AssistantAgent evaluates another agent's output and returns feedback for revision; nested chats and SocietyOfMindAgent embed an inner critique 'monologue' that surfaces as one agent.",
+            "auto_or_manual": "Manual / opt-in — you compose the agents and conversation pattern",
+            "paid": "Free / OSS framework primitive"
+          },
+          {
+            "name": "OpenAI Agents SDK",
+            "what_it_does": "Guardrails run input/output/tool validation in parallel and fail-fast (safety tripwire, not a regenerate loop); separate trace-grading / evals for LLM-as-judge scoring of runs.",
+            "auto_or_manual": "Manual / opt-in to define guardrails; evals are a separate post-hoc step, not a same-agent retry loop",
+            "paid": "SDK free / OSS; evals & trace grading live on the paid OpenAI platform surface"
+          },
+          {
+            "name": "Microsoft Agent Framework",
+            "what_it_does": "LLM-as-judge implemented as another agent with a stricter rubric system prompt to check whether output actually followed the scoring rubric; post-execution evaluation pattern.",
+            "auto_or_manual": "Manual / opt-in — you build the judge agent",
+            "paid": "Free / OSS SDK primitive"
+          },
+          {
+            "name": "Devin",
+            "what_it_does": "Autonomous VM coding agent: plans, writes code, runs tests, reads error logs, iterates/fixes autonomously; v3.0 adds dynamic re-planning when it hits a roadblock.",
+            "auto_or_manual": "Automatic / fully built into the product",
+            "paid": "Paid product — Pro $20/mo up to Max $200/mo, Teams $80/mo, Enterprise (historically $500/mo); usage billed in ACU compute units. Loop is bundled, not itemized."
+          },
+          {
+            "name": "Cursor",
+            "what_it_does": "Agent mode runs a run-and-fix loop (edits files, runs tests/terminal commands, watches output, iterates until done or a guardrail); opt-in lint-check auto-identifies errors; Cursor Auto-review run mode (shipped 3.6, May 29 2026) sandboxes/classifies tool calls.",
+            "auto_or_manual": "Automatic once Auto-run / lint-check is enabled (opt-in toggle), then runs unattended",
+            "paid": "Paid product (Pro subscription); the loop is bundled, not a separate charge"
+          },
+          {
+            "name": "Cline",
+            "what_it_does": "Open-source VS Code agent: analyzes task, plans, executes, checks results; generates and runs test suites, reads error stacks, makes targeted edits, re-runs tests, and repeats until pass or it asks for input.",
+            "auto_or_manual": "Automatic loop within the product (auto-approve is opt-in)",
+            "paid": "Free / open-source — BYO API key, no Cline subscription; you pay only model/API costs (~$0.80-$2.00 per feature session)"
+          },
+          {
+            "name": "Claude Code",
+            "what_it_does": "Agentic test-fix loop (run tests -> read failures -> fix -> re-run). 2.1 makes auto-verification native (lint/type/test -> evaluate vs pass criteria -> self-correct/retry/confirm). Community patterns add a fresh-model verification SUBAGENT and Stop/PostToolUse hooks that gate completion.",
+            "auto_or_manual": "Mixed — native auto-verification in 2.1; deeper grader-gating commonly assembled via subagents/hooks (opt-in)",
+            "paid": "Bundled in Claude Code (subscription/API); the loop is not a separate upcharge"
+          }
+        ],
+        "stats": [
+          {
+            "stat": "Devin pricing: Pro $20/mo, Max $200/mo, Teams $80/mo, plus Enterprise (historically launched at $500/mo); self-serve billed in ACU compute units",
+            "source": "comparedge.com/tools/devin-ai/pricing; docs.devin.ai/admin/billing; alternativeto.net 2024 GA $500/mo"
+          },
+          {
+            "stat": "Devin reported ~13.86% on SWE-Bench (third-party review figure; treat as indicative only)",
+            "source": "openaitoolshub.org/en/blog/devin-ai-review"
+          },
+          {
+            "stat": "CrewAI task guardrails auto-retry the same agent up to ~2 additional times by default (configurable)",
+            "source": "analyticsvidhya.com CrewAI guardrails; docs.crewai.com/en/concepts/tasks"
+          },
+          {
+            "stat": "Cline cost: BYO key, no subscription; ~$0.80-$2.00 per feature session (Claude Sonnet 4), ~$10-$25 for a full active dev day",
+            "source": "baeseokjae.github.io/posts/cline-ai-review-2026; deployhq.com/guides/cline"
+          },
+          {
+            "stat": "Cursor Auto-review run mode shipped in Cursor 3.6 on May 29, 2026 (three-stage allowlist/sandbox/classifier filter on tool calls)",
+            "source": "totalum.app/blog/cursor-auto-review-totalum"
+          },
+          {
+            "stat": "Claude Code 2.1 promotes auto-verification to a native workflow (generate -> lint/type/test -> evaluate vs pass criteria -> self-correct/retry/confirm)",
+            "source": "sitepoint.com/claude-code-21-the-complete-xhigh-and-autoverification-guide-2026"
+          }
+        ]
+      },
+      {
+        "angle": "evidence",
+        "findings": [
+          {
+            "claim": "Self-reflection / verbal feedback loops measurably improve agent task success — BUT in the canonical papers the feedback signal is grounded in EXTERNAL outcomes (unit tests, environment rewards), not pure self-grade.",
+            "detail": "Reflexion (Shinn et al., NeurIPS 2023, arXiv 2303.11366) converts external feedback (test results, env reward) into verbal 'self-reflection' stored in memory and retried. It reports SOTA on code-gen (e.g. 91% pass@1 on HumanEval vs 80% GPT-4 baseline in the paper) and an ~8% absolute boost from self-reflection over plain episodic memory. The authors explicitly note 'refinement-only approaches are not as effective as self-reflection-guided refinement' — i.e. the gain comes from grounding reflection in real signals. This is the strongest support for a verify-and-retry loop, with the caveat that the verifier is external (tests), not the model grading itself in a vacuum.",
+            "confidence": "high",
+            "source": "Reflexion, Shinn et al. 2023, arXiv:2303.11366 (NeurIPS 2023); github.com/noahshinn/reflexion"
+          },
+          {
+            "claim": "Iterative self-feedback (Self-Refine) improves output quality across diverse tasks without any extra training — a direct precedent for a generate→critique→refine loop.",
+            "detail": "Self-Refine (Madaan et al. 2023, arXiv 2303.17651) uses the SAME model as generator, critic, and refiner. Across 7 tasks (dialog, math reasoning, code optimization, etc.) on GPT-3.5/ChatGPT/GPT-4, outputs improved ~20% (absolute, on their preference/quality metrics) vs single-pass generation. Key nuance the authors stress: 'specific, actionable feedback matters more than the number of refinement rounds' — vague self-critique adds little, and gains plateau quickly. This supports the loop but warns that loop quality hinges on critique specificity, not iteration count.",
+            "confidence": "high",
+            "source": "Self-Refine, Madaan et al. 2023, arXiv:2303.17651"
+          },
+          {
+            "claim": "External tool/verifier feedback dramatically outperforms intrinsic self-evaluation — the model's own critiques contribute marginally and can be worse than the original answer.",
+            "detail": "CRITIC (Gou et al. 2023, arXiv 2305.11738) shows tool-interactive critiquing (code interpreter, search, calculators) is what drives correction. Their ablation: pure Self-Eval reaches only ~54% accuracy at verifying its own answers on HotpotQA (barely above random), and on TriviaQA self-critique performs WORSE than an 'only-true' baseline. Conclusion: 'the model's own critiques contribute marginally to improvement, and even fall short compared to the initial output.' Direct implication for a coding harness: tie the verify step to compiler/test/linter signals, not a self-grade.",
+            "confidence": "high",
+            "source": "CRITIC, Gou et al. 2023, arXiv:2305.11738 (ICLR 2024)"
+          },
+          {
+            "claim": "COUNTER (the strongest): With no external feedback, LLMs cannot reliably self-correct reasoning and performance can DEGRADE after self-correction — correct answers get changed to wrong ones.",
+            "detail": "Huang et al. 2023 ('LLMs Cannot Self-Correct Reasoning Yet', arXiv 2310.01798, ICLR 2024) isolate 'intrinsic self-correction' (no oracle/external signal). On GSM8K, CommonSenseQA, HotpotQA, accuracy does not improve and often drops once the model is asked to review/revise — because it flips already-correct answers. They argue prior positive results leaned on oracle labels (knowing when to stop) that aren't available in deployment. This is the central risk for an automatic self-grade loop: false-negative self-grades trigger edits that break working code.",
+            "confidence": "high",
+            "source": "Huang et al. 2023, arXiv:2310.01798 (ICLR 2024)"
+          },
+          {
+            "claim": "A critical meta-survey concludes self-correction via PROMPTED self-feedback essentially never works outside narrow, self-correction-friendly tasks; reliable gains require external feedback or large-scale fine-tuning.",
+            "detail": "Kamoi et al. 2024 ('When Can LLMs Actually Correct Their Own Mistakes?', TACL 2024, arXiv 2406.01297) survey the field and find: (1) NO prior work demonstrates successful self-correction with feedback from prompted LLMs, except tasks 'exceptionally suited' for it; (2) self-correction works when reliable external feedback exists (code interpreters, retrieval, oracle); (3) many positive papers used 'impractical frameworks or unfair evaluations that over-evaluate self-correction' (e.g. oracle stopping). This is the best single citation that a pure self-grade loop is unlikely to help and may be measuring an artifact.",
+            "confidence": "high",
+            "source": "Kamoi et al. 2024, TACL, arXiv:2406.01297"
+          },
+          {
+            "claim": "FAILURE MODE — self-preference / self-evaluation bias: models systematically over-rate their OWN outputs, so a self-grader is a biased verifier prone to false 'pass' grades.",
+            "detail": "Wataoka et al. ('Self-Preference Bias in LLM-as-a-Judge', arXiv 2410.21819) quantify that LLMs, GPT-4 most strongly, rate their own generations higher than humans do. Mechanism: judges reward low-perplexity (familiar) text — the model finds its own output 'more predictable' and scores it up. Measured self-preference spans roughly -38% to +90% on ArenaHard. For a self-grading harness this is double-edged: it inflates pass grades on the model's own buggy code (missed defects) and, combined with verbosity/position bias, makes the grade an unreliable gate.",
+            "confidence": "high",
+            "source": "Self-Preference Bias in LLM-as-a-Judge, Wataoka et al., arXiv:2410.21819"
+          },
+          {
+            "claim": "The error-localization bottleneck: LLMs are bad at FINDING their own mistakes even though they can FIX a mistake once its location is given — so the verify step, not the retry step, is the weak link.",
+            "detail": "Tyen et al. ('LLMs cannot find reasoning errors, but can correct them given the error location', arXiv 2311.08516) decompose self-correction into mistake-finding vs output-correction. Models fail at mistake-finding (the verifier role) but succeed at correction once handed the location. Implication for a verify-and-retry loop: the value lives almost entirely in giving the loop an accurate, external locator (failing test name, stack trace, compiler error line) rather than asking the model to self-diagnose.",
+            "confidence": "medium",
+            "source": "Tyen et al. 2023, arXiv:2311.08516"
+          },
+          {
+            "claim": "SUPPORT for a verifier (but a TRAINED/external one): test-time scaling with a dedicated critic/verifier model lifts coding-agent pass rates substantially — prompt-based self-reranking underperforms a trained critic.",
+            "detail": "OpenHands reported SOTA on SWE-Bench Verified by generating multiple rollouts and selecting with a trained critic model, improving from 60.6% (single trajectory) to 66.4% with five attempts; they explicitly found a trained critic beats prompt-based reranking. Broader test-time-scaling results (DeepSWE 42.2% pass@1 → 59% with TTS; CWM 53.9%→65.8% with TTS) confirm parallel-sample + verifier selection helps. Caveat for the harness: the lift comes from a SEPARATE verifier and best-of-N selection, not the same model self-grading a single attempt.",
+            "confidence": "medium",
+            "source": "OpenHands blog (Apr 2025) 'SOTA on SWE-Bench Verified with Inference-Time Scaling and Critic Model'; DeepSWE (together.ai); CWM arXiv:2510.02387"
+          },
+          {
+            "claim": "FAILURE MODE — iterative AI code generation can DEGRADE quality/security over passes, not just stall: more refinement rounds introduced more vulnerabilities in one systematic study.",
+            "detail": "'Security Degradation in Iterative AI Code Generation' (arXiv 2506.11022) finds a paradox where repeatedly asking the model to expand/refine code accumulates security flaws across iterations. Combined with Huang et al.'s answer-flipping result, this is direct evidence that an unbounded auto-retry loop has downside risk, not just diminishing returns — argue for hard iteration caps and an external pass/fail gate before each retry.",
+            "confidence": "medium",
+            "source": "Security Degradation in Iterative AI Code Generation, arXiv:2506.11022"
+          },
+          {
+            "claim": "COST/LATENCY — multi-pass verify-and-retry multiplies tokens and wall-clock roughly linearly with passes; loops that don't gate on external signal pay this cost for near-zero accuracy gain (per Huang/Kamoi).",
+            "detail": "Self-Refine and Reflexion both run N full generate+critique+refine cycles, so cost and latency scale ~Nx the single-pass call (best-of-N verifier selection is even more, generating K parallel rollouts then scoring each). Because Huang et al. and Kamoi et al. show intrinsic (self-grade-only) loops yield little or negative accuracy, the expected ROI of a PURE self-grade loop is a multiplied bill for flat accuracy. The defensible design is: cheap external check (compile/test/lint) as the gate, capped retries, and reflection only on a real failure signal.",
+            "confidence": "medium",
+            "source": "Synthesis of Self-Refine (2303.17651), Reflexion (2303.11366), Huang et al. (2310.01798), Kamoi et al. (2406.01297)"
+          },
+          {
+            "claim": "Real-world AI-generated code already shows elevated defect/rework signatures, which is the practical problem a verify loop is meant to catch — but argues the gate should be tests/static analysis, the very signals that demonstrably work.",
+            "detail": "GitClear's analysis of ~211M lines (2025 report) found churn (code reverted/revised within two weeks) rose from 5.5% (2020) to a projected ~7.9% in 2024, copy/paste lines rose from 8.3% to 12.3% (+48% relative), duplicated code blocks rose ~8x, and refactored ('moved') lines fell from 24.1% to 9.5%. Cloned code is associated with 15-50% more defects in cited research. Google DORA 2024 estimated a 7.2% drop in delivery stability per 25% increase in AI adoption. These motivate an automated verifier but point it at external quality signals, not self-grading.",
+            "confidence": "medium",
+            "source": "GitClear 2025 AI Copilot Code Quality report; Google DORA 2024 report (via GitClear/DevOps.com summaries)"
+          }
+        ],
+        "stats": [
+          {
+            "stat": "Reflexion: ~8% absolute boost from self-reflection over episodic-memory baseline; SOTA code-gen (paper reports 91% pass@1 on HumanEval vs 80% GPT-4 baseline). Feedback is EXTERNAL (tests/env reward).",
+            "source": "Reflexion, Shinn et al. 2023, arXiv:2303.11366"
+          },
+          {
+            "stat": "Self-Refine: ~20% average improvement over single-pass generation across 7 tasks (GPT-3.5/ChatGPT/GPT-4); gains plateau fast and depend on critique specificity, not round count.",
+            "source": "Self-Refine, Madaan et al. 2023, arXiv:2303.17651"
+          },
+          {
+            "stat": "CRITIC: pure self-evaluation verifies its own answers at only ~54% on HotpotQA (near random); self-critique scored WORSE than the original output on TriviaQA. Tool feedback is what drives correction.",
+            "source": "CRITIC, Gou et al. 2023, arXiv:2305.11738"
+          },
+          {
+            "stat": "Intrinsic (no external feedback) self-correction does NOT improve and often DEGRADES accuracy on GSM8K/CommonSenseQA/HotpotQA — model flips correct answers to wrong.",
+            "source": "Huang et al. 2023, arXiv:2310.01798 (ICLR 2024)"
+          },
+          {
+            "stat": "Meta-survey: NO prior work shows successful self-correction from prompted-LLM self-feedback except tasks 'exceptionally suited' to it; reliable gains need external feedback or large-scale fine-tuning.",
+            "source": "Kamoi et al. 2024, TACL, arXiv:2406.01297"
+          },
+          {
+            "stat": "Self-preference bias: LLMs (GPT-4 strongest) over-rate their own outputs vs humans; measured self-preference ranges roughly -38% to +90% on ArenaHard; correlated with low perplexity (familiarity).",
+            "source": "Self-Preference Bias in LLM-as-a-Judge, arXiv:2410.21819"
+          },
+          {
+            "stat": "Coding-agent test-time scaling with a TRAINED critic: SWE-Bench Verified 60.6% (1 trajectory) -> 66.4% (5 attempts); trained critic beats prompt-based reranking. DeepSWE 42.2% pass@1 -> 59% with TTS; CWM 53.9% -> 65.8% with TTS.",
+            "source": "OpenHands blog Apr 2025; DeepSWE (together.ai); CWM arXiv:2510.02387"
+          },
+          {
+            "stat": "AI-era code quality drift: churn 5.5% (2020) -> ~7.9% (2024 projected); copy/paste lines 8.3% -> 12.3% (+48% rel); duplicated blocks ~8x increase; refactored 'moved' lines 24.1% -> 9.5%; cloned code ~15-50% more defects.",
+            "source": "GitClear 2025 AI Copilot Code Quality report (~211M LOC)"
+          },
+          {
+            "stat": "Google DORA 2024: estimated 7.2% decrease in delivery stability per 25% increase in AI adoption.",
+            "source": "Google DORA 2024 report (via GitClear / DevOps.com)"
+          },
+          {
+            "stat": "Cost/latency: generate->critique->refine loops scale ~Nx single-pass cost; best-of-N verifier selection scales with K parallel rollouts plus scoring. Pure self-grade loops pay this for ~flat/negative accuracy.",
+            "source": "Synthesis: Self-Refine 2303.17651, Reflexion 2303.11366, Huang 2310.01798"
+          }
+        ],
+        "competitors": []
+      },
+      {
+        "angle": "market-cost",
+        "findings": [
+          {
+            "claim": "AI code review / verification is a distinct, fast-growing market segment with strong demand signals, not just a feature",
+            "detail": "The broader AI code-tools market is sized at ~$7.65B (2025) growing to ~$9.46B (2026) at ~23.7% CAGR (reaching ~$22.2B by 2030). The narrower AI-code-review tooling slice is estimated at ~$750M in 2025. Pure-play AI code-review vendor ARR is reported at ~$420M for 2026, up from ~$180M in 2025 (~133% YoY). Search demand for 'AI code review' reportedly grew +310% from mid-2025 to Q1 2026, and Gartner is cited estimating 30% of enterprises with 1,000+ developers had deployed at least one AI code review tool by end of 2025. Demand is driven by the fact that ~46% of new code is now AI-generated, which turns human-only review into a bottleneck.",
+            "confidence": "medium",
+            "source": "thebusinessresearchcompany.com/report/artificial-intelligence-ai-code-tools-global-market-report; datainsightsmarket.com/reports/ai-code-review-tool-507639; ideaplan.io/blog/ai-code-review-tools-market-share-2026; dev.to/rahulxsingh/the-state-of-ai-code-review-in-2026"
+          },
+          {
+            "claim": "The cost of low-quality AI-generated code is large, measurable, and concentrated in rework/defects — the core pain a self-grading critic targets",
+            "detail": "Engineering leaders analyzing post-AI metrics report rework rates (developer time spent fixing recently-shipped code) rising 30-60% within six months of heavy AI tool adoption; one widely-cited framing is that for every 10 hours saved by AI code generation, 4-6 hours go to rework, debugging, and incident response. Translated to budgets, a $1M AI development project implies ~$300K in unplanned rework. Quality data backs the pain: SonarSource's Aug-2025 analysis found a 'systemic lack of security awareness' in LLM output, ~40% of AI-generated code is reported to carry security vulnerabilities, and GitClear's analysis of 211M lines found duplicated code blocks rose 8x in 2024 while refactoring dropped to historic lows. Macro anchor: CISQ estimates poor software quality cost the US economy ~$2.41 trillion, dominated by rework.",
+            "confidence": "medium",
+            "source": "medium.com/@justhamade/true-cost-of-ai-generated-code; tembo.io/blog/ai-technical-debt; usekyros.ai/blog/vibe-coding-crisis-ai-technical-debt; qodo.ai/reports/state-of-ai-code-quality"
+          },
+          {
+            "claim": "Automated grading/verification (LLM-as-judge / verifier) is already productized and monetized along two distinct lines",
+            "detail": "Line 1 — eval/judge platforms sold to AI builders: DeepEval/Confident AI, Braintrust, Galileo, Evidently (OSS lib >25M downloads + cloud), LangSmith, Arize, and Ragas all ship LLM-as-judge scoring as a product. Line 2 — in-product agent reviewers/verifiers sold to developers: Cursor BugBot, Qodo (PR review + Qodo Cover test-gen), Greptile, and autonomous agents like Devin that 'iterate until they reach a result for review.' This confirms both 'judge-as-a-service' and 'verification-as-a-paid-feature' business models exist; a self-grading critic loop sits at their intersection (an internal verifier rather than a separate SKU).",
+            "confidence": "high",
+            "source": "confident-ai.com/knowledge-base/compare/best-llm-evaluation-tools; evidentlyai.com/llm-guide/llm-as-a-judge; greptile.com/content-library/best-ai-code-review-tools; qodo.ai/blog/best-ai-coding-assistant-tools"
+          },
+          {
+            "claim": "Pricing signals: graders bundle cheap; in-product reviewers command a $30-40/dev/month premium",
+            "detail": "Eval/judge platforms anchor low per-seat (DeepEval: $0 Developer / $39 seat/mo Plus / custom Enterprise). In-product reviewers price higher and as add-ons: Cursor BugBot is ~$40/month on top of Cursor's $20 base; Qodo is ~$30/developer/month positioned as the premium 'quality platform.' The raw token cost of a single LLM-judge pass is small — roughly $0.001-0.003 with GPT-4o-mini and $0.015-0.045 with Claude Sonnet — meaning the willingness-to-pay ($30-40/mo) vastly exceeds marginal grader compute, so a per-step grader is economically defensible if it demonstrably cuts rework.",
+            "confidence": "high",
+            "source": "confident-ai.com/knowledge-base/compare/best-llm-evaluation-tools; lushbinary.com/blog/ai-coding-agents-comparison; qodo.ai/blog/augment-code-vs-cursor; evidentlyai.com/llm-guide/llm-as-a-judge"
+          },
+          {
+            "claim": "Research validates that verifier-based reranking / per-step grading buys quality at acceptable, tunable cost — the central cost-latency argument for a per-step grader",
+            "detail": "Test-time-scaling literature shows verifier reranking reaches higher accuracy at lower k than self-consistency while using 1-3x fewer tokens, and Self-Truncation Best-of-N matches full Best-of-N at 75-80% lower cost. The cost curve is steep and tunable: Best@50 can match SOTA while Best@500 costs >10x; simple non-agentic pipelines hit 27.3% solve at just $0.34/issue. This supports framing a grader as 'cheap insurance' — a single verification pass per step is a small token multiplier on the actor, and aggressive sampling is optional, not required.",
+            "confidence": "high",
+            "source": "arxiv.org/pdf/2505.23604 (Satori-SWE); arxiv.org/pdf/2412.21139 (SWE-Gym); openreview.net/pdf?id=BcKYVmh3yH (Self-Estimating Best-of-N)"
+          },
+          {
+            "claim": "Multi-pass critic loops are an established pattern, but the dominant design risk is the 'self-confirmation / hallucination barrier' — the angle that differentiates a credible grader",
+            "detail": "Reflexion (actor/evaluator/self-reflection) and actor-critic adversarial coding are well-documented patterns; loops typically run 3-5 rounds until the critic approves or a max-iteration cap hits, and are reported to cut downstream human review cycles from 3-5 to 1-2. The critical caveat: when the verifier is the same model critiquing itself, the system only works if the critic interface induces stricter evaluation than the actor — otherwise it sits near the 'hallucination barrier' and self-confirms. Practical safeguards required: max-iteration limits, tracking whether cycles actually improve metrics, and state-hash dedup to prevent infinite/non-converging loops. This means a trustworthy self-grader needs structural rigor (rubric, separate framing, objective checks), not just 'ask the model if it's happy.'",
+            "confidence": "high",
+            "source": "arxiv.org/pdf/2303.11366 (Reflexion); understandingdata.com/posts/actor-critic-adversarial-coding; medium.com/@Micheal-Lanham/self-correcting-agents-are-not-what-you-think-they-are; stackviv.ai/blog/reflection-ai-agents-self-improvement"
+          },
+          {
+            "claim": "User expectations: developers tolerate added latency/cost only when it is bounded and visibly reduces rework; uncapped loops are the failure mode",
+            "detail": "The market framing favors 'spend extra compute only when reliability matters' — single-model quick polishing for simple tasks, multi-agent reflection reserved for complex/high-reliability work. Buyers already pay premiums (BugBot autofix spawns cloud VMs; Qodo runs pre-merge gates), indicating tolerance for background/async verification cost. But the cited risks (infinite reflection loops, non-converging cycles) mean users expect hard caps, convergence tracking, and an off-ramp. For a per-step grader, the defensible framing is: bounded passes (e.g., cap at N), a small token multiplier per step vs. the actor, and an explicit 'this caught X before you had to review it' value story tied to the 30-60% rework figures.",
+            "confidence": "medium",
+            "source": "understandingdata.com/posts/actor-critic-adversarial-coding; lushbinary.com/blog/ai-coding-agents-comparison; stackviv.ai/blog/reflection-ai-agents-self-improvement"
+          }
+        ],
+        "competitors": [
+          {
+            "name": "DeepEval / Confident AI",
+            "what_it_does": "Open-source LLM eval framework with LLM-as-judge metrics (correctness, faithfulness, etc.) plus a hosted platform; the canonical 'judge-as-a-product' for AI builders",
+            "auto_or_manual": "automatic (LLM-as-judge), config-driven rubrics",
+            "paid": "Freemium: $0 Developer / $39 per seat/mo Plus / custom Enterprise"
+          },
+          {
+            "name": "Braintrust",
+            "what_it_does": "Eval + prompt/experiment platform; runs LLM-as-judge scorers over agent/prompt outputs in CI and production",
+            "auto_or_manual": "automatic",
+            "paid": "Paid SaaS (usage/seat tiers; enterprise)"
+          },
+          {
+            "name": "Galileo",
+            "what_it_does": "LLM evaluation/observability platform focused on hallucination detection and output quality scoring",
+            "auto_or_manual": "automatic",
+            "paid": "Paid SaaS / enterprise"
+          },
+          {
+            "name": "Evidently AI",
+            "what_it_does": "Open-source eval library (>25M downloads) for LLM-as-judge tests plus Evidently Cloud for collaborative eval runs",
+            "auto_or_manual": "automatic",
+            "paid": "OSS free + paid Cloud"
+          },
+          {
+            "name": "LangSmith",
+            "what_it_does": "Eval/observability within the LangChain ecosystem; LLM-as-judge evaluators on traces",
+            "auto_or_manual": "automatic",
+            "paid": "Freemium + paid seats"
+          },
+          {
+            "name": "Arize / Ragas",
+            "what_it_does": "Arize: eval within its ML/LLM monitoring platform; Ragas: RAG-specific LLM-as-judge metrics",
+            "auto_or_manual": "automatic",
+            "paid": "Arize paid SaaS; Ragas OSS"
+          },
+          {
+            "name": "Cursor BugBot",
+            "what_it_does": "In-IDE/PR AI reviewer that flags bugs; Autofix spawns cloud-VM agents to fix findings ('Fix All') — verification-as-a-paid-feature inside a coding agent",
+            "auto_or_manual": "automatic (background reviewer + autofix)",
+            "paid": "~$40/month add-on on top of Cursor's ~$20/mo base"
+          },
+          {
+            "name": "Qodo (formerly CodiumAI)",
+            "what_it_does": "Quality platform: pre-merge PR review, IDE-level review, compliance checks, and Qodo Cover unit-test generation — closest 'verification/grading as product' for code",
+            "auto_or_manual": "automatic, context-aware pre-merge gating",
+            "paid": "~$30/developer/month (premium tier)"
+          },
+          {
+            "name": "Greptile",
+            "what_it_does": "AI code-review tool doing context-aware pre-merge PR validation across the codebase",
+            "auto_or_manual": "automatic",
+            "paid": "Paid SaaS (per-seat)"
+          },
+          {
+            "name": "Devin (Cognition)",
+            "what_it_does": "Autonomous SWE agent that runs tests/terminal/browser and iterates until a result is ready for review — embodies an internal verify-and-retry loop rather than a separate grader SKU",
+            "auto_or_manual": "automatic (agentic self-iteration)",
+            "paid": "Paid subscription / ACU-based pricing"
+          }
+        ],
+        "stats": [
+          {
+            "stat": "AI code-tools market: ~$7.65B (2025) → ~$9.46B (2026) at ~23.7% CAGR; ~$22.2B by 2030",
+            "source": "thebusinessresearchcompany.com/report/artificial-intelligence-ai-code-tools-global-market-report"
+          },
+          {
+            "stat": "AI code-review tool market estimated ~$750M in 2025 (~9.2% CAGR to 2033)",
+            "source": "datainsightsmarket.com/reports/ai-code-review-tool-507639"
+          },
+          {
+            "stat": "Pure-play AI code-review vendor ARR ~$420M (2026) vs ~$180M (2025) = ~+133% YoY",
+            "source": "ideaplan.io/blog/ai-code-review-tools-market-share-2026"
+          },
+          {
+            "stat": "'AI code review' search demand +310% from mid-2025 to Q1 2026",
+            "source": "dev.to/rahulxsingh/the-state-of-ai-code-review-in-2026"
+          },
+          {
+            "stat": "Gartner (cited): 30% of enterprises with 1,000+ developers deployed at least one AI code review tool by end of 2025",
+            "source": "dev.to/rahulxsingh/the-state-of-ai-code-review-in-2026"
+          },
+          {
+            "stat": "~46% of new code is AI-generated, making human-only review a bottleneck",
+            "source": "dev.to/rahulxsingh/the-state-of-ai-code-review-in-2026"
+          },
+          {
+            "stat": "~40% of AI-generated code is reported to contain security vulnerabilities",
+            "source": "codescene.com/use-cases/ai-code-quality"
+          },
+          {
+            "stat": "Rework rates rise 30-60% within 6 months of heavy AI tool adoption; for every 10 hrs saved, 4-6 hrs go to rework/debugging/incident response",
+            "source": "tembo.io/blog/ai-technical-debt"
+          },
+          {
+            "stat": "A $1M AI development project implies ~$300K in unplanned rework",
+            "source": "medium.com/@justhamade/true-cost-of-ai-generated-code"
+          },
+          {
+            "stat": "Up to 40% of an IT budget can be spent on technical-debt fallout",
+            "source": "smartdev.com/glossary-technical-debt-ai-induced"
+          },
+          {
+            "stat": "GitClear (211M LOC analyzed): duplicated code blocks rose 8x in 2024; refactoring dropped to historic lows",
+            "source": "medium.com/@justhamade/true-cost-of-ai-generated-code"
+          },
+          {
+            "stat": "CISQ: poor software quality cost the US economy ~$2.41 trillion, dominated by rework",
+            "source": "usekyros.ai/blog/vibe-coding-crisis-ai-technical-debt"
+          },
+          {
+            "stat": "LLM-judge cost per evaluation: ~$0.001-0.003 (GPT-4o-mini) or ~$0.015-0.045 (Claude Sonnet)",
+            "source": "confident-ai.com/knowledge-base/compare/best-llm-evaluation-tools"
+          },
+          {
+            "stat": "DeepEval pricing: $0 Developer / $39 per seat/mo Plus / custom Enterprise",
+            "source": "confident-ai.com/knowledge-base/compare/best-llm-evaluation-tools"
+          },
+          {
+            "stat": "Cursor BugBot ~$40/mo add-on on top of ~$20/mo base; Qodo ~$30/developer/mo",
+            "source": "lushbinary.com/blog/ai-coding-agents-comparison; qodo.ai/blog/augment-code-vs-cursor"
+          },
+          {
+            "stat": "Verifier reranking: higher accuracy at lower k than self-consistency using 1-3x fewer tokens; Self-Truncation Best-of-N matches full BoN at 75-80% lower cost",
+            "source": "openreview.net/pdf?id=BcKYVmh3yH; arxiv.org/pdf/2412.21139"
+          },
+          {
+            "stat": "Cost curve is steep/tunable: Best@50 can match SOTA while Best@500 costs >10x; simple non-agentic pipeline = 27.3% solve at $0.34/issue",
+            "source": "arxiv.org/pdf/2505.23604"
+          },
+          {
+            "stat": "Critic loops typically run 3-5 rounds (with max-iteration cap) and can cut downstream human review cycles from 3-5 to 1-2",
+            "source": "understandingdata.com/posts/actor-critic-adversarial-coding"
+          }
+        ]
+      }
+    ],
+    "verdicts": [
+      {
+        "claim": "max_review_fix_cycles is defined and validated in config but is NOT wired to any automatic grade/fix loop — no code path consumes it to drive retries (the feature would be the first real consumer).",
+        "verdict": "refuted",
+        "evidence": "max_review_fix_cycles IS already consumed by live runtime code that bounds an orchestrator-driven reviewer→fixer review/fix cycle. Definition: src/config/mod.rs:178 (field), :190 (default Limit::Value(2)). Consumer: src/app/mod.rs:3704-3710 `review_fix_cycle_limit_reached` reads `self.config.limits.max_review_fix_cycles` (:3707) and compares it to `review_fix_cycle_count(&run.previous_results)` (:3708), where `review_fix_cycle_count` (src/app/mod.rs:6019-6033) counts completed reviewer→fixer cycles. It is invoked in the live drive loop: `handle_orchestrator_decision` (src/app/mod.rs:1873, called from the loop at :1818 and :1861) dispatches to `handle_single_agent_decision` (:1977-1980) and `handle_parallel_group_decision` (:1993-1998), both of which call `stop_for_review_fix_cycle_limit` (:3712-3724) to set RunState::LimitReached and emit the \"Run review/fix cycle limit reached.\" event keyed \"max_review_fix_cycles\" (:3719). End-to-end coverage: test `review_fix_cycle_limit_stops_before_extra_fixer_pass` (src/app/mod.rs:11391-11432) sets `max_review_fix_cycles = 1`, runs a real fake-runtime drive, and asserts RunState::LimitReached, the limit-reached event, and exactly 2 fixer passes — proving the limit bounds retries at runtime. Unit test `review_fix_cycle_count_skips_initial_fixer_pass` (src/app/mod.rs:11321-11339) covers the counter. The orchestrator routes to \"fixer\"/\"reviewer\" agents (src/orchestrator/mod.rs:803, 1328, 1338). Thus a real consumer already exists; the claim's \"no code path consumes it\" and \"would be the first real consumer\" are false.",
+        "correction": "max_review_fix_cycles already has a live consumer: it bounds the orchestrator's reviewer→fixer cycle. `review_fix_cycle_limit_reached` (src/app/mod.rs:3704-3710) reads the limit and `stop_for_review_fix_cycle_limit` (:3712) halts the run (RunState::LimitReached) once `review_fix_cycle_count` (:6019) reaches it; this is wired through `handle_single_agent_decision` (:1977) and `handle_parallel_group_decision` (:1993) in the active drive loop, with passing end-to-end and unit tests (:11391, :11321). The only true kernel: the *specific* self-grading \"grader-sentinel verify-and-retry\" loop described in docs/feature-roadmap.md:148 and plans/AUDIT-and-ROADMAP-2026-06-14.md:326 (a grader that programmatically grades and re-dispatches the SAME agent) does not exist — but that is a different mechanism, and the existing reviewer→fixer cycle is already a real, automatically-routed review/fix loop the limit governs."
+      },
+      {
+        "claim": "The per-step limit re-check logic is duplicated across several call sites (idea claims ~5 copies); a single shared guard does not yet exist, so adding a grader step risks adding a 6th copy unless refactored.",
+        "verdict": "holds",
+        "evidence": "In src/app/mod.rs the per-step max_agent_steps re-check is copy-pasted as a full inline block (predicate `limit_reached(&self.config.limits.max_agent_steps, run.step_count)` -> set `RunState::LimitReached` -> `record_event(\"run_limit_reached\", json!({\"limit\":\"max_agent_steps\",\"value\":run.step_count}))` -> return/break) at 4 call sites: prepare_parallel_children (2399-2408, breaks), run_orchestrator_step (2895-2904), run_agent_step (3040-3049), and run_council_workflow (3208-3217). The identical JSON payload is confirmed at lines 2405/2901/3046/3214. A 5th call to the same predicate exists at line 3772 (schedule_parse_repair, boolean-only guard), and a 6th related check at parallel_group_exceeds_agent_step_limit (2351). No `stop_for_agent_step_limit` helper or combined per-step guard exists for this check — `rg \"fn stop_for\"` shows dedicated helpers only for the OTHER limits (stop_for_wall_clock_limit 3648, stop_for_step_time_limit 3666, stop_for_step_action_limit 3685, stop_for_review_fix_cycle_limit 3712, stop_for_parallel_group_agent_step_limit 2357). apply_parallel_limit_checks (2757) is only a partial combined guard for the parallel path covering wall-clock+step-time, not max_agent_steps. A new grader step would be another per-step execution path and would naturally replicate the same inline block, so the duplication and absence-of-shared-guard premises hold.",
+        "correction": "The exact count is 4 fully-duplicated inline blocks (lines 2399, 2895, 3040, 3208), with 5 total call-sites of the `limit_reached(max_agent_steps, run.step_count)` predicate (adding line 3772). So \"~5 copies\" is approximately right but the precise figure for the duplicated set-state+event+return block is 4. Also note the codebase already has dedicated `stop_for_*` guard helpers for every OTHER limit (wall-clock, step-time, step-action, review-fix-cycle, parallel-group agent-step); only this per-step max_agent_steps re-check lacks one, which is exactly the gap a grader step would widen to a 5th/6th copy."
+      },
+      {
+        "claim": "Council is dispatched via a sentinel agent id resolved as a virtual routing target inside the orchestrator decision loop, with synthesis in app/mod.rs — a pattern a new grader sentinel could cleanly reuse rather than a bespoke path.",
+        "verdict": "holds",
+        "evidence": "The core mechanism is confirmed. A reserved id constant `pub const COUNCIL_WORKFLOW_AGENT_ID: &str = \"council\"` (src/orchestrator/mod.rs:9) acts as the sentinel id. It is resolved as a virtual routing target in `validate_agent_reference` (src/orchestrator/mod.rs:642-653), which special-cases the id and bypasses the real `config.agents.get(agent_id)` lookup (line 654), returning Ok without a configured agent; validation is reached via `validate_decision_next_step` (src/orchestrator/mod.rs:486,500,558) and it gets a synthetic routing line in `build_orchestrator_prompt` (src/orchestrator/mod.rs:704). Dispatch happens in the drive loop: `drive_and_replay` (src/app/mod.rs:1286) -> `handle_single_agent_decision` (src/app/mod.rs:1886,1954) -> `if next_agent_id == COUNCIL_WORKFLOW_AGENT_ID` at src/app/mod.rs:1960 calls `run_council_workflow` (src/app/mod.rs:3155). Synthesis is `synthesize_council_decision` at src/app/mod.rs:5557. Both workflow execution and synthesis live in app/mod.rs, matching the claim.",
+        "correction": "Three precision caveats. (1) The code never calls it a \"sentinel\"; it is named COUNCIL_WORKFLOW_AGENT_ID / \"harness workflow\" — \"sentinel\" is an apt paraphrase, not a literal term. (2) The claim's phrasing implies dispatch is in the orchestrator module and only synthesis in app/mod.rs, but the orchestrator module (src/orchestrator/mod.rs) only VALIDATES the virtual target and emits the prompt routing line; the actual dispatch (src/app/mod.rs:1960), workflow execution (src/app/mod.rs:3155), and synthesis (src/app/mod.rs:5557) ALL live in app/mod.rs's drive loop. So \"inside the orchestrator decision loop\" only holds if \"orchestrator decision loop\" means the OrchestratorDecision-processing drive loop in app/mod.rs, not code under src/orchestrator/. (3) There is NO generic virtual-target registry: council is the only such target, wired through hardcoded `if agent_id == COUNCIL_WORKFLOW_AGENT_ID` string-equality branches at 3 sites (orchestrator/mod.rs:642, app/mod.rs:1960, and the prompt line orchestrator/mod.rs:704). A \"grader sentinel\" would copy this shape (new const + validation branch + dispatch branch + prompt line + workflow/synthesis fns), i.e. a parallel bespoke path following the same template — not plug into an extension point. So \"clean reuse rather than a bespoke path\" is aspirational; the council path is itself bespoke."
+      },
+      {
+        "claim": "AgentResult already exposes verification/findings/blocker that a grader could emit a structured verdict through, AND the clarification WaitingForUser pause/resume can carry the escalation when cycles are exhausted.",
+        "verdict": "holds",
+        "evidence": "Part 1 (fields exist): src/orchestrator/mod.rs:147-160 defines `struct AgentResult` with `findings: Vec<String>` (line 154), `verification: Vec<String>` (line 157), `blocker: Option<String>` (line 158), alongside `status: AgentResultStatus` (line 152) and `summary` (line 153). AgentResult is the structured agent-step output contract: `RunStepResult::Agent { result: AgentResult }` (line 165), and `AgentResult::completed` initializes these fields empty (lines 224-240). So a grader agent could populate findings/verification/blocker to emit a structured verdict. No grader exists yet (grep for `grader`/`grade`/`verdict` finds only unrelated symlink-resolution `verdict` usages in src/actions/mod.rs:672,687), so this is a feasibility claim about existing fields, which holds.\n\nPart 2 (WaitingForUser is a real generic pause/resume that can carry an escalation): Orchestrator emits `DecisionStatus::WaitingForUser` carrying `clarifying_question` + structured `clarifying_options` (id/label/description) + `recommended_option_id` + `multi_select` — src/orchestrator/mod.rs:64-73, 78-83, validated at 404-416/447-469. App pauses on it: `RunState::WaitingForUser`, stores `PendingClarification { run }`, surfaces `PendingClarificationView`, records `clarification_requested` — src/app/mod.rs:1895-1925. Resume: `resolve_pending_clarification` appends the user answer to the run prompt, sets `RunState::Planning`, and re-drives the same run — src/app/mod.rs:1689-1736. The mechanism is generic and capable of carrying an escalation (question + structured options) and resuming, so \"can carry the escalation\" holds as a capability.",
+        "correction": "Both halves are accurate only as feasibility/capability claims (\"could emit\"/\"can carry\") about existing primitives — NOT as descriptions of existing wiring. Two gaps to flag: (1) No grader/verdict-emitting agent exists today; the three AgentResult fields are present but nothing currently writes a structured verdict into them. (2) The \"when cycles are exhausted\" path is NOT currently routed through WaitingForUser. When `max_review_fix_cycles` (default 2, src/config/mod.rs:178,190) is reached, the app calls `stop_for_review_fix_cycle_limit`, which sets `RunState::LimitReached` and records a `run_limit_reached` event (src/app/mod.rs:1977-1980, 1993-1998, 3704-3724) — it terminates the run rather than escalating to the user via clarification. So escalating exhausted cycles through the WaitingForUser clarification flow is a feasible reuse of the existing pause/resume primitive, but it would require new wiring; today exhaustion dead-ends in LimitReached."
+      },
+      {
+        "claim": "Automatic self-critique/reflection loops materially and reliably improve coding-agent output quality (the feature's core value premise).",
+        "verdict": "uncertain",
+        "evidence": "The literature splits on one decisive axis — whether the loop is grounded in EXTERNAL feedback (test/compiler/linter execution) or is pure intrinsic self-grade. SUPPORT (external-feedback case): Reflexion (Shinn et al., NeurIPS 2023) reports +11 pts pass@1 on HumanEval and SOTA code-gen results, but it consumes external signals (unit-test results, environment feedback) — https://openreview.net/pdf?id=vAElhFcKW6 . Self-Refine (Madaan et al.) shows iterative refinement gains across tasks. 2025 studies (Stanford test-runner-feedback work; \"How Many Tries Does It Take?\", https://arxiv.org/html/2604.10508) find execution-feedback self-repair materially improves code/test generation, and newer 2024-2025 models repair more reliably. REFUTE/CAVEAT (pure self-critique): Huang et al., ICLR 2024 \"LLMs Cannot Self-Correct Reasoning Yet\" (https://arxiv.org/abs/2310.01798) finds intrinsic self-correction WITHOUT external feedback fails and performance sometimes DEGRADES, and that earlier reported gains often relied on oracle labels. Olausson et al., ICLR 2024 \"Is Self-Repair a Silver Bullet for Code Generation?\" (https://arxiv.org/pdf/2306.09896) finds gains are modest/variable/sometimes absent once repair cost is counted, and that self-repair is bottlenecked by the model's own feedback quality — a human expert's feedback yielded 1.58x more passing fixes than GPT-4's self-feedback. Self-preference bias work (NeurIPS 2024, https://arxiv.org/pdf/2404.13076 ; https://arxiv.org/abs/2410.21819) shows LLM judges favor their own generations, with harmful bias worst exactly when the model is weak on that instance — undermining the self-grading half of any pure reflection loop. So \"material\" improvement is well-supported when loops are grounded in external/test feedback, but \"reliably\" as an unqualified universal is contested: pure automatic self-critique is unreliable and can reduce quality.",
+        "correction": "Qualify the premise: self-critique/reflection loops materially and reliably improve coding-agent output ONLY when grounded in EXTERNAL feedback (running tests, compiler/linter/traceback signals, or oracle stopping criteria). The improvement is driven by that external signal, not by the model's self-assessment. Pure intrinsic self-grade is the weak link — it is unreliable (self-preference bias), is bottlenecked by the model's ability to localize its own errors, and can degrade output (Huang et al.; Olausson et al.). For the feature to deliver its value premise, the reflection loop must be wired to execute tests/tools and feed real results back, not merely ask the model to re-grade itself; expect diminishing or negative returns from ungrounded self-critique, especially on weaker models, and budget for the extra inference cost which can erase modest gains."
+      },
+      {
+        "claim": "Major agent frameworks/products ship an automatic critic/verifier loop as a notable, sometimes paid/premium capability — supporting the idea that this is \"what larger frameworks charge for\".",
+        "verdict": "holds",
+        "evidence": "The descriptive core is well-supported. The critic/verify-refine loop is a productized pattern across major frameworks: LangChain/LangGraph ship a reflection pattern (langgraph-reflection: main agent -> critic/judge -> loop), and AutoGen and CrewAI support coder+critic reflection loops. It is grounded in established methods — Reflexion (arXiv 2303.11366), Self-Refine (arXiv 2303.17651, NeurIPS 2023; ~20% preference gain), and CRITIC. The 'sometimes paid/premium' qualifier is concretely true: Cursor BugBot positions its review-to-fix loop as a premium feature (8 parallel passes + majority voting + validator; BugBot Autofix spawns cloud agents; pricing moved from $40/seat to usage-based ~$1.00-1.50/review), CodeRabbit is a widely adopted paid AI-review product (2M+ repos, 13M+ PRs), and OpenAI o1/o3 internalize verifier/process-reward models as a premium reasoning tier. Sources: LangGraph reflection (vijaykumarkartha.medium.com/self-reflecting-ai-agents-using-langchain-d3a93684da92); Self-Refine (https://arxiv.org/abs/2303.17651); BugBot/CodeRabbit pricing (https://aicodereview.cc/tool/cursor-bugbot/, https://www.devtoolsacademy.com/blog/state-of-ai-code-review-tools-2025/); o1 verifiers (https://openai.com/index/deliberative-alignment/).",
+        "correction": "Two important caveats temper the rhetorical conclusion. (1) External feedback matters far more than pure self-grading: Huang et al., 'LLMs Cannot Self-Correct Reasoning Yet' (ICLR 2024, https://arxiv.org/abs/2310.01798) found LLMs fail to self-correct reasoning without external feedback and can DEGRADE after intrinsic self-correction; self-preference bias (https://arxiv.org/abs/2410.21819) shows LLM judges favor their own outputs even when objectively worse (plus verbosity/position bias). Effective critic loops therefore rely on asymmetric/external signals — a different model, passing tests, tool/search results, or user clarification — not a model grading itself. (2) The phrase 'what larger frameworks charge for' overstates exclusivity: the critic/verifier loop itself is commoditized and freely available in open-source frameworks (LangGraph, AutoGen, CrewAI, public Reflexion/Self-Refine). Paid products (BugBot, CodeRabbit, Qodo, LangSmith) monetize the surrounding packaging — cloud compute, autofix, ensemble validation with a real validator, integrations, observability — rather than the loop as a uniquely gated primitive. So the claim is best read as 'some products sell critic/verify-loop features,' not 'the loop is what frameworks fundamentally charge for.'"
+      }
+    ]
+  }
+}

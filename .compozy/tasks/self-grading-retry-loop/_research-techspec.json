@@ -1,0 +1,584 @@
+{
+  "summary": "Extract exact current signatures and design constraints for the grading loop techspec",
+  "agentCount": 6,
+  "logs": [],
+  "result": {
+    "verdictGrounding": {
+      "area": "verdict-grounding",
+      "signatures": [
+        {
+          "name": "AgentResultStatus enum",
+          "location": "src/orchestrator/mod.rs:124-135",
+          "snippet": "#[serde(rename_all = \"snake_case\")]\npub enum AgentResultStatus {\n    Completed,\n    Blocked,\n    Failed,\n    Cancelled,\n    ParseError,\n    LimitReached,\n    ApprovalDenied,\n    NoChanges,\n}"
+        },
+        {
+          "name": "AgentResult struct",
+          "location": "src/orchestrator/mod.rs:147-160",
+          "snippet": "pub struct AgentResult {\n    pub schema_version: u32,\n    pub agent: String,\n    pub step_id: String,\n    pub status: AgentResultStatus,\n    pub summary: String,\n    pub findings: Vec<String>,\n    pub changed_files: Vec<String>,\n    pub commands: Vec<String>,\n    pub verification: Vec<String>,\n    pub blocker: Option<String>,\n    pub artifacts: Vec<ArtifactReference>,\n}"
+        },
+        {
+          "name": "AgentResult::completed constructor",
+          "location": "src/orchestrator/mod.rs:224-244",
+          "snippet": "impl AgentResult {\n    pub fn completed(agent: impl Into<String>, step_id: impl Into<String>, summary: impl Into<String>) -> Self {\n        Self { schema_version: 1, agent: agent.into(), step_id: step_id.into(),\n            status: AgentResultStatus::Completed, summary: summary.into(),\n            findings: Vec::new(), changed_files: Vec::new(), commands: Vec::new(),\n            verification: Vec::new(), blocker: None, artifacts: Vec::new() }\n    }\n}"
+        },
+        {
+          "name": "parse_agent_result",
+          "location": "src/orchestrator/mod.rs:297-312",
+          "snippet": "pub fn parse_agent_result(text: &str) -> Result<AgentResult> {\n    parse_contract(text)\n}\n// parse_contract: extract_json_payload(text).ok_or_else(|| anyhow!(\"missing JSON contract\"))?;\n//                 serde_json::from_str(payload).context(\"failed to parse JSON contract\")"
+        },
+        {
+          "name": "ActionStatus enum + ActionResult struct (command output carrier)",
+          "location": "src/actions/mod.rs:48-66",
+          "snippet": "pub enum ActionStatus { Completed, Denied, ApprovalRequired, Failed }\n\npub struct ActionResult {\n    pub schema_version: u32,\n    pub action_id: String,\n    pub status: ActionStatus,\n    pub summary: String,\n    pub content: Option<Value>,   // <- exit_code/stdout/stderr live here\n    pub artifact: Option<Value>,\n    pub diagnostic: Option<String>,\n}"
+        },
+        {
+          "name": "execute_run_command (exit-code capture)",
+          "location": "src/actions/mod.rs:947-993",
+          "snippet": "let exit_code = output.status.code();\nlet status = if output.status.success() { ActionStatus::Completed } else { ActionStatus::Failed };\nOk(action_result(request, status,\n    match exit_code { Some(code) => format!(\"Command exited with status {code}.\"), None => \"Command terminated by signal.\".to_string() },\n    Some(json!({ \"command\": command, \"exit_code\": exit_code, \"stdout\": stdout, \"stderr\": stderr })),\n    if output.status.success() { None } else { Some(\"command returned a non-zero exit status\".to_string()) }))"
+        },
+        {
+          "name": "record_command_completed_with_group (DURABLE exit-code event)",
+          "location": "src/app/mod.rs:4753-4801",
+          "snippet": "let exit_code = result.content.as_ref().and_then(|c| c.get(\"exit_code\")).cloned().unwrap_or(Value::Null);\nself.record_event_with_group(Some(run_id..), group_id.., Some(step_id..),\n    \"command_completed\",\n    json!({ \"action_id\": request.action_id.clone(), \"command\": command,\n            \"status\": result.status.clone(), \"exit_code\": exit_code,\n            \"diagnostic\": result.diagnostic.clone() }), display)"
+        },
+        {
+          "name": "step loop: feed ActionResult back to agent",
+          "location": "src/app/mod.rs:4003-4059",
+          "snippet": "let action = execute_action_request(&request.agent_profile, &context, &action_request);\nlet result = match await_with_step_limit(action, ..).await { ... };\nself.record_action_specific_events(run_id, &step_id, &action_request, &result)?;   // -> command_completed event\nself.record_action_completed(run_id, &step_id, &action_request, &result)?;\nrequest.action_results.push(result);   // <- next runtime turn sees exit_code via envelope.action_results"
+        },
+        {
+          "name": "single-agent step completion (where AgentResult is trusted as-is)",
+          "location": "src/app/mod.rs:3083-3095",
+          "snippet": "Ok(StepOutcome::Output(output)) => match *output {\n    RuntimeOutput::AgentResult { result } => {\n        self.record_event(Some(run.run_id.clone()), Some(result.step_id.clone()),\n            \"agent_result\", serde_json::to_value(&result)?,\n            format!(\"{}: {}\", result.agent, result.summary))?;\n        run.previous_results.push(RunStepResult::Agent { result });\n        self.clear_active_step(&step_id);\n        Ok(AgentStepOutcome::Completed)\n    }"
+        },
+        {
+          "name": "runtime agent_result schema brief (codex)",
+          "location": "src/runtime/codex.rs:320-333",
+          "snippet": "When output_schema is agent_result, return (findings, changed_files, commands, and verification are each a list of plain strings ...):\n  \"status\": \"completed|blocked|failed|cancelled|parse_error|limit_reached|approval_denied|no_changes\",\n  \"commands\": [\"short description of a command you ran, e.g. cargo test\"],\n  \"verification\": [\"how you confirmed the result, e.g. cargo test passed\"],"
+        },
+        {
+          "name": "runtime agent_result schema brief (claude, identical)",
+          "location": "src/runtime/claude.rs:1001-1014",
+          "snippet": "\"status\": \"completed|blocked|failed|cancelled|parse_error|limit_reached|approval_denied|no_changes\",\n\"verification\": [\"how you confirmed the result, e.g. cargo test passed\"],"
+        },
+        {
+          "name": "runtime agent_result schema brief (cursor, identical)",
+          "location": "src/runtime/cursor.rs:1033-1046",
+          "snippet": "\"status\": \"completed|blocked|failed|cancelled|parse_error|limit_reached|approval_denied|no_changes\",\n\"verification\": [\"how you confirmed the result, e.g. cargo test passed\"],"
+        },
+        {
+          "name": "orchestrator envelope already carries exit_code via session_events",
+          "location": "src/runtime/mod.rs:785-792 ; src/app/mod.rs:3824-3828",
+          "snippet": "// envelope: \"session_events\": request.session_events, \"previous_results\": request.previous_results, \"action_results\": request.action_results\n// runtime_history_events(): last 100 history events (incl. command_completed with exit_code preserved through compact_history_payload)"
+        },
+        {
+          "name": "history read API (decision loop CAN read recorded exit codes)",
+          "location": "src/history/mod.rs:180 ; src/app/mod.rs:4164-4173",
+          "snippet": "pub fn read_events(&self) -> Result<Vec<HistoryEvent>>\nfn record_event(&mut self, run_id: Option<String>, step_id: Option<String>, kind: &str, payload: serde_json::Value, display: impl Into<String>) -> Result<()>"
+        }
+      ],
+      "how_it_works": [
+        "A RunCommand action is executed by execute_run_command (src/actions/mod.rs:947-993). It runs `sh -c <command>` and captures ground truth: `exit_code = output.status.code()` (line 968), and sets ActionStatus::Completed vs Failed strictly from `output.status.success()` (969-973). The exit_code, stdout, stderr are embedded into ActionResult.content as JSON (981-986); diagnostic is set to \"command returned a non-zero exit status\" on failure.",
+        "The exit code is captured in TWO places. (a) Fed back to the AGENT: the step loop pushes the ActionResult into request.action_results (src/app/mod.rs:4059), which is serialized into the next runtime turn's envelope as `action_results` (src/runtime/mod.rs:788) and `session_events`. (b) Recorded DURABLY by the HARNESS: record_command_completed_with_group (src/app/mod.rs:4753-4801) emits a `command_completed` history event with payload {action_id, command, status, exit_code, diagnostic}. So the answer to 'can the decision loop read the exit code, or only the agent?' is BOTH — it is durably recorded and readable via history.read_events() (src/history/mod.rs:180).",
+        "CRITICAL GAP: although the exit code is recorded as ground truth, the VERDICT is currently self-attested, never derived from it. When the (grader) agent finishes, it returns a RuntimeOutput::AgentResult whose `status` (AgentResultStatus::Completed/Failed/...) and free-text `verification` strings are chosen by the model. The harness accepts that result verbatim at src/app/mod.rs:3084-3092 (single agent) and src/app/mod.rs:2229-2230 (parallel child via record_parallel_child_result): it records an `agent_result` event from `serde_json::to_value(&result)` and pushes it into run.previous_results. No code compares the claimed status/verification against the recorded command_completed exit_code.",
+        "The runtime schema briefs that drive this self-attestation are identical across codex/claude/cursor (src/runtime/codex.rs:320-333, src/runtime/claude.rs:1001-1014, src/runtime/cursor.rs:1033-1046). They instruct the agent to fill `verification` with prose like 'how you confirmed the result, e.g. cargo test passed' and to pick `status` from the enum. AgentResult is then reconstructed from that JSON by parse_agent_result -> parse_contract (serde Deserialize), so every field including `status`/`verification` is model-controlled.",
+        "The next orchestrator decision is an LLM step too: previous_results (self-attested AgentResults) plus session_events (which DOES include command_completed with the real exit_code, preserved through compact_history_payload, src/app/mod.rs:5126-5131) are placed in its envelope (src/runtime/mod.rs:785-792). So the orchestrator could in principle read the exit code, but nothing programmatically grounds PASS in exit-0 — it is left to model judgment.",
+        "Harness-constructed terminal results already exist and bypass the agent: failed_agent_result (src/app/mod.rs:5976-5990), limit_reached_agent_result, cancelled_agent_result. These prove the harness can author/override an AgentResult's status deterministically — the same seam a derived verdict can use."
+      ],
+      "design_recommendation": "Ground the grade in the recorded command_completed exit_code, not the agent's self-attested AgentResult.status/verification. Recommended shape: introduce a HARNESS-OWNED GraderVerdict record derived deterministically, kept OUT of the model-filled contract. Concretely: (1) Add a struct GraderVerdict { passed: bool, command: String, exit_code: Option<i64>, source_event_id: String, basis: enum {ExitCode, NoVerificationCommand, ToolError} } in src/orchestrator/mod.rs near AgentResult (124-160). Do NOT add it as a plain serde field on AgentResult that the agent fills — AgentResult is reconstructed by parse_agent_result/parse_contract (src/orchestrator/mod.rs:297-312), so any agent-writable field is still self-attested. If you attach it to AgentResult, mark it `#[serde(skip_deserializing, default)]` so only the harness can set it. (2) Derive it at the single-agent completion seam src/app/mod.rs:3083-3092 (and the parallel path at record_parallel_child_result, src/app/mod.rs:2229-2230) right before `run.previous_results.push(RunStepResult::Agent { result })`. The derivation source should be the durable command_completed events for this run_id+step_id (already written by record_command_completed_with_group, src/app/mod.rs:4753-4801) read via history.read_events() (src/history/mod.rs:180), or equivalently the in-memory request.action_results accumulated at src/app/mod.rs:4059 (whose ActionResult.content.exit_code / ActionStatus is the same ground truth from execute_run_command, src/actions/mod.rs:968-986). PASS requires that the designated verification command exists AND its recorded exit_code == 0 (mirror the existing `output.status.success()` logic at src/actions/mod.rs:969); otherwise FAIL/UNVERIFIED — never trust AgentResult.status alone. (3) Emit a new `grader_verdict` history event (use record_event, src/app/mod.rs:4164) so it is durable and visible in the projection, and so the next orchestrator decision can consume a harness-authored verdict rather than prose. (4) Identify WHICH command is the verification command via config (a grader-agent setting / expected grade command) rather than guessing, so an arbitrary passing `echo` cannot satisfy the gate. This reuses the existing event-sourcing pattern (record ground truth as an event, then derive), matches how failed_agent_result/limit_reached_agent_result already let the harness override status (src/app/mod.rs:5976-6004), and makes a fabricated `status: completed` / `verification: [\\\"cargo test passed\\\"]` non-load-bearing because PASS is computed from the recorded exit code.",
+      "gotchas": [
+        "AgentResult.status and AgentResult.verification are fully model-controlled: they are deserialized from agent output by parse_agent_result -> parse_contract (src/orchestrator/mod.rs:297-312). A grader can emit status=completed with verification=[\"cargo test passed\"] having run nothing. Do not gate on these.",
+        "The exit code IS already durable and readable by the decision loop — record_command_completed_with_group writes a `command_completed` event with exit_code/status/diagnostic (src/app/mod.rs:4787-4800) and history.read_events() returns it. The missing piece is purely the derivation/gate, not capture.",
+        "ActionStatus::Failed vs Completed is already derived from output.status.success() in execute_run_command (src/actions/mod.rs:969-973), but a non-zero exit only sets the ActionResult/diagnostic — it does NOT prevent the agent from subsequently returning AgentResultStatus::Completed. The two are decoupled today.",
+        "command_completed is suppressed for ApprovalRequired/Denied actions (src/app/mod.rs:4761-4766), and RunCommand can also be Denied by policy before execution (execute_action_request, src/actions/mod.rs:290-332, incl. VCS-mutation denial). A verdict deriver must treat 'no command_completed event / denied' as UNVERIFIED, not PASS.",
+        "Parallel children take a different completion path (record_parallel_child_result at src/app/mod.rs:2229-2230) and resumed approvals take resolve_pending_approval (src/app/mod.rs:1667-1686); both push action_results and AgentResults. Any verdict derivation must cover all three seams (single agent 3083, parallel child 2229, approval-resume 1679) or graders that run their command behind an approval will be ungraded.",
+        "session_events passed to the orchestrator are compacted (compact_history_payload, src/app/mod.rs:5126-5215). Scalar exit_code survives, but if you rely on the orchestrator LLM reading exit codes from session_events you inherit truncation and model-judgment risk — prefer a harness-computed grader_verdict event over LLM inference.",
+        "The agent only ever sees stdout/stderr/exit_code as text in the NEXT turn's action_results; it can mis-summarize them. Grounding must read the structured ActionResult.content.exit_code / the command_completed payload, not the agent's prose."
+      ]
+    },
+    "dispatchLoop": {
+      "area": "dispatch-loop",
+      "signatures": [
+        {
+          "name": "handle_orchestrator_decision (Continue/WaitingForUser/Complete/Failed dispatch)",
+          "location": "src/app/mod.rs:1873-1952",
+          "snippet": "async fn handle_orchestrator_decision(\n    &mut self,\n    run: &mut RunDriveContext,\n    decision: crate::orchestrator::OrchestratorDecision,\n) -> Result<bool> {\n    match decision.status {\n        DecisionStatus::Continue => {\n            let next_step = decision\n                .normalized_next_step()\n                .context(\"failed to normalize orchestrator next step\")?\n                .context(\"validated continue decision missing next_step\")?;\n            match next_step {\n                DecisionNextStep::SingleAgent(plan) => {\n                    self.handle_single_agent_decision(run, &decision, &plan.agent)\n                        .await\n                }\n                DecisionNextStep::ParallelGroup(group) => {\n                    self.handle_parallel_group_decision(run, &decision, group)\n                        .await\n                }\n            }\n        }\n        DecisionStatus::WaitingForUser => {\n            self.state.run_state = RunState::WaitingForUser;\n            self.pending_clarification = Some(PendingClarification { run: run.clone() });\n            // ... records clarification_requested ...\n            Ok(false)\n        }\n        DecisionStatus::Complete => {\n            self.state.run_state = RunState::Completed;\n            self.record_workflow_completed(run, false)?;\n            self.record_event(/* \"run_completed\", final_summary */)?;\n            Ok(false)\n        }\n        DecisionStatus::Failed => {\n            self.state.run_state = RunState::Failed;\n            self.record_workflow_completed(run, false)?;\n            self.record_event(/* \"run_failed\", reason */)?;\n            Ok(false)\n        }\n    }\n}"
+        },
+        {
+          "name": "drive_run_inner main orchestrator loop (the loop shape; Ok(true)=continue, Ok(false)=break)",
+          "location": "src/app/mod.rs:1858-1870",
+          "snippet": "loop {\n    match self.run_orchestrator_step(run, None).await? {\n        OrchestratorStepOutcome::Decision(decision) => {\n            if !self.handle_orchestrator_decision(run, *decision).await? {\n                break;\n            }\n        }\n        OrchestratorStepOutcome::Retry => continue,\n        OrchestratorStepOutcome::Paused | OrchestratorStepOutcome::Stop => break,\n    }\n}\nOk(())"
+        },
+        {
+          "name": "handle_single_agent_decision (council sentinel branch + council_route_allowed gate + review/fix gate)",
+          "location": "src/app/mod.rs:1954-1985",
+          "snippet": "async fn handle_single_agent_decision(\n    &mut self,\n    run: &mut RunDriveContext,\n    decision: &crate::orchestrator::OrchestratorDecision,\n    next_agent_id: &str,\n) -> Result<bool> {\n    if next_agent_id == COUNCIL_WORKFLOW_AGENT_ID {\n        if !council_route_allowed(&run.prompt, self.state.session_goal.as_deref()) {\n            self.state.run_state = RunState::Failed;\n            self.record_event(/* \"orchestrator_decision_invalid\" ... */)?;\n            return Ok(false);\n        }\n        return self.run_council_workflow(run, decision).await;\n    }\n    if self.review_fix_cycle_limit_reached(run, next_agent_id) {\n        self.stop_for_review_fix_cycle_limit(run)?;\n        return Ok(false);\n    }\n    match self.run_agent_step(run, next_agent_id, None).await? {\n        AgentStepOutcome::Completed => Ok(true),\n        AgentStepOutcome::Paused | AgentStepOutcome::Stop => Ok(false),\n    }\n}"
+        },
+        {
+          "name": "run_agent_step (signature + AgentResult arm: record agent_result, push RunStepResult::Agent, return Completed)",
+          "location": "src/app/mod.rs:3026-3095",
+          "snippet": "async fn run_agent_step(\n    &mut self,\n    run: &mut RunDriveContext,\n    next_agent_id: &str,\n    resume: Option<(String, RuntimeRequest, Instant)>,\n) -> Result<AgentStepOutcome> {\n    self.state.run_state = RunState::Running;\n    // ... wall-clock + max_agent_steps limit checks; step_count += 1 (line 3055) ...\n    // non-resume branch fetches producing profile (MOVED into runtime_request):\n    //   let agent = self.agent(next_agent_id)?.clone();   // line 3052\n    //   let request = self.runtime_request(.., agent, run.previous_results.clone(), \"agent_result\")?; // 3063-3070\n    match self\n        .execute_runtime_step_with_actions(request, run, step, step_started_at)\n        .await\n    {\n        Ok(StepOutcome::Output(output)) => match *output {\n            RuntimeOutput::AgentResult { result } => {\n                self.record_event(\n                    Some(run.run_id.clone()),\n                    Some(result.step_id.clone()),\n                    \"agent_result\",\n                    serde_json::to_value(&result)?,\n                    format!(\"{}: {}\", result.agent, result.summary),\n                )?;\n                run.previous_results.push(RunStepResult::Agent { result });\n                self.clear_active_step(&step_id);\n                Ok(AgentStepOutcome::Completed)\n            }\n            // ... ParseError / OrchestratorDecision / ActionRequest arms ...\n        }"
+        },
+        {
+          "name": "run_council_workflow (virtual-workflow executor template: serial loop, limit checks, step_count++, synthesis, push, return)",
+          "location": "src/app/mod.rs:3155-3323",
+          "snippet": "async fn run_council_workflow(\n    &mut self,\n    run: &mut RunDriveContext,\n    decision: &crate::orchestrator::OrchestratorDecision,\n) -> Result<bool> {\n    self.state.run_state = RunState::Running;\n    if self.wall_clock_limit_reached(run) { self.stop_for_wall_clock_limit(run)?; return Ok(false); }\n    // execution_mode + preset/members lookup; record \"council_started\" ...\n    let mut reports = Vec::new();\n    for (member_id, member) in members {\n        if self.wall_clock_limit_reached(run) { self.stop_for_wall_clock_limit(run)?; return Ok(false); }\n        if limit_reached(&self.config.limits.max_agent_steps, run.step_count) {\n            self.state.run_state = RunState::LimitReached;\n            self.record_event(/* \"run_limit_reached\", max_agent_steps */)?;\n            return Ok(false);\n        }\n        let step_id = new_id();\n        run.step_count += 1;\n        self.record_event(/* \"agent_step_started\", council.member */)?;\n        let request = self.runtime_request(.., agent, run.previous_results.clone(), \"agent_result\")?;\n        let step_result = tokio::time::timeout(timeout, execute_runtime_step(&self.config, request)).await;\n        // build CouncilMemberReport (Ok/Err/timeout); record \"councillor_result\"; reports.push(report);\n    }\n    let synthesis = synthesize_council_decision(decision, &reports);\n    let result = council_agent_result(new_id(), &synthesis, &reports);\n    self.record_event(/* council_synthesized */)?;\n    self.record_event(/* \"agent_result\", result */)?;\n    self.record_event(/* council_completed */)?;\n    run.previous_results.push(RunStepResult::Agent { result });\n    Ok(true)\n}"
+        },
+        {
+          "name": "AgentStepOutcome enum",
+          "location": "src/app/mod.rs:765-769",
+          "snippet": "enum AgentStepOutcome {\n    Completed,\n    Paused,\n    Stop,\n}"
+        },
+        {
+          "name": "normalized_next_step (schema v1/v2 -> DecisionNextStep)",
+          "location": "src/orchestrator/mod.rs:247-279",
+          "snippet": "pub fn normalized_next_step(&self) -> Result<Option<DecisionNextStep>> {\n    if self.next_agent.is_some() && self.next_step.is_some() {\n        bail!(\"orchestrator decision contains both next_agent and next_step\");\n    }\n    match self.schema_version {\n        1 => { /* next_step SingleAgent ok; ParallelGroup bails; else wrap next_agent as SingleAgentStepPlan */ }\n        2 => { if self.next_agent.is_some() { bail!(..) } Ok(self.next_step.clone()) }\n        version => bail!(\"unsupported orchestrator decision schema_version {version}\"),\n    }\n}"
+        },
+        {
+          "name": "DecisionNextStep / SingleAgentStepPlan",
+          "location": "src/orchestrator/mod.rs:85-99",
+          "snippet": "#[serde(rename_all = \"snake_case\", tag = \"kind\")]\npub enum DecisionNextStep {\n    SingleAgent(SingleAgentStepPlan),\n    ParallelGroup(ParallelGroupPlan),\n}\npub struct SingleAgentStepPlan {\n    pub agent: String,\n    pub instruction: Option<String>,\n    pub required_capabilities: Vec<Capability>,\n}"
+        },
+        {
+          "name": "AgentResult (changed_files field used for grader gate)",
+          "location": "src/orchestrator/mod.rs:147-160",
+          "snippet": "pub struct AgentResult {\n    pub schema_version: u32,\n    pub agent: String,\n    pub step_id: String,\n    pub status: AgentResultStatus,\n    pub summary: String,\n    pub findings: Vec<String>,\n    pub changed_files: Vec<String>,\n    pub commands: Vec<String>,\n    pub verification: Vec<String>,\n    pub blocker: Option<String>,\n    pub artifacts: Vec<ArtifactReference>,\n}"
+        },
+        {
+          "name": "AgentProfile::has_capability",
+          "location": "src/config/mod.rs:368-372",
+          "snippet": "pub fn has_capability(&self, capability: &Capability) -> bool {\n    self.capabilities\n        .iter()\n        .any(|existing| existing == capability)\n}"
+        },
+        {
+          "name": "App::agent (profile lookup by id; returns &AgentProfile)",
+          "location": "src/app/mod.rs:4066-4071",
+          "snippet": "fn agent(&self, id: &str) -> Result<&AgentProfile> {\n    self.config\n        .agents\n        .get(id)\n        .ok_or_else(|| anyhow!(\"missing required agent {id}\"))\n}"
+        },
+        {
+          "name": "council_route_allowed (sentinel-route gate template)",
+          "location": "src/app/mod.rs:5535-5555",
+          "snippet": "fn council_route_allowed(prompt: &str, session_goal: Option<&str>) -> bool {\n    let text = match session_goal {\n        Some(goal) => format!(\"{prompt} {goal}\").to_ascii_lowercase(),\n        None => prompt.to_ascii_lowercase(),\n    };\n    [\"council\", \"high-risk\", \"high risk\", \"architecture\", \"security\",\n     \"data integrity\", \"difficult review\", \"privacy\", \"compliance\",\n     \"migration\", \"rollback\"]\n    .iter().any(|needle| text.contains(needle))\n}"
+        },
+        {
+          "name": "COUNCIL_WORKFLOW_AGENT_ID sentinel constant",
+          "location": "src/orchestrator/mod.rs:9",
+          "snippet": "pub const COUNCIL_WORKFLOW_AGENT_ID: &str = \"council\";"
+        },
+        {
+          "name": "runtime_request (consumes agent_profile by VALUE)",
+          "location": "src/app/mod.rs:3792-3800",
+          "snippet": "fn runtime_request(\n    &self,\n    run_id: &str,\n    step_id: &str,\n    prompt: RuntimePrompt<'_>,\n    agent_profile: AgentProfile,\n    previous_results: Vec<RunStepResult>,\n    output_schema: &str,\n) -> Result<RuntimeRequest> {"
+        }
+      ],
+      "how_it_works": [
+        "The loop lives in drive_run_inner (src/app/mod.rs:1858-1868): it repeatedly calls run_orchestrator_step, and each OrchestratorDecision is fed to handle_orchestrator_decision, whose bool return is the loop continuation signal -- Ok(true) keeps looping (re-enter orchestrator), Ok(false) breaks. So a grader that wants the orchestrator to re-evaluate just needs to return true / leave run_state Running and add a result to previous_results.",
+        "handle_orchestrator_decision (1873-1952) matches decision.status. Only DecisionStatus::Continue dispatches work: it calls normalized_next_step() (orchestrator/mod.rs:247) to collapse schema v1 next_agent / v2 next_step into a DecisionNextStep, then routes SingleAgent -> handle_single_agent_decision or ParallelGroup -> handle_parallel_group_decision. Complete sets RunState::Completed + records run_completed and returns Ok(false); WaitingForUser parks a clarification; Failed sets RunState::Failed. Complete/WaitingForUser/Failed all return Ok(false) (loop ends).",
+        "handle_single_agent_decision (1954-1985) is the existing sentinel-route precedent: it first checks `next_agent_id == COUNCIL_WORKFLOW_AGENT_ID` (a magic agent id that is NOT a real AgentProfile), gates it through council_route_allowed (5535) against prompt+session_goal, and on success delegates to the virtual executor run_council_workflow instead of run_agent_step. Otherwise it applies review_fix_cycle_limit_reached and calls run_agent_step, mapping AgentStepOutcome::Completed -> Ok(true) and Paused/Stop -> Ok(false).",
+        "run_agent_step (3026-3095) is the leaf executor for one real agent. In the non-resume branch it enforces max_agent_steps (3040), increments run.step_count (3055), fetches the producing profile `let agent = self.agent(next_agent_id)?.clone()` (3052) and MOVES it into runtime_request (3063-3070). In the success path RuntimeOutput::AgentResult arm (3084-3095) it: (a) record_event \"agent_result\" with the serialized AgentResult, (b) `run.previous_results.push(RunStepResult::Agent { result })` (3092), (c) clear_active_step, (d) returns Ok(AgentStepOutcome::Completed).",
+        "Key scoping fact for a grader gate: at the AgentResult arm, the producing AgentProfile clone (`agent`, line 3052) is already MOVED into runtime_request, so it is NOT in scope. But `next_agent_id: &str` is a function parameter in scope for the whole body, so the gate can re-fetch via `self.agent(next_agent_id)` (4066, returns &AgentProfile) and call `.has_capability(&Capability::Edit)`. The changed-file signal is `result.changed_files` (orchestrator/mod.rs:155) -- but `result` is consumed by the push at line 3092, so the gate value must be computed (or changed_files cloned) BEFORE that push.",
+        "run_council_workflow (3155-3323) is the proven virtual-workflow executor template and maps 1:1 onto a grader: set RunState::Running; wall_clock_limit_reached guard; a serial `for member in members` loop; inside each iteration re-check wall-clock + `limit_reached(&self.config.limits.max_agent_steps, run.step_count)` (returning Ok(false)/LimitReached on breach), `run.step_count += 1`, emit agent_step_started, build a runtime_request with output_schema \"agent_result\", run it (here via tokio timeout + execute_runtime_step), and collect a report; after the loop it synthesizes one AgentResult, records agent_result/*_completed events, `run.previous_results.push(RunStepResult::Agent { result })`, and returns Ok(true) so the orchestrator loop continues."
+      ],
+      "design_recommendation": "Recommended shape: a hybrid -- reuse run_council_workflow (src/app/mod.rs:3155-3323) as the EXECUTOR template, but TRIGGER it by force-injection at the run_agent_step AgentResult arm rather than as an orchestrator-routed sentinel. Concretely: (1) Add `async fn run_grading_workflow(&mut self, run: &mut RunDriveContext, producing_agent_id: &str, edited: &AgentResult) -> Result<()>` cloned structurally from run_council_workflow -- same RunState::Running + wall_clock_limit_reached guard, same `limit_reached(&self.config.limits.max_agent_steps, run.step_count)` check, `run.step_count += 1`, agent_step_started/agent_result/grading_completed events, and `run.previous_results.push(RunStepResult::Agent { result: grader_result })` so the grader verdict becomes ordinary prior context. (2) Inject the call in the AgentResult arm of run_agent_step between line 3092 (`run.previous_results.push(RunStepResult::Agent { result })`) and line 3094 (`Ok(AgentStepOutcome::Completed)`), gated by something like `let should_grade = self.agent(next_agent_id).map(|a| a.has_capability(&Capability::Edit)).unwrap_or(false) && !changed.is_empty();` -- compute `changed`/`should_grade` from `result.changed_files` BEFORE the push at 3092 (result is moved there). Do NOT loop inside run_agent_step: let it return Completed, and let the existing drive_run_inner loop (1858-1868) re-enter the orchestrator, which sees the grader's RunStepResult::Agent and decides whether to re-route to the editor/fixer -- this gives the grade->fix->re-grade loop for free and reuses the existing review_fix_cycle_limit_reached gate (1977) for cycle bounding. Rationale for force-injection over a `GRADER_WORKFLOW_AGENT_ID` sentinel routed like council (1960-1976 + council_route_allowed at 5535): an auto-grader should fire deterministically on every qualifying edit, not depend on the orchestrator electing to route to it; the gate inputs (changed_files + producing profile capability) are precisely available at run_agent_step but are LOST by the time a fresh orchestrator decision is normalized. Use the sentinel pattern only if you instead want the orchestrator to opt into grading on demand -- in that case mirror handle_single_agent_decision's council branch exactly (sentinel id check + a grading_route_allowed gate + delegate to run_grading_workflow returning Ok(true)/Ok(false)).",
+      "gotchas": [
+        "At the AgentResult arm, `result` is MOVED by `run.previous_results.push(RunStepResult::Agent { result })` (src/app/mod.rs:3092). Any grader gate that needs result.changed_files / result.status / result.agent must read or clone them BEFORE line 3092, or refactor to bind the result first and push after grading.",
+        "The producing AgentProfile is NOT in scope at the AgentResult arm: the `let agent = self.agent(next_agent_id)?.clone()` at line 3052 lives only in the non-resume branch and is moved into runtime_request (3063-3070). To check has_capability(Edit) you must re-fetch `self.agent(next_agent_id)` (4066). Also note this profile fetch only happens on the non-resume path -- the resume path (3037-3038) reuses a prebuilt request and never touches the profile.",
+        "run_agent_step is reached from THREE call sites, not just handle_single_agent_decision: the resume paths in drive_run_inner (1828-1839 Agent resume) and the subtask path (1848-1854). Force-injecting grading inside run_agent_step's AgentResult arm will fire for ALL of them (including subtasks and council members route through run_council_workflow, which does NOT call run_agent_step -- council uses execute_runtime_step directly at 3247, so council members won't be auto-graded). Confirm whether subtask runs should be graded; if not, gate on run.subtask.is_none().",
+        "step_count is the shared budget: both run_agent_step (3055) and run_council_workflow (3221) increment run.step_count and both check `limit_reached(&self.config.limits.max_agent_steps, run.step_count)`. A grader step that increments step_count consumes the same max_agent_steps budget as real agent work and can itself trip LimitReached -- decide whether grading should be budget-exempt or share the budget.",
+        "COUNCIL_WORKFLOW_AGENT_ID = \"council\" (orchestrator/mod.rs:9) is a virtual id with no AgentProfile entry; handle_single_agent_decision special-cases it BEFORE the run_agent_step path, and self.agent(\"council\") would error with 'missing required agent'. A grader sentinel id must be handled the same way (intercepted before agent lookup) and must not collide with any real `[agents.*]` key.",
+        "handle_orchestrator_decision's bool contract drives the loop: returning Ok(false) BREAKS the orchestrator loop (drive_run_inner 1861-1863). run_council_workflow returns Ok(true) on success specifically so the loop continues. A sentinel-routed grader must follow the same Ok(true)=keep-looping / Ok(false)=stop convention; an inline force-injected grader instead just needs to leave run_state == Running and return AgentStepOutcome::Completed so the caller maps it to Ok(true).",
+        "normalized_next_step (orchestrator/mod.rs:247) bails if a decision sets both next_agent and next_step, and schema_version 1 cannot select ParallelGroup. If grading is ever orchestrator-routed, route it as a SingleAgent next_step/next_agent only -- do not try to express it as a ParallelGroup under schema v1."
+      ]
+    },
+    "cycleLimits": {
+      "area": "cycle-limits",
+      "signatures": [
+        {
+          "name": "review_fix_cycle_limit_reached",
+          "location": "src/app/mod.rs:3704-3710",
+          "snippet": "fn review_fix_cycle_limit_reached(&self, run: &RunDriveContext, next_agent_id: &str) -> bool {\n    next_agent_id == \"fixer\"\n        && limit_reached(\n            &self.config.limits.max_review_fix_cycles,\n            review_fix_cycle_count(&run.previous_results),\n        )\n}"
+        },
+        {
+          "name": "stop_for_review_fix_cycle_limit",
+          "location": "src/app/mod.rs:3712-3724",
+          "snippet": "fn stop_for_review_fix_cycle_limit(&mut self, run: &RunDriveContext) -> Result<()> {\n    self.state.run_state = RunState::LimitReached;\n    self.record_event(\n        Some(run.run_id.clone()),\n        None,\n        \"run_limit_reached\",\n        json!({\n            \"limit\": \"max_review_fix_cycles\",\n            \"value\": review_fix_cycle_count(&run.previous_results)\n        }),\n        \"Run review/fix cycle limit reached.\",\n    )\n}"
+        },
+        {
+          "name": "review_fix_cycle_count (free fn — hardcodes reviewer/fixer pair)",
+          "location": "src/app/mod.rs:6019-6033",
+          "snippet": "fn review_fix_cycle_count(results: &[RunStepResult]) -> u32 {\n    let mut saw_review_since_last_fix = false;\n    let mut cycles = 0;\n    for result in agent_results(results) {\n        match result.agent.as_str() {\n            \"reviewer\" => saw_review_since_last_fix = true,\n            \"fixer\" if saw_review_since_last_fix => {\n                cycles += 1;\n                saw_review_since_last_fix = false;\n            }\n            _ => {}\n        }\n    }\n    cycles\n}"
+        },
+        {
+          "name": "call site (serial agent step) — passes next_agent_id",
+          "location": "src/app/mod.rs:1977-1980",
+          "snippet": "if self.review_fix_cycle_limit_reached(run, next_agent_id) {\n    self.stop_for_review_fix_cycle_limit(run)?;\n    return Ok(false);\n}"
+        },
+        {
+          "name": "call site (parallel group) — hardcodes \"fixer\" AND scans group steps",
+          "location": "src/app/mod.rs:1993-1998",
+          "snippet": "if self.review_fix_cycle_limit_reached(run, \"fixer\")\n    && group.steps.iter().any(|step| step.agent == \"fixer\")\n{\n    self.stop_for_review_fix_cycle_limit(run)?;\n    return Ok(false);\n}"
+        },
+        {
+          "name": "stop_for_wall_clock_limit (helper: Result<()>, caller does the return)",
+          "location": "src/app/mod.rs:3648-3660",
+          "snippet": "fn stop_for_wall_clock_limit(&mut self, run: &RunDriveContext) -> Result<()> {\n    self.state.run_state = RunState::LimitReached;\n    self.record_event(\n        Some(run.run_id.clone()),\n        None,\n        \"run_limit_reached\",\n        json!({\n            \"limit\": \"max_wall_clock_minutes\",\n            \"elapsed_seconds\": run.started_at.elapsed().as_secs()\n        }),\n        \"Run wall-clock limit reached.\",\n    )\n}"
+        },
+        {
+          "name": "step_time_limit_reached + stop_for_step_time_limit (predicate + stop pair)",
+          "location": "src/app/mod.rs:3662-3683",
+          "snippet": "fn step_time_limit_reached(&self, step_started_at: Instant) -> bool {\n    time_limit_reached(&self.config.limits.max_step_minutes, step_started_at)\n}\n\nfn stop_for_step_time_limit(&mut self, run: &RunDriveContext, step_id: &str, step_started_at: Instant) -> Result<()> {\n    self.state.run_state = RunState::LimitReached;\n    self.record_event(\n        Some(run.run_id.clone()), Some(step_id.to_string()),\n        \"step_limit_reached\",\n        json!({ \"limit\": \"max_step_minutes\", \"elapsed_seconds\": step_started_at.elapsed().as_secs() }),\n        \"Step time limit reached.\",\n    )\n}"
+        },
+        {
+          "name": "stop_for_step_action_limit",
+          "location": "src/app/mod.rs:3685-3702",
+          "snippet": "fn stop_for_step_action_limit(&mut self, run: &RunDriveContext, step_id: &str, action_count: usize) -> Result<()> {\n    self.state.run_state = RunState::LimitReached;\n    self.record_event(\n        Some(run.run_id.clone()), Some(step_id.to_string()),\n        \"step_limit_reached\",\n        json!({ \"limit\": \"max_step_actions\", \"value\": action_count }),\n        \"Step action limit reached.\",\n    )\n}"
+        },
+        {
+          "name": "parallel_group_exceeds_agent_step_limit + stop_for_parallel_group_agent_step_limit (batch group check — NOT the per-step one)",
+          "location": "src/app/mod.rs:2346-2376",
+          "snippet": "// predicate (2346-2355):\nmatch self.config.limits.max_agent_steps {\n    Limit::Value(limit) => run.step_count.saturating_add(group.steps.len() as u32) > limit,\n    Limit::Unlimited => false,\n}\n// stop (2357-2376) records run_limit_reached with limit=max_agent_steps via record_event_with_group"
+        },
+        {
+          "name": "DUP per-step stop block #1 — prepare_parallel_children (break variant)",
+          "location": "src/app/mod.rs:2399-2408",
+          "snippet": "if limit_reached(&self.config.limits.max_agent_steps, run.step_count) {\n    self.state.run_state = RunState::LimitReached;\n    self.record_event(\n        Some(run.run_id.clone()), None, \"run_limit_reached\",\n        json!({ \"limit\": \"max_agent_steps\", \"value\": run.step_count }),\n        \"Run limit reached before a parallel child step.\",\n    )?;\n    break;\n}"
+        },
+        {
+          "name": "DUP per-step stop block #2 — orchestrator step (returns OrchestratorStepOutcome::Stop)",
+          "location": "src/app/mod.rs:2895-2904",
+          "snippet": "if limit_reached(&self.config.limits.max_agent_steps, run.step_count) {\n    self.state.run_state = RunState::LimitReached;\n    self.record_event(\n        Some(run.run_id.clone()), None, \"run_limit_reached\",\n        json!({ \"limit\": \"max_agent_steps\", \"value\": run.step_count }),\n        \"Run limit reached.\",\n    )?;\n    return Ok(OrchestratorStepOutcome::Stop);\n}"
+        },
+        {
+          "name": "DUP per-step stop block #3 — run_agent_step (returns AgentStepOutcome::Stop)",
+          "location": "src/app/mod.rs:3040-3049",
+          "snippet": "if limit_reached(&self.config.limits.max_agent_steps, run.step_count) {\n    self.state.run_state = RunState::LimitReached;\n    self.record_event(\n        Some(run.run_id.clone()), None, \"run_limit_reached\",\n        json!({ \"limit\": \"max_agent_steps\", \"value\": run.step_count }),\n        \"Run limit reached before the next specialized agent.\",\n    )?;\n    return Ok(AgentStepOutcome::Stop);\n}"
+        },
+        {
+          "name": "DUP per-step stop block #4 — run_council_workflow (returns false)",
+          "location": "src/app/mod.rs:3208-3217",
+          "snippet": "if limit_reached(&self.config.limits.max_agent_steps, run.step_count) {\n    self.state.run_state = RunState::LimitReached;\n    self.record_event(\n        Some(run.run_id.clone()), None, \"run_limit_reached\",\n        json!({ \"limit\": \"max_agent_steps\", \"value\": run.step_count }),\n        \"Run limit reached before the next councillor.\",\n    )?;\n    return Ok(false);\n}"
+        },
+        {
+          "name": "max_agent_steps usage #5 (3772) is a GUARD, not a stop block — schedule_parse_repair",
+          "location": "src/app/mod.rs:3771-3775",
+          "snippet": "if run.parse_repair_attempts >= 1\n    || limit_reached(&self.config.limits.max_agent_steps, run.step_count)\n{\n    return Ok(false);\n}"
+        },
+        {
+          "name": "Limit enum + is_reached_by",
+          "location": "src/config/mod.rs:74-99",
+          "snippet": "pub enum Limit {\n    Value(u32),\n    Unlimited,\n}\n\nimpl Limit {\n    pub fn default_agent_steps() -> Self { Self::Value(12) }\n    pub fn default_step_actions() -> Self { Self::Value(20) }\n    pub fn default_minutes(value: u32) -> Self { Self::Value(value) }\n    pub fn is_reached_by(&self, value: u32) -> bool {\n        match self {\n            Self::Value(limit) => value >= *limit,\n            Self::Unlimited => false,\n        }\n    }\n}"
+        },
+        {
+          "name": "limit_reached free fn (thin wrapper over is_reached_by)",
+          "location": "src/app/mod.rs:5492-5494",
+          "snippet": "fn limit_reached(limit: &Limit, count: u32) -> bool {\n    limit.is_reached_by(count)\n}"
+        },
+        {
+          "name": "Limits struct + Default (config field + default for max_review_fix_cycles)",
+          "location": "src/config/mod.rs:171-194",
+          "snippet": "pub struct Limits {\n    pub max_agent_steps: Limit,\n    pub max_step_actions: Limit,\n    pub max_wall_clock_minutes: Limit,\n    pub max_step_minutes: Limit,\n    pub max_command_minutes: Limit,\n    pub max_review_fix_cycles: Limit,\n    pub max_parallel_agent_steps: u32,\n}\n// Default: max_review_fix_cycles: Limit::Value(2)  (line 190)"
+        },
+        {
+          "name": "RawLimits + merge for max_review_fix_cycles",
+          "location": "src/config/mod.rs:463-471, 972-974",
+          "snippet": "// RawLimits (deny_unknown_fields): max_review_fix_cycles: Option<Limit>,  (469)\n// merge: if let Some(value) = limits.max_review_fix_cycles { self.limits.max_review_fix_cycles = value; }  (972-974)"
+        }
+      ],
+      "how_it_works": [
+        "Two distinct limit families exist. (A) Per-step run cap: config `max_agent_steps` (Limit, default Value(12)) checked via the free fn `limit_reached(&self.config.limits.max_agent_steps, run.step_count)` at the top of every step-spawning path. (B) Cycle cap: config `max_review_fix_cycles` (Limit, default Value(2)) checked via `review_fix_cycle_limit_reached` which counts reviewer->fixer transitions in `run.previous_results`.",
+        "The reached-vs-stop split is the established pattern: a `*_reached(&self, ...) -> bool` predicate (e.g. wall_clock_limit_reached 3644, step_time_limit_reached 3662) plus a `stop_for_*(&mut self, ...) -> Result<()>` helper (3648, 3666, 3685) that sets `self.state.run_state = RunState::LimitReached` and records a `run_limit_reached`/`step_limit_reached` event. Callers invoke the predicate, then the stop helper, then return their own outcome variant.",
+        "For max_agent_steps this pattern is only partially applied. The batch parallel-group case HAS a predicate+stop pair (`parallel_group_exceeds_agent_step_limit` 2346 / `stop_for_parallel_group_agent_step_limit` 2357). But the four per-step sites (2399, 2895, 3040, 3208) inline the full body: `limit_reached(...)` guard, then 6 hand-copied lines (set state + record_event with json!({\"limit\":\"max_agent_steps\",\"value\":run.step_count})), differing only in the trailing message string and the return expression (`break`, `OrchestratorStepOutcome::Stop`, `AgentStepOutcome::Stop`, `Ok(false)`). The 5th max_agent_steps reference (3772) is a guard inside schedule_parse_repair, not a stop — it just suppresses a repair attempt.",
+        "CONFIRMED: there is NO shared `stop_for_agent_step_limit` helper. grep for `stop_for_agent_step_limit` returns nothing; the only agent-step stop helper is the group-specific `stop_for_parallel_group_agent_step_limit`.",
+        "The review-fix cycle bound is hardcoded to the reviewer/fixer agent ids in two places: `review_fix_cycle_limit_reached` gates on `next_agent_id == \"fixer\"` (3705), and `review_fix_cycle_count` matches the literal strings \"reviewer\" and \"fixer\" (6024-6025). The serial call site (1977) forwards the real `next_agent_id`; the parallel call site (1993) passes the literal \"fixer\" and additionally scans `group.steps` for an agent == \"fixer\". The event payload's `limit` field is the literal \"max_review_fix_cycles\". There is NO grade-retry cycle concept anywhere (grep for grade/grader/grade_retry across src/ finds nothing).",
+        "Limit is a 2-variant enum (Value(u32)/Unlimited) with `is_reached_by` using `>=`; both the per-step and cycle paths route through `is_reached_by` (cycle via `limit_reached`, batch group via its own inline match at 2351-2354 that uses `>` on a saturating_add instead — a subtle inconsistency)."
+      ],
+      "design_recommendation": "(a) Per-step helper: add a predicate+stop pair mirroring the existing family, next to stop_for_wall_clock_limit at src/app/mod.rs:3648. Add `fn agent_step_limit_reached(&self, run: &RunDriveContext) -> bool { limit_reached(&self.config.limits.max_agent_steps, run.step_count) }` and `fn stop_for_agent_step_limit(&mut self, run: &RunDriveContext, message: &str) -> Result<()> { self.state.run_state = RunState::LimitReached; self.record_event(Some(run.run_id.clone()), None, \\\"run_limit_reached\\\", json!({\\\"limit\\\": \\\"max_agent_steps\\\", \\\"value\\\": run.step_count}), message) }`. Pass `message` as a param because the only per-site variation is the trailing string. Then rewrite all four duplicated blocks (2399, 2895, 3040, 3208) to `if self.agent_step_limit_reached(run) { self.stop_for_agent_step_limit(run, \\\"<msg>\\\")?; <return/break>; }`, keeping each site's own control-flow expression (this matches how wall_clock callers already keep their own return). Reuse the predicate at the 3772 guard too (`if run.parse_repair_attempts >= 1 || self.agent_step_limit_reached(run)`), without the stop helper. This eliminates the 6th copy and centralizes the LimitReached+event mutation. Optionally fold the batch-group inline match (2351-2354) onto is_reached_by for consistency (note it currently uses `>` with saturating_add over the projected post-group count, so it must stay a separate batch predicate, but its stop body could share the event-shape).\\n(b) Generalize the cycle bound beyond the hardcoded \\\"fixer\\\": (1) Generalize `review_fix_cycle_count` (src/app/mod.rs:6019) into `fn cycle_count(results: &[RunStepResult], open_agent: &str, close_agent: &str) -> u32` with the same saw_open/close accumulation but comparing `result.agent` to the params. Keep `review_fix_cycle_count` as a thin call `cycle_count(results, \\\"reviewer\\\", \\\"fixer\\\")` or replace its callers. (2) Introduce a small table of bounds, e.g. `struct CycleBound { limit_field: fn(&Limits) -> &Limit, label: &'static str, open_agent: &'static str, close_agent: &'static str }` with entries for review-fix (reviewer->fixer, max_review_fix_cycles) and grade-retry (e.g. grader->fixer or grader->reviser, a new max_grade_retry_cycles). (3) Replace `review_fix_cycle_limit_reached(run, next_agent_id)` (3704) with `fn cycle_limit_reached(&self, run, next_agent_id) -> Option<&CycleBound>` that returns the first bound whose `close_agent == next_agent_id` AND `limit_reached(bound.limit, cycle_count(run.previous_results, bound.open_agent, bound.close_agent))`. (4) Make `stop_for_review_fix_cycle_limit` (3712) take the bound so the event `limit`/`value` are parameterized (`json!({\\\"limit\\\": bound.label, \\\"value\\\": cycle_count(...)})`). (5) Update both call sites: serial (1977) `if let Some(bound) = self.cycle_limit_reached(run, next_agent_id) { self.stop_for_cycle_limit(run, bound)?; return Ok(false); }`; parallel (1993) iterate `group.steps` and check each `step.agent` against `cycle_limit_reached(run, &step.agent)` instead of the literal \\\"fixer\\\". (6) Add config plumbing for the new bound: `max_grade_retry_cycles: Limit` in Limits (src/config/mod.rs:178) + Default (190, e.g. Value(1)), RawLimits field (469), and merge block (972). Tests to update: review_fix_cycle_count_skips_initial_fixer_pass (src/app/mod.rs:11321) and the toml fixture max_review_fix_cycles=1 (11401) / config defaults asserts in src/config/mod.rs.",
+      "gotchas": [
+        "The 5th cited location (src/app/mod.rs:3772) is NOT a stop block — it is a guard inside schedule_parse_repair that returns Ok(false) (suppresses a repair) when steps are exhausted. A shared stop helper must NOT be applied here; only the predicate part (agent_step_limit_reached) is reusable.",
+        "The batch parallel-group check at 2351-2354 uses `run.step_count.saturating_add(group.steps.len()) > limit` (strict `>` on projected count), whereas every per-step site uses `is_reached_by` (`>=` on current count). These are intentionally different (pre-flight vs per-step) — do not collapse the group predicate into the per-step helper or you change semantics.",
+        "record_event vs record_event_with_group: the four per-step duplicates use `record_event` (no group); the group stop helper uses `record_event_with_group`. A shared per-step helper should use plain record_event; the group path stays separate.",
+        "Each duplicated block ends with a DIFFERENT control-flow expression (break / OrchestratorStepOutcome::Stop / AgentStepOutcome::Stop / Ok(false)). Follow the existing wall_clock convention: the stop helper returns Result<()> and the CALLER performs the return — do not try to bake the return into the helper.",
+        "The parallel cycle call site (1993) has redundant logic: it passes the literal \"fixer\" to review_fix_cycle_limit_reached AND separately scans group.steps for agent==\"fixer\". When generalizing, fold both into a per-step scan over group.steps so each agent id is checked against the bound table, otherwise grade-retry agents in a parallel group would bypass the bound.",
+        "Generalizing changes the event payload `limit` string (from the literal \"max_review_fix_cycles\" to a per-bound label). Tests/assertions that match on event.payload[\"limit\"] (e.g. the max_agent_steps assertion at src/app/mod.rs:8076) and any review-fix event assertions must be kept aligned.",
+        "Limit::Value(0) is rejected at deserialize time (config/mod.rs:131-135) — any new max_grade_retry_cycles default must be a positive Value or Unlimited; 0 is not representable.",
+        "review_fix_cycle_count counts reviewer->fixer in ORDER over agent_results, resetting saw_open after each close. A generalized cycle_count must preserve this single-pass reset semantics so interleaved reviewer/grader/fixer sequences are attributed to the correct bound (the open_agent flag is per-bound, so call cycle_count once per bound rather than sharing one flag)."
+      ]
+    },
+    "escalation": {
+      "area": "escalation",
+      "signatures": [
+        {
+          "name": "handle_orchestrator_decision — WaitingForUser pause arm (captures RunDriveContext, mints question_id, records clarification_requested)",
+          "location": "src/app/mod.rs:1895-1926",
+          "snippet": "DecisionStatus::WaitingForUser => {\n    self.state.run_state = RunState::WaitingForUser;\n    self.pending_clarification = Some(PendingClarification { run: run.clone() });\n    let question = decision\n        .clarifying_question\n        .clone()\n        .context(\"validated waiting_for_user decision missing clarifying_question\")?;\n    let view = PendingClarificationView {\n        run_id: run.run_id.clone(),\n        question_id: new_id(),\n        question,\n        options: decision.clarifying_options.clone(),\n        recommended_option_id: decision.recommended_option_id.clone(),\n        multi_select: decision.multi_select,\n    };\n    self.state.pending_clarification = Some(view.clone());\n    self.set_agent_status(\"orchestrator\", \"waiting_for_user\");\n    self.record_event(\n        Some(run.run_id.clone()),\n        None,\n        \"clarification_requested\",\n        json!({\n            \"question_id\": view.question_id,\n            \"question\": view.question,\n            \"options\": view.options,\n            \"recommended_option_id\": view.recommended_option_id,\n            \"multi_select\": view.multi_select,\n        }),\n        \"Orchestrator asked a clarifying question.\",\n    )?;\n    Ok(false)\n}"
+        },
+        {
+          "name": "resolve_pending_clarification — consumes the answer (currently: append to prompt + re-drive; THE branch point)",
+          "location": "src/app/mod.rs:1689-1736",
+          "snippet": "pub async fn resolve_pending_clarification(\n    &mut self,\n    answer: ClarificationAnswer,\n) -> Result<()> {\n    let Some(clarification_view) = &self.state.pending_clarification else {\n        bail!(\"no clarification is pending\");\n    };\n    if answer.question_id != clarification_view.question_id { /* mismatch err */ }\n    if answer.answer.trim().is_empty() { /* empty err */ }\n    let Some(pending) = self.pending_clarification.take() else {\n        bail!(\"no clarification is pending\");\n    };\n    self.record_event(\n        Some(pending.run.run_id.clone()),\n        None,\n        \"clarification_answered\",\n        json!({\n            \"question_id\": answer.question_id.clone(),\n            \"answer\": answer.answer.clone(),\n            \"answer_source\": answer.answer_source.clone(),\n            \"selected_option_id\": answer.selected_option_id.clone(),\n            \"selected_option_label\": answer.selected_option_label.clone(),\n        }),\n        user_event_display(&answer.answer),\n    )?;\n\n    let mut run = pending.run;\n    run.prompt = format!(\"{}\\n\\nUser clarification: {}\", run.prompt, answer.answer);\n\n    self.state.pending_clarification = None;\n    self.state.run_state = RunState::Planning;\n    self.publish_state();\n\n    self.drive_and_replay(run, None).await?;\n    Ok(())\n}"
+        },
+        {
+          "name": "PendingClarification (app-private capture of the paused run)",
+          "location": "src/app/mod.rs:366-369",
+          "snippet": "#[derive(Clone, Debug)]\nstruct PendingClarification {\n    run: RunDriveContext,\n}"
+        },
+        {
+          "name": "RunDriveContext (the run snapshot carried across the pause; previous_results drives cycle count)",
+          "location": "src/app/mod.rs:412-425",
+          "snippet": "#[derive(Clone, Debug)]\nstruct RunDriveContext {\n    run_id: String,\n    parent_run_id: Option<String>,\n    submitted_prompt: String,\n    prompt: String,\n    skill_context: Option<SkillPromptContext>,\n    subtask: Option<SubtaskContext>,\n    workflow: Option<WorkflowRunContext>,\n    previous_results: Vec<RunStepResult>,\n    step_count: u32,\n    started_at: Instant,\n    parse_repair_attempts: u32,\n}"
+        },
+        {
+          "name": "ClarificationAnswer (transport from TUI to app; carries selected_option_id already)",
+          "location": "src/app/mod.rs:250-257",
+          "snippet": "#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]\npub struct ClarificationAnswer {\n    pub question_id: String,\n    pub answer: String,\n    pub selected_option_id: Option<String>,\n    pub selected_option_label: Option<String>,\n    pub answer_source: String,\n}"
+        },
+        {
+          "name": "PendingClarificationView (snapshot in AppState the TUI renders)",
+          "location": "src/app/mod.rs:210-221",
+          "snippet": "#[derive(Clone, Debug, Serialize, Deserialize)]\npub struct PendingClarificationView {\n    pub run_id: String,\n    pub question_id: String,\n    pub question: String,\n    pub options: Vec<ClarificationOption>,\n    pub recommended_option_id: Option<String>,\n    #[serde(default)]\n    pub multi_select: bool,\n}"
+        },
+        {
+          "name": "OrchestratorDecision clarifying_options / recommended_option_id / multi_select",
+          "location": "src/orchestrator/mod.rs:64-74",
+          "snippet": "pub clarifying_question: Option<String>,\n#[serde(default)]\npub clarifying_options: Vec<ClarificationOption>,\n#[serde(default)]\npub recommended_option_id: Option<String>,\n#[serde(default)]\npub multi_select: bool,\npub final_summary: Option<String>,"
+        },
+        {
+          "name": "ClarificationOption (multi-option struct — id is the stable key to branch on)",
+          "location": "src/orchestrator/mod.rs:77-83",
+          "snippet": "#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]\npub struct ClarificationOption {\n    pub id: String,\n    pub label: String,\n    #[serde(default)]\n    pub description: Option<String>,\n}"
+        },
+        {
+          "name": "build_clarification_answer — TUI selected-option path that populates selected_option_id from option.id",
+          "location": "src/tui/mod.rs:2096-2176",
+          "snippet": "} else if focused < options.len() {\n    // A real option is focused: submit it (focus-driven).\n    let option = &options[focused];\n    (\n        option.label.clone(),\n        Some(option.id.clone()),\n        Some(option.label.clone()),\n        \"recommended\".to_string(),\n    )\n} else if !custom.is_empty() {\n    (custom, None, None, \"custom\".to_string())\n} else {\n    return None;\n};\nSome(crate::app::ClarificationAnswer {\n    question_id: clarification.question_id.clone(),\n    answer,\n    selected_option_id,\n    selected_option_label,\n    answer_source,\n})"
+        },
+        {
+          "name": "Complete / Failed arms of handle_orchestrator_decision (templates the accept/abort branches must mirror)",
+          "location": "src/app/mod.rs:1927-1949",
+          "snippet": "DecisionStatus::Complete => {\n    self.state.run_state = RunState::Completed;\n    self.record_workflow_completed(run, false)?;\n    self.record_event(Some(run.run_id.clone()), None, \"run_completed\",\n        json!({ \"summary\": decision.final_summary }), \"Run completed.\")?;\n    Ok(false)\n}\nDecisionStatus::Failed => {\n    self.state.run_state = RunState::Failed;\n    self.record_workflow_completed(run, false)?;\n    self.record_event(Some(run.run_id.clone()), None, \"run_failed\",\n        json!({ \"reason\": decision.reason }), \"Run failed by orchestrator decision.\")?;\n    Ok(false)\n}"
+        },
+        {
+          "name": "review_fix_cycle_limit_reached / stop_for_review_fix_cycle_limit (the grade-exhaustion site that today stops at LimitReached)",
+          "location": "src/app/mod.rs:3704-3724",
+          "snippet": "fn review_fix_cycle_limit_reached(&self, run: &RunDriveContext, next_agent_id: &str) -> bool {\n    next_agent_id == \"fixer\"\n        && limit_reached(\n            &self.config.limits.max_review_fix_cycles,\n            review_fix_cycle_count(&run.previous_results),\n        )\n}\nfn stop_for_review_fix_cycle_limit(&mut self, run: &RunDriveContext) -> Result<()> {\n    self.state.run_state = RunState::LimitReached;\n    self.record_event(Some(run.run_id.clone()), None, \"run_limit_reached\",\n        json!({ \"limit\": \"max_review_fix_cycles\",\n            \"value\": review_fix_cycle_count(&run.previous_results) }),\n        \"Run review/fix cycle limit reached.\")?;\n}"
+        },
+        {
+          "name": "review_fix_cycle_count — the cycle counter retry must reset (derived from run.previous_results)",
+          "location": "src/app/mod.rs:6019-6033",
+          "snippet": "fn review_fix_cycle_count(results: &[RunStepResult]) -> u32 {\n    let mut saw_review_since_last_fix = false;\n    let mut cycles = 0;\n    for result in agent_results(results) {\n        match result.agent.as_str() {\n            \"reviewer\" => saw_review_since_last_fix = true,\n            \"fixer\" if saw_review_since_last_fix => { cycles += 1; saw_review_since_last_fix = false; }\n            _ => {}\n        }\n    }\n    cycles\n}"
+        }
+      ],
+      "how_it_works": [
+        "The clarification transport is a full multi-option picker today, not just free text. The orchestrator emits a WaitingForUser decision carrying clarifying_options: Vec<ClarificationOption> (each {id, label, description}), recommended_option_id, and a multi_select flag (orchestrator/mod.rs:64-83). Validation (orchestrator/mod.rs:448-478) requires 2-4 options with unique non-empty ids and a recommended_option_id that matches one of them — so accept/retry/abort fits the existing contract directly.",
+        "On pause (app/mod.rs:1895-1926) the WaitingForUser arm clones the whole RunDriveContext into self.pending_clarification = PendingClarification { run }, mints a fresh question_id via new_id(), copies options/recommended_option_id/multi_select into a PendingClarificationView placed in state.pending_clarification, and records a clarification_requested event. The view is what the TUI renders; the private PendingClarification is what holds the resumable run.",
+        "The TUI renders options as a focusable single/multi-select list (tui/mod.rs render_clarification_composer / clarification_key_command). On submit, build_clarification_answer (tui/mod.rs:2096-2176) sets selected_option_id = Some(option.id) and answer = option.label for the focused real option (answer_source \"recommended\"), or leaves selected_option_id = None with answer_source \"custom\" for free text. So a user choosing a named option already returns its stable id over the wire.",
+        "resolve_pending_clarification (app/mod.rs:1689-1736) is where the answer is consumed. It validates question_id match and non-empty answer, take()s the PendingClarification, records a clarification_answered event (which already logs selected_option_id, but never branches on it), then unconditionally does run.prompt = format!(\"{}\\n\\nUser clarification: {}\", run.prompt, answer.answer), sets RunState::Planning, and drive_and_replay(run, None). Every answer currently funnels into the same append-and-re-drive path regardless of which option was picked.",
+        "Grade/cycle exhaustion today does NOT use this transport. review_fix_cycle_limit_reached (app/mod.rs:3704) checks limits.max_review_fix_cycles against review_fix_cycle_count(run.previous_results) (a reviewer-then-fixer pair counter, app/mod.rs:6019-6033). When hit (call sites app/mod.rs:1977-1980 and 1993-1998), stop_for_review_fix_cycle_limit just sets RunState::LimitReached and records run_limit_reached — a hard stop with no user choice.",
+        "The Complete and Failed decision arms (app/mod.rs:1927-1949) are the exact templates for the accept and abort outcomes: Complete sets RunState::Completed + record_workflow_completed(run,false) + run_completed event; Failed sets RunState::Failed + record_workflow_completed + run_failed event."
+      ],
+      "design_recommendation": "Reuse the clarification transport end-to-end; do not invent a new pause mechanism. (1) ESCALATE INSTEAD OF STOP: replace the two hard-stop call sites at app/mod.rs:1977-1980 and 1993-1998 (and the body of stop_for_review_fix_cycle_limit at 3704-3724) with a WaitingForUser-style pause. Mirror the WaitingForUser arm (1895-1926): store self.pending_clarification = Some(PendingClarification { run: run.clone() }); build a PendingClarificationView with question_id = new_id(), a question like 'Review/fix cycle limit reached — what should I do?', and three ClarificationOptions with STABLE ids 'accept' / 'retry' / 'abort' (recommended_option_id = 'abort' or 'accept', multi_select = false); record an escalation/clarification_requested event; set RunState::WaitingForUser; return Ok(false). Because the TUI already maps a focused option to selected_option_id = option.id (tui/mod.rs:2152-2161), no TUI change is required — the three ids arrive verbatim. (2) BRANCH IN resolve_pending_clarification BEFORE THE PROMPT-APPEND: insert the tri-state branch between the clarification_answered record_event (ends app/mod.rs:1725) and the unconditional 'let mut run = pending.run; run.prompt = format!(...)' at 1727-1728. Match on answer.selected_option_id.as_deref(): \\n- Some(\\\"accept\\\") => mirror the Complete arm (1927-1937): self.state.run_state = RunState::Completed; self.record_workflow_completed(&pending.run, false)?; record a run_completed event; clear state.pending_clarification; publish_state(); return Ok(()) WITHOUT re-driving. \\n- Some(\\\"abort\\\") => mirror the Failed arm (1939-1949): RunState::Failed; record_workflow_completed; run_failed event (reason 'user aborted on cycle exhaustion'); clear pending; publish_state(); return Ok(()) WITHOUT re-driving. \\n- Some(\\\"retry\\\") => RESET THE CYCLE then drive: take pending.run as mut, trim the review/fix history so review_fix_cycle_count() falls back under max_review_fix_cycles (e.g. retain only non reviewer/fixer agent_results in run.previous_results, or drop the trailing reviewer→fixer pairs) — this is required or the next fixer routing will immediately re-trip review_fix_cycle_limit_reached and re-escalate in a loop; set RunState::Planning; publish_state(); drive_and_replay(run, None). \\n- None / any other id / free-text => preserve TODAY'S behavior exactly: fall through to the existing append-and-re-drive (1727-1734), so ordinary clarifications are unaffected. Gate the accept/retry/abort interpretation on the escalation context (e.g. a flag/marker on PendingClarification, or a reserved question namespace) so a normal clarification that happens to use the literal id 'retry' is not hijacked. (3) Keep the trim logic next to review_fix_cycle_count (app/mod.rs:6019) so the reset and the counter stay in sync. This adds the tri-state with zero new transport surface: one new escalation emit site, one new branch before line 1727, and a small previous_results reset helper.",
+      "gotchas": [
+        "There is NO existing accept/retry/abort path — grade exhaustion currently dead-ends at RunState::LimitReached (stop_for_review_fix_cycle_limit, app/mod.rs:3712); the tri-state is net-new behavior layered on the existing pause transport.",
+        "selected_option_id is already plumbed through the wire and logged in the clarification_answered event (app/mod.rs:1721) but is never read for control flow — resolve_pending_clarification ignores it and always appends + re-drives. That ignored field is exactly the hook to branch on.",
+        "resolve_pending_clarification rejects an empty answer (app/mod.rs:1705-1707). Since build_clarification_answer sets answer = option.label for a chosen option, accept/retry/abort options must have non-empty labels or the answer will be rejected before the branch runs.",
+        "The retry branch MUST mutate run.previous_results to drop the cycle count below max_review_fix_cycles. review_fix_cycle_limit_reached re-checks on the very next fixer routing (app/mod.rs:1977, 1993); without a reset, retry re-escalates immediately — an infinite escalation loop.",
+        "Reserve/namespace the accept/retry/abort ids so they are only interpreted as control verbs in the escalation context. A normal orchestrator clarification could legitimately use an option labelled/ided 'retry'; without a context gate, branching purely on selected_option_id would mis-route it.",
+        "accept/abort branches must NOT call drive_and_replay (the run is terminal) and must clear self.pending_clarification + self.state.pending_clarification and publish_state(), matching how the Complete/Failed arms leave the app idle. Only the retry branch continues the loop.",
+        "Both stop_for_review_fix_cycle_limit call sites return Ok(false) inside handle_single_agent_decision / handle_parallel_group_decision; converting them to an escalation must keep returning Ok(false) (pause), not Ok(true) (continue), so drive_and_replay stops the loop and waits for the user.",
+        "The orchestrator's waiting_for_user validation enforces 2-4 options and a recommended_option_id that matches an option (orchestrator/mod.rs:448-478). If you synthesize the escalation view directly in the app (bypassing the orchestrator), you can skip that validator, but keep ids unique and recommended_option_id consistent to match the established contract."
+      ]
+    },
+    "chatProjection": {
+      "area": "chat-projection",
+      "signatures": [
+        {
+          "name": "record_event / record_event_with_group (single event chokepoint)",
+          "location": "src/app/mod.rs:4164-4241",
+          "snippet": "fn record_event(\n    &mut self,\n    run_id: Option<String>,\n    step_id: Option<String>,\n    kind: &str,\n    payload: serde_json::Value,\n    display: impl Into<String>,\n) -> Result<()> {\n    self.record_event_with_group(run_id, None, step_id, kind, payload, display)\n}\n\nfn record_event_with_group(\n    &mut self,\n    run_id: Option<String>,\n    group_id: Option<String>,\n    step_id: Option<String>,\n    kind: &str,\n    payload: serde_json::Value,\n    display: impl Into<String>,\n) -> Result<()> {\n    let event = HistoryEvent::new_with_group(\n        self.history.session_id().to_string(),\n        run_id, group_id, step_id, kind, payload,\n    );\n    self.history.append_event(&event)?;\n    if self.debug_enabled { self.history.append_debug_event(&event)?; }\n    self.chat_projection.apply_history_event(&event);\n    self.sync_chat_items();\n    self.state.events.push(display.into());\n    self.publish_state();\n    Ok(())\n}"
+        },
+        {
+          "name": "HistoryEvent (kind is free-form String, payload is serde_json::Value)",
+          "location": "src/history/mod.rs:12-26, 39-46",
+          "snippet": "pub struct HistoryEvent {\n    pub schema_version: u32,\n    pub event_id: String,\n    pub session_id: String,\n    pub run_id: Option<String>,\n    #[serde(default)] pub group_id: Option<String>,\n    pub step_id: Option<String>,\n    pub timestamp: String,\n    pub kind: String,\n    pub payload: Value,\n    #[serde(default)] pub payload_truncated: bool,\n}\n// pub fn new_with_group(session_id, run_id, group_id, step_id, kind: impl Into<String>, payload: Value) -> Self"
+        },
+        {
+          "name": "apply_history_event dispatch + catch-all + council anti-pattern routing",
+          "location": "src/app/chat/projection.rs:58-112",
+          "snippet": "pub fn apply_history_event(&mut self, event: &HistoryEvent) {\n    match event.kind.as_str() {\n        \"session_started\" | \"session_ended\" => {}\n        \"run_started\" => self.apply_run_started(event),\n        \"prompt_submitted\" => self.apply_user_prompt(event),\n        \"clarification_requested\" => self.apply_clarification_requested(event),\n        \"clarification_answered\" => self.apply_clarification_answered(event),\n        \"orchestrator_decision\" => self.apply_orchestrator_decision(event),\n        // ... action/command/file/approval arms ...\n        \"run_completed\" | \"run_failed\" | \"run_limit_reached\" | \"run_interrupted\"\n        | \"subtask_completed\" => self.apply_run_summary(event),\n        \"diagnostic\" => self.apply_diagnostic(event),\n        // council events fall here -> apply_diagnostic (lifecycle_key: None, NO collapse):\n        \"config_viewed\" | \"session_goal_viewed\" | ... \n        | \"council_started\"\n        | \"council_synthesized\"\n        | \"council_completed\"\n        | ... | \"orchestrator_decision_invalid\" => self.apply_diagnostic(event),\n        _ => {}\n    }\n}"
+        },
+        {
+          "name": "ChatLifecycleKey enum",
+          "location": "src/app/chat/mod.rs:115-144",
+          "snippet": "#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]\n#[serde(rename_all = \"snake_case\", tag = \"kind\")]\npub enum ChatLifecycleKey {\n    Prompt { run_id: String },\n    Run { run_id: String },\n    Clarification { run_id: String, question_id: String },\n    Workflow { run_id: String },\n    Step { run_id: String, step_id: String, item_kind: ChatItemKind },\n    Action { run_id: String, step_id: String, action_id: String },\n    FollowUp { follow_up_id: String },\n}"
+        },
+        {
+          "name": "ChatLifecycleKey::item_id (must add an arm for any new variant)",
+          "location": "src/app/chat/mod.rs:205-230",
+          "snippet": "impl ChatLifecycleKey {\n    pub fn item_id(&self) -> String {\n        match self {\n            ChatLifecycleKey::Prompt { run_id } => format!(\"chat:prompt:{run_id}\"),\n            ChatLifecycleKey::Run { run_id } => format!(\"chat:run:{run_id}\"),\n            // ... Clarification / Workflow / Step / Action / FollowUp ...\n        }\n    }\n}"
+        },
+        {
+          "name": "ChatItemKind enum + slug()",
+          "location": "src/app/chat/mod.rs:25-43, 232-243",
+          "snippet": "#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]\n#[serde(rename_all = \"snake_case\")]\npub enum ChatItemKind {\n    UserPrompt, RoutingDecision, AgentProgress, ActionRequested, CommandResult,\n    FileEdit, Approval, Clarification, Diagnostic, SkillContext, AgentResult,\n    RunSummary,\n    /// Synthetic branded welcome item ... never updates.\n    Welcome,\n}\n// impl ChatItemKind { pub fn slug(&self) -> &'static str { match self { ... } } }"
+        },
+        {
+          "name": "upsert (insert-or-evolve keyed by ChatLifecycleKey)",
+          "location": "src/app/chat/projection.rs:1339-1383",
+          "snippet": "fn upsert(&mut self, input: ItemInput) {\n    let lifecycle_key = input.lifecycle_key.clone();\n    let id = lifecycle_key.as_ref().map(ChatLifecycleKey::item_id)\n        .unwrap_or_else(|| format!(\"chat:event:{}\", input.fallback_event_id));\n    let item = ChatItemView { id, lifecycle_key: lifecycle_key.clone(), kind: input.kind,\n        status: input.status, severity: input.severity,\n        title: concise(&input.title, MAX_TITLE_CHARS),\n        summary: input.summary.map(|s| concise(&s, MAX_SUMMARY_CHARS)),\n        body: bounded_body(input.body), details: input.details,\n        source: input.source, updated_at: input.updated_at };\n    if let Some(key) = lifecycle_key {\n        if let Some(index) = self.index.get(&key).copied() {\n            let existing = &mut self.items[index];\n            let mut source = item.source;\n            for event_id in &existing.source.event_ids { source.merge_event(event_id); }\n            *existing = ChatItemView { source, ..item };\n            if is_terminal_run_conclusion(&self.items[index], &key) {\n                let concluded = self.items.remove(index);\n                self.items.push(concluded);\n                self.rebuild_index();\n            }\n            return;\n        }\n        self.index.insert(key, self.items.len());\n    }\n    self.items.push(item);\n}"
+        },
+        {
+          "name": "MAX_BODY_LINES + bounded_body (body cap = 12 lines)",
+          "location": "src/app/chat/projection.rs:19, 1914-1922",
+          "snippet": "const MAX_BODY_LINES: usize = 12;\n\nfn bounded_body(body: Vec<ChatLineView>) -> Vec<ChatLineView> {\n    body.into_iter()\n        .take(MAX_BODY_LINES)\n        .map(|mut line| { line.text = concise(&line.text, MAX_SUMMARY_CHARS); line })\n        .collect()\n}"
+        },
+        {
+          "name": "is_terminal_run_conclusion",
+          "location": "src/app/chat/projection.rs:1425-1434",
+          "snippet": "fn is_terminal_run_conclusion(item: &ChatItemView, key: &ChatLifecycleKey) -> bool {\n    matches!(key, ChatLifecycleKey::Run { .. } | ChatLifecycleKey::Workflow { .. })\n        && item.kind == ChatItemKind::RunSummary\n        && matches!(item.status,\n            ChatItemStatus::Completed | ChatItemStatus::Failed | ChatItemStatus::Interrupted)\n}"
+        },
+        {
+          "name": "apply_clarification_answered (model for reading prior item + accumulating body across rounds)",
+          "location": "src/app/chat/projection.rs:1266-1315",
+          "snippet": "fn apply_clarification_answered(&mut self, event: &HistoryEvent) {\n    let answer = string_field(&event.payload, \"answer\").unwrap_or_else(|| \"No answer provided.\".to_string());\n    let lifecycle_key = clarification_key(event);\n    // READ the prior item's body to recover the question text:\n    let question = lifecycle_key.as_ref()\n        .and_then(|key| self.index.get(key).copied())\n        .and_then(|index| self.items.get(index))\n        .and_then(|item| item.body.first())\n        .map(|line| line.text.clone());\n    let mut body = Vec::new();\n    if let Some(question) = question { body.push(ChatLineView::muted(format!(\"Question: {question}\"))); }\n    body.push(ChatLineView::plain(format!(\"Answer: {answer}\")));\n    // ... appends Option:/Custom answer lines by answer_source ...\n    self.upsert(ItemInput {\n        lifecycle_key, kind: ChatItemKind::Clarification, status: ChatItemStatus::Completed,\n        severity: ChatSeverity::Info, title: \"Clarifying question answered\".to_string(),\n        summary: Some(concise(&answer, MAX_SUMMARY_CHARS)), body,\n        details: history_detail(event, \"history\"), source: source_from_event(event, None),\n        updated_at: event.timestamp.clone(), fallback_event_id: event.event_id.clone(),\n    });\n}"
+        },
+        {
+          "name": "ItemInput struct (the upsert payload all apply_* arms build)",
+          "location": "src/app/chat/projection.rs:1436-1449",
+          "snippet": "struct ItemInput {\n    lifecycle_key: Option<ChatLifecycleKey>,\n    kind: ChatItemKind,\n    status: ChatItemStatus,\n    severity: ChatSeverity,\n    title: String,\n    summary: Option<String>,\n    body: Vec<ChatLineView>,\n    details: Vec<ChatDetailRef>,\n    source: ChatSourceRef,\n    updated_at: String,\n    fallback_event_id: String,\n}"
+        },
+        {
+          "name": "apply_diagnostic (what council/grade-as-diagnostic would do WRONG: lifecycle_key=None)",
+          "location": "src/app/chat/projection.rs:1089-1130",
+          "snippet": "fn apply_diagnostic(&mut self, event: &HistoryEvent) {\n    // ...\n    self.upsert(ItemInput {\n        lifecycle_key: None,            // <- no key => a NEW item every event, never collapses\n        kind: ChatItemKind::Diagnostic,\n        status: if is_error { ChatItemStatus::Failed } else { ChatItemStatus::Completed },\n        // ...\n    });\n}"
+        }
+      ],
+      "how_it_works": [
+        "Single chokepoint: every state change is written through App::record_event_with_group (src/app/mod.rs:4215). record_event (4164) is a thin wrapper that passes group_id=None. There is no other path into history or the projection — append_event persists, then self.chat_projection.apply_history_event(&event) updates the in-memory projection, sync_chat_items() copies it into AppState, publish_state() pushes it over the watch channel. So a new feature appears in chat purely by (a) emitting a new event kind here and (b) handling it in apply_history_event.",
+        "kind is a free-form &str -> stored as HistoryEvent.kind: String (src/history/mod.rs:22); payload is an arbitrary serde_json::Value (line 23). No enum/registry constrains kinds — you invent a string and add a match arm. run_id/group_id/step_id are the structured correlation fields used to build lifecycle keys.",
+        "Dispatch is a single match on event.kind.as_str() (projection.rs:59) ending in a catch-all `_ => {}` (line 110) that SILENTLY DROPS unknown kinds. A new kind shows nothing in chat until an explicit arm is added — this is fail-safe but means forgetting the arm = invisible event.",
+        "Collapsing is keyed: upsert (1339) looks up input.lifecycle_key in self.index (a BTreeMap<ChatLifecycleKey, usize>). If the key already exists it overwrites the existing item in place (preserving/merging source.event_ids) instead of pushing a new one. So ALL events that build the same ChatLifecycleKey evolve ONE chat item. Items with lifecycle_key: None always push a fresh item (no collapse).",
+        "The clarification pair is the canonical evolving-item model: apply_clarification_requested creates the item keyed by Clarification{run_id,question_id}; apply_clarification_answered (1266) re-derives the SAME key, READS the prior item's body via self.index.get(key) -> self.items.get(index) -> item.body.first() to recover earlier content, rebuilds an accumulated body, and upserts under the same key. That read-prior-then-rebuild pattern is exactly what a multi-round grade loop needs.",
+        "Body is capped: bounded_body (1914) truncates every item's body to MAX_BODY_LINES = 12 (projection.rs:19) and each line to MAX_SUMMARY_CHARS. An evolving item that appends one line per round must keep rounds within ~12 lines or older rounds get dropped.",
+        "is_terminal_run_conclusion (1425) plus the reorder block in upsert (1369-1377) is the precedent for a placeholder item that starts as Running and, on its terminal update, is moved to the end of the list so it renders chronologically. A grade loop wanting the final PASS/FAIL to sit at the bottom would mirror this.",
+        "Anti-pattern (council): council_started / council_synthesized / council_completed are routed (projection.rs:98-100) to apply_diagnostic, which upserts with lifecycle_key: None (line 1107). Result: each council phase becomes a SEPARATE Diagnostic chat item that never collapses — the council review is scattered across multiple lines rather than one evolving review item. A grade loop must NOT copy this; it must use a real lifecycle key + dedicated apply arm."
+      ],
+      "gotchas": [
+        "The catch-all `_ => {}` at projection.rs:110 silently drops any kind without an explicit arm — a new grade_round event emits to history but renders nothing until you add a match arm. Easy to miss in testing because record_event still succeeds.",
+        "ChatItemKind derives PartialOrd/Ord and is embedded inside ChatLifecycleKey::Step and serialized (snake_case). Adding a variant changes Ord ordering and the serde tag surface; also you MUST add the matching slug() arm (mod.rs:232) or it won't compile.",
+        "Adding a ChatLifecycleKey variant forces a new arm in item_id() (mod.rs:206) — non-exhaustive match won't compile, which is good, but the id string format must be unique/stable across rounds (rebuild from history must reproduce identical ids).",
+        "MAX_BODY_LINES = 12 hard cap via bounded_body: a grade loop with a high max-rounds (>~10) that writes a line per round will lose the earliest rounds. Prefer a compact rolling body (e.g. a status header line + last N round lines) or summarize.",
+        "ChatProjection::rebuild (projection.rs:50) replays the entire event log on session load, so apply_grade_round must be a pure function of the event stream — it cannot depend on App state or in-memory-only counters. The round number / max must live in the event payload, not be inferred from wall-clock arrival.",
+        "upsert merges source.event_ids from the existing item (1365-1366) so the evolved item keeps provenance of every round's event — good, but means details/source you set on the new ItemInput are unioned, not replaced; build details to reflect the latest round only if you don't want duplicates.",
+        "Severity/status transitions are not enforced anywhere; the apply arm is the sole author of status. A retry loop must explicitly choose Running (working/between rounds), Failed (max exhausted), Completed (PASS) — there is no state machine guarding regressions."
+      ],
+      "design_recommendation": "Model the grade/retry loop on the clarification pair, NOT on council. (1) New event kind(s): emit a single `grade_round` kind through App::record_event(Some(run_id), Some(step_id), \\\"grade_round\\\", payload, display) at src/app/mod.rs (the only sanctioned path is record_event/record_event_with_group, mod.rs:4164/4215). Payload should carry the structured fields the projection needs so rebuild stays pure: { \\\"round\\\": N, \\\"max_rounds\\\": M, \\\"verdict\\\": \\\"working\\\"|\\\"fail\\\"|\\\"pass\\\", \\\"feedback\\\": \\\"...\\\", optional \\\"target_step_id\\\" }. One kind covering all three states keeps the dispatch arm and lifecycle simple; alternatively split into grade_started/grade_failed/grade_passed, but a single kind with a verdict field is closer to the run_summary precedent (apply_run_summary, projection.rs:1041, branches on kind/fields to pick title/status/severity). (2) New ChatLifecycleKey variant: add `Grade { run_id: String }` (one grading loop per run) or `Grade { run_id: String, target_step_id: String }` if multiple independent loops can run — to src/app/chat/mod.rs:117 enum, plus a matching arm in item_id() at mod.rs:206 (e.g. format!(\\\"chat:grade:{run_id}\\\")). Add a `GradeLoop` variant to ChatItemKind (mod.rs:27) and its slug() arm (mod.rs:232). (3) New apply_grade_round arm: register \\\"grade_round\\\" => self.apply_grade_round(event) BEFORE the catch-all in apply_history_event (projection.rs:59-110; do NOT let it fall into the council/apply_diagnostic block at 98-109). Implement apply_grade_round by mirroring apply_clarification_answered (projection.rs:1266): build the Grade key, READ the prior item via self.index.get(&key) -> self.items.get(index) -> item.body to recover earlier round lines, append one compact line for the new round (e.g. ChatLineView::warning(format!(\\\"Round {round}/{max}: FAIL — {feedback}\\\")) for a fail, ChatLineView::plain(\\\"Round {round}/{max}: PASS\\\") for pass), and upsert under the same Grade key so every round collapses into ONE evolving item. Drive status/severity from verdict: working => (Running, Info/Warning), fail with round<max => (Running, Warning), fail with round==max => (Failed, Error), pass => (Completed, Success). Keep total body within MAX_BODY_LINES=12 (projection.rs:19) — if max_rounds can exceed that, keep a header line plus only the most recent rounds. Optionally add the Grade key to is_terminal_run_conclusion's reorder logic (projection.rs:1425) if you want the concluded PASS/FAIL item to drop to chronological bottom like RunSummary. Anti-pattern to avoid: do not route grade events to apply_diagnostic the way council_started/synthesized/completed are (projection.rs:98-100), because apply_diagnostic upserts with lifecycle_key: None (projection.rs:1107) and therefore produces a separate, non-collapsing item per phase."
+    },
+    "config": {
+      "area": "config ([grading] section design) and the verify/command auto-approval surface",
+      "signatures": [
+        {
+          "name": "EffectiveConfig (resolved, in-memory config; NOT Deserialize)",
+          "location": "src/config/mod.rs:401-415",
+          "snippet": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct EffectiveConfig {\n    pub schema_version: u32,\n    pub working_directory: PathBuf,\n    pub config_sources: Vec<PathBuf>,\n    pub active_preset: Option<String>,\n    pub approval_mode: ApprovalMode,\n    pub workspace: WorkspacePolicy,\n    pub features: Features,\n    pub ui: UiConfig,\n    pub limits: Limits,\n    pub council: CouncilConfig,\n    pub runtimes: BTreeMap<String, RuntimeConfig>,\n    pub agents: BTreeMap<String, AgentProfile>,\n}"
+        },
+        {
+          "name": "RawConfig (TOML deserialize target, deny_unknown_fields)",
+          "location": "src/config/mod.rs:417-431",
+          "snippet": "#[derive(Clone, Debug, Default, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct RawConfig {\n    schema_version: Option<u32>,\n    preset: Option<String>,\n    approval_mode: Option<ApprovalMode>,\n    workspace: Option<RawWorkspacePolicy>,\n    features: Option<RawFeatures>,\n    ui: Option<RawUiConfig>,\n    limits: Option<RawLimits>,\n    council: Option<RawCouncilConfig>,\n    runtimes: Option<BTreeMap<String, RawRuntimeConfig>>,\n    presets: Option<BTreeMap<String, RawPreset>>,\n    agents: Option<BTreeMap<String, RawAgentProfile>>,\n}"
+        },
+        {
+          "name": "Features (bool opt-in precedent for [grading].enabled)",
+          "location": "src/config/mod.rs:196-199",
+          "snippet": "#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]\npub struct Features {\n    pub parallel_step_groups: bool,\n}"
+        },
+        {
+          "name": "RawFeatures (Option-wrapped raw mirror, deny_unknown_fields)",
+          "location": "src/config/mod.rs:447-451",
+          "snippet": "#[derive(Clone, Debug, Default, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct RawFeatures {\n    parallel_step_groups: Option<bool>,\n}"
+        },
+        {
+          "name": "apply_raw features merge arm (the exact pattern to mirror)",
+          "location": "src/config/mod.rs:938-942",
+          "snippet": "if let Some(features) = raw.features {\n    if let Some(value) = features.parallel_step_groups {\n        self.features.parallel_step_groups = value;\n    }\n}"
+        },
+        {
+          "name": "apply_raw signature",
+          "location": "src/config/mod.rs:909",
+          "snippet": "fn apply_raw(&mut self, raw: RawConfig, source_dir: &Path, source_name: &str) -> Result<()> {"
+        },
+        {
+          "name": "builtin EffectiveConfig constructor (where features default is set; add grading here)",
+          "location": "src/config/mod.rs:892-907",
+          "snippet": "Self {\n    working_directory,\n    config_sources: Vec::new(),\n    active_preset: None,\n    approval_mode: ApprovalMode::Yolo,\n    workspace: WorkspacePolicy::default(),\n    features: Features::default(),\n    ui: UiConfig::default(),\n    limits: Limits::default(),\n    council: builtin_council_config(),\n    runtimes,\n    presets: BTreeMap::new(),\n    agents,\n    agent_layers: Vec::new(),\n}"
+        },
+        {
+          "name": "UiConfig (precedent for #[serde(default)] + manual Default when defaults are non-zero)",
+          "location": "src/config/mod.rs:201-222",
+          "snippet": "#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]\n#[serde(default)]\npub struct UiConfig {\n    pub hide_banner: bool,\n    pub prompt_history_enabled: bool,\n    pub prompt_history_max: usize,\n}\n\nimpl Default for UiConfig {\n    fn default() -> Self {\n        Self {\n            hide_banner: false,\n            prompt_history_enabled: true,\n            prompt_history_max: 200,\n        }\n    }\n}"
+        },
+        {
+          "name": "librarian built-in agent ships enabled: false",
+          "location": "src/config/mod.rs:857-873",
+          "snippet": "insert_builtin_agent(\n    &mut agents,\n    BuiltinAgent {\n        id: \"librarian\",\n        name: \"Librarian\",\n        runtime: \"zai\",\n        model: \"glm-5.1\",\n        effort: AgentEffort::Medium,\n        thinking: true,\n        capabilities: vec![Capability::Read, Capability::Answer],\n        instructions: \"Research current official documentation and APIs. Return cited answers without editing files or running commands.\",\n        orchestrator_description: Some(\n            \"Use for current official documentation, API lookup, and library research; do not use for edits or shell commands.\",\n        ),\n        enabled: false,\n    },\n);"
+        },
+        {
+          "name": "designer built-in agent ships enabled: false",
+          "location": "src/config/mod.rs:874-890",
+          "snippet": "BuiltinAgent {\n    id: \"designer\",\n    name: \"Designer\",\n    runtime: \"codex\",\n    model: \"default\",\n    effort: AgentEffort::High,\n    thinking: false,\n    capabilities: vec![Capability::Read, Capability::Edit, Capability::Verify],\n    instructions: \"Work on user-facing UI and TUI changes through harness actions, preserving accessibility and verification evidence.\",\n    orchestrator_description: Some(\n        \"Use for user-facing UI/TUI implementation and polish; do not use for backend-only or non-visual changes.\",\n    ),\n    enabled: false,\n},"
+        },
+        {
+          "name": "init-config scaffold renders enabled = false (starter_config_text raw string)",
+          "location": "src/config/mod.rs:2314-2331",
+          "snippet": "[agents.librarian]\nruntime = \"zai\"\nmodel = \"glm-5.1\"\neffort = \"medium\"\nthinking = true\ncapabilities = [\"read\", \"answer\"]\ninstructions_file = \"agents/librarian.md\"\nenabled = false\n\n[agents.designer]\nruntime = \"codex\"\nmodel = \"default\"\neffort = \"high\"\nthinking = false\ncapabilities = [\"read\", \"edit\", \"verify\"]\ninstructions_file = \"agents/designer.md\"\norchestrator_description = \"Use for user-facing UI/TUI implementation and polish; do not use for backend-only or non-visual changes.\"\nenabled = false"
+        },
+        {
+          "name": "init-config scaffold [features] block (template for a parallel [grading] block)",
+          "location": "src/config/mod.rs:2196-2200",
+          "snippet": "r#\"schema_version = 1\napproval_mode = \"yolo\"\n\n[features]\nparallel_step_groups = false"
+        },
+        {
+          "name": "classify_command (gate that calls the read-only allowlist; returns Allow/Approve/Deny)",
+          "location": "src/actions/mod.rs:371-440",
+          "snippet": "pub fn classify_command(command: &str) -> CommandClassification {\n    let normalized = command.trim();\n    let lower = normalized.to_ascii_lowercase();\n    if lower.is_empty() {\n        return CommandClassification::Deny;\n    }\n    // ... deny_patterns checked first ...\n    if is_default_read_only_command(&lower) {\n        return CommandClassification::Allow;\n    }\n    // ... approve_prefixes (git commit, rm, mv, installs ...) -> Approve ...\n    CommandClassification::Approve\n}"
+        },
+        {
+          "name": "is_default_read_only_command (auto-approval allowlist; verify cmds like cargo test/check/build/clippy auto-allowed)",
+          "location": "src/actions/mod.rs:443-484",
+          "snippet": "fn is_default_read_only_command(lower: &str) -> bool {\n    if has_shell_control_syntax(lower) {\n        return false;\n    }\n\n    let allow_prefixes = [\n        \"cargo test\",\n        \"cargo check\",\n        \"cargo build\",\n        \"cargo fmt\",\n        \"cargo clippy\",\n        \"cargo metadata\",\n        \"cargo tree\",\n        \"cargo locate-project\",\n        \"git status\",\n        \"git diff\",\n        \"git log\",\n        \"git show\",\n        \"git rev-parse\",\n        \"git ls-files\",\n        \"git grep\",\n        \"git blame\",\n        \"git describe\",\n        \"rg \",\n        \"ls\",\n        \"pwd\",\n        \"sed -n\",\n        \"cat \",\n        \"grep \",\n        \"find \",\n        \"wc \",\n        \"atelier --doctor\",\n        \"atelier --print-config\",\n        \"atelier --help\",\n        \"atelier --version\",\n    ];\n    allow_prefixes\n        .iter()\n        .any(|prefix| command_has_prefix(lower, prefix))\n        || is_read_only_git_branch_command(lower)\n        || is_read_only_git_remote_command(lower)\n}"
+        },
+        {
+          "name": "has_shell_control_syntax (any chaining/redirect/subshell forces non-read-only -> approval)",
+          "location": "src/actions/mod.rs:486-521",
+          "snippet": "fn has_shell_control_syntax(command: &str) -> bool {\n    let mut chars = command.chars().peekable();\n    let mut in_single = false;\n    let mut in_double = false;\n    let mut escaped = false;\n    while let Some(ch) = chars.next() {\n        // ... quote/escape state tracking ...\n        match ch {\n            '\\n' | '\\r' | ';' | '&' | '|' | '>' | '<' | '`' | '(' | ')' => return true,\n            '$' if chars.peek() == Some(&'(') => return true,\n            _ => {}\n        }\n    }\n    false\n}"
+        },
+        {
+          "name": "max_command_minutes (default 10) -> command_timeout at execution sites",
+          "location": "src/config/mod.rs:189 (default), :468 (RawLimits), :969-970 (apply_raw); src/app/mod.rs:2481,3992 (used as command_timeout(&self.config.limits.max_command_minutes))",
+          "snippet": "// Limits::default: max_command_minutes: Limit::default_minutes(10),\n// app/mod.rs: command_timeout: command_timeout(&self.config.limits.max_command_minutes),"
+        },
+        {
+          "name": "test precedent: built-in agent available but disabled by default",
+          "location": "src/config/mod.rs:3307-3324",
+          "snippet": "fn librarian_is_available_but_disabled_by_default() {\n    // loads config from \"schema_version = 1\\n\" only\n    let librarian = config.agents.get(\"librarian\").unwrap();\n    assert!(!librarian.enabled);\n    assert_eq!(librarian.capabilities, vec![Capability::Read, Capability::Answer]);\n}"
+        }
+      ],
+      "how_it_works": [
+        "Config merge order is built-in defaults -> home -> local -> CLI flags. Each TOML file deserializes into RawConfig (every section/field is Option<...>, every Raw struct has #[serde(default)] #[serde(deny_unknown_fields)]), then apply_raw merges only the Some(...) fields onto the already-resolved EffectiveConfig. EffectiveConfig itself is NOT Deserialize (derives only Clone/Debug/PartialEq/Eq) — it is built in code (builtin constructor at src/config/mod.rs:892) and mutated by apply_raw. So a new [grading] section needs THREE touch points exactly like features: a resolved GradingConfig field on EffectiveConfig, a RawGradingConfig field on RawConfig, and an apply_raw merge arm.",
+        "The bool opt-in precedent is Features.parallel_step_groups (src/config/mod.rs:196-199): a plain bool defaulting to false via derive(Default). Its raw mirror RawFeatures wraps it in Option<bool> (:447-451), and apply_raw copies it only when present (:938-942). Consumers gate behavior on config.features.parallel_step_groups (e.g. src/orchestrator/mod.rs:507 bails when disabled). A [grading].enabled=false default follows this exact shape.",
+        "Built-in agents that ship disabled-by-default (librarian :857-873, designer :874-890) set enabled: false in their BuiltinAgent literal AND the init-config scaffold (starter_config_text raw string, :2314-2331) prints `enabled = false` so users see the knob commented-in. Tests assert they are present-but-disabled (:3307-3324). This is the precedent for shipping the grading feature visible-but-off.",
+        "Read-only command auto-approval: classify_command (src/actions/mod.rs:371) returns Allow only when is_default_read_only_command (:443) matches a prefix in the allowlist AND has_shell_control_syntax (:486) is false. The allowlist already auto-approves the canonical verify commands the grader would run agent-discovered (`cargo test`, `cargo check`, `cargo build`, `cargo clippy`, `cargo fmt`). decision_for_command (:356) maps Allow->Allowed, Approve->Allowed under Yolo / RequiresApproval under Normal, Deny->Denied.",
+        "has_shell_control_syntax means any verify command containing a pipe, redirect, `;`, `&&`/`||`, backtick, subshell `(...)`/`$(...)`, or a newline is treated as NOT read-only and therefore needs approval (or Yolo). A multi-step verify like `cargo fmt --check && cargo clippy && cargo test` will NOT auto-approve because of the `&&`; each leg auto-approves only when issued as a separate single command. This matters for how an agent-discovered verify command should be shaped/split.",
+        "Command timeout for any RunCommand is driven by limits.max_command_minutes (default 10 min, src/config/mod.rs:189), converted via command_timeout(...) at the two execution sites in src/app/mod.rs (:2481, :3992). A long verify build/test inherits this 10-minute cap; there is no grading-specific timeout today."
+      ],
+      "design_recommendation": "Add a [grading] section as a sibling of [features], following the Features+UiConfig precedents exactly. There is currently NO grading config and NO verify_command field anywhere (confirmed: only references to verify are the `Capability::Verify` capability and the `cargo test/check/build/clippy` auto-approve allowlist) — V1 keeps the verify command agent-discovered per ADR-002, so do NOT add a verify_command field.\\n\\n1) Resolved struct (mirror UiConfig at src/config/mod.rs:201-222 because the default for max_attempts is non-zero, so use #[serde(default)] + a manual Default impl):\\n```rust\\n#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]\\n#[serde(default)]\\npub struct GradingConfig {\\n    /// Opt-in grade->fix verification loop. Off by default (ADR-002).\\n    pub enabled: bool,\\n    /// Bounded number of grade->fix attempts before giving up.\\n    pub max_attempts: u32,\\n}\\n\\nimpl Default for GradingConfig {\\n    fn default() -> Self {\\n        Self { enabled: false, max_attempts: 2 }\\n    }\\n}\\n```\\nPlace it next to Features (~src/config/mod.rs:196-199). Keep the MVP to exactly these two fields: `enabled` is the Features-style opt-in gate; `max_attempts` is the only extra field the loop needs (a bounded iteration count so the grade->fix cycle can't run forever). Default 2 deliberately matches the existing limits.max_review_fix_cycles default (Limits::default at src/config/mod.rs:190) so behavior is unsurprising.\\n\\n2) EffectiveConfig: add `pub grading: GradingConfig,` after `pub features: Features,` (src/config/mod.rs:409), and add `grading: GradingConfig::default(),` in the builtin constructor right after `features: Features::default(),` (src/config/mod.rs:898).\\n\\n3) Raw mirror (mirror RawFeatures at src/config/mod.rs:447-451):\\n```rust\\n#[derive(Clone, Debug, Default, Deserialize)]\\n#[serde(deny_unknown_fields)]\\nstruct RawGradingConfig {\\n    enabled: Option<bool>,\\n    max_attempts: Option<u32>,\\n}\\n```\\nand add `grading: Option<RawGradingConfig>,` to RawConfig (after `features: ...`, src/config/mod.rs:424).\\n\\n4) apply_raw arm — copy the features arm verbatim in shape, insert right after the features block (after src/config/mod.rs:942):\\n```rust\\nif let Some(grading) = raw.grading {\\n    if let Some(value) = grading.enabled {\\n        self.grading.enabled = value;\\n    }\\n    if let Some(value) = grading.max_attempts {\\n        self.grading.max_attempts = value;\\n    }\\n}\\n```\\n\\n5) init-config scaffold: add a [grading] block to starter_config_text right after the [features] block (src/config/mod.rs:2199-2200) so it ships visible-but-off, matching the librarian/designer enabled=false precedent:\\n```toml\\n[grading]\\nenabled = false\\nmax_attempts = 2\\n```\\n\\n6) Verify-command surface: rely on the existing auto-approval allowlist (src/actions/mod.rs:443-484) — the grader's agent-discovered verify command auto-approves only if it is a single command with a whitelisted prefix (cargo test/check/build/clippy/fmt) and contains no shell-control syntax (src/actions/mod.rs:486-521). Spec note: a chained verify (`&&`, pipes) will require approval/Yolo, and any verify command inherits the 10-minute limits.max_command_minutes timeout (src/config/mod.rs:189; src/app/mod.rs:2481,3992); the grader should issue verify legs as separate single commands to stay on the auto-approve path. No verify_command config field in V1.",
+      "gotchas": [
+        "EffectiveConfig is NOT Deserialize (derives only Clone/Debug/PartialEq/Eq at src/config/mod.rs:401). Adding a non-Default field requires updating the builtin constructor at src/config/mod.rs:892 or the struct literal won't compile — there is no serde default to fall back on. Also the PartialEq/Eq derive means GradingConfig must be Eq (fine for bool+u32, but no f32/f64 thresholds).",
+        "All Raw structs use #[serde(deny_unknown_fields)] (RawConfig at :418, RawFeatures at :448). Forgetting it on RawGradingConfig would silently accept typos; including it means a misspelled key under [grading] becomes a hard load error. Tests load via load_from_temp / load_effective_config and will catch this.",
+        "Do NOT add a verify_command field — ADR-002 keeps the verify command agent-discovered in V1. There is currently zero verify_command surface in the codebase; the only 'verify' touchpoints are Capability::Verify and the cargo test/check/build/clippy entries in the read-only allowlist (src/actions/mod.rs:449-453).",
+        "The auto-approve allowlist matches by PREFIX on a lowercased command and rejects anything with shell-control syntax. A grader running a combined gate like `cargo fmt --check && cargo clippy && cargo test` will NOT auto-approve (the `&&` trips has_shell_control_syntax at src/actions/mod.rs:514); only single commands auto-approve. Spec the verify contract accordingly.",
+        "Versioning: this is config-only and does not change schema_version (apply_raw still bails on anything != 1, src/config/mod.rs:910-914). No Cargo.toml/npm version bump is implied by adding an optional section, but any release-time check:versions rules still apply if a version bump rides along.",
+        "If grading should be tunable per-preset/agent later, note that presets only carry agent overrides (RawPreset has only `agents`, src/config/mod.rs:435) — a top-level [grading] section is global, consistent with [features]. Don't try to nest it under presets in the MVP.",
+        "max_attempts default (2) intentionally mirrors limits.max_review_fix_cycles (default 2). If the team prefers a single knob, the alternative is to reuse limits.max_review_fix_cycles instead of adding grading.max_attempts — but that couples grading to council review-fix semantics, so a dedicated field is the cleaner recommendation."
+      ]
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# Lifecycle Hooks — Task List
+
+## Tasks
+
+| # | Title | Status | Complexity | Dependencies |
+|---|-------|--------|------------|--------------|
+| 01 | Hooks core types & normalize() + public-event vocabulary | pending | medium | — |
+| 02 | Hooks config through the ladder + drop local-layer hooks | pending | medium | task_01 |
+| 03 | Notifier backends (OSC-native + fallback command) | pending | medium | task_01 |
+| 04 | Off-thread hook dispatcher (channel + subprocess + hook events) | pending | high | task_01, task_03 |
+| 05 | Event tap + App wiring + dispatcher spawn | pending | high | task_01, task_02, task_04 |
+| 06 | Hook transcript projection | pending | low | task_01 |
+| 07 | `atelier --events follow` CLI | pending | medium | task_01 |
+| 08 | Doctor hooks check | pending | low | task_02, task_04 |
+| 09 | Docs & recipes | pending | low | task_02, task_03, task_07, task_08 |
