@@ -11,6 +11,7 @@ use crate::config::{
     AgentProfile, AgentPromptMetadata, ApprovalMode, Capability, CouncilExecutionMode,
     CouncilMemberProfile, EffectiveConfig, Limit,
 };
+use crate::governance::{GovernanceAnswer, GovernanceDecisionView, GOVERNANCE_DECISION_RESOLVED};
 use crate::history::{HistoryEvent, HistoryStore};
 use crate::ids::new_id;
 use crate::orchestrator::{
@@ -122,6 +123,7 @@ pub struct AppState {
     #[serde(default)]
     pub show_first_approval_explainer: bool,
     pub pending_clarification: Option<PendingClarificationView>,
+    pub pending_governance_decision: Option<PendingGovernanceDecisionView>,
     pub agents: Vec<AgentView>,
     /// Live-activity-first roster view-model, rebuilt on every publish (ADR-003).
     /// Empty until the roster builder (task 03) populates it.
@@ -218,6 +220,16 @@ pub struct PendingClarificationView {
     /// renders checkboxes instead of a single-choice list.
     #[serde(default)]
     pub multi_select: bool,
+}
+
+/// The user-facing snapshot of a pending governance decision, mirroring
+/// `PendingClarificationView`. The full decision payload lives in `view`; the
+/// `decision_id` is what the resolver matches an answer against (ADR-003).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingGovernanceDecisionView {
+    pub run_id: String,
+    pub decision_id: String,
+    pub view: GovernanceDecisionView,
 }
 
 #[derive(Clone, Debug)]
@@ -326,6 +338,7 @@ pub struct App {
     chat_projection: ChatProjection,
     pending_approval: Option<PendingApproval>,
     pending_clarification: Option<PendingClarification>,
+    pending_governance_decision: Option<PendingGovernanceDecision>,
     active_step: Option<ActiveStep>,
     active_steps: Vec<ActiveStep>,
     follow_up_queue: VecDeque<QueuedFollowUp>,
@@ -365,6 +378,14 @@ struct PendingParallelApproval {
 
 #[derive(Clone, Debug)]
 struct PendingClarification {
+    run: RunDriveContext,
+}
+
+/// The captured run context behind a pending governance decision, mirroring
+/// `PendingClarification`. Held on `App` (not `AppState`) so the resume can ride
+/// the clarification transport (`RunDriveContext` capture + `drive_and_replay`).
+#[derive(Clone, Debug)]
+struct PendingGovernanceDecision {
     run: RunDriveContext,
 }
 
@@ -855,6 +876,7 @@ impl App {
             pending_approval: None,
             show_first_approval_explainer: false,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: build_agent_views(&config, &availability),
             roster_rows: Vec::new(),
             // Branded welcome item present from the first frame (ADR-005);
@@ -874,6 +896,7 @@ impl App {
             chat_projection: ChatProjection::new(),
             pending_approval: None,
             pending_clarification: None,
+            pending_governance_decision: None,
             active_step: None,
             active_steps: Vec::new(),
             follow_up_queue: VecDeque::new(),
@@ -1299,6 +1322,7 @@ impl App {
             && self.state.active_run_id.is_none()
             && self.pending_approval.is_none()
             && self.pending_clarification.is_none()
+            && self.pending_governance_decision.is_none()
     }
 
     /// React to the Run that just ended: drain queued follow-ups FIFO after a
@@ -1402,6 +1426,8 @@ impl App {
                     "run is waiting for action approval"
                 } else if self.pending_clarification.is_some() {
                     "run is waiting for clarification"
+                } else if self.pending_governance_decision.is_some() {
+                    "run is waiting for a governance decision"
                 } else {
                     "run is waiting for user"
                 }
@@ -1735,6 +1761,109 @@ impl App {
         Ok(())
     }
 
+    /// Resolve the pending governance decision, mirroring
+    /// `resolve_pending_clarification` over the same pause/resume transport.
+    ///
+    /// `decision_id` is the id the user is answering; it must match the pending
+    /// decision (the shared `GovernanceAnswer` carries no id, so the caller
+    /// threads it through — ADR-003). `Accept` resumes the captured run via
+    /// `drive_and_replay`; `Reject { redirect: Some }` appends the redirect to
+    /// the prompt and re-drives; `Reject { redirect: None }` aborts the run.
+    pub async fn resolve_pending_governance_decision(
+        &mut self,
+        decision_id: &str,
+        answer: GovernanceAnswer,
+    ) -> Result<()> {
+        let Some(view) = self.state.pending_governance_decision.as_ref() else {
+            bail!("no governance decision is pending");
+        };
+
+        if view.decision_id != decision_id {
+            return Err(anyhow!(
+                "decision id does not match pending governance decision (expected: {}, got: {})",
+                view.decision_id,
+                decision_id
+            ));
+        }
+
+        let Some(pending) = self.pending_governance_decision.take() else {
+            bail!("no governance decision is pending");
+        };
+        let run_id = pending.run.run_id.clone();
+
+        match answer {
+            GovernanceAnswer::Accept => {
+                self.record_event(
+                    Some(run_id.clone()),
+                    None,
+                    GOVERNANCE_DECISION_RESOLVED,
+                    json!({ "decision_id": decision_id, "outcome": "accept" }),
+                    "Governance decision accepted; run continues.",
+                )?;
+
+                self.state.pending_governance_decision = None;
+                self.state.run_state = RunState::Planning;
+                self.publish_state();
+
+                self.drive_and_replay(pending.run, None).await?;
+            }
+            GovernanceAnswer::Reject {
+                redirect: Some(redirect),
+            } => {
+                self.record_event(
+                    Some(run_id.clone()),
+                    None,
+                    GOVERNANCE_DECISION_RESOLVED,
+                    json!({
+                        "decision_id": decision_id,
+                        "outcome": "reject",
+                        "redirect": redirect.clone(),
+                    }),
+                    user_event_display(&redirect),
+                )?;
+
+                let mut run = pending.run;
+                let redirect = redirect.trim();
+                if !redirect.is_empty() {
+                    run.prompt = format!("{}\n\nUser redirect: {}", run.prompt, redirect);
+                }
+
+                self.state.pending_governance_decision = None;
+                self.state.run_state = RunState::Planning;
+                self.publish_state();
+
+                self.drive_and_replay(run, None).await?;
+            }
+            GovernanceAnswer::Reject { redirect: None } => {
+                self.record_event(
+                    Some(run_id.clone()),
+                    None,
+                    GOVERNANCE_DECISION_RESOLVED,
+                    json!({ "decision_id": decision_id, "outcome": "reject" }),
+                    "Governance decision rejected; run aborted.",
+                )?;
+                self.record_event(
+                    Some(run_id.clone()),
+                    None,
+                    "run_interrupted",
+                    json!({ "reason": "governance_decision_rejected" }),
+                    "Run aborted before any action.",
+                )?;
+                self.write_run_record(&pending.run)?;
+
+                self.state.pending_governance_decision = None;
+                self.state.active_run_id = None;
+                self.state.live_step = None;
+                self.state.live_steps.clear();
+                self.state.run_state = RunState::Interrupted;
+                self.sync_chat_items();
+                self.publish_state();
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn interrupt(&mut self) -> Result<()> {
         if self.state.active_run_id.is_some() {
             self.state.run_state = RunState::Interrupted;
@@ -1745,6 +1874,11 @@ impl App {
                 .map(|pending| pending.run.clone())
                 .or_else(|| {
                     self.pending_clarification
+                        .as_ref()
+                        .map(|pending| pending.run.clone())
+                })
+                .or_else(|| {
+                    self.pending_governance_decision
                         .as_ref()
                         .map(|pending| pending.run.clone())
                 });
@@ -1766,8 +1900,10 @@ impl App {
             // Keep the explainer flag in sync with approval presence (none pending → false).
             self.state.show_first_approval_explainer = false;
             self.state.pending_clarification = None;
+            self.state.pending_governance_decision = None;
             self.pending_approval = None;
             self.pending_clarification = None;
+            self.pending_governance_decision = None;
             self.active_step = None;
             self.active_steps.clear();
             self.sync_chat_items();
@@ -11751,6 +11887,216 @@ runtime = "fake"
 
         assert!(app.state.pending_clarification.is_none());
         assert!(app.pending_clarification.is_none());
+    }
+
+    /// Seed an active run paused on a governance decision, mirroring the state
+    /// the early-abort gate (task_05) will produce. Returns the decision id.
+    fn seed_pending_governance_decision(app: &mut App, prompt: &str) -> String {
+        let run = app.build_follow_up_run(prompt.to_string()).unwrap();
+        let run_id = run.run_id.clone();
+        let decision_id = "gov-decision-1".to_string();
+        let view = GovernanceDecisionView {
+            run_id: run_id.clone(),
+            decision_id: decision_id.clone(),
+            kind: crate::governance::GovernanceKind::EarlyAbort,
+            title: "Confirm intent before this run edits files".to_string(),
+            intent: "Create a feature".to_string(),
+            approach: vec!["Implement it".to_string()],
+            agent: Some("fixer".to_string()),
+            write_scope: vec!["src".to_string()],
+            risk_label: "Edits source files".to_string(),
+            plan: None,
+        };
+        app.pending_governance_decision = Some(PendingGovernanceDecision { run });
+        app.state.pending_governance_decision = Some(PendingGovernanceDecisionView {
+            run_id,
+            decision_id: decision_id.clone(),
+            view,
+        });
+        app.state.run_state = RunState::WaitingForUser;
+        app.publish_state();
+        decision_id
+    }
+
+    #[tokio::test]
+    async fn app_state_defaults_to_no_pending_governance_decision() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert!(app.pending_governance_decision.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_with_no_pending_errors() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let err = app
+            .resolve_pending_governance_decision("any-id", GovernanceAnswer::Accept)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("no governance decision is pending"));
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_mismatched_id_errors() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        seed_pending_governance_decision(&mut app, "create a feature");
+
+        let err = app
+            .resolve_pending_governance_decision("wrong-id", GovernanceAnswer::Accept)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not match pending governance decision"));
+        // The pending decision is left untouched after a mismatch.
+        assert!(app.state.pending_governance_decision.is_some());
+        assert!(app.pending_governance_decision.is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_accept_resumes_run() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let decision_id = seed_pending_governance_decision(&mut app, "create a feature");
+
+        app.resolve_pending_governance_decision(&decision_id, GovernanceAnswer::Accept)
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert!(app.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        let history = app.history.read_events().unwrap();
+        assert!(history.iter().any(|event| {
+            event.kind == "governance_decision_resolved"
+                && event.payload.get("outcome").and_then(|v| v.as_str()) == Some("accept")
+        }));
+        // The run was actually driven after acceptance.
+        assert!(history
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision"));
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_reject_redirect_redrives() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let decision_id = seed_pending_governance_decision(&mut app, "create a feature");
+
+        app.resolve_pending_governance_decision(
+            &decision_id,
+            GovernanceAnswer::Reject {
+                redirect: Some("focus on tests".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        let history = app.history.read_events().unwrap();
+        let resolved = history
+            .iter()
+            .find(|event| event.kind == "governance_decision_resolved")
+            .unwrap();
+        assert_eq!(
+            resolved.payload.get("outcome").and_then(|v| v.as_str()),
+            Some("reject")
+        );
+        assert_eq!(
+            resolved.payload.get("redirect").and_then(|v| v.as_str()),
+            Some("focus on tests")
+        );
+        // The redirected run was re-driven.
+        assert!(history
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision"));
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_reject_abort_does_not_resume() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let decision_id = seed_pending_governance_decision(&mut app, "create a feature");
+
+        app.resolve_pending_governance_decision(
+            &decision_id,
+            GovernanceAnswer::Reject { redirect: None },
+        )
+        .await
+        .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert!(app.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        assert!(app.state.active_run_id.is_none());
+
+        let history = app.history.read_events().unwrap();
+        assert!(history.iter().any(|event| {
+            event.kind == "governance_decision_resolved"
+                && event.payload.get("outcome").and_then(|v| v.as_str()) == Some("reject")
+                && event.payload.get("redirect").is_none()
+        }));
+        assert!(history.iter().any(|event| event.kind == "run_interrupted"));
+        // The run was aborted before any orchestration ran.
+        assert!(!history
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision"));
+    }
+
+    #[tokio::test]
+    async fn interrupt_clears_pending_governance_decision_state() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        seed_pending_governance_decision(&mut app, "create a feature");
+        assert!(app.state.pending_governance_decision.is_some());
+        assert!(app.pending_governance_decision.is_some());
+
+        app.interrupt().unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        assert!(app.state.active_run_id.is_none());
+        assert!(app.state.pending_governance_decision.is_none());
+        assert!(app.pending_governance_decision.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_governance_decision_exposed_on_app_state_and_cleared_after_accept() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let decision_id = seed_pending_governance_decision(&mut app, "create a feature");
+
+        // The pause is visible to the render path via AppState.
+        let view = app.state.pending_governance_decision.as_ref().unwrap();
+        assert_eq!(view.decision_id, decision_id);
+        assert_eq!(
+            Some(view.run_id.as_str()),
+            app.state.active_run_id.as_deref()
+        );
+        assert_eq!(view.view.intent, "Create a feature");
+
+        app.resolve_pending_governance_decision(&decision_id, GovernanceAnswer::Accept)
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
     }
 
     #[tokio::test]

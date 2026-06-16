@@ -6,7 +6,7 @@
 |---|-------|--------|------------|--------------|
 | 01 | Governance module with shared decision and plan types | completed | medium | — |
 | 02 | Add chat governance-decision variants and projection arm | completed | medium | task_01 |
-| 03 | Pending governance decision state and resolver | pending | medium | task_01 |
+| 03 | Pending governance decision state and resolver | completed | medium | task_01 |
 | 04 | TUI governance decision card and key routing | pending | medium | task_02, task_03 |
 | 05 | Early-abort gate in the drive loop with feature flag | pending | high | task_02, task_03 |
 | 06 | Orchestrator prompt nudge for turn-one intent | pending | low | task_05 |
