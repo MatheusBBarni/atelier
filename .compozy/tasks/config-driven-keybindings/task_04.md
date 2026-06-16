@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Default keymap wiring into key routing
 type: frontend
 complexity: high
@@ -38,11 +38,11 @@ keymap while no-config behavior stays byte-for-byte identical to today.
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Implement the exhaustive `command_for_action` match.
-- [ ] 4.2 Add the `keymap` field to `TuiUiState` and build it from `DEFAULTS` at init.
-- [ ] 4.3 Consult the keymap in the normal-input branch behind the reserved guard.
-- [ ] 4.4 Confirm all ten actions (incl. editing) are reachable by their default keys.
-- [ ] 4.5 Add a default-fidelity regression test for the full default key set.
+- [x] 4.1 Implement the exhaustive `command_for_action` match.
+- [x] 4.2 Add the `keymap` field to `TuiUiState` and build it from `DEFAULTS` at init.
+- [x] 4.3 Consult the keymap in the normal-input branch behind the reserved guard.
+- [x] 4.4 Confirm all ten actions (incl. editing) are reachable by their default keys.
+- [x] 4.5 Add a default-fidelity regression test for the full default key set.
 
 ## Implementation Details
 Within `src/tui/mod.rs`: routing wrapper (`:1056`) and the normal-input fallback
@@ -72,12 +72,12 @@ exhaustive match).
 
 ## Tests
 - Unit tests:
-  - [ ] `command_for_action` maps each of the ten `KeyAction` variants to the correct `TuiCommand` (exhaustive).
-  - [ ] With the default keymap: `Ctrl-L`→ToggleRoster, `PageUp`→ScrollEvents(PageUp), `Ctrl-A`→cursor LineStart, `Ctrl-K`→InputKill(ToLineEnd).
-  - [ ] Default-fidelity: for the representative pre-feature key set, routing output equals the prior mapping.
-  - [ ] An unmapped key (a plain character) still falls through to `InputCharacter`.
+  - [x] `command_for_action` maps each of the ten `KeyAction` variants to the correct `TuiCommand` (exhaustive) — `command_for_action_maps_all_ten_actions`.
+  - [x] With the default keymap: `Ctrl-L`→ToggleRoster, `PageUp`→ScrollEvents(PageUp), `Ctrl-A`→cursor LineStart, `Ctrl-K`→InputKill(ToLineEnd) — `default_keymap_routes_all_ten_actions_by_their_default_keys`.
+  - [x] Default-fidelity: for the representative pre-feature key set, routing output equals the prior mapping — `default_keymap_preserves_pre_feature_routing`.
+  - [x] An unmapped key (a plain character) still falls through to `InputCharacter` — `unmapped_key_falls_through_to_input_character`.
 - Integration tests:
-  - [ ] Routing a modal key (e.g. approval `Esc`/`Enter`) is unaffected by the keymap; normal-context keys resolve via the keymap.
+  - [x] Routing a modal key is unaffected by the keymap; normal-context keys resolve via the keymap — `keymap_is_gated_to_the_normal_context` (approval Ctrl-A inert; normal Ctrl-A → LineStart).
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -86,3 +86,23 @@ exhaustive match).
 - Test coverage >=80%
 - No-config behavior is byte-for-byte identical (regression test green).
 - All ten actions reachable; keymap never resolves inside a modal context.
+
+## Implementation Notes
+- The keymap is consulted only in the final normal-input `else` branch of
+  `key_event_to_tui_command_with_ui` (after the reserved guard + modal cascade);
+  on a hit it maps via `command_for_action`, on a miss it falls through to the
+  unchanged base handler — so keys the keymap doesn't own route byte-identically.
+- `TuiUiState.keymap` is built by a new `default_keymap()` helper (DEFAULTS, no
+  overrides) in the `Default` impl, so `run_tui` (via `with_skill_suggestions`) and
+  every test inherit it. **task_08** replaces this with the config-resolved keymap.
+- Removed the task_02 `#[allow(dead_code)]` markers on `InputKill`/`LineStart`/
+  `LineEnd`/`InputKillCommand` — `command_for_action` now constructs them in prod.
+- **Touched `src/keybindings.rs`**: added `PartialEq, Eq` to `Keymap` (content-based,
+  order-independent) so it can be a field of the equality-deriving `TuiUiState`.
+- **Known follow-up for task_08 (unbind):** the base handler still hardcodes the
+  remappable keys (Ctrl-L, PageUp/Down, Home/End) as the miss fallback, so an
+  *unbound* default would currently still be caught there. task_08 must ensure unbind
+  truly removes a binding (e.g. stop the base handler from shadowing keymap-owned keys).
+- Verified `2026-06-16`: 5 new tests pass; clippy `--all-targets` clean; fmt clean;
+  full `cargo test --lib` passed 1010 → 1015 (exactly the 5 new tests), with only the
+  pre-existing environmental skill/codex failures remaining.

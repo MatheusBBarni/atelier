@@ -135,7 +135,10 @@ pub type KeybindingOverrides = BTreeMap<KeyAction, Option<KeyChord>>;
 
 /// Resolved `KeyChord -> KeyAction` lookup, built once at TUI init from the
 /// defaults plus validated user overrides.
-#[derive(Clone, Debug, Default)]
+///
+/// `PartialEq`/`Eq` compare the resolved bindings by content (order-independent),
+/// so a `Keymap` can live on equality-derived UI state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Keymap {
     lookup: HashMap<KeyChord, KeyAction>,
 }

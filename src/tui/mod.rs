@@ -10,6 +10,7 @@ use crate::app::{
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
 use crate::governance::{GovernanceAnswer, GovernanceDecisionView};
+use crate::keybindings::{self, KeyAction, Keymap};
 use crate::orchestrator::RunState;
 use crate::skills::{
     self, SkillSourceTag, SkillSuggestion, SKILL_DISCOVERY_MAX_DEPTH, SKILL_FILE_NAME,
@@ -192,9 +193,6 @@ enum TuiCommand {
     ReloadSkills,
     InputCharacter(char),
     InputBackspace,
-    // Constructed in production once task_04 default-binds the editing actions via
-    // `command_for_action`; until then it is only built from tests.
-    #[allow(dead_code)]
     InputKill(InputKillCommand),
 }
 
@@ -214,22 +212,14 @@ enum InputCursorCommand {
     Right,
     Up,
     Down,
-    // LineStart/LineEnd are constructed in production once task_04 default-binds the
-    // editing actions via `command_for_action`; until then they are only built from tests.
     /// Jump the cursor to the start of the composer line (readline `Ctrl-A`).
-    #[allow(dead_code)]
     LineStart,
     /// Jump the cursor to the end of the composer line (readline `Ctrl-E`).
-    #[allow(dead_code)]
     LineEnd,
 }
 
 /// Readline-style kill operations over the single-line composer. Kills discard
 /// text (no kill-ring/yank in V1).
-///
-/// Constructed in production once task_04 default-binds these actions via
-/// `command_for_action`; until then these variants are only built from tests.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputKillCommand {
     /// Delete from the cursor to the end of the line (readline `Ctrl-K`).
@@ -372,6 +362,11 @@ struct TuiUiState {
     work_spinner_frame: usize,
     theme: Theme,
     hide_banner: bool,
+    /// Resolved key → action map consulted in the normal-input branch only
+    /// (ADR-003). Built once at TUI init; Wave 1 uses `DEFAULTS` (no config),
+    /// task_08 swaps in the config-resolved map. No overrides ⇒ byte-identical
+    /// default routing.
+    keymap: Keymap,
 }
 
 impl Default for TuiUiState {
@@ -419,7 +414,36 @@ impl Default for TuiUiState {
                 truecolor: true,
             }),
             hide_banner: false,
+            keymap: default_keymap(),
         }
+    }
+}
+
+/// The Wave-1 keymap: `DEFAULTS` resolved with no user overrides. Byte-identical
+/// to the pre-feature routing for the keys it owns. task_08 replaces the call site
+/// at TUI init with the config-resolved map.
+fn default_keymap() -> Keymap {
+    Keymap::resolve(
+        &keybindings::DEFAULTS,
+        &keybindings::KeybindingOverrides::new(),
+    )
+}
+
+/// The single bridge from a remappable [`KeyAction`] to its concrete [`TuiCommand`]
+/// (ADR-003). Exhaustive by construction: adding a `KeyAction` variant forces a new
+/// arm here, so action names can never drift from the command enum.
+fn command_for_action(action: KeyAction) -> TuiCommand {
+    match action {
+        KeyAction::ToggleRoster => TuiCommand::ToggleRoster,
+        KeyAction::ScrollPageUp => TuiCommand::ScrollEvents(EventScrollCommand::PageUp),
+        KeyAction::ScrollPageDown => TuiCommand::ScrollEvents(EventScrollCommand::PageDown),
+        KeyAction::ScrollTop => TuiCommand::ScrollEvents(EventScrollCommand::Top),
+        KeyAction::ScrollBottom => TuiCommand::ScrollEvents(EventScrollCommand::Bottom),
+        KeyAction::InputLineStart => TuiCommand::MoveInputCursor(InputCursorCommand::LineStart),
+        KeyAction::InputLineEnd => TuiCommand::MoveInputCursor(InputCursorCommand::LineEnd),
+        KeyAction::InputKillToEnd => TuiCommand::InputKill(InputKillCommand::ToLineEnd),
+        KeyAction::InputKillToStart => TuiCommand::InputKill(InputKillCommand::ToLineStart),
+        KeyAction::InputKillWordBack => TuiCommand::InputKill(InputKillCommand::WordBack),
     }
 }
 
@@ -1178,7 +1202,16 @@ fn key_event_to_tui_command_with_ui(
         queue_control_key_command(state, ui_state, key)
             .or_else(|| key_event_to_tui_command(state, key))
     } else {
-        key_event_to_tui_command(state, key)
+        // Normal-input context only (ADR-003): consult the active keymap first. A hit
+        // maps through the exhaustive `command_for_action` bridge; a miss falls through
+        // to the unchanged hardcoded handler, so no-config behavior is byte-identical
+        // for keys the keymap does not own. The keymap is never consulted in the modal
+        // branches above.
+        if let Some(action) = ui_state.keymap.action_for(&key) {
+            Some(command_for_action(action))
+        } else {
+            key_event_to_tui_command(state, key)
+        }
     }
 }
 
@@ -8341,6 +8374,165 @@ mod tests {
                 ClarificationCommand::PreviousOption
             )),
             "clarification Up"
+        );
+    }
+
+    // ── default keymap wiring (config-driven-keybindings task_04) ──
+
+    #[test]
+    fn command_for_action_maps_all_ten_actions() {
+        use KeyAction::*;
+        assert_eq!(command_for_action(ToggleRoster), TuiCommand::ToggleRoster);
+        assert_eq!(
+            command_for_action(ScrollPageUp),
+            TuiCommand::ScrollEvents(EventScrollCommand::PageUp)
+        );
+        assert_eq!(
+            command_for_action(ScrollPageDown),
+            TuiCommand::ScrollEvents(EventScrollCommand::PageDown)
+        );
+        assert_eq!(
+            command_for_action(ScrollTop),
+            TuiCommand::ScrollEvents(EventScrollCommand::Top)
+        );
+        assert_eq!(
+            command_for_action(ScrollBottom),
+            TuiCommand::ScrollEvents(EventScrollCommand::Bottom)
+        );
+        assert_eq!(
+            command_for_action(InputLineStart),
+            TuiCommand::MoveInputCursor(InputCursorCommand::LineStart)
+        );
+        assert_eq!(
+            command_for_action(InputLineEnd),
+            TuiCommand::MoveInputCursor(InputCursorCommand::LineEnd)
+        );
+        assert_eq!(
+            command_for_action(InputKillToEnd),
+            TuiCommand::InputKill(InputKillCommand::ToLineEnd)
+        );
+        assert_eq!(
+            command_for_action(InputKillToStart),
+            TuiCommand::InputKill(InputKillCommand::ToLineStart)
+        );
+        assert_eq!(
+            command_for_action(InputKillWordBack),
+            TuiCommand::InputKill(InputKillCommand::WordBack)
+        );
+    }
+
+    #[test]
+    fn default_keymap_routes_all_ten_actions_by_their_default_keys() {
+        let state = state_with_input("hello", false);
+        let ui = TuiUiState::default(); // built from DEFAULTS
+        let route = |k: KeyEvent| key_event_to_tui_command_with_ui(&state, &ui, k);
+        let ctrl = |c: char| key_with_modifiers(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        assert_eq!(route(ctrl('l')), Some(TuiCommand::ToggleRoster));
+        assert_eq!(
+            route(key(KeyCode::PageUp)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::PageUp))
+        );
+        assert_eq!(
+            route(key(KeyCode::PageDown)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::PageDown))
+        );
+        assert_eq!(
+            route(key(KeyCode::Home)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::Top))
+        );
+        assert_eq!(
+            route(key(KeyCode::End)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::Bottom))
+        );
+        assert_eq!(
+            route(ctrl('a')),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::LineStart))
+        );
+        assert_eq!(
+            route(ctrl('e')),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::LineEnd))
+        );
+        assert_eq!(
+            route(ctrl('k')),
+            Some(TuiCommand::InputKill(InputKillCommand::ToLineEnd))
+        );
+        assert_eq!(
+            route(ctrl('u')),
+            Some(TuiCommand::InputKill(InputKillCommand::ToLineStart))
+        );
+        assert_eq!(
+            route(ctrl('w')),
+            Some(TuiCommand::InputKill(InputKillCommand::WordBack))
+        );
+    }
+
+    #[test]
+    fn default_keymap_preserves_pre_feature_routing() {
+        let state = state_with_input("draft", false);
+        let ui = TuiUiState::default();
+        let route = |k: KeyEvent| key_event_to_tui_command_with_ui(&state, &ui, k);
+
+        // Remappable keys (now resolved via the keymap) — identical commands to before.
+        assert_eq!(
+            route(key_with_modifiers(
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL
+            )),
+            Some(TuiCommand::ToggleRoster)
+        );
+        assert_eq!(
+            route(key(KeyCode::PageUp)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::PageUp))
+        );
+        assert_eq!(
+            route(key(KeyCode::Home)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::Top))
+        );
+        // Keys the keymap does not own — unchanged via the fallback handler.
+        assert_eq!(
+            route(key(KeyCode::Up)),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up))
+        );
+        assert_eq!(
+            route(key(KeyCode::Left)),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Left))
+        );
+        assert_eq!(
+            route(key(KeyCode::Backspace)),
+            Some(TuiCommand::InputBackspace)
+        );
+    }
+
+    #[test]
+    fn unmapped_key_falls_through_to_input_character() {
+        let state = state_with_input("", false);
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui, key(KeyCode::Char('z'))),
+            Some(TuiCommand::InputCharacter('z'))
+        );
+    }
+
+    #[test]
+    fn keymap_is_gated_to_the_normal_context() {
+        let ui = TuiUiState::default();
+        let ctrl_a = key_with_modifiers(KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        // In the approval modal, the normal-mode Ctrl-A editing binding must NOT be
+        // interpreted by the keymap — it stays inert (the base handler returns None).
+        let appr_state = state_with_input("", true);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&appr_state, &ui, ctrl_a),
+            None,
+            "Ctrl-A must not trigger line-start inside the approval modal"
+        );
+
+        // In the normal context the same key resolves via the keymap.
+        let normal_state = state_with_input("", false);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&normal_state, &ui, ctrl_a),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::LineStart))
         );
     }
 
