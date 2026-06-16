@@ -5,11 +5,12 @@ use self::chat::{ChatItemView, ChatProjection};
 use self::git::{fetch_git_context, GitContext};
 use crate::actions::{
     execute_action_request, is_vcs_mutation, vcs_action_explicitly_requested, ActionDecision,
-    ActionExecutionContext, ActionKind, ActionRequest, ActionResult, ActionStatus, TrustTarget,
+    ActionExecutionContext, ActionKind, ActionRequest, ActionResult, ActionStatus, GateOutcome,
+    RiskNote, RiskTier, TrustTarget,
 };
 use crate::config::{
-    AgentProfile, AgentPromptMetadata, ApprovalMode, Capability, CouncilExecutionMode,
-    CouncilMemberProfile, EffectiveConfig, Limit,
+    AgentProfile, AgentPromptMetadata, Capability, CouncilExecutionMode, CouncilMemberProfile,
+    EffectiveConfig, Limit,
 };
 use crate::governance::{
     GovernanceAnswer, GovernanceDecisionView, GovernanceKind, GOVERNANCE_DECISION_REQUESTED,
@@ -202,7 +203,7 @@ pub struct ConfigStatusView {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PendingApprovalView {
     pub run_id: String,
     pub group_id: Option<String>,
@@ -211,6 +212,29 @@ pub struct PendingApprovalView {
     pub agent: String,
     pub summary: String,
     pub diagnostic: Option<String>,
+    /// Risk fields for the rich modal (ADR-003), populated from the action's
+    /// `RiskNote` at approval-creation time. `#[serde(default)]` keeps older
+    /// snapshots/records deserializing.
+    #[serde(default)]
+    pub tier: Option<RiskTier>,
+    #[serde(default)]
+    pub catastrophic: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub resolved_command: Option<String>,
+    #[serde(default)]
+    pub diff: Option<String>,
+    #[serde(default)]
+    pub affected_paths: Vec<String>,
+    #[serde(default)]
+    pub boundary_crossed: Option<String>,
+    #[serde(default)]
+    pub reversible: Option<bool>,
+    /// The exact target the "approve-and-trust" option would grant; `None` hides
+    /// that option (e.g. for catastrophic actions).
+    #[serde(default)]
+    pub trust_target: Option<TrustTarget>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -248,17 +272,41 @@ impl InterruptHandle {
     }
 }
 
+/// The user's answer at the approval modal (ADR-004). Replaces the former bare
+/// `bool`: "approve" and "approve-and-trust" must never share a keystroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalResolution {
+    Deny,
+    ApproveOnce,
+    ApproveAndTrust,
+}
+
+impl ApprovalResolution {
+    /// Whether the action should run (either approve variant).
+    pub fn approves(self) -> bool {
+        matches!(
+            self,
+            ApprovalResolution::ApproveOnce | ApprovalResolution::ApproveAndTrust
+        )
+    }
+
+    /// Whether the action's target should be added to the session trust list.
+    pub fn grants_trust(self) -> bool {
+        matches!(self, ApprovalResolution::ApproveAndTrust)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ApprovalHandle {
     sender: watch::Sender<ApprovalSignal>,
 }
 
 impl ApprovalHandle {
-    pub fn answer(&self, approved: bool) {
+    pub fn resolve(&self, resolution: ApprovalResolution) {
         let current = *self.sender.borrow();
         let _ = self.sender.send(ApprovalSignal {
             sequence: current.sequence.wrapping_add(1),
-            approved,
+            resolution,
         });
     }
 }
@@ -304,7 +352,7 @@ impl PromptSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
     PromptSubmitted(String, PromptSource),
-    ApprovalAnswered(bool),
+    ApprovalAnswered(ApprovalResolution),
     ClarificationAnswered(ClarificationAnswer),
     /// Resolve the pending governance decision `decision_id` with `answer`
     /// (governance spine, ADR-003). The `decision_id` lets the resolver reject a
@@ -876,7 +924,7 @@ struct ParallelRuntimeResumeHandle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ApprovalSignal {
     sequence: u64,
-    approved: bool,
+    resolution: ApprovalResolution,
 }
 
 #[derive(Clone, Debug)]
@@ -929,7 +977,7 @@ impl App {
         let (interrupt_sender, interrupt_receiver) = watch::channel(0);
         let (approval_sender, approval_receiver) = watch::channel(ApprovalSignal {
             sequence: 0,
-            approved: false,
+            resolution: ApprovalResolution::Deny,
         });
         let state = AppState {
             session_id: history.session_id().to_string(),
@@ -1031,10 +1079,10 @@ impl App {
                 self.publish_state();
                 self.submit_prompt_with_source(prompt, source).await
             }
-            AppEvent::ApprovalAnswered(approved) => {
+            AppEvent::ApprovalAnswered(resolution) => {
                 self.state.input.clear();
                 self.publish_state();
-                self.resolve_pending_approval(approved).await?;
+                self.resolve_pending_approval(resolution).await?;
                 Ok(())
             }
             AppEvent::ClarificationAnswered(answer) => {
@@ -1685,12 +1733,13 @@ impl App {
 
     pub async fn resolve_pending_approval(
         &mut self,
-        approved: bool,
+        resolution: ApprovalResolution,
     ) -> Result<Option<ActionResult>> {
         let Some(mut pending) = self.pending_approval.take() else {
             return Ok(None);
         };
         self.state.pending_approval = None;
+        let approved = resolution.approves();
         // Keep the explainer flag in sync with approval presence (none pending → false).
         self.state.show_first_approval_explainer = false;
         self.record_event(
@@ -1699,7 +1748,8 @@ impl App {
             "approval_resolved",
             json!({
                 "action_id": pending.action_request.action_id.clone(),
-                "approved": approved
+                "approved": approved,
+                "resolution": approval_resolution_label(resolution),
             }),
             if approved {
                 "Action approval granted."
@@ -1707,6 +1757,25 @@ impl App {
                 "Action approval denied."
             },
         )?;
+
+        // Approve-and-trust grants the exact target into the session trust list,
+        // but only for non-catastrophic actions (catastrophic exposes no target,
+        // ADR-004). Recorded as `trust_granted` so trust stays auditable.
+        if resolution.grants_trust() {
+            if let Some(target) =
+                crate::actions::assess_risk(&pending.action_request, &pending.context).target
+            {
+                if self.trust_store.grant(target.clone()) {
+                    self.record_event(
+                        Some(pending.run_id.clone()),
+                        Some(pending.step_id.clone()),
+                        "trust_granted",
+                        json!({ "target": trust_target_payload(&target) }),
+                        format!("Trusted for this session: {}", trust_target_label(&target)),
+                    )?;
+                }
+            }
+        }
 
         if self.wall_clock_limit_reached(&pending.run) {
             self.stop_for_wall_clock_limit(&pending.run)?;
@@ -1724,7 +1793,10 @@ impl App {
         }
 
         let result = if approved {
-            pending.context.approval_mode = ApprovalMode::Yolo;
+            // The user approved this exact action; mark the context pre-approved so
+            // the re-run runs it even when catastrophic or floor=Enforce (which
+            // would otherwise re-prompt).
+            pending.context.pre_approved = true;
             self.record_command_started_if_executable(
                 &pending.run.run_id,
                 &pending.step_id,
@@ -2444,7 +2516,7 @@ impl App {
                                     run,
                                     child,
                                     pending,
-                                    approval.approved,
+                                    approval.resolution,
                                     resume_handle.clone(),
                                 )
                                 .await?;
@@ -2760,6 +2832,7 @@ impl App {
             action_scope: crate::actions::ActionScope::ParallelFileScope(child.file_scope.clone()),
             floor: self.config.approval.floor,
             trusted_targets: self.trust_store.snapshot(),
+            pre_approved: false,
         };
         self.record_command_started_if_executable_with_group(
             &run.run_id,
@@ -2855,9 +2928,10 @@ impl App {
         run: &RunDriveContext,
         child: &mut ParallelChildRuntimeState,
         mut pending: PendingParallelApproval,
-        approved: bool,
+        resolution: ApprovalResolution,
         resume_handle: ParallelRuntimeResumeHandle,
     ) -> Result<()> {
+        let approved = resolution.approves();
         self.record_event_with_group(
             Some(pending.run_id.clone()),
             Some(pending.group_id.clone()),
@@ -2865,7 +2939,8 @@ impl App {
             "approval_resolved",
             json!({
                 "action_id": pending.action_request.action_id.clone(),
-                "approved": approved
+                "approved": approved,
+                "resolution": approval_resolution_label(resolution),
             }),
             if approved {
                 "Action approval granted."
@@ -2873,6 +2948,24 @@ impl App {
                 "Action approval denied."
             },
         )?;
+
+        // Approve-and-trust grants the non-catastrophic target (ADR-004).
+        if resolution.grants_trust() {
+            if let Some(target) =
+                crate::actions::assess_risk(&pending.action_request, &pending.context).target
+            {
+                if self.trust_store.grant(target.clone()) {
+                    self.record_event_with_group(
+                        Some(pending.run_id.clone()),
+                        Some(pending.group_id.clone()),
+                        Some(pending.step_id.clone()),
+                        "trust_granted",
+                        json!({ "target": trust_target_payload(&target) }),
+                        format!("Trusted for this session: {}", trust_target_label(&target)),
+                    )?;
+                }
+            }
+        }
 
         if self.wall_clock_limit_reached(run) {
             self.stop_for_wall_clock_limit(run)?;
@@ -2896,7 +2989,9 @@ impl App {
         }
 
         let result = if approved {
-            pending.context.approval_mode = ApprovalMode::Yolo;
+            // Pre-approve the re-run so catastrophic / floor=Enforce actions execute
+            // instead of re-prompting (mirrors the serial path).
+            pending.context.pre_approved = true;
             self.record_command_started_if_executable_with_group(
                 &pending.run_id,
                 Some(&pending.group_id),
@@ -2990,14 +3085,17 @@ impl App {
             .pending_approval
             .as_ref()
             .map(|pending| pending.step_id.clone());
-        self.state.pending_approval = queue.front().map(|pending| PendingApprovalView {
-            run_id: pending.run_id.clone(),
-            group_id: Some(pending.group_id.clone()),
-            step_id: pending.step_id.clone(),
-            action_id: pending.action_request.action_id.clone(),
-            agent: pending.agent_profile.id.clone(),
-            summary: action_requested_display(&pending.action_request).to_string(),
-            diagnostic: pending.reason.clone(),
+        self.state.pending_approval = queue.front().map(|pending| {
+            build_pending_approval_view(
+                pending.run_id.clone(),
+                Some(pending.group_id.clone()),
+                pending.step_id.clone(),
+                pending.agent_profile.id.clone(),
+                action_requested_display(&pending.action_request).to_string(),
+                pending.reason.clone(),
+                &pending.action_request,
+                &pending.context,
+            )
         });
         // First-approval explainer (ADR-004), mirroring the serial path: consult the
         // persisted latch only when the *surfaced* approval changes (a new head, not a
@@ -4273,6 +4371,7 @@ impl App {
                         action_scope: crate::actions::ActionScope::Unrestricted,
                         floor: self.config.approval.floor,
                         trusted_targets: self.trust_store.snapshot(),
+                        pre_approved: false,
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -4300,15 +4399,16 @@ impl App {
                     if matches!(result.status, ActionStatus::ApprovalRequired) {
                         self.set_live_step_status(&step_id, LiveStepStatus::WaitingForApproval);
                         self.set_agent_status(&request.agent_profile.id, "waiting_approval");
-                        let view = PendingApprovalView {
-                            run_id: run_id.to_string(),
-                            group_id: None,
-                            step_id: step_id.clone(),
-                            action_id: action_request.action_id.clone(),
-                            agent: request.agent_profile.id.clone(),
-                            summary: result.summary.clone(),
-                            diagnostic: result.diagnostic.clone(),
-                        };
+                        let view = build_pending_approval_view(
+                            run_id.to_string(),
+                            None,
+                            step_id.clone(),
+                            request.agent_profile.id.clone(),
+                            result.summary.clone(),
+                            result.diagnostic.clone(),
+                            &action_request,
+                            &context,
+                        );
                         self.pending_approval = Some(PendingApproval {
                             run_id: run_id.to_string(),
                             step_id: step_id.clone(),
@@ -5020,6 +5120,7 @@ impl App {
         request: &ActionRequest,
         result: &ActionResult,
     ) -> Result<()> {
+        self.record_gate_outcome_event_with_group(run_id, group_id, step_id, request, result)?;
         match request.kind {
             ActionKind::RunCommand => {
                 self.record_command_completed_with_group(run_id, group_id, step_id, request, result)
@@ -5028,6 +5129,55 @@ impl App {
                 self.record_file_edit_applied_with_group(run_id, group_id, step_id, request, result)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Audit the floor/trust gate outcome stamped by the enforcement point
+    /// (ADR-002/003): a trust auto-approval emits `approval_auto_resolved`; a
+    /// gray-area warn-and-run under Yolo+Warn emits `floor_warned`.
+    fn record_gate_outcome_event_with_group(
+        &mut self,
+        run_id: &str,
+        group_id: Option<&str>,
+        step_id: &str,
+        request: &ActionRequest,
+        result: &ActionResult,
+    ) -> Result<()> {
+        match result.gate_outcome {
+            GateOutcome::AutoApprovedByTrust => {
+                let target = result.risk.as_ref().and_then(|risk| risk.target.as_ref());
+                self.record_event_with_group(
+                    Some(run_id.to_string()),
+                    group_id.map(str::to_string),
+                    Some(step_id.to_string()),
+                    "approval_auto_resolved",
+                    json!({
+                        "action_id": request.action_id.clone(),
+                        "target": target.map(trust_target_payload),
+                    }),
+                    "Auto-approved by session trust.",
+                )
+            }
+            GateOutcome::WarnedAllowed => {
+                let (tier, reason) = result
+                    .risk
+                    .as_ref()
+                    .map(|risk| (risk_tier_label(risk.tier), risk.reason.clone()))
+                    .unwrap_or(("medium", "gray-area action".to_string()));
+                self.record_event_with_group(
+                    Some(run_id.to_string()),
+                    group_id.map(str::to_string),
+                    Some(step_id.to_string()),
+                    "floor_warned",
+                    json!({
+                        "action_id": request.action_id.clone(),
+                        "tier": tier,
+                        "reason": reason,
+                    }),
+                    format!("Floor warning ({tier}): {reason}"),
+                )
+            }
+            GateOutcome::Normal | GateOutcome::ApprovalRequired => Ok(()),
         }
     }
 
@@ -6120,6 +6270,103 @@ async fn wait_for_approval(
         if receiver.changed().await.is_err() {
             pending::<()>().await;
         }
+    }
+}
+
+/// Wire label for the `tier` field on risk-bearing events / views.
+fn risk_tier_label(tier: RiskTier) -> &'static str {
+    match tier {
+        RiskTier::Low => "low",
+        RiskTier::Medium => "medium",
+        RiskTier::High => "high",
+    }
+}
+
+/// Wire label for the `approval_resolved.resolution` field.
+fn approval_resolution_label(resolution: ApprovalResolution) -> &'static str {
+    match resolution {
+        ApprovalResolution::Deny => "deny",
+        ApprovalResolution::ApproveOnce => "approve_once",
+        ApprovalResolution::ApproveAndTrust => "approve_and_trust",
+    }
+}
+
+/// Human-readable description of a trust target for chat/event display.
+fn trust_target_label(target: &TrustTarget) -> String {
+    match target {
+        TrustTarget::Command(command) => format!("command `{command}`"),
+        TrustTarget::WritePath(path) => format!("writes to {}", path.display()),
+    }
+}
+
+/// Stable structured payload for trust targets in `trust_granted` /
+/// `approval_auto_resolved` events (projected in task_06).
+fn trust_target_payload(target: &TrustTarget) -> serde_json::Value {
+    match target {
+        TrustTarget::Command(command) => json!({ "kind": "command", "value": command }),
+        TrustTarget::WritePath(path) => {
+            json!({ "kind": "write_path", "value": path.display().to_string() })
+        }
+    }
+}
+
+/// Cap a preview string (command/diff) before it enters `AppState`, so a huge
+/// diff can't bloat the snapshot channel (TechSpec "Known Risks").
+fn capped_preview(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 4000;
+    if text.chars().count() <= MAX_PREVIEW_CHARS {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(MAX_PREVIEW_CHARS).collect();
+    format!("{truncated}\n… (truncated)")
+}
+
+/// Build the rich `PendingApprovalView` for the modal (ADR-003). Risk fields are
+/// derived from `assess_risk` (the same pure assessment the gate used), with the
+/// command/diff previews capped before they enter `AppState`.
+#[allow(clippy::too_many_arguments)]
+fn build_pending_approval_view(
+    run_id: String,
+    group_id: Option<String>,
+    step_id: String,
+    agent: String,
+    summary: String,
+    diagnostic: Option<String>,
+    request: &ActionRequest,
+    context: &ActionExecutionContext,
+) -> PendingApprovalView {
+    let risk: RiskNote = crate::actions::assess_risk(request, context);
+    let resolved_command = request
+        .params
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(|command| capped_preview(&crate::actions::normalize_command(command)));
+    let diff = request
+        .params
+        .get("diff")
+        .and_then(serde_json::Value::as_str)
+        .map(capped_preview);
+    let affected_paths = match &risk.target {
+        Some(TrustTarget::WritePath(path)) => vec![path.display().to_string()],
+        _ => Vec::new(),
+    };
+    PendingApprovalView {
+        run_id,
+        group_id,
+        step_id,
+        action_id: request.action_id.clone(),
+        agent,
+        summary,
+        diagnostic,
+        tier: Some(risk.tier),
+        catastrophic: risk.catastrophic,
+        reason: Some(risk.reason),
+        resolved_command,
+        diff,
+        affected_paths,
+        boundary_crossed: None,
+        reversible: None,
+        trust_target: risk.target,
     }
 }
 
@@ -7228,6 +7475,7 @@ runtime = "fake"
             action_scope: crate::actions::ActionScope::Unrestricted,
             floor: app.config.approval.floor,
             trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
+            pre_approved: false,
         };
         let rendered_context = ActionExecutionContext {
             user_prompt: Some(request.prompt.clone()),
@@ -8614,7 +8862,7 @@ prompt = "{reviewer_prompt}"
 
         assert!(saw_pending_approval);
         assert!(saw_reviewer_complete_while_pending);
-        approval_handle.answer(false);
+        approval_handle.resolve(ApprovalResolution::Deny);
 
         let app = tokio::time::timeout(Duration::from_secs(2), run)
             .await
@@ -10343,7 +10591,10 @@ runtime = "fake"
 
         // Resolving the approval clears the flag so it never lingers true while no
         // approval is pending — the flag stays in sync with approval state (F1).
-        first.resolve_pending_approval(false).await.unwrap();
+        first
+            .resolve_pending_approval(ApprovalResolution::Deny)
+            .await
+            .unwrap();
         assert!(first.state.pending_approval.is_none());
         assert!(!first.state.show_first_approval_explainer);
 
@@ -10666,7 +10917,7 @@ runtime = "fake"
                 }
             }
         }
-        approval_handle.answer(false);
+        approval_handle.resolve(ApprovalResolution::Deny);
 
         let app = tokio::time::timeout(Duration::from_secs(2), run)
             .await
@@ -12212,6 +12463,152 @@ runtime = "fake"
         assert!(app.state.pending_approval.is_some());
     }
 
+    // ---- Approval resolution, trust grant & audit events (task_05) ----
+
+    #[test]
+    fn capped_preview_truncates_long_input() {
+        assert_eq!(capped_preview("short"), "short");
+        let long = "x".repeat(10_000);
+        let capped = capped_preview(&long);
+        assert!(capped.chars().count() < long.chars().count());
+        assert!(capped.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn pending_view_is_populated_with_risk_fields() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        let pending = app.state.pending_approval.as_ref().unwrap();
+        assert_eq!(pending.tier, Some(RiskTier::Medium));
+        assert!(!pending.catastrophic);
+        assert!(pending.reason.as_ref().is_some_and(|r| !r.is_empty()));
+        assert_eq!(
+            pending.resolved_command.as_deref(),
+            Some("echo trusted-run")
+        );
+        assert_eq!(
+            pending.trust_target,
+            Some(TrustTarget::Command("echo trusted-run".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_and_trust_grants_target_and_records_event() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_some());
+
+        app.resolve_pending_approval(ApprovalResolution::ApproveAndTrust)
+            .await
+            .unwrap();
+
+        assert!(app
+            .trust_store
+            .contains(&TrustTarget::Command("echo trusted-run".to_string())));
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "trust_granted"));
+    }
+
+    #[tokio::test]
+    async fn approve_and_trust_is_noop_for_catastrophic_action() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("secret read action create a feature")
+            .await
+            .unwrap();
+
+        let pending = app.state.pending_approval.as_ref().unwrap();
+        assert!(pending.catastrophic);
+        assert_eq!(pending.trust_target, None);
+
+        app.resolve_pending_approval(ApprovalResolution::ApproveAndTrust)
+            .await
+            .unwrap();
+        // Catastrophic exposes no target, so nothing is granted.
+        assert!(app.trust_store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn approve_once_runs_without_granting_trust() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        app.resolve_pending_approval(ApprovalResolution::ApproveOnce)
+            .await
+            .unwrap();
+        assert!(app.trust_store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deny_produces_reason_and_resumes_the_run() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        let result = app
+            .resolve_pending_approval(ApprovalResolution::Deny)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, ActionStatus::Denied);
+        assert!(result.diagnostic.is_some_and(|reason| !reason.is_empty()));
+        // Deny-and-continue: the run is no longer waiting on the user.
+        assert!(app.state.pending_approval.is_none());
+        assert_ne!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    #[tokio::test]
+    async fn trusted_auto_run_records_approval_auto_resolved_event() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("echo trusted-run".to_string()));
+
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_approval.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "approval_auto_resolved"));
+    }
+
+    #[tokio::test]
+    async fn gray_area_under_yolo_warn_records_floor_warned_event() {
+        let dir = tempdir().unwrap();
+        // fake_config is Yolo with the default Warn floor.
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        // The gray-area command ran (no modal) and a warning was audited.
+        assert!(app.state.pending_approval.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "floor_warned"));
+    }
+
     #[tokio::test]
     async fn app_state_defaults_to_no_pending_clarification() {
         let dir = tempdir().unwrap();
@@ -13276,7 +13673,11 @@ runtime = "fake"
             .await
             .unwrap();
 
-        let result = app.resolve_pending_approval(false).await.unwrap().unwrap();
+        let result = app
+            .resolve_pending_approval(ApprovalResolution::Deny)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result.status, ActionStatus::Denied);
         assert_eq!(app.state.run_state, RunState::Completed);
         assert!(app.state.active_run_id.is_none());

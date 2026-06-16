@@ -115,6 +115,18 @@ impl Runtime for FakeRuntime {
                     params: serde_json::json!({ "command": "echo trusted-run" }),
                 },
             }
+        } else if should_emit_fake_catastrophic_action_request(&request) {
+            // Catastrophic (secret-read) classification, but harmless to execute:
+            // a relative `id_rsa` that does not exist in the test's temp workspace.
+            RuntimeOutput::ActionRequest {
+                request: ActionRequest {
+                    schema_version: 1,
+                    action_id: new_id(),
+                    step_id: request.step_id.clone(),
+                    kind: ActionKind::RunCommand,
+                    params: serde_json::json!({ "command": "cat id_rsa" }),
+                },
+            }
         } else if should_emit_fake_action_request(&request) {
             RuntimeOutput::ActionRequest {
                 request: ActionRequest {
@@ -566,6 +578,13 @@ fn should_emit_fake_trusted_command_action_request(request: &RuntimeRequest) -> 
         && request.agent_profile.id == "fixer"
         && request.agent_profile.has_capability(&Capability::Command)
         && fake_control_text(request).contains("trusted run action")
+}
+
+fn should_emit_fake_catastrophic_action_request(request: &RuntimeRequest) -> bool {
+    request.action_results.is_empty()
+        && request.agent_profile.id == "fixer"
+        && request.agent_profile.has_capability(&Capability::Command)
+        && fake_control_text(request).contains("secret read action")
 }
 
 fn should_emit_fake_write_action_request(request: &RuntimeRequest) -> bool {

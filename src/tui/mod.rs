@@ -3,8 +3,9 @@ use crate::app::chat::{
 };
 use crate::app::git::GitContext;
 use crate::app::{
-    ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, InterruptHandle,
-    PendingClarificationView, PromptSource, QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
+    ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, ApprovalResolution,
+    InterruptHandle, PendingClarificationView, PromptSource, QueuedFollowUpStatus,
+    QueuedFollowUpView, RosterRow,
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
@@ -751,11 +752,11 @@ async fn execute_tui_command_with_interrupt(
                 event,
                 AppEvent::PromptSubmitted(_, _) | AppEvent::ApprovalAnswered(_)
             );
-            if let AppEvent::ApprovalAnswered(approved) = &event {
+            if let AppEvent::ApprovalAnswered(resolution) = &event {
                 if let (Some(approval_handle), Some(pending)) =
                     (approval_handle, state.pending_approval.as_ref())
                 {
-                    approval_handle.answer(*approved);
+                    approval_handle.resolve(*resolution);
                     if pending.group_id.is_some() {
                         if clears_input {
                             clear_input(state, ui_state);
@@ -1513,7 +1514,13 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
             code: KeyCode::Enter,
             ..
         } if state.pending_approval.is_some() => Some(TuiCommand::Dispatch(
-            AppEvent::ApprovalAnswered(approval_input_is_yes(&state.input)),
+            // Rich key routing (approve-and-trust, type-to-confirm) is task_07; for
+            // now Enter maps the yes/no input to ApproveOnce/Deny.
+            AppEvent::ApprovalAnswered(if approval_input_is_yes(&state.input) {
+                ApprovalResolution::ApproveOnce
+            } else {
+                ApprovalResolution::Deny
+            }),
         )),
         KeyEvent {
             code: KeyCode::Enter,
@@ -5880,6 +5887,7 @@ mod tests {
                 agent: "fixer".to_string(),
                 summary: "Action requires action approval.".to_string(),
                 diagnostic: Some("command requires action approval: cargo install x".to_string()),
+                ..Default::default()
             }),
             show_first_approval_explainer: false,
             pending_clarification: None,
@@ -5916,6 +5924,7 @@ mod tests {
                 agent: "fixer".to_string(),
                 summary: "Action requires action approval.".to_string(),
                 diagnostic: Some("command requires action approval: cargo install x".to_string()),
+                ..Default::default()
             }),
             show_first_approval_explainer,
             pending_clarification: None,
@@ -7544,11 +7553,15 @@ mod tests {
                 &yes_state,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
-            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(true)))
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::ApproveOnce
+            )))
         );
         assert_eq!(
             key_event_to_tui_command(&no_state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(false)))
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::Deny
+            )))
         );
     }
 
@@ -7573,7 +7586,7 @@ mod tests {
             &sender,
             None,
             Some(&approval_handle),
-            TuiCommand::Dispatch(AppEvent::ApprovalAnswered(true)),
+            TuiCommand::Dispatch(AppEvent::ApprovalAnswered(ApprovalResolution::ApproveOnce)),
         )
         .await
         .unwrap();
@@ -8122,6 +8135,7 @@ mod tests {
                 agent: "fixer".to_string(),
                 summary: "Action requires approval.".to_string(),
                 diagnostic: None,
+                ..Default::default()
             }),
             show_first_approval_explainer: false,
             pending_clarification: None,
@@ -8684,11 +8698,15 @@ mod tests {
         assert!(yes_state.pending_clarification.is_none());
         assert_eq!(
             key_event_to_tui_command_with_ui(&yes_state, &ui_state, key(KeyCode::Enter)),
-            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(true)))
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::ApproveOnce
+            )))
         );
         assert_eq!(
             key_event_to_tui_command_with_ui(&no_state, &ui_state, key(KeyCode::Enter)),
-            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(false)))
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::Deny
+            )))
         );
     }
 

@@ -3910,6 +3910,7 @@ mod tests {
             agent: "fixer".to_string(),
             summary: "Execute dangerous command".to_string(),
             diagnostic: None,
+            ..Default::default()
         }
     }
 

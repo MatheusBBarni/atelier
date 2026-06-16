@@ -175,6 +175,11 @@ pub struct ActionExecutionContext {
     /// Per-action snapshot of the session trust list (ADR-004). Defaults to empty;
     /// the App fills it from the `TrustStore` (task_04).
     pub trusted_targets: Arc<HashSet<TrustTarget>>,
+    /// Set when re-running an action the user explicitly approved at the modal
+    /// (task_05). Short-circuits the floor/trust matrix to `Allowed` so an approved
+    /// catastrophic or `floor=Enforce` action actually runs instead of re-prompting;
+    /// the hard checks (capability/path/scope/command-policy) still apply.
+    pub pre_approved: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +203,7 @@ impl ActionExecutionContext {
             action_scope: ActionScope::Unrestricted,
             floor: FloorPolicy::default(),
             trusted_targets: Arc::new(HashSet::new()),
+            pre_approved: false,
         }
     }
 }
@@ -319,6 +325,12 @@ fn apply_floor_and_trust(
     context: &ActionExecutionContext,
     request: &ActionRequest,
 ) -> ActionDecision {
+    // The user already approved this exact action at the modal (task_05); the gate
+    // must not re-prompt, even for catastrophic or floor=Enforce actions.
+    if context.pre_approved {
+        return ActionDecision::Allowed;
+    }
+
     let risk = assess_risk(request, context);
 
     // Catastrophic always prompts and is never trustable — checked first so trust
@@ -1913,6 +1925,7 @@ mod tests {
             action_scope: ActionScope::Unrestricted,
             floor: config.approval.floor,
             trusted_targets: Arc::new(HashSet::new()),
+            pre_approved: false,
         }
     }
 
