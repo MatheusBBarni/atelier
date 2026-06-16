@@ -1,4 +1,4 @@
-use crate::config::{EffectiveConfig, RuntimeKind};
+use crate::config::{ApprovalMode, EffectiveConfig, FloorPolicy, RuntimeKind};
 use crate::history::{list_session_event_paths, read_events_from_path, HistoryEvent};
 use crate::runtime::{check_runtime_availability, RuntimeAvailabilityStatus};
 use anyhow::Result;
@@ -62,6 +62,7 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
     checks.push(prompt_files_check(config));
     checks.push(model_fallback_check(config));
     checks.push(tool_access_check(config));
+    checks.push(approval_check(config));
     checks.push(governance_metrics_check(config));
 
     for runtime in config.runtimes.values() {
@@ -218,6 +219,31 @@ fn tool_access_check(config: &EffectiveConfig) -> DoctorCheck {
         message: "effective tool access computed from capabilities and tool allowlists".to_string(),
         remediation: None,
         context: Some(serde_json::json!({ "agents": agents })),
+    }
+}
+
+fn approval_check(config: &EffectiveConfig) -> DoctorCheck {
+    let mode = match config.approval_mode {
+        ApprovalMode::Yolo => "yolo",
+        ApprovalMode::Normal => "normal",
+    };
+    let floor = match config.approval.floor {
+        FloorPolicy::Warn => "warn",
+        FloorPolicy::Enforce => "enforce",
+    };
+    DoctorCheck {
+        id: "config.approval".to_string(),
+        title: "Approval Policy".to_string(),
+        status: DoctorStatus::Ok,
+        severity: DoctorSeverity::Info,
+        message: format!(
+            "approval_mode = {mode}; gray-area floor = {floor} (catastrophic core always prompts)"
+        ),
+        remediation: None,
+        context: Some(serde_json::json!({
+            "approval_mode": mode,
+            "floor": floor,
+        })),
     }
 }
 
@@ -895,6 +921,42 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.id == "runtime.codex"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_approval_mode_and_floor() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("atelier.toml");
+        fs::write(
+            &config_path,
+            "schema_version = 1\napproval_mode = \"normal\"\n[approval]\nfloor = \"enforce\"\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let report = run_doctor(&config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "config.approval")
+            .expect("approval check present");
+        assert_eq!(check.status, DoctorStatus::Ok);
+        assert!(
+            check.message.contains("normal"),
+            "message: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("enforce"),
+            "message: {}",
+            check.message
+        );
+        let context = check.context.as_ref().unwrap();
+        assert_eq!(context["approval_mode"], "normal");
+        assert_eq!(context["floor"], "enforce");
     }
 
     #[tokio::test]

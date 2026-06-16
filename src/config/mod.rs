@@ -23,6 +23,25 @@ pub enum ApprovalMode {
     Normal,
 }
 
+/// Posture for the gray-area floor (ADR-002's phased-rollout lever). `Warn`
+/// surfaces the risk and records an audit annotation but still runs under `Yolo`;
+/// `Enforce` re-prompts instead. This controls ONLY the gray-area tier — the
+/// catastrophic core is non-bypassable and not configurable off.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FloorPolicy {
+    #[default]
+    Warn,
+    Enforce,
+}
+
+/// Approval-system posture. Today it carries only the gray-area `floor`; the
+/// `approval_mode` (`Yolo`/`Normal`) stays a top-level field for back-compat.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalConfig {
+    pub floor: FloorPolicy,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
@@ -409,6 +428,7 @@ pub struct EffectiveConfig {
     pub config_sources: Vec<PathBuf>,
     pub active_preset: Option<String>,
     pub approval_mode: ApprovalMode,
+    pub approval: ApprovalConfig,
     pub workspace: WorkspacePolicy,
     pub features: Features,
     pub ui: UiConfig,
@@ -424,6 +444,7 @@ struct RawConfig {
     schema_version: Option<u32>,
     preset: Option<String>,
     approval_mode: Option<ApprovalMode>,
+    approval: Option<RawApprovalConfig>,
     workspace: Option<RawWorkspacePolicy>,
     features: Option<RawFeatures>,
     ui: Option<RawUiConfig>,
@@ -446,6 +467,12 @@ struct RawWorkspacePolicy {
     extra_read_roots: Option<Vec<PathBuf>>,
     extra_write_roots: Option<Vec<PathBuf>>,
     allow_unrestricted_reads: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawApprovalConfig {
+    floor: Option<FloorPolicy>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -613,6 +640,7 @@ struct MergedConfig {
     config_sources: Vec<PathBuf>,
     active_preset: Option<PendingPresetSelection>,
     approval_mode: ApprovalMode,
+    approval: ApprovalConfig,
     workspace: WorkspacePolicy,
     features: Features,
     ui: UiConfig,
@@ -899,6 +927,7 @@ impl MergedConfig {
             config_sources: Vec::new(),
             active_preset: None,
             approval_mode: ApprovalMode::Yolo,
+            approval: ApprovalConfig::default(),
             workspace: WorkspacePolicy::default(),
             features: Features::default(),
             ui: UiConfig::default(),
@@ -920,6 +949,12 @@ impl MergedConfig {
 
         if let Some(approval_mode) = raw.approval_mode {
             self.approval_mode = approval_mode;
+        }
+
+        if let Some(approval) = raw.approval {
+            if let Some(floor) = approval.floor {
+                self.approval.floor = floor;
+            }
         }
 
         if let Some(workspace) = raw.workspace {
@@ -1480,6 +1515,7 @@ impl MergedConfig {
             config_sources: self.config_sources,
             active_preset,
             approval_mode: self.approval_mode,
+            approval: self.approval,
             workspace: self.workspace,
             features: self.features,
             ui: self.ui,
@@ -1968,6 +2004,7 @@ pub(crate) struct PrintableConfig {
     pub(crate) approval_mode: ApprovalMode,
     pub(crate) workspace: WorkspacePolicy,
     pub(crate) features: Features,
+    pub(crate) approval: ApprovalConfig,
     pub(crate) ui: UiConfig,
     pub(crate) limits: Limits,
     pub(crate) council: PrintableCouncilConfig,
@@ -2047,6 +2084,7 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
         approval_mode: config.approval_mode.clone(),
         workspace: config.workspace.clone(),
         features: config.features.clone(),
+        approval: config.approval.clone(),
         ui: config.ui.clone(),
         limits: config.limits.clone(),
         council: PrintableCouncilConfig {
@@ -2206,6 +2244,12 @@ approval_mode = "yolo"
 
 [features]
 parallel_step_groups = false
+
+# Approval floor posture for gray-area actions (ADR-002). "warn" (default)
+# surfaces the risk but still auto-runs under yolo; "enforce" re-prompts
+# instead. The catastrophic core always prompts and cannot be disabled here.
+# [approval]
+# floor = "warn"
 
 # Optional UI tweaks. Uncomment to adjust the input experience.
 # [ui]
@@ -2624,6 +2668,81 @@ prompt_history_max = 50
         .unwrap();
 
         assert!(config.ui.prompt_history_enabled);
+    }
+
+    #[test]
+    fn approval_floor_defaults_to_warn_when_section_absent() {
+        // Omitting [approval] preserves today's gray-area behavior (ADR-002).
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+        assert_eq!(config.approval.floor, FloorPolicy::Warn);
+    }
+
+    #[test]
+    fn approval_floor_can_be_set_to_enforce() {
+        let config =
+            load_from_temp("schema_version = 1\n[approval]\nfloor = \"enforce\"\n").unwrap();
+        assert_eq!(config.approval.floor, FloorPolicy::Enforce);
+    }
+
+    #[test]
+    fn approval_floor_local_enforce_overrides_home_warn() {
+        // Layer precedence (built-in → home → local): home warns, the project file
+        // opts into enforce; local wins.
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(
+            &home_path,
+            "schema_version = 1\n[approval]\nfloor = \"warn\"\n",
+        )
+        .unwrap();
+
+        let local_dir = tempdir().unwrap();
+        fs::write(
+            local_dir.path().join("atelier.toml"),
+            "[approval]\nfloor = \"enforce\"\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: local_dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        assert_eq!(config.approval.floor, FloorPolicy::Enforce);
+    }
+
+    #[test]
+    fn approval_invalid_floor_value_names_the_field() {
+        let error = load_from_temp("schema_version = 1\n[approval]\nfloor = \"block\"\n")
+            .expect_err("invalid floor value should fail to load");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("floor"),
+            "error should name the floor field, got: {message}"
+        );
+    }
+
+    #[test]
+    fn redacted_toml_includes_approval_floor() {
+        let config =
+            load_from_temp("schema_version = 1\n[approval]\nfloor = \"enforce\"\n").unwrap();
+        let rendered = to_redacted_toml(&config).unwrap();
+        assert!(rendered.contains("[approval]"));
+        assert!(rendered.contains("floor = \"enforce\""));
+    }
+
+    #[test]
+    fn approval_section_cannot_disable_catastrophic_core() {
+        // The catastrophic core is intentionally not configurable; any attempt to
+        // add such a key is rejected by deny_unknown_fields.
+        let error = load_from_temp("schema_version = 1\n[approval]\ncatastrophic = false\n")
+            .expect_err("unknown approval keys must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("catastrophic") || message.contains("unknown"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
