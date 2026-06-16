@@ -9,4 +9,4 @@
 | 03 | Add `EffectiveConfig::required_runtime_ids()` with guardrail test | completed | low | — |
 | 04 | Elevate unavailable orchestrator runtime to Error in `run_doctor` | completed | medium | task_03 |
 | 05 | Add `--doctor --strict` flag, exit gate, and discovery nudge | completed | medium | task_04 |
-| 06 | Document `--strict` and exit-code contract; dogfood in release CI | pending | low | task_05 |
+| 06 | Document `--strict` and exit-code contract; dogfood in release CI | completed | low | task_05 |
