@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: First-run onboarding & Approvals help
 type: frontend
 complexity: medium
@@ -28,11 +28,11 @@ Introduce the changed behavior so it isn't a surprise: a tier-aware first-run ex
 - SHOULD keep copy concise (progressive disclosure); defer full rule lists to help, not the first-run card.
 
 ## Subtasks
-- [ ] 09.1 Update the first-run explainer copy (tier-aware; explains Yolo-catastrophic prompts).
-- [ ] 09.2 Confirm the latch fires once across Normal and Yolo-catastrophic first prompts.
-- [ ] 09.3 Expand the Approvals help tab (tiers, trust, `/trust`, floor posture).
-- [ ] 09.4 Update the Keys help tab for the new approval keys.
-- [ ] 09.5 Add tests for the once-only behavior and help content.
+- [x] 09.1 Update the first-run explainer copy (tier-aware; explains Yolo-catastrophic prompts).
+- [x] 09.2 Confirm the latch fires once across Normal and Yolo-catastrophic first prompts.
+- [x] 09.3 Expand the Approvals help tab (tiers, trust, `/trust`, floor posture).
+- [x] 09.4 Update the Keys help tab for the new approval keys.
+- [x] 09.5 Add tests for the once-only behavior and help content.
 
 ## Implementation Details
 Work in `src/history/mod.rs` (latch: `first_approval_explainer_shown` ~199, `mark_first_approval_explainer_shown` ~205; copy currently in `src/app/chat/projection.rs` ~14) and `src/tui/mod.rs` (Approvals tab ~3774, Keys tab `keys_tab_lines` ~3737). Reuse `show_first_approval_explainer` on `AppState` (~123). See TechSpec "System Architecture (history)" and PRD "User Experience → First contact" / "Phased Rollout".
@@ -55,12 +55,12 @@ Work in `src/history/mod.rs` (latch: `first_approval_explainer_shown` ~199, `mar
 
 ## Tests
 - Unit tests:
-  - [ ] First surfaced approval sets `show_first_approval_explainer = true`; the explainer copy mentions tiers and the Yolo-catastrophic case.
-  - [ ] After the latch is marked, a subsequent approval does not show the explainer.
-  - [ ] The Approvals help tab text includes "trust", "/trust", risk tiers, and "floor".
-  - [ ] The Keys help tab lists the approve, approve-and-trust, and deny keys.
+  - [x] First surfaced approval sets `show_first_approval_explainer = true`; the explainer copy mentions tiers and the Yolo-catastrophic case.
+  - [x] After the latch is marked, a subsequent approval does not show the explainer.
+  - [x] The Approvals help tab text includes "trust", "/trust", risk tiers, and "floor".
+  - [x] The Keys help tab lists the approve, approve-and-trust, and deny keys.
 - Integration tests:
-  - [ ] FakeRuntime under Yolo: the first catastrophic prompt shows the explainer; a later catastrophic prompt in the same/next session (latch set) does not.
+  - [x] FakeRuntime under Yolo: the first catastrophic prompt shows the explainer; a later catastrophic prompt in the same/next session (latch set) does not.
 - Test coverage target: >=80%
 - All tests must pass
 

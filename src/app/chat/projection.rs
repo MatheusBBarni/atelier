@@ -9,10 +9,12 @@ use crate::history::HistoryEvent;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// One-line explainer shown beside the first approval a user ever hits (ADR-004,
-/// Phase 2). Kept to a single line and shown at most once per user.
+/// One-line explainer shown beside the first approval a user ever hits (ADR-002
+/// Phase 2). Tier-aware: actions carry a risk tier and a catastrophic one always
+/// asks even in yolo. Kept to a single line and shown at most once per user; the
+/// full rules live in /help → Approvals.
 pub(crate) const FIRST_APPROVAL_EXPLAINER: &str =
-    "First approval: an agent wants to run a gated action — reply y to approve or n to deny.";
+    "First approval: actions are risk-tiered; a catastrophic one always asks, even in yolo. y=approve, t=approve & trust, n=deny — see /help.";
 
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_SUMMARY_CHARS: usize = 240;

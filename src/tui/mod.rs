@@ -3955,6 +3955,11 @@ fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState,
 fn keys_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
     vec![
         Line::from("Enter                submit prompt or answer approval"),
+        Line::from("At an approval:"),
+        Line::from("  y / approve        approve once (High tier needs the word approve)"),
+        Line::from("  t / trust          approve & trust this session (when offered)"),
+        Line::from("  n / anything else  deny"),
+        Line::from("  (catastrophic)     retype the command exactly to confirm"),
         Line::from("Ctrl-L               show or hide Agent Roster"),
         Line::from("Arrow keys           move input cursor"),
         Line::from("↑/↓ at input edges   recall recent prompts"),
@@ -4005,6 +4010,24 @@ fn approvals_tab_lines(theme: &Theme) -> Vec<Line<'static>> {
         body("commands run automatically. Best for trusted, fast iteration."),
         body("normal: every write or command pauses for your approval before"),
         body("it runs. Read-only actions still proceed without a prompt."),
+        Line::from(""),
+        header("Risk tiers"),
+        body("Each gated action is tiered low / medium / high, with a small"),
+        body("catastrophic core (home/root deletion, force-push, secret reads,"),
+        body("fetch-and-run). A catastrophic action ALWAYS prompts — even in"),
+        body("yolo — and requires retyping the command to confirm; it can never"),
+        body("be trusted away. High-tier prompts need the explicit word approve."),
+        Line::from(""),
+        header("Gray-area floor"),
+        body("The gray-area floor governs the in-between actions. [approval]"),
+        body("floor = warn (default) surfaces a 'would have blocked' note but"),
+        body("still runs them in yolo; floor = enforce makes them prompt instead."),
+        Line::from(""),
+        header("Session trust"),
+        body("approve & trust (the t key) remembers an exact command or write"),
+        body("path for this session only, so identical repeats auto-run without"),
+        body("a prompt. Trust is in-memory and never persisted. Manage it with"),
+        body("/trust (list), /trust revoke <n>, and /trust clear."),
         Line::from(""),
         header("Capabilities"),
         body("Each agent is granted only the capabilities it needs (read,"),
@@ -6065,7 +6088,7 @@ mod tests {
         let state = fallback_approval_state(true);
         // Wide enough that the single explainer line is not wrapped by the
         // paragraph renderer, so the full text is contiguous in the output.
-        let text = render_to_text(&state, 200, 24);
+        let text = render_to_text(&state, 260, 24);
         // The explainer line shows alongside the (unchanged) approval prompt.
         assert!(text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
         assert!(text.contains("Approval required for fixer"));
@@ -6202,6 +6225,32 @@ mod tests {
         let view = approval_view(Some(crate::actions::RiskTier::Medium), false, None);
         // Under NO_COLOR the tier must still be conveyed by its text label.
         assert!(modal_text(&view, true).contains("MEDIUM"));
+    }
+
+    #[test]
+    fn approvals_help_tab_documents_tiers_trust_and_floor() {
+        let theme = Theme::resolve(TerminalCaps {
+            no_color: false,
+            truecolor: true,
+        });
+        let text = help_tab_text(&approvals_tab_lines(&theme));
+        assert!(text.contains("/trust"), "missing /trust: {text}");
+        assert!(text.contains("trust"));
+        assert!(text.contains("floor"), "missing floor posture");
+        assert!(text.contains("catastrophic"));
+        assert!(text.contains("tier"), "missing risk tiers");
+    }
+
+    #[test]
+    fn keys_help_tab_lists_approval_resolution_keys() {
+        let theme = Theme::resolve(TerminalCaps {
+            no_color: false,
+            truecolor: true,
+        });
+        let text = help_tab_text(&keys_tab_lines(&theme));
+        assert!(text.contains("approve"));
+        assert!(text.contains("trust"));
+        assert!(text.contains("deny"));
     }
 
     #[test]

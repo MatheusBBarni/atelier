@@ -12826,6 +12826,44 @@ runtime = "fake"
         assert!(app.state.pending_approval.is_some());
     }
 
+    // ---- First-run onboarding & Approvals help (task_09) --------------
+
+    #[test]
+    fn first_approval_explainer_copy_is_tier_aware() {
+        let copy = crate::app::chat::FIRST_APPROVAL_EXPLAINER;
+        assert!(copy.contains("risk-tiered"), "copy: {copy}");
+        assert!(copy.to_lowercase().contains("catastrophic"), "copy: {copy}");
+        assert!(copy.to_lowercase().contains("yolo"), "copy: {copy}");
+    }
+
+    #[tokio::test]
+    async fn first_catastrophic_prompt_under_yolo_shows_explainer_once() {
+        let dir = tempdir().unwrap();
+        // fake_config is Yolo; a catastrophic action still surfaces an approval.
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.submit_prompt("secret read action create a feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_some());
+        assert!(
+            app.state.show_first_approval_explainer,
+            "first surfaced approval should show the explainer"
+        );
+
+        // Resolve and trigger a second approval; the once-only latch suppresses it.
+        app.resolve_pending_approval(ApprovalResolution::Deny)
+            .await
+            .unwrap();
+        app.submit_prompt("secret read action create another feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_some());
+        assert!(
+            !app.state.show_first_approval_explainer,
+            "explainer must not repeat once the latch is set"
+        );
+    }
+
     #[tokio::test]
     async fn app_state_defaults_to_no_pending_clarification() {
         let dir = tempdir().unwrap();
