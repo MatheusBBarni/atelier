@@ -1350,10 +1350,16 @@ impl MergedConfig {
             .map(|preset| preset.name.clone());
 
         let mut runtimes = BTreeMap::new();
+        // Sibling runtime ids for near-miss "did you mean?" hints (ADR-004),
+        // captured before the map is consumed by the loop below.
+        let runtime_ids: Vec<String> = self.runtimes.keys().cloned().collect();
         for (id, runtime) in self.runtimes {
-            let kind = runtime
-                .kind
-                .ok_or_else(|| anyhow!("runtime {id} is missing required field type"))?;
+            let kind = runtime.kind.ok_or_else(|| {
+                anyhow!(
+                    "runtime {id} is missing required field type{}",
+                    did_you_mean(&id, runtime_ids.iter().map(String::as_str))
+                )
+            })?;
 
             let config = match kind {
                 RuntimeKind::Codex => RuntimeConfig {
@@ -1447,21 +1453,33 @@ impl MergedConfig {
         }
 
         let mut agents = BTreeMap::new();
+        // Sibling agent ids for near-miss hints, captured before the loop consumes
+        // the map (ADR-004).
+        let agent_ids: Vec<String> = self.agents.keys().cloned().collect();
         for (id, agent) in self.agents {
-            let runtime = agent
-                .runtime
-                .ok_or_else(|| anyhow!("agent {id} is missing required field runtime"))?;
+            let runtime = agent.runtime.ok_or_else(|| {
+                anyhow!(
+                    "agent {id} is missing required field runtime{}",
+                    did_you_mean(&id, agent_ids.iter().map(String::as_str))
+                )
+            })?;
             if !runtimes.contains_key(&runtime) {
-                bail!("agent {id} points at undefined runtime {runtime}");
+                bail!(
+                    "agent {id} points at undefined runtime {runtime}{}",
+                    did_you_mean(&runtime, runtimes.keys().map(String::as_str))
+                );
             }
 
             let model = agent.model.unwrap_or_else(|| "default".to_string());
             validate_model_name(&model).with_context(|| format!("invalid model for agent {id}"))?;
             let model_fallbacks = agent.model_fallbacks.unwrap_or_default();
             validate_model_fallbacks(&id, &model, &model_fallbacks)?;
-            let capabilities = agent
-                .capabilities
-                .ok_or_else(|| anyhow!("agent {id} is missing required field capabilities"))?;
+            let capabilities = agent.capabilities.ok_or_else(|| {
+                anyhow!(
+                    "agent {id} is missing required field capabilities{}",
+                    did_you_mean(&id, agent_ids.iter().map(String::as_str))
+                )
+            })?;
             let instruction_source = agent
                 .instruction_source
                 .ok_or_else(|| anyhow!("agent {id} is missing instructions"))?;
@@ -1744,6 +1762,19 @@ fn legacy_home_config_path() -> PathBuf {
 
 fn first_existing<I: IntoIterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.exists())
+}
+
+/// Format a "; did you mean `x`?" fragment for an unknown config name, or an
+/// empty string when no sibling key is within the edit-distance threshold
+/// (ADR-004). The unknown name is excluded from the candidates so a typo'd key
+/// that is itself present in the merged map can't suggest itself (distance 0).
+/// Purely additive: callers append this to errors that already fire.
+fn did_you_mean<'a>(unknown: &str, siblings: impl IntoIterator<Item = &'a str>) -> String {
+    let candidates = siblings.into_iter().filter(|name| *name != unknown);
+    match crate::util::suggest_nearby_name(unknown, candidates) {
+        Some(name) => format!("; did you mean `{name}`?"),
+        None => String::new(),
+    }
 }
 
 pub fn default_home_config_path() -> PathBuf {
@@ -2730,6 +2761,70 @@ prompt_history_max = 50
         let rendered = to_redacted_toml(&config).unwrap();
         assert!(rendered.contains("[approval]"));
         assert!(rendered.contains("floor = \"enforce\""));
+    }
+
+    // ---- Near-miss "did you mean?" config hints (task_02) -------------
+
+    #[test]
+    fn runtime_missing_type_suggests_nearby_runtime() {
+        let error = load_from_temp("schema_version = 1\n[runtimes.codx]\n")
+            .expect_err("runtime missing type should fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("did you mean `codex`?"),
+            "expected codex hint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn agent_undefined_runtime_suggests_nearby_runtime() {
+        let error = load_from_temp("schema_version = 1\n[agents.fixer]\nruntime = \"codx\"\n")
+            .expect_err("agent pointing at an undefined runtime should fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("undefined runtime codx"),
+            "expected the base error, got: {message}"
+        );
+        assert!(
+            message.contains("did you mean `codex`?"),
+            "expected codex hint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn agent_missing_field_suggests_nearby_agent() {
+        let error = load_from_temp("schema_version = 1\n[agents.fixr]\n")
+            .expect_err("agent missing required fields should fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("did you mean `fixer`?"),
+            "expected fixer hint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn valid_custom_runtime_name_loads_with_no_hint() {
+        // False-positive lock: an unconventional but valid custom runtime loads
+        // cleanly and is present — no error, so no near-miss hint can fire.
+        let config =
+            load_from_temp("schema_version = 1\n[runtimes.my_custom_thing]\ntype = \"codex\"\n")
+                .expect("a valid custom runtime should load");
+        assert!(config.runtimes.contains_key("my_custom_thing"));
+    }
+
+    #[test]
+    fn wild_typo_runtime_gets_no_suggestion() {
+        let error = load_from_temp("schema_version = 1\n[runtimes.zzzzzz]\n")
+            .expect_err("runtime missing type should fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("runtime zzzzzz is missing required field type"),
+            "expected the base error, got: {message}"
+        );
+        assert!(
+            !message.contains("did you mean"),
+            "a wild typo must not get a suggestion, got: {message}"
+        );
     }
 
     #[test]
