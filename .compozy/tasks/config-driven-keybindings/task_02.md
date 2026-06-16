@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Composer line-editing commands and handlers
 type: frontend
 complexity: medium
@@ -37,11 +37,11 @@ the "native input feel" parity that every user gets, independent of any config.
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add `LineStart`/`LineEnd` to `InputCursorCommand` and handle them in `move_input_cursor`.
-- [ ] 2.2 Add `TuiCommand::InputKill(InputKillCommand{ToLineEnd,ToLineStart,WordBack})`.
-- [ ] 2.3 Implement `kill_input` mutating input + cursor, UTF-8 safe, edge-correct.
-- [ ] 2.4 Wire execution arms in the `TuiCommand` match.
-- [ ] 2.5 Add unit tests for every operation including multi-byte and boundary cursors.
+- [x] 2.1 Add `LineStart`/`LineEnd` to `InputCursorCommand` and handle them in `move_input_cursor`.
+- [x] 2.2 Add `TuiCommand::InputKill(InputKillCommand{ToLineEnd,ToLineStart,WordBack})`.
+- [x] 2.3 Implement `kill_input` mutating input + cursor, UTF-8 safe, edge-correct.
+- [x] 2.4 Wire execution arms in the `TuiCommand` match.
+- [x] 2.5 Add unit tests for every operation including multi-byte and boundary cursors.
 
 ## Implementation Details
 All changes are within `src/tui/mod.rs`: the `InputCursorCommand` enum (`:203`), the `TuiCommand`
@@ -70,14 +70,14 @@ and "Implementation Design" for the editing semantics.
 
 ## Tests
 - Unit tests:
-  - [ ] `ToLineEnd` from a mid-string cursor deletes the suffix and leaves the cursor in place.
-  - [ ] `ToLineStart` deletes the prefix before the cursor and moves the cursor to 0.
-  - [ ] `WordBack` deletes the word before the cursor (including a trailing run of spaces).
-  - [ ] `LineStart`/`LineEnd` set the cursor to 0 / char-count without altering the text.
-  - [ ] Multi-byte input ("héllo🚀 wörld") keeps cursor/byte indices correct after a kill.
-  - [ ] Empty input is a no-op for all kills; `ToLineEnd` at end and `ToLineStart` at 0 are no-ops.
+  - [x] `ToLineEnd` from a mid-string cursor deletes the suffix and leaves the cursor in place.
+  - [x] `ToLineStart` deletes the prefix before the cursor and moves the cursor to 0.
+  - [x] `WordBack` deletes the word before the cursor (including a trailing run of spaces).
+  - [x] `LineStart`/`LineEnd` set the cursor to 0 / char-count without altering the text.
+  - [x] Multi-byte input ("héllo🚀 wörld") keeps cursor/byte indices correct after a kill.
+  - [x] Empty input is a no-op for all kills; `ToLineEnd` at end and `ToLineStart` at 0 are no-ops.
 - Integration tests:
-  - [ ] Executing `MoveInputCursor(LineStart)` then `InputKill(ToLineEnd)` through the command handler clears the line and sets cursor 0.
+  - [x] Executing `MoveInputCursor(LineStart)` then `InputKill(ToLineEnd)` through the command handler clears the line and sets cursor 0.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -86,3 +86,17 @@ and "Implementation Design" for the editing semantics.
 - Test coverage >=80%
 - Editing operations are correct for ASCII and multi-byte input with no panics at boundaries.
 - No regression to existing `InputCharacter`/`InputBackspace`/arrow behavior.
+
+## Implementation Notes
+- The new `InputCursorCommand::LineStart/LineEnd`, `TuiCommand::InputKill`, and the
+  `InputKillCommand` variants carry `#[allow(dead_code)]` (house pattern, mirrors
+  `RosterRowStyle`) because this task deliberately does **not** bind them to keys —
+  task_04 constructs them in production via `command_for_action` and should remove
+  the allows then. They are exercised now only by tests calling the handlers directly.
+- `try_recall_history` gained the new cursor variants in its non-recall arm to keep
+  the match exhaustive (LineStart/LineEnd never trigger history recall).
+- Verified `2026-06-16`: 7 new tests pass; `cargo clippy --all-targets` clean;
+  `cargo fmt --check` clean on `src/tui/mod.rs`. Full `cargo test --lib` shows only
+  pre-existing environmental failures (skill-discovery against the user's real
+  `~/.claude/skills` + codex CLI shell-outs) — the passing count rose by exactly the
+  7 new tests, confirming no regression.

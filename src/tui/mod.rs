@@ -192,6 +192,10 @@ enum TuiCommand {
     ReloadSkills,
     InputCharacter(char),
     InputBackspace,
+    // Constructed in production once task_04 default-binds the editing actions via
+    // `command_for_action`; until then it is only built from tests.
+    #[allow(dead_code)]
+    InputKill(InputKillCommand),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +214,32 @@ enum InputCursorCommand {
     Right,
     Up,
     Down,
+    // LineStart/LineEnd are constructed in production once task_04 default-binds the
+    // editing actions via `command_for_action`; until then they are only built from tests.
+    /// Jump the cursor to the start of the composer line (readline `Ctrl-A`).
+    #[allow(dead_code)]
+    LineStart,
+    /// Jump the cursor to the end of the composer line (readline `Ctrl-E`).
+    #[allow(dead_code)]
+    LineEnd,
+}
+
+/// Readline-style kill operations over the single-line composer. Kills discard
+/// text (no kill-ring/yank in V1).
+///
+/// Constructed in production once task_04 default-binds these actions via
+/// `command_for_action`; until then these variants are only built from tests.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputKillCommand {
+    /// Delete from the cursor to the end of the line (readline `Ctrl-K`).
+    ToLineEnd,
+    /// Delete from the start of the line up to the cursor (readline `Ctrl-U`,
+    /// `unix-line-discard`).
+    ToLineStart,
+    /// Delete the whitespace-and-word immediately before the cursor (readline
+    /// `Ctrl-W`).
+    WordBack,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -724,6 +754,10 @@ async fn execute_tui_command_with_interrupt(
         }
         TuiCommand::InputBackspace => {
             remove_input_character_before_cursor(state, ui_state);
+            Ok(true)
+        }
+        TuiCommand::InputKill(command) => {
+            kill_input(state, ui_state, command);
             Ok(true)
         }
         TuiCommand::Dispatch(event) => {
@@ -1782,6 +1816,59 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     reset_dropdown_selections(ui_state);
 }
 
+/// Apply a readline-style kill to the composer, mutating `state.input` and the
+/// char-indexed `input_cursor`. UTF-8 safe (char-indexed logic, byte-indexed
+/// `replace_range`) and a no-op at edge cursors / on empty input. Mirrors the
+/// dropdown/status/history housekeeping of the other input mutators.
+fn kill_input(state: &mut AppState, ui_state: &mut TuiUiState, command: InputKillCommand) {
+    clamp_input_cursor(ui_state, &state.input);
+    let cursor = ui_state.input_cursor;
+    let char_count = input_char_count(&state.input);
+    // Char-index half-open range [start, end) to delete, and the resulting cursor.
+    let (start_char, end_char, new_cursor) = match command {
+        InputKillCommand::ToLineEnd => (cursor, char_count, cursor),
+        InputKillCommand::ToLineStart => (0, cursor, 0),
+        InputKillCommand::WordBack => {
+            let start = word_back_start(&state.input, cursor);
+            (start, cursor, start)
+        }
+    };
+    if start_char >= end_char {
+        return; // empty range: nothing to kill (covers empty input + edge cursors)
+    }
+
+    let start_byte = byte_index_for_char(&state.input, start_char);
+    let end_byte = byte_index_for_char(&state.input, end_char);
+    state.input.replace_range(start_byte..end_byte, "");
+    ui_state.input_cursor = new_cursor;
+    ui_state.input_preferred_col = None;
+    ui_state.status_message = None;
+    // Killing a recalled composition down to empty returns to a fresh draft, matching
+    // `remove_input_character_before_cursor`.
+    if state.input.is_empty() {
+        ui_state.prompt_history_cursor = 0;
+        ui_state.prompt_history_draft.clear();
+    }
+    clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
+    reset_dropdown_selections(ui_state);
+}
+
+/// The char index where the word before `cursor` begins, for `WordBack`: skip a
+/// trailing run of whitespace, then the run of non-whitespace word characters
+/// (readline `unix-word-rubout`).
+fn word_back_start(input: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = cursor.min(chars.len());
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
 fn move_input_cursor(ui_state: &mut TuiUiState, input: &str, command: InputCursorCommand) {
     clamp_input_cursor(ui_state, input);
     let input_len = input_char_count(input);
@@ -1796,6 +1883,14 @@ fn move_input_cursor(ui_state: &mut TuiUiState, input: &str, command: InputCurso
         }
         InputCursorCommand::Up | InputCursorCommand::Down => {
             move_input_cursor_vertically(ui_state, input_len, command);
+        }
+        InputCursorCommand::LineStart => {
+            ui_state.input_cursor = 0;
+            ui_state.input_preferred_col = None;
+        }
+        InputCursorCommand::LineEnd => {
+            ui_state.input_cursor = input_len;
+            ui_state.input_preferred_col = None;
         }
     }
     reset_dropdown_selections(ui_state);
@@ -1889,7 +1984,10 @@ fn try_recall_history(
             set_recalled_input(ui_state, state, text);
             true
         }
-        InputCursorCommand::Left | InputCursorCommand::Right => false,
+        InputCursorCommand::Left
+        | InputCursorCommand::Right
+        | InputCursorCommand::LineStart
+        | InputCursorCommand::LineEnd => false,
     }
 }
 
@@ -10829,6 +10927,125 @@ runtime = "fake"
         };
         let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
         assert!(text.contains("recall recent prompts"));
+    }
+
+    // ── composer line-editing: cursor jumps + kills (config-driven-keybindings task_02) ──
+
+    fn ui_state_with_cursor(cursor: usize) -> TuiUiState {
+        TuiUiState {
+            input_cursor: cursor,
+            ..TuiUiState::default()
+        }
+    }
+
+    #[test]
+    fn kill_to_line_end_deletes_suffix_and_keeps_cursor() {
+        let mut state = state_with_input("hello world", false);
+        let mut ui = ui_state_with_cursor(5); // just after "hello"
+        kill_input(&mut state, &mut ui, InputKillCommand::ToLineEnd);
+        assert_eq!(state.input, "hello");
+        assert_eq!(ui.input_cursor, 5);
+    }
+
+    #[test]
+    fn kill_to_line_start_deletes_prefix_and_moves_cursor_to_zero() {
+        let mut state = state_with_input("hello world", false);
+        let mut ui = ui_state_with_cursor(6); // just before "world"
+        kill_input(&mut state, &mut ui, InputKillCommand::ToLineStart);
+        assert_eq!(state.input, "world");
+        assert_eq!(ui.input_cursor, 0);
+    }
+
+    #[test]
+    fn kill_word_back_deletes_word_and_trailing_spaces() {
+        let mut state = state_with_input("foo bar ", false);
+        let mut ui = ui_state_with_cursor(input_char_count("foo bar ")); // 8, at end
+        kill_input(&mut state, &mut ui, InputKillCommand::WordBack);
+        // The trailing space + the word "bar" are both removed.
+        assert_eq!(state.input, "foo ");
+        assert_eq!(ui.input_cursor, 4);
+    }
+
+    #[test]
+    fn line_start_and_line_end_move_cursor_without_changing_text() {
+        let input = "hello";
+        let mut ui = ui_state_with_cursor(2);
+        move_input_cursor(&mut ui, input, InputCursorCommand::LineEnd);
+        assert_eq!(ui.input_cursor, input_char_count(input));
+        move_input_cursor(&mut ui, input, InputCursorCommand::LineStart);
+        assert_eq!(ui.input_cursor, 0);
+    }
+
+    #[test]
+    fn kills_are_utf8_safe_for_multibyte_input() {
+        let text = "héllo🚀 wörld";
+        let mut state = state_with_input(text, false);
+        let mut ui = ui_state_with_cursor(input_char_count(text)); // 12, at end
+        kill_input(&mut state, &mut ui, InputKillCommand::WordBack);
+        assert_eq!(state.input, "héllo🚀 ");
+        assert_eq!(ui.input_cursor, 7);
+        // Cursor (char index) must still map to a valid byte boundary at the end.
+        assert_eq!(
+            byte_index_for_char(&state.input, ui.input_cursor),
+            state.input.len()
+        );
+    }
+
+    #[test]
+    fn kills_are_noops_at_edges_and_on_empty_input() {
+        // Empty input: every kill is a no-op.
+        for cmd in [
+            InputKillCommand::ToLineEnd,
+            InputKillCommand::ToLineStart,
+            InputKillCommand::WordBack,
+        ] {
+            let mut state = state_with_input("", false);
+            let mut ui = ui_state_with_cursor(0);
+            kill_input(&mut state, &mut ui, cmd);
+            assert_eq!(state.input, "");
+            assert_eq!(ui.input_cursor, 0);
+        }
+
+        // ToLineEnd with the cursor already at the end is a no-op.
+        let mut state = state_with_input("abc", false);
+        let mut ui = ui_state_with_cursor(3);
+        kill_input(&mut state, &mut ui, InputKillCommand::ToLineEnd);
+        assert_eq!(state.input, "abc");
+        assert_eq!(ui.input_cursor, 3);
+
+        // ToLineStart with the cursor at 0 is a no-op.
+        let mut ui = ui_state_with_cursor(0);
+        kill_input(&mut state, &mut ui, InputKillCommand::ToLineStart);
+        assert_eq!(state.input, "abc");
+        assert_eq!(ui.input_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn line_start_then_kill_to_end_clears_the_line_through_the_handler() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("hello world", false);
+        let mut ui = ui_state_with_cursor_at_end(&state.input);
+
+        execute_tui_command(
+            &mut state,
+            &mut ui,
+            &sender,
+            TuiCommand::MoveInputCursor(InputCursorCommand::LineStart),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ui.input_cursor, 0);
+
+        execute_tui_command(
+            &mut state,
+            &mut ui,
+            &sender,
+            TuiCommand::InputKill(InputKillCommand::ToLineEnd),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "");
+        assert_eq!(ui.input_cursor, 0);
     }
 
     // ── task_05 TUI file-index state and consumer ──

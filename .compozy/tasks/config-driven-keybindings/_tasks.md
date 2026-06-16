@@ -5,7 +5,7 @@
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
 | 01 | Keybindings foundation module | completed | medium | — |
-| 02 | Composer line-editing commands and handlers | pending | medium | — |
+| 02 | Composer line-editing commands and handlers | completed | medium | — |
 | 03 | Reserved-key single chokepoint | pending | medium | — |
 | 04 | Default keymap wiring into key routing | pending | high | task_01, task_02, task_03 |
 | 05 | Data-driven Keys help tab | pending | low | task_04 |
