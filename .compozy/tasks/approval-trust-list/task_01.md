@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Risk assessment & command normalization
 type: backend
 complexity: medium
@@ -29,11 +29,11 @@ Add the pure risk-classification layer that every later task builds on: a `RiskN
 </requirements>
 
 ## Subtasks
-- [ ] 01.1 Define `RiskTier`, `RiskNote`, `TrustTarget` and their serde derives.
-- [ ] 01.2 Implement `normalize_command` (tilde/`$HOME`/`$PWD` + whitespace) as the shared helper.
-- [ ] 01.3 Implement `assess_risk`, reusing `classify_command`/`has_shell_control_syntax`, mapping tiers and the catastrophic set.
-- [ ] 01.4 Derive the `TrustTarget` per action kind; return `None` when catastrophic.
-- [ ] 01.5 Add unit + adversarial-variant tests for the catastrophic set and normalization parity.
+- [x] 01.1 Define `RiskTier`, `RiskNote`, `TrustTarget` and their serde derives.
+- [x] 01.2 Implement `normalize_command` (tilde/`$HOME`/`$PWD` + whitespace) as the shared helper.
+- [x] 01.3 Implement `assess_risk`, reusing `classify_command`/`has_shell_control_syntax`, mapping tiers and the catastrophic set.
+- [x] 01.4 Derive the `TrustTarget` per action kind; return `None` when catastrophic.
+- [x] 01.5 Add unit + adversarial-variant tests for the catastrophic set and normalization parity.
 
 ## Implementation Details
 All work is in `src/actions/mod.rs`, beside the existing `classify_command`/`decision_for_command`. No new modules or files. See TechSpec "Implementation Design → Core Interfaces" and "System Architecture → Component Overview" for the type shapes and the normalization rule; see ADR-003 for the fail-closed framing and expansion depth.
@@ -56,15 +56,15 @@ All work is in `src/actions/mod.rs`, beside the existing `classify_command`/`dec
 
 ## Tests
 - Unit tests:
-  - [ ] `rm -rf ~` → `catastrophic = true`, `tier = High`, `target = None`.
-  - [ ] `rm -rf $HOME` and `rm -rf ${HOME}` → `catastrophic = true` (normalization closes the disguise).
-  - [ ] `git push --force origin main` and `git push -f` → `catastrophic = true`.
-  - [ ] `cat ~/.ssh/id_rsa` (secret read) → `catastrophic = true`.
-  - [ ] `cargo test` → `tier = Low`, `catastrophic = false`, `target = Some(Command("cargo test"))`.
-  - [ ] `npm install left-pad` → `tier = Medium`, `target = Some(Command(...))`.
-  - [ ] WriteFile to a path inside a write root → `target = Some(WritePath(path))`, non-catastrophic.
-  - [ ] Adversarial spacing/case/quoting: `RM  -RF   ~`, `rm -rf "$HOME"` → still `catastrophic = true`.
-  - [ ] Normalization parity: `normalize_command("rm -rf ~") == normalize_command("rm -rf $HOME")`.
+  - [x] `rm -rf ~` → `catastrophic = true`, `tier = High`, `target = None`.
+  - [x] `rm -rf $HOME` and `rm -rf ${HOME}` → `catastrophic = true` (normalization closes the disguise).
+  - [x] `git push --force origin main` and `git push -f` → `catastrophic = true`.
+  - [x] `cat ~/.ssh/id_rsa` (secret read) → `catastrophic = true`.
+  - [x] `cargo test` → `tier = Low`, `catastrophic = false`, `target = Some(Command("cargo test"))`.
+  - [x] `npm install left-pad` → `tier = Medium`, `target = Some(Command(...))`.
+  - [x] WriteFile to a path inside a write root → `target = Some(WritePath(path))`, non-catastrophic.
+  - [x] Adversarial spacing/case/quoting: `RM  -RF   ~`, `rm -rf "$HOME"` → still `catastrophic = true`.
+  - [x] Normalization parity: `normalize_command("rm -rf ~") == normalize_command("rm -rf $HOME")`.
 - Integration tests:
   - [ ] Exercised end-to-end via the enforcement matrix in task_03 and the FakeRuntime runs in task_05 (no standalone integration harness for this pure module).
 - Test coverage target: >=80%

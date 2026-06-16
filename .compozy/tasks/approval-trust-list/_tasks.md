@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Risk assessment & command normalization | pending | medium | — |
+| 01 | Risk assessment & command normalization | completed | medium | — |
 | 02 | Approval floor configuration | pending | low | — |
 | 03 | Floor + trust enforcement in the single decision point | pending | high | task_01, task_02 |
 | 04 | Session TrustStore & per-action context wiring | pending | medium | task_02, task_03 |
