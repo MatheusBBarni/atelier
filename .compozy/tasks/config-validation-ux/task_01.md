@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Relocate edit_distance to a shared util module and add suggest_nearby_name"
 type: refactor
 complexity: medium
@@ -28,10 +28,10 @@ Move the private `edit_distance` helper out of the skills module into a new neut
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Create `src/util.rs` with the moved `edit_distance` and the new `suggest_nearby_name`.
-- [ ] 1.2 Declare `pub mod util;` in the crate root module list.
-- [ ] 1.3 Repoint `skills` to the shared `edit_distance` and delete the private definition.
-- [ ] 1.4 Add unit tests for `edit_distance` and `suggest_nearby_name`.
+- [x] 1.1 Create `src/util.rs` with the moved `edit_distance` and the new `suggest_nearby_name`.
+- [x] 1.2 Declare `pub mod util;` in the crate root module list.
+- [x] 1.3 Repoint `skills` to the shared `edit_distance` and delete the private definition.
+- [x] 1.4 Add unit tests for `edit_distance` and `suggest_nearby_name`.
 
 ## Implementation Details
 See TechSpec "Implementation Design → Core Interfaces" for the helper signatures and "Development Sequencing → Build Order" step 1. Keep `suggest_nearby_name` a pure leaf with no dependency on `config` or `skills` types. The threshold mirrors the skills convention so suggestion behavior stays consistent across the crate.
@@ -55,12 +55,12 @@ See TechSpec "Implementation Design → Core Interfaces" for the helper signatur
 
 ## Tests
 - Unit tests:
-  - [ ] `edit_distance("codx", "codex")` returns 1; identical strings return 0; empty vs `"abc"` returns 3.
-  - [ ] `suggest_nearby_name("codx", ["codex","claude","cursor","zai"])` returns `Some("codex")`.
-  - [ ] `suggest_nearby_name("zzzzzz", ["codex","claude","cursor","zai"])` returns `None` (beyond threshold).
-  - [ ] When two candidates are within threshold, the single closest (smallest distance) is returned.
+  - [x] `edit_distance("codx", "codex")` returns 1; identical strings return 0; empty vs `"abc"` returns 3.
+  - [x] `suggest_nearby_name("codx", ["codex","claude","cursor","zai"])` returns `Some("codex")`.
+  - [x] `suggest_nearby_name("zzzzzz", ["codex","claude","cursor","zai"])` returns `None` (beyond threshold).
+  - [x] When two candidates are within threshold, the single closest (smallest distance) is returned.
 - Integration tests:
-  - [ ] Existing `skills` name-suggestion tests pass unchanged against the relocated `edit_distance`.
+  - [x] Existing `skills` name-suggestion tests pass unchanged against the relocated `edit_distance`.
 - Test coverage target: >=80%
 - All tests must pass
 

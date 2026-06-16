@@ -15,5 +15,6 @@ pub mod runtime;
 pub mod skills;
 pub mod slash_commands;
 pub mod tui;
+pub mod util;
 
 pub use cli::{run_cli, Cli};
