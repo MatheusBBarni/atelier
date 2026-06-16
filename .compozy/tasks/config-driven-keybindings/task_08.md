@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Resolve keybinding customizations end-to-end
 type: frontend
 complexity: medium
@@ -36,11 +36,11 @@ remap path and completes the customization half of the feature.
 </requirements>
 
 ## Subtasks
-- [ ] 8.1 Thread `EffectiveConfig.keybindings` into `TuiUiState` construction.
-- [ ] 8.2 Resolve defaults + overrides into the active keymap at init.
-- [ ] 8.3 Verify routing reflects rebinds and unbinds.
-- [ ] 8.4 Verify the Keys tab reflects the customized keymap.
-- [ ] 8.5 Add end-to-end tests from config to routed behavior.
+- [x] 8.1 Thread `EffectiveConfig.keybindings` into `TuiUiState` construction.
+- [x] 8.2 Resolve defaults + overrides into the active keymap at init.
+- [x] 8.3 Verify routing reflects rebinds and unbinds.
+- [x] 8.4 Verify the Keys tab reflects the customized keymap.
+- [x] 8.5 Add end-to-end tests from config to routed behavior.
 
 ## Implementation Details
 Within `src/tui/mod.rs`: the `TuiUiState` construction / TUI init (`run_tui` near `:478-520`) where
@@ -69,11 +69,11 @@ ADR-003.
 
 ## Tests
 - Unit tests:
-  - [ ] With overrides `{ToggleRoster: Some(ctrl+g)}`, routing maps `ctrl+g`→ToggleRoster and `ctrl+l` no longer toggles (falls through).
-  - [ ] With `{ToggleRoster: None}` (unbind), `ctrl+l` no longer toggles and no other key does.
-  - [ ] `Ctrl-C` still interrupts regardless of overrides (reserved guard intact).
+  - [x] With overrides `{ToggleRoster: Some(ctrl+g)}`, routing maps `ctrl+g`→ToggleRoster and `ctrl+l` no longer toggles (falls through) — `rebind_routes_new_key_and_drops_old_default`.
+  - [x] With `{ToggleRoster: None}` (unbind), `ctrl+l` no longer toggles and no other key does — `unbind_removes_the_action_key_entirely`.
+  - [x] `Ctrl-C` still interrupts regardless of overrides (reserved guard intact) — `reserved_ctrl_c_survives_keybinding_overrides`.
 - Integration tests:
-  - [ ] A `load_from_temp` config with `[keybindings.normal] toggle-roster = "ctrl+g"` builds a `TuiUiState` whose routing and Keys-tab output reflect `ctrl+g`.
+  - [x] A loaded config with `[keybindings.normal] toggle-roster = "ctrl+g"` builds a `TuiUiState` whose routing and Keys-tab output reflect `ctrl+g` — `config_keybindings_resolve_into_routing_and_keys_tab`.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -82,3 +82,21 @@ ADR-003.
 - Test coverage >=80%
 - End-to-end rebind and unbind work; reserved and modal-context keys are unaffected.
 - The Keys tab shows the customized bindings.
+
+## Implementation Notes
+- `run_tui` now builds `ui_state.keymap = Keymap::resolve(&keybindings::DEFAULTS,
+  &config.keybindings)` (captured before `config` is moved into the app), replacing
+  the DEFAULTS-only construction from task_04. No overrides ⇒ identical default keymap.
+- **Closed the unbind/rebind-shadowing gap flagged in task_04:** the base
+  `key_event_to_tui_command` no longer handles the remappable keys (Ctrl-L,
+  PageUp/PageDown, Home/End) — the active `Keymap` (consulted in the normal-input
+  branch) is their sole authority. Otherwise an unbound/rebound action's *old* default
+  key would still fire via the base fallback. Consequence: those keys no longer act as a
+  fallback inside modal contexts (dropdown/approval/clarification) — consistent with the
+  keymap-is-normal-only gating (ADR-003) and covered by no existing test.
+- Updated `ctrl_l_toggles_roster_visibility_without_app_event` to route Ctrl-L through
+  the wrapper (the keymap entry point) rather than the base fn directly.
+- Verified `2026-06-16`: 4 new tests + the updated Ctrl-L test pass; clippy
+  `--all-targets` clean; fmt clean; full `cargo test --lib` 1033 passed (only
+  environmental failures); integration suites `cli` (10), `keybindings` (2),
+  `slash_command_catalog` (4) green.

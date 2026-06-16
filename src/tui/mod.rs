@@ -536,6 +536,9 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let hide_banner = config.ui.hide_banner;
     let prompt_history_enabled = config.ui.prompt_history_enabled;
     let prompt_history_max = config.ui.prompt_history_max;
+    // Resolve the active keymap from defaults + validated config overrides (task_08).
+    // Captured before `config` is moved into the app; no overrides ⇒ default keymap.
+    let keymap = Keymap::resolve(&keybindings::DEFAULTS, &config.keybindings);
     let theme = Theme::resolve(TerminalCaps::detect());
     let mut app = App::new_with_debug(config, debug_enabled).await?;
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
@@ -580,6 +583,8 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     ui_state.hide_banner = hide_banner;
     ui_state.prompt_history_enabled = prompt_history_enabled;
     ui_state.prompt_history_max = prompt_history_max;
+    // Replace the DEFAULTS-only keymap (task_04) with the config-resolved one.
+    ui_state.keymap = keymap;
     let result = run_loop(
         &mut terminal,
         state_receiver,
@@ -1537,11 +1542,12 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
     match key {
         // Ctrl-C (interrupt/quit) is owned by the reserved-key guard in
         // `key_event_to_tui_command_with_ui`; it never reaches this handler in prod.
-        KeyEvent {
-            code: KeyCode::Char('l'),
-            modifiers: KeyModifiers::CONTROL,
-            ..
-        } => Some(TuiCommand::ToggleRoster),
+        //
+        // The remappable normal-mode actions (Ctrl-L toggle-roster, PageUp/PageDown
+        // and Home/End scroll) are NOT handled here: they are owned by the active
+        // `Keymap`, consulted in the normal-input branch of the wrapper (task_04/08).
+        // Keeping them here would shadow a user rebind/unbind of their default key,
+        // and would also leak them into modal fallbacks (the keymap is normal-only).
         KeyEvent {
             code: KeyCode::Up, ..
         } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up)),
@@ -1557,21 +1563,6 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
             code: KeyCode::Right,
             ..
         } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Right)),
-        KeyEvent {
-            code: KeyCode::PageUp,
-            ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::PageUp)),
-        KeyEvent {
-            code: KeyCode::PageDown,
-            ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::PageDown)),
-        KeyEvent {
-            code: KeyCode::Home,
-            ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::Top)),
-        KeyEvent {
-            code: KeyCode::End, ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::Bottom)),
         KeyEvent {
             code: KeyCode::Enter,
             ..
@@ -8599,6 +8590,135 @@ mod tests {
         );
     }
 
+    // ── resolve customizations end-to-end (config-driven-keybindings task_08) ──
+
+    fn ui_state_with_overrides(overrides: keybindings::KeybindingOverrides) -> TuiUiState {
+        TuiUiState {
+            keymap: Keymap::resolve(&keybindings::DEFAULTS, &overrides),
+            ..TuiUiState::default()
+        }
+    }
+
+    #[test]
+    fn rebind_routes_new_key_and_drops_old_default() {
+        let mut overrides = keybindings::KeybindingOverrides::new();
+        overrides.insert(
+            KeyAction::ToggleRoster,
+            Some(keybindings::parse_key("ctrl+g").unwrap()),
+        );
+        let ui = ui_state_with_overrides(overrides);
+        let state = state_with_input("", false);
+
+        // The new key toggles the roster…
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('g'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::ToggleRoster)
+        );
+        // …and the displaced default no longer does (falls through to None).
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unbind_removes_the_action_key_entirely() {
+        let mut overrides = keybindings::KeybindingOverrides::new();
+        overrides.insert(KeyAction::ToggleRoster, None);
+        let ui = ui_state_with_overrides(overrides);
+        let state = state_with_input("", false);
+
+        // The old default no longer toggles, and nothing else picks it up.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn reserved_ctrl_c_survives_keybinding_overrides() {
+        let mut overrides = keybindings::KeybindingOverrides::new();
+        overrides.insert(
+            KeyAction::ToggleRoster,
+            Some(keybindings::parse_key("ctrl+g").unwrap()),
+        );
+        let ui = ui_state_with_overrides(overrides);
+        let state = state_with_input("", false);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested))
+        );
+    }
+
+    #[test]
+    fn config_keybindings_resolve_into_routing_and_keys_tab() {
+        use crate::config::{load_effective_config, ConfigLoadOptions};
+        // A user-scope config (explicit --config) rebinds toggle-roster to ctrl+g.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("home-config.toml");
+        std::fs::write(
+            &config_path,
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: work_dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        // Resolve exactly as `run_tui` does.
+        let ui = TuiUiState {
+            keymap: Keymap::resolve(&keybindings::DEFAULTS, &config.keybindings),
+            ..TuiUiState::default()
+        };
+        let state = state_with_input("", false);
+
+        // Routing reflects the rebind end-to-end.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('g'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::ToggleRoster)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            None
+        );
+
+        // And the Keys tab shows the customized binding, not the old default.
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&keys_tab_lines(&ui.keymap, &theme));
+        assert!(text.contains("ctrl+g"), "keys tab shows rebound key");
+        assert!(
+            !text.contains("ctrl+l"),
+            "old default key gone from keys tab"
+        );
+    }
+
     #[test]
     fn esc_closes_help_modal_only_when_visible() {
         let state = state_with_input("", false);
@@ -8756,9 +8876,11 @@ mod tests {
         let mut ui_state = TuiUiState::default();
         let (sender, mut receiver) = mpsc::channel(1);
 
+        // Ctrl-L is owned by the active keymap (default), routed via the wrapper.
         assert_eq!(
-            key_event_to_tui_command(
+            key_event_to_tui_command_with_ui(
                 &state,
+                &ui_state,
                 KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)
             ),
             Some(TuiCommand::ToggleRoster)
