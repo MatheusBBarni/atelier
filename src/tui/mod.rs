@@ -4,8 +4,8 @@ use crate::app::chat::{
 use crate::app::git::GitContext;
 use crate::app::{
     ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, ApprovalResolution,
-    InterruptHandle, PendingClarificationView, PromptSource, QueuedFollowUpStatus,
-    QueuedFollowUpView, RosterRow,
+    InterruptHandle, PendingApprovalView, PendingClarificationView, PromptSource,
+    QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
@@ -1513,15 +1513,17 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
         KeyEvent {
             code: KeyCode::Enter,
             ..
-        } if state.pending_approval.is_some() => Some(TuiCommand::Dispatch(
-            // Rich key routing (approve-and-trust, type-to-confirm) is task_07; for
-            // now Enter maps the yes/no input to ApproveOnce/Deny.
-            AppEvent::ApprovalAnswered(if approval_input_is_yes(&state.input) {
-                ApprovalResolution::ApproveOnce
-            } else {
-                ApprovalResolution::Deny
-            }),
-        )),
+        } if state.pending_approval.is_some() => {
+            // Tier-aware resolution (ADR-001/002): approve-once, a distinct
+            // approve-and-trust token, deny — with the High tier requiring the
+            // explicit word and the catastrophic core requiring type-to-confirm.
+            let resolution = state
+                .pending_approval
+                .as_ref()
+                .map(|view| parse_approval_resolution(&state.input, view))
+                .unwrap_or(ApprovalResolution::Deny);
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(resolution)))
+        }
         KeyEvent {
             code: KeyCode::Enter,
             ..
@@ -1570,11 +1572,149 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
-fn approval_input_is_yes(input: &str) -> bool {
-    matches!(
-        input.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes" | "approve" | "approved"
-    )
+/// Map the typed approval input to a resolution, honoring the habituation
+/// controls (ADR-001/002): a distinct approve-and-trust token (only when a trust
+/// target exists); the catastrophic core requires retyping the exact resolved
+/// command (type-to-confirm); the High tier requires the explicit word `approve`
+/// (a reflexive `y`/Enter denies); Low/Medium accept the usual short affirmations.
+fn parse_approval_resolution(input: &str, view: &PendingApprovalView) -> ApprovalResolution {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if view.trust_target.is_some() && matches!(lower.as_str(), "t" | "trust") {
+        return ApprovalResolution::ApproveAndTrust;
+    }
+
+    if view.catastrophic {
+        let confirmed = match view.resolved_command.as_deref() {
+            Some(command) => trimmed == command,
+            None => lower == "confirm",
+        };
+        return if confirmed {
+            ApprovalResolution::ApproveOnce
+        } else {
+            ApprovalResolution::Deny
+        };
+    }
+
+    let is_high = view.tier.map(crate::app::risk_tier_label) == Some("high");
+    if is_high {
+        return if matches!(lower.as_str(), "approve" | "approved") {
+            ApprovalResolution::ApproveOnce
+        } else {
+            ApprovalResolution::Deny
+        };
+    }
+
+    if matches!(lower.as_str(), "y" | "yes" | "approve" | "approved") {
+        ApprovalResolution::ApproveOnce
+    } else {
+        ApprovalResolution::Deny
+    }
+}
+
+/// Render the rich decision-support modal lines from the enriched
+/// `PendingApprovalView` (ADR-001). The tier is conveyed by an explicit text
+/// label (so it survives `NO_COLOR`) plus a tier-colored accent; details
+/// (resolved command, affected paths, boundary, reversibility) follow the lead
+/// line, and the key hint adapts to the tier.
+fn approval_modal_lines(
+    pending: &PendingApprovalView,
+    theme: &Theme,
+    show_first_approval_explainer: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if show_first_approval_explainer {
+        lines.push(Line::styled(
+            crate::app::chat::FIRST_APPROVAL_EXPLAINER,
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+
+    let tier_label = pending.tier.map(crate::app::risk_tier_label);
+    let (tier_text, tier_color) = match tier_label {
+        Some("low") => ("LOW", theme.risk_low),
+        Some("medium") => ("MEDIUM", theme.risk_medium),
+        Some("high") => ("HIGH", theme.risk_high),
+        _ => ("RISK", theme.text_muted),
+    };
+    // Lead line: explicit tier label (+ catastrophic marker) then the agent.
+    let mut lead = format!("[{tier_text}]");
+    if pending.catastrophic {
+        lead.push_str(" [CATASTROPHIC]");
+    }
+    lead.push_str(&format!(" Approval required for {}", pending.agent));
+    lines.push(Line::styled(
+        lead,
+        Style::default().fg(tier_color).add_modifier(Modifier::BOLD),
+    ));
+
+    // One-line reason.
+    if let Some(reason) = pending.reason.as_deref() {
+        lines.push(Line::styled(
+            reason.to_string(),
+            Style::default().fg(theme.text),
+        ));
+    } else if let Some(diagnostic) = pending.diagnostic.as_deref() {
+        lines.push(Line::styled(
+            diagnostic.to_string(),
+            Style::default().fg(theme.text),
+        ));
+    }
+
+    // Detail: resolved command, or a diff preview when present.
+    if let Some(command) = pending.resolved_command.as_deref() {
+        lines.push(Line::styled(
+            format!("$ {command}"),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+    if let Some(diff) = pending.diff.as_deref() {
+        for diff_line in diff.lines().take(8) {
+            lines.push(Line::styled(
+                diff_line.to_string(),
+                Style::default().fg(theme.text_dim),
+            ));
+        }
+    }
+    if !pending.affected_paths.is_empty() {
+        lines.push(Line::styled(
+            format!("Affected: {}", pending.affected_paths.join(", ")),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+    if let Some(boundary) = pending.boundary_crossed.as_deref() {
+        lines.push(Line::styled(
+            format!("Boundary: {boundary}"),
+            Style::default().fg(theme.status_warn),
+        ));
+    }
+    if let Some(reversible) = pending.reversible {
+        lines.push(Line::styled(
+            format!("Reversible: {}", if reversible { "yes" } else { "no" }),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+
+    // Key hint, adapted to the tier and trust availability.
+    let trust_hint = if pending.trust_target.is_some() {
+        " · t = approve & trust"
+    } else {
+        ""
+    };
+    let hint = if pending.catastrophic {
+        match pending.resolved_command.as_deref() {
+            Some(command) => format!("Type the command exactly to confirm: {command} · n = deny"),
+            None => "Type confirm to approve · n = deny".to_string(),
+        }
+    } else if tier_label == Some("high") {
+        format!("Type approve to allow{trust_hint} · n = deny")
+    } else {
+        format!("y = approve{trust_hint} · n = deny")
+    };
+    lines.push(Line::styled(hint, Style::default().fg(theme.accent)));
+
+    lines
 }
 
 fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
@@ -2860,27 +3000,7 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
             &welcome_facts,
         )
     } else if let Some(pending) = &state.pending_approval {
-        let mut lines = Vec::new();
-        // First-approval explainer: a single muted line shown at most once per
-        // user (ADR-004), gated by the persisted latch via `AppState`. Additive —
-        // the approval prompt below is unchanged.
-        if state.show_first_approval_explainer {
-            lines.push(Line::styled(
-                crate::app::chat::FIRST_APPROVAL_EXPLAINER,
-                Style::default().fg(theme.text_muted),
-            ));
-        }
-        lines.push(Line::from(format!(
-            "Approval required for {} action {}.",
-            pending.agent, pending.action_id
-        )));
-        lines.push(Line::from(
-            pending
-                .diagnostic
-                .as_deref()
-                .unwrap_or("Approve or deny the pending action."),
-        ));
-        lines
+        approval_modal_lines(pending, &theme, state.show_first_approval_explainer)
     } else if state.events.is_empty() {
         vec![Line::from("No chat yet.")]
     } else {
@@ -5901,7 +6021,7 @@ mod tests {
             git_context: None,
         };
         let text = render_to_text(&state, 100, 24);
-        assert!(text.contains("Approval required for fixer action action."));
+        assert!(text.contains("Approval required for fixer"));
         assert!(text.contains("command requires action approval"));
         // No explainer when the show-once latch is already set.
         assert!(!text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
@@ -5948,7 +6068,7 @@ mod tests {
         let text = render_to_text(&state, 200, 24);
         // The explainer line shows alongside the (unchanged) approval prompt.
         assert!(text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
-        assert!(text.contains("Approval required for fixer action action."));
+        assert!(text.contains("Approval required for fixer"));
     }
 
     #[test]
@@ -5956,7 +6076,159 @@ mod tests {
         let state = fallback_approval_state(false);
         let text = render_to_text(&state, 100, 24);
         assert!(!text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
-        assert!(text.contains("Approval required for fixer action action."));
+        assert!(text.contains("Approval required for fixer"));
+    }
+
+    // ---- Rich approval modal & resolution key routing (task_07) -------
+
+    fn approval_view(
+        tier: Option<crate::actions::RiskTier>,
+        catastrophic: bool,
+        trust_target: Option<crate::actions::TrustTarget>,
+    ) -> PendingApprovalView {
+        PendingApprovalView {
+            agent: "fixer".to_string(),
+            reason: Some("installs software".to_string()),
+            resolved_command: Some("npm install left-pad".to_string()),
+            tier,
+            catastrophic,
+            trust_target,
+            ..Default::default()
+        }
+    }
+
+    fn modal_text(view: &PendingApprovalView, no_color: bool) -> String {
+        let theme = Theme::resolve(TerminalCaps {
+            no_color,
+            truecolor: !no_color,
+        });
+        approval_modal_lines(view, &theme, false)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn medium_tier_modal_shows_label_reason_and_command() {
+        let view = approval_view(Some(crate::actions::RiskTier::Medium), false, None);
+        let text = modal_text(&view, false);
+        assert!(text.contains("MEDIUM"));
+        assert!(text.contains("installs software"));
+        assert!(text.contains("npm install left-pad"));
+    }
+
+    #[test]
+    fn trust_option_visible_only_when_target_present() {
+        let with_trust = approval_view(
+            Some(crate::actions::RiskTier::Medium),
+            false,
+            Some(crate::actions::TrustTarget::Command(
+                "npm install left-pad".to_string(),
+            )),
+        );
+        assert!(modal_text(&with_trust, false).contains("approve & trust"));
+
+        let without = approval_view(Some(crate::actions::RiskTier::Medium), false, None);
+        assert!(!modal_text(&without, false).contains("approve & trust"));
+    }
+
+    #[test]
+    fn high_tier_requires_explicit_approve_word() {
+        let view = approval_view(Some(crate::actions::RiskTier::High), false, None);
+        // A reflexive "y" / empty Enter must not approve a High-tier action.
+        assert_eq!(
+            parse_approval_resolution("y", &view),
+            ApprovalResolution::Deny
+        );
+        assert_eq!(
+            parse_approval_resolution("", &view),
+            ApprovalResolution::Deny
+        );
+        assert_eq!(
+            parse_approval_resolution("approve", &view),
+            ApprovalResolution::ApproveOnce
+        );
+    }
+
+    #[test]
+    fn catastrophic_requires_type_to_confirm() {
+        let view = approval_view(Some(crate::actions::RiskTier::High), true, None);
+        assert_eq!(
+            parse_approval_resolution("y", &view),
+            ApprovalResolution::Deny
+        );
+        assert_eq!(
+            parse_approval_resolution("approve", &view),
+            ApprovalResolution::Deny
+        );
+        // Only retyping the exact resolved command confirms.
+        assert_eq!(
+            parse_approval_resolution("npm install left-pad", &view),
+            ApprovalResolution::ApproveOnce
+        );
+    }
+
+    #[test]
+    fn resolution_keys_map_to_distinct_outcomes() {
+        let view = approval_view(
+            Some(crate::actions::RiskTier::Medium),
+            false,
+            Some(crate::actions::TrustTarget::Command(
+                "npm install left-pad".to_string(),
+            )),
+        );
+        assert_eq!(
+            parse_approval_resolution("y", &view),
+            ApprovalResolution::ApproveOnce
+        );
+        assert_eq!(
+            parse_approval_resolution("t", &view),
+            ApprovalResolution::ApproveAndTrust
+        );
+        assert_eq!(
+            parse_approval_resolution("n", &view),
+            ApprovalResolution::Deny
+        );
+    }
+
+    #[test]
+    fn tier_label_survives_no_color() {
+        let view = approval_view(Some(crate::actions::RiskTier::Medium), false, None);
+        // Under NO_COLOR the tier must still be conveyed by its text label.
+        assert!(modal_text(&view, true).contains("MEDIUM"));
+    }
+
+    #[test]
+    fn high_tier_enter_routing_denies_then_dedicated_word_approves() {
+        // Integration through the key router: a High-tier pending approval is not
+        // approved by Enter+"y", but is by Enter+"approve".
+        let mut state = state_with_input("y", true);
+        if let Some(view) = state.pending_approval.as_mut() {
+            view.tier = Some(crate::actions::RiskTier::High);
+            view.reason = Some("matches a high-risk pattern".to_string());
+            view.resolved_command = Some("sudo rm file".to_string());
+        }
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            key_event_to_tui_command(&state, enter),
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::Deny
+            )))
+        );
+
+        state.input = "approve".to_string();
+        assert_eq!(
+            key_event_to_tui_command(&state, enter),
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::ApproveOnce
+            )))
+        );
     }
 
     #[test]
@@ -9266,7 +9538,7 @@ mod tests {
 
         let text = render_to_text(&state, 100, 24);
 
-        assert!(text.contains("Approval required for fixer action action."));
+        assert!(text.contains("Approval required for fixer"));
         assert!(!text.contains("Clarifying question"));
         assert!(!text.contains("Custom:"));
         assert!(!text.contains("★ recommended"));

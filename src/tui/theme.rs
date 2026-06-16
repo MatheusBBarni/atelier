@@ -95,6 +95,14 @@ const STATUS_OK: TokenSpec = TokenSpec::new(0x8c, 0xff, 0xb0, 121); // --green
 const STATUS_WARN: TokenSpec = TokenSpec::new(0xff, 0xb4, 0x54, 215); // --amber
 const STATUS_ERROR: TokenSpec = TokenSpec::new(0xff, 0x6f, 0x61, 203); // --red
 
+// Risk-tier accents for the approval modal (ADR-001/002). Reuse the brand
+// green/amber/red hues so a tier reads consistently with status coloring, but as
+// dedicated semantic tokens (the tier is also always spelled out in text, so the
+// label survives `NO_COLOR`).
+const RISK_LOW: TokenSpec = TokenSpec::new(0x8c, 0xff, 0xb0, 121); // --green
+const RISK_MEDIUM: TokenSpec = TokenSpec::new(0xff, 0xb4, 0x54, 215); // --amber
+const RISK_HIGH: TokenSpec = TokenSpec::new(0xff, 0x6f, 0x61, 203); // --red
+
 // Near-black brand ink (--ink). Used as the dark foreground on bright badges
 // and selection highlights, mirroring the web `.brand__mark` (ink-on-green).
 const INK: TokenSpec = TokenSpec::new(0x06, 0x08, 0x07, 232);
@@ -129,6 +137,10 @@ pub struct Theme {
     pub status_ok: Color,
     pub status_warn: Color,
     pub status_error: Color,
+    /// Risk-tier accents for the approval modal (Low/Medium/High).
+    pub risk_low: Color,
+    pub risk_medium: Color,
+    pub risk_high: Color,
     /// Near-black ink for dark foregrounds on bright badges/selections.
     pub ink: Color,
     pub user_prompt_bg: Color,
@@ -150,6 +162,9 @@ impl Theme {
             status_ok: STATUS_OK.pick(caps),
             status_warn: STATUS_WARN.pick(caps),
             status_error: STATUS_ERROR.pick(caps),
+            risk_low: RISK_LOW.pick(caps),
+            risk_medium: RISK_MEDIUM.pick(caps),
+            risk_high: RISK_HIGH.pick(caps),
             ink: INK.pick(caps),
             user_prompt_bg: USER_PROMPT_BG.pick(caps),
             agent_accents: AGENT_ACCENTS.map(|spec| spec.pick(caps)),
@@ -197,6 +212,9 @@ mod tests {
             theme.status_ok,
             theme.status_warn,
             theme.status_error,
+            theme.risk_low,
+            theme.risk_medium,
+            theme.risk_high,
             theme.ink,
             theme.user_prompt_bg,
         ];

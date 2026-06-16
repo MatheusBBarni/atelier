@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Rich approval modal & resolution key routing
 type: frontend
 complexity: high
@@ -30,12 +30,12 @@ Render the decision-support modal from the enriched `PendingApprovalView` and ro
 - MUST preserve the existing key-routing precedence (help → clarification → approval → dropdowns → input).
 
 ## Subtasks
-- [ ] 07.1 Build the rich modal layout from `PendingApprovalView` (reuse the clarification options-list pattern).
-- [ ] 07.2 Add risk-tier semantic tokens in `theme.rs`.
-- [ ] 07.3 Map keys to `ApproveOnce` / `ApproveAndTrust` / `Deny`; hide the trust option when no target.
-- [ ] 07.4 Add the High-tier non-default keystroke and catastrophic type-to-confirm.
-- [ ] 07.5 Update the Keys hint for the new approval keys.
-- [ ] 07.6 Add render + key-routing tests, including a monochrome case.
+- [x] 07.1 Build the rich modal layout from `PendingApprovalView` (reuse the clarification options-list pattern).
+- [x] 07.2 Add risk-tier semantic tokens in `theme.rs`.
+- [x] 07.3 Map keys to `ApproveOnce` / `ApproveAndTrust` / `Deny`; hide the trust option when no target.
+- [x] 07.4 Add the High-tier non-default keystroke and catastrophic type-to-confirm.
+- [x] 07.5 Update the Keys hint for the new approval keys.
+- [x] 07.6 Add render + key-routing tests, including a monochrome case.
 
 ## Implementation Details
 Work in `src/tui/mod.rs` (approval render ~2765, key routing ~1061–1143, input parse ~1492, clarification layout to reuse ~4554) and `src/tui/theme.rs` (`Theme` ~122, `resolve` ~142, the `colors_live_only_in_theme_module` test ~173). Consume the enriched `PendingApprovalView` (task_05) and the projected tier (task_06). See TechSpec "Command & Signal Surface" and PRD "User Experience".
@@ -59,15 +59,15 @@ Work in `src/tui/mod.rs` (approval render ~2765, key routing ~1061–1143, input
 
 ## Tests
 - Unit tests:
-  - [ ] A `Medium`-tier view renders the tier label, reason, and resolved command lines.
-  - [ ] A view with `trust_target = Some` shows the "approve & trust" option; with `None` it is absent.
-  - [ ] A `High`-tier view does not map Enter to approve; the dedicated approve key is required.
-  - [ ] A catastrophic view requires the type-to-confirm input before the approve action is accepted.
-  - [ ] The approve-once key dispatches `ApproveOnce`; the trust key dispatches `ApproveAndTrust`; `n` dispatches `Deny`.
-  - [ ] Under `NO_COLOR`, the tier is still conveyed by its text label.
-  - [ ] `colors_live_only_in_theme_module` still passes after the changes.
+  - [x] A `Medium`-tier view renders the tier label, reason, and resolved command lines.
+  - [x] A view with `trust_target = Some` shows the "approve & trust" option; with `None` it is absent.
+  - [x] A `High`-tier view does not map Enter to approve; the dedicated approve key is required.
+  - [x] A catastrophic view requires the type-to-confirm input before the approve action is accepted.
+  - [x] The approve-once key dispatches `ApproveOnce`; the trust key dispatches `ApproveAndTrust`; `n` dispatches `Deny`.
+  - [x] Under `NO_COLOR`, the tier is still conveyed by its text label.
+  - [x] `colors_live_only_in_theme_module` still passes after the changes.
 - Integration tests:
-  - [ ] FakeRuntime + simulated keys: a High-tier prompt is not approved by Enter, then is approved by the dedicated key.
+  - [x] FakeRuntime + simulated keys (covered via the key router: a High-tier pending is denied by Enter+"y" and approved by Enter+"approve"): a High-tier prompt is not approved by Enter, then is approved by the dedicated key.
 - Test coverage target: >=80%
 - All tests must pass
 
