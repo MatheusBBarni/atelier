@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Governance module with shared decision and plan types
 type: backend
 complexity: medium
@@ -29,11 +29,11 @@ Create the shared contract every governance surface will render through: a new `
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Create `src/governance.rs` and declare `pub mod governance;` in `src/lib.rs`.
-- [ ] 1.2 Define `GovernanceDecisionView` and `GovernanceKind`.
-- [ ] 1.3 Define `GovernancePlanView` + `GovernancePlanStep` (steps + edges).
-- [ ] 1.4 Define `GovernanceAnswer` and the two event-kind constants.
-- [ ] 1.5 Derive serde + equality; confirm round-trip.
+- [x] 1.1 Create `src/governance.rs` and declare `pub mod governance;` in `src/lib.rs`.
+- [x] 1.2 Define `GovernanceDecisionView` and `GovernanceKind`.
+- [x] 1.3 Define `GovernancePlanView` + `GovernancePlanStep` (steps + edges).
+- [x] 1.4 Define `GovernanceAnswer` and the two event-kind constants.
+- [x] 1.5 Derive serde + equality; confirm round-trip.
 
 ## Implementation Details
 Add `src/governance.rs` and insert `pub mod governance;` in the `src/lib.rs` module list (after `orchestrator`/before `runtime` per project alphabetical grouping). Pure data types only. Reference TechSpec "Implementation Design → Core Interfaces / Data Models" for the field set; do not reproduce it here.
@@ -59,12 +59,12 @@ Add `src/governance.rs` and insert `pub mod governance;` in the `src/lib.rs` mod
 
 ## Tests
 - Unit tests:
-  - [ ] `GovernanceDecisionView` round-trips through serde (serialize→deserialize equals original).
-  - [ ] `GovernanceAnswer::Reject { redirect: Some("x") }` and `Reject { redirect: None }` and `Accept` each round-trip.
-  - [ ] `GovernancePlanView` with one step + no edges (single-agent) and with multiple steps + edges (DAG-shaped) both round-trip.
-  - [ ] The event-kind constants equal `"governance_decision_requested"` and `"governance_decision_resolved"`.
+  - [x] `GovernanceDecisionView` round-trips through serde (serialize→deserialize equals original).
+  - [x] `GovernanceAnswer::Reject { redirect: Some("x") }` and `Reject { redirect: None }` and `Accept` each round-trip.
+  - [x] `GovernancePlanView` with one step + no edges (single-agent) and with multiple steps + edges (DAG-shaped) both round-trip.
+  - [x] The event-kind constants equal `"governance_decision_requested"` and `"governance_decision_resolved"`.
 - Integration tests:
-  - [ ] `multiagent::governance::GovernanceDecisionView` is constructible from outside the module (export smoke test).
+  - [x] `multiagent::governance::GovernanceDecisionView` is constructible from outside the module (export smoke test).
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -73,3 +73,8 @@ Add `src/governance.rs` and insert `pub mod governance;` in the `src/lib.rs` mod
 - Test coverage >=80%
 - The module compiles, is exported, and its types serialize stably.
 - `cargo fmt --check` and `cargo clippy --all-targets` are clean.
+
+## Completion Notes
+- `pub mod governance;` was placed between `file_index` and `history` in `src/lib.rs`. The spec said "after `orchestrator`/before `runtime` per project alphabetical grouping" — those two directives contradict (the module list is strictly alphabetical, and `governance` sorts between `file_index` and `history`). Followed the stated *alphabetical* rationale, which matches the project's actual convention.
+- `GovernanceAnswer` serializes internally-tagged as `{ "outcome": "accept" | "reject", "redirect"? }`, matching the techspec's documented `governance_decision_resolved` payload shape so task_03/task_05 can map it directly.
+- Verified: `cargo test --lib governance` (10 passed), `cargo test --test governance_types` (3 passed), `cargo fmt --check` (clean), `cargo clippy --all-targets` (clean).

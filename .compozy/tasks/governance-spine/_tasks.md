@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Governance module with shared decision and plan types | pending | medium | — |
+| 01 | Governance module with shared decision and plan types | completed | medium | — |
 | 02 | Add chat governance-decision variants and projection arm | pending | medium | task_01 |
 | 03 | Pending governance decision state and resolver | pending | medium | task_01 |
 | 04 | TUI governance decision card and key routing | pending | medium | task_02, task_03 |

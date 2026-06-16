@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod docgen;
 pub mod doctor;
 pub mod file_index;
+pub mod governance;
 pub mod history;
 pub mod ids;
 pub mod orchestrator;
