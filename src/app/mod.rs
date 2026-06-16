@@ -6274,7 +6274,7 @@ async fn wait_for_approval(
 }
 
 /// Wire label for the `tier` field on risk-bearing events / views.
-fn risk_tier_label(tier: RiskTier) -> &'static str {
+pub(crate) fn risk_tier_label(tier: RiskTier) -> &'static str {
     match tier {
         RiskTier::Low => "low",
         RiskTier::Medium => "medium",

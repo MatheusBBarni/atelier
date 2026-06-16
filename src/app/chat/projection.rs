@@ -72,6 +72,9 @@ impl ChatProjection {
             "file_edit_applied" => self.apply_file_edit_applied(event),
             "approval_requested" => self.apply_approval_requested(event),
             "approval_resolved" => self.apply_approval_resolved(event),
+            "approval_auto_resolved" => self.apply_approval_auto_resolved(event),
+            "floor_warned" => self.apply_floor_warned(event),
+            "trust_granted" | "trust_revoked" | "trust_cleared" => self.apply_trust_event(event),
             "action_denied" => self.apply_action_denied(event),
             "action_completed" => self.apply_action_completed(event),
             "artifact_written" => self.apply_artifact_written(event),
@@ -212,6 +215,17 @@ impl ChatProjection {
         // never changes the approve/deny prompt below it.
         if show_first_approval_explainer {
             body.push(ChatLineView::muted(FIRST_APPROVAL_EXPLAINER));
+        }
+        if let Some(tier) = approval.tier {
+            let marker = if approval.catastrophic {
+                " (catastrophic)"
+            } else {
+                ""
+            };
+            body.push(ChatLineView::muted(format!(
+                "risk: {}{marker}",
+                crate::app::risk_tier_label(tier)
+            )));
         }
         body.push(ChatLineView::warning(&approval.summary));
         if let Some(diagnostic) = approval.diagnostic.as_deref() {
@@ -601,6 +615,16 @@ impl ChatProjection {
         };
         let diagnostic = string_field(&event.payload, "diagnostic");
         let mut body = Vec::new();
+        // Risk tier from the serialized `ActionResult.risk` (task_03); tolerated as
+        // absent for older records.
+        if let Some(tier) = event
+            .payload
+            .get("risk")
+            .and_then(|risk| risk.get("tier"))
+            .and_then(Value::as_str)
+        {
+            body.push(ChatLineView::muted(format!("risk: {tier}")));
+        }
         if let Some(command) = command.as_deref() {
             body.push(ChatLineView::code(format!("$ {command}")));
         }
@@ -664,6 +688,105 @@ impl ChatProjection {
             body: vec![line],
             details: history_detail(event, "approval"),
             source: source_from_event(event, Some(action_id)),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    /// A trust-driven auto-approval (ADR-004): a non-modal `Diagnostic`/`Info`
+    /// item so the auto-run stays auditable in the transcript.
+    fn apply_approval_auto_resolved(&mut self, event: &HistoryEvent) {
+        let target = event
+            .payload
+            .get("target")
+            .map(trust_target_display)
+            .unwrap_or_else(|| "a trusted action".to_string());
+        let message = format!("Auto-approved by session trust: {target}");
+        self.upsert(ItemInput {
+            lifecycle_key: None,
+            kind: ChatItemKind::Diagnostic,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "Auto-approved by trust".to_string(),
+            summary: Some(message_summary(&message)),
+            body: vec![ChatLineView::muted(message)],
+            details: history_detail(event, "history"),
+            source: source_from_event(event, string_field(&event.payload, "action_id")),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    /// A gray-area "would have blocked" warning under Yolo+Warn (ADR-002): a
+    /// `Diagnostic`/`Warning` item that surfaces the warn-only signal.
+    fn apply_floor_warned(&mut self, event: &HistoryEvent) {
+        let reason = string_field(&event.payload, "reason")
+            .unwrap_or_else(|| "gray-area action".to_string());
+        let tier = string_field(&event.payload, "tier").unwrap_or_else(|| "medium".to_string());
+        let message = format!("Would have blocked (warn-only, {tier}): {reason}");
+        self.upsert(ItemInput {
+            lifecycle_key: None,
+            kind: ChatItemKind::Diagnostic,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Warning,
+            title: "Floor warning (warn-only)".to_string(),
+            summary: Some(message_summary(&message)),
+            body: vec![ChatLineView::warning(message)],
+            details: history_detail(event, "history"),
+            source: source_from_event(event, string_field(&event.payload, "action_id")),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    /// Trust-list lifecycle events (granted / revoked / cleared), projected as
+    /// `Info` items naming the target or count so trust stays auditable (ADR-004).
+    fn apply_trust_event(&mut self, event: &HistoryEvent) {
+        let (title, message) = match event.kind.as_str() {
+            "trust_granted" => {
+                let target = event
+                    .payload
+                    .get("target")
+                    .map(trust_target_display)
+                    .unwrap_or_else(|| "an action".to_string());
+                (
+                    "Trusted for this session",
+                    format!("Trusted for this session: {target}"),
+                )
+            }
+            "trust_revoked" => {
+                let target = event
+                    .payload
+                    .get("target")
+                    .map(trust_target_display)
+                    .unwrap_or_else(|| "an action".to_string());
+                ("Trust revoked", format!("Trust revoked: {target}"))
+            }
+            _ => {
+                let count = event
+                    .payload
+                    .get("count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                (
+                    "Trust cleared",
+                    format!(
+                        "Cleared {count} trusted entr{}",
+                        if count == 1 { "y" } else { "ies" }
+                    ),
+                )
+            }
+        };
+        self.upsert(ItemInput {
+            lifecycle_key: None,
+            kind: ChatItemKind::Diagnostic,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: title.to_string(),
+            summary: Some(message_summary(&message)),
+            body: vec![ChatLineView::muted(message)],
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
             fallback_event_id: event.event_id.clone(),
         });
@@ -2677,6 +2800,20 @@ fn string_field(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
+/// Render a `{ kind, value }` trust-target payload (task_05) as human-readable
+/// text — the command or path, never the opaque key.
+fn trust_target_display(target: &Value) -> String {
+    let value = target
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match target.get("kind").and_then(Value::as_str) {
+        Some("command") => format!("command `{value}`"),
+        Some("write_path") => format!("writes to {value}"),
+        _ => value.to_string(),
+    }
+}
+
 /// Extract a field as a vector of non-empty strings; missing/non-array yields
 /// an empty vector.
 fn string_array(value: &Value, field: &str) -> Vec<String> {
@@ -3899,6 +4036,125 @@ mod tests {
 
         assert_eq!(item.kind, ChatItemKind::Approval);
         assert_eq!(item.status, ChatItemStatus::WaitingApproval);
+    }
+
+    // ---- Trust & floor projection (task_06) ---------------------------
+
+    #[test]
+    fn approval_auto_resolved_projects_info_naming_target() {
+        let events = vec![event(
+            "approval_auto_resolved",
+            Some("run-1"),
+            Some("step-1"),
+            json!({ "action_id": "a1", "target": { "kind": "command", "value": "cargo test" } }),
+        )];
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::Diagnostic);
+        assert_eq!(item.severity, ChatSeverity::Info);
+        assert!(item_text(item).contains("cargo test"));
+    }
+
+    #[test]
+    fn floor_warned_projects_warning_with_reason_and_marker() {
+        let events = vec![event(
+            "floor_warned",
+            Some("run-1"),
+            Some("step-1"),
+            json!({ "action_id": "a1", "tier": "medium", "reason": "installs software" }),
+        )];
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::Diagnostic);
+        assert_eq!(item.severity, ChatSeverity::Warning);
+        let text = item_text(item);
+        assert!(text.contains("installs software"));
+        assert!(text.contains("warn-only"));
+    }
+
+    #[test]
+    fn trust_events_project_info_items_naming_target_or_count() {
+        let granted = ChatProjection::rebuild(&[event(
+            "trust_granted",
+            None,
+            None,
+            json!({ "target": { "kind": "command", "value": "cargo build" } }),
+        )]);
+        assert_eq!(granted.items()[0].severity, ChatSeverity::Info);
+        assert!(item_text(&granted.items()[0]).contains("cargo build"));
+
+        let revoked = ChatProjection::rebuild(&[event(
+            "trust_revoked",
+            None,
+            None,
+            json!({ "target": { "kind": "write_path", "value": "src/lib.rs" } }),
+        )]);
+        assert!(item_text(&revoked.items()[0]).contains("src/lib.rs"));
+
+        let cleared =
+            ChatProjection::rebuild(&[event("trust_cleared", None, None, json!({ "count": 3 }))]);
+        assert!(item_text(&cleared.items()[0]).contains('3'));
+    }
+
+    #[test]
+    fn pending_approval_item_includes_tier_label() {
+        let mut projection = ChatProjection::rebuild(&[]);
+        let mut approval = pending_approval_view();
+        approval.tier = Some(crate::actions::RiskTier::High);
+        approval.catastrophic = true;
+        projection.apply_pending_approval(Some(&approval), false);
+        let item = projection
+            .items()
+            .iter()
+            .find(|item| item.kind == ChatItemKind::Approval)
+            .unwrap();
+        let text = item_text(item);
+        assert!(text.contains("high"));
+        assert!(text.contains("catastrophic"));
+    }
+
+    #[test]
+    fn approval_requested_without_risk_field_projects_without_panic() {
+        // Older records lack the `risk` field; projection must tolerate it.
+        let events = vec![event(
+            "approval_requested",
+            Some("run-1"),
+            Some("step-1"),
+            json!({ "action_id": "a1", "summary": "do thing" }),
+        )];
+        let projection = ChatProjection::rebuild(&events);
+        assert_eq!(projection.items()[0].kind, ChatItemKind::Approval);
+    }
+
+    #[test]
+    fn replaying_trust_and_floor_sequence_yields_ordered_items() {
+        let events = vec![
+            event(
+                "approval_requested",
+                Some("run-1"),
+                Some("step-1"),
+                json!({ "action_id": "a1", "summary": "install", "risk": { "tier": "medium" } }),
+            ),
+            event(
+                "floor_warned",
+                Some("run-1"),
+                Some("step-2"),
+                json!({ "action_id": "a2", "tier": "medium", "reason": "installs software" }),
+            ),
+            event(
+                "trust_granted",
+                Some("run-1"),
+                Some("step-1"),
+                json!({ "target": { "kind": "command", "value": "cargo test" } }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        assert_eq!(projection.items().len(), 3);
+        assert_eq!(projection.items()[0].kind, ChatItemKind::Approval);
+        assert_eq!(projection.items()[1].kind, ChatItemKind::Diagnostic);
+        assert_eq!(projection.items()[1].severity, ChatSeverity::Warning);
+        assert_eq!(projection.items()[2].kind, ChatItemKind::Diagnostic);
+        assert_eq!(projection.items()[2].severity, ChatSeverity::Info);
     }
 
     fn pending_approval_view() -> PendingApprovalView {
