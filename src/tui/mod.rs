@@ -3640,6 +3640,7 @@ fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
         ChatItemKind::FileEdit => "file edit",
         ChatItemKind::Approval => "approval",
         ChatItemKind::Clarification => "clarification",
+        ChatItemKind::GovernanceDecision => "governance",
         ChatItemKind::Diagnostic => "diagnostic",
         ChatItemKind::SkillContext => "skills",
         ChatItemKind::AgentResult => "agent",
@@ -8912,6 +8913,14 @@ runtime = "fake"
         assert_ne!(
             chat_kind_label(&ChatItemKind::Clarification),
             chat_kind_label(&ChatItemKind::Approval)
+        );
+    }
+
+    #[test]
+    fn governance_decision_chat_kind_label_is_governance() {
+        assert_eq!(
+            chat_kind_label(&ChatItemKind::GovernanceDecision),
+            "governance"
         );
     }
 

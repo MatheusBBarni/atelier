@@ -62,6 +62,7 @@ impl ChatProjection {
             "prompt_submitted" => self.apply_user_prompt(event),
             "clarification_requested" => self.apply_clarification_requested(event),
             "clarification_answered" => self.apply_clarification_answered(event),
+            "governance_decision_requested" => self.apply_governance_decision_requested(event),
             "orchestrator_decision" => self.apply_orchestrator_decision(event),
             "agent_step_started" => self.apply_agent_step_started(event),
             "runtime_stream_delta" => self.apply_runtime_stream_delta(event),
@@ -1314,6 +1315,68 @@ impl ChatProjection {
         });
     }
 
+    /// Project a `governance_decision_requested` event (payload = a serialized
+    /// `GovernanceDecisionView`) into a `WaitingForUser` decision card. Risk is
+    /// conveyed by an explicit text label so it stays legible under `NO_COLOR`.
+    fn apply_governance_decision_requested(&mut self, event: &HistoryEvent) {
+        let intent = string_field(&event.payload, "intent")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                "Confirm the interpreted intent before this run proceeds.".to_string()
+            });
+        let title = string_field(&event.payload, "title")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Confirm intent before this run edits files".to_string());
+        let risk_label = string_field(&event.payload, "risk_label")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Unspecified".to_string());
+
+        // Risk sits at position 2 (right after the intent) so the `bounded_body`
+        // line cap can never drop it, and it is an explicit text label — not
+        // color alone — so it stays legible under NO_COLOR. Each line is capped
+        // to the existing content-preview length by `bounded_body`.
+        let mut body = vec![
+            ChatLineView::plain(intent.clone()),
+            ChatLineView::warning(format!("Risk: {risk_label}")),
+        ];
+
+        let approach = string_array(&event.payload, "approach");
+        if !approach.is_empty() {
+            body.push(ChatLineView::muted("Approach:"));
+            for bullet in approach {
+                body.push(ChatLineView::muted(format!("- {bullet}")));
+            }
+        }
+
+        if let Some(agent) =
+            string_field(&event.payload, "agent").filter(|value| !value.trim().is_empty())
+        {
+            body.push(ChatLineView::muted(format!("Agent: {agent}")));
+        }
+
+        let write_scope = string_array(&event.payload, "write_scope");
+        if !write_scope.is_empty() {
+            body.push(ChatLineView::muted(format!(
+                "Write scope: {}",
+                write_scope.join(", ")
+            )));
+        }
+
+        self.upsert(ItemInput {
+            lifecycle_key: governance_decision_key(event),
+            kind: ChatItemKind::GovernanceDecision,
+            status: ChatItemStatus::WaitingForUser,
+            severity: ChatSeverity::Warning,
+            title,
+            summary: Some(intent),
+            body,
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
     fn apply_projection_warning(&mut self, event: &HistoryEvent, title: &str) {
         self.upsert(ItemInput {
             lifecycle_key: None,
@@ -1821,6 +1884,16 @@ fn clarification_key(event: &HistoryEvent) -> Option<ChatLifecycleKey> {
     Some(ChatLifecycleKey::Clarification {
         run_id: event.run_id.clone()?,
         question_id: string_field(&event.payload, "question_id")?,
+    })
+}
+
+fn governance_decision_key(event: &HistoryEvent) -> Option<ChatLifecycleKey> {
+    Some(ChatLifecycleKey::GovernanceDecision {
+        run_id: event
+            .run_id
+            .clone()
+            .or_else(|| string_field(&event.payload, "run_id"))?,
+        decision_id: string_field(&event.payload, "decision_id")?,
     })
 }
 
@@ -2602,6 +2675,23 @@ fn readable_kind(kind: &str) -> String {
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Extract a field as a vector of non-empty strings; missing/non-array yields
+/// an empty vector.
+fn string_array(value: &Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .filter(|item| !item.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn concise(text: &str, max_chars: usize) -> String {
@@ -3618,6 +3708,86 @@ mod tests {
         assert_eq!(item.title, "Clarifying question");
         assert!(item.body.iter().any(|line| line.text == "Which scope?"));
         assert!(item.body.iter().any(|line| line.text.contains("★")));
+    }
+
+    #[test]
+    fn governance_decision_requested_projects_decision_card() {
+        let events = vec![event(
+            "governance_decision_requested",
+            Some("run-1"),
+            None,
+            json!({
+                "run_id": "run-1",
+                "decision_id": "dec-1",
+                "kind": "early_abort",
+                "title": "Confirm intent before this run edits files",
+                "intent": "Refactor the config loader into smaller modules",
+                "approach": ["Split merge logic", "Add unit tests"],
+                "agent": "implementer",
+                "write_scope": ["src/config"],
+                "risk_label": "Edits source files in src/config"
+            }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::GovernanceDecision);
+        assert_eq!(item.status, ChatItemStatus::WaitingForUser);
+        assert_eq!(item.title, "Confirm intent before this run edits files");
+        assert_eq!(
+            item.lifecycle_key,
+            Some(ChatLifecycleKey::GovernanceDecision {
+                run_id: "run-1".to_string(),
+                decision_id: "dec-1".to_string(),
+            })
+        );
+        // Intent line present.
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "Refactor the config loader into smaller modules"));
+        // Approach bullets present (leading whitespace is collapsed by the
+        // shared content-preview cap, so the rendered bullet is "- ...").
+        assert!(item.body.iter().any(|line| line.text == "Approach:"));
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "- Split merge logic"));
+        // Write scope present.
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "Write scope: src/config"));
+        // Risk conveyed as an explicit text label (legible under NO_COLOR).
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text == "Risk: Edits source files in src/config"));
+    }
+
+    #[test]
+    fn governance_decision_requested_falls_back_when_fields_missing() {
+        let events = vec![event(
+            "governance_decision_requested",
+            Some("run-2"),
+            None,
+            json!({ "decision_id": "dec-2", "kind": "early_abort" }),
+        )];
+
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+
+        assert_eq!(item.kind, ChatItemKind::GovernanceDecision);
+        assert_eq!(item.status, ChatItemStatus::WaitingForUser);
+        assert!(item.body.iter().any(|line| line.text.starts_with("Risk: ")));
+        // No approach/write-scope lines when those fields are absent.
+        assert!(!item.body.iter().any(|line| line.text == "Approach:"));
+        assert!(!item
+            .body
+            .iter()
+            .any(|line| line.text.starts_with("Write scope:")));
     }
 
     #[test]
