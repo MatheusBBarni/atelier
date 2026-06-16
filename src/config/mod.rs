@@ -196,6 +196,10 @@ impl Default for Limits {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Features {
     pub parallel_step_groups: bool,
+    /// Pause a first-turn single-agent run that intends to write, so the user
+    /// can confirm the interpreted intent before any edit (governance spine,
+    /// ADR-004). Off by default.
+    pub governance_early_abort: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -448,6 +452,7 @@ struct RawWorkspacePolicy {
 #[serde(deny_unknown_fields)]
 struct RawFeatures {
     parallel_step_groups: Option<bool>,
+    governance_early_abort: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -938,6 +943,9 @@ impl MergedConfig {
         if let Some(features) = raw.features {
             if let Some(value) = features.parallel_step_groups {
                 self.features.parallel_step_groups = value;
+            }
+            if let Some(value) = features.governance_early_abort {
+                self.features.governance_early_abort = value;
             }
         }
 
@@ -2514,6 +2522,21 @@ max_parallel_agent_steps = 0
 
         assert!(config.features.parallel_step_groups);
         assert_eq!(config.limits.max_parallel_agent_steps, 0);
+    }
+
+    #[test]
+    fn governance_early_abort_defaults_off_and_parses_true() {
+        let default = load_from_temp("schema_version = 1\n").unwrap();
+        assert!(!default.features.governance_early_abort);
+
+        let enabled = load_from_temp(
+            r#"
+[features]
+governance_early_abort = true
+"#,
+        )
+        .unwrap();
+        assert!(enabled.features.governance_early_abort);
     }
 
     #[test]

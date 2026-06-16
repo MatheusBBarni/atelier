@@ -11,7 +11,10 @@ use crate::config::{
     AgentProfile, AgentPromptMetadata, ApprovalMode, Capability, CouncilExecutionMode,
     CouncilMemberProfile, EffectiveConfig, Limit,
 };
-use crate::governance::{GovernanceAnswer, GovernanceDecisionView, GOVERNANCE_DECISION_RESOLVED};
+use crate::governance::{
+    GovernanceAnswer, GovernanceDecisionView, GovernanceKind, GOVERNANCE_DECISION_REQUESTED,
+    GOVERNANCE_DECISION_RESOLVED,
+};
 use crate::history::{HistoryEvent, HistoryStore};
 use crate::ids::new_id;
 use crate::orchestrator::{
@@ -2004,6 +2007,16 @@ impl App {
         loop {
             match self.run_orchestrator_step(run, None).await? {
                 OrchestratorStepOutcome::Decision(decision) => {
+                    // Governance early-abort (ADR-004): on the first orchestrator
+                    // turn of a non-trivial single-agent write run, pause for an
+                    // intent check before `handle_orchestrator_decision` runs any
+                    // agent/action. Gated entirely behind the feature flag.
+                    if self.config.features.governance_early_abort
+                        && early_abort_triggers(run, decision.as_ref())
+                    {
+                        self.pause_for_early_abort(run, decision.as_ref())?;
+                        break;
+                    }
                     if !self.handle_orchestrator_decision(run, *decision).await? {
                         break;
                     }
@@ -2014,6 +2027,64 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Build the governance decision view and pause the run into
+    /// `pending_governance_decision`, recording the `governance_decision_requested`
+    /// event. Mirrors the clarification pause; no agent or action has run yet, so
+    /// nothing is written before the user resolves the decision.
+    fn pause_for_early_abort(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+    ) -> Result<()> {
+        let agent = match decision.normalized_next_step() {
+            Ok(Some(DecisionNextStep::SingleAgent(plan))) => Some(plan.agent),
+            _ => None,
+        };
+        let decision_id = new_id();
+        let view = GovernanceDecisionView {
+            run_id: run.run_id.clone(),
+            decision_id: decision_id.clone(),
+            kind: GovernanceKind::EarlyAbort,
+            title: "Confirm intent before this run edits files".to_string(),
+            intent: decision.reason.clone(),
+            approach: decision.plan.clone(),
+            agent,
+            write_scope: self.governance_write_scope(),
+            risk_label: early_abort_risk_label(decision),
+            plan: None,
+        };
+
+        self.state.run_state = RunState::WaitingForUser;
+        self.pending_governance_decision = Some(PendingGovernanceDecision { run: run.clone() });
+        self.state.pending_governance_decision = Some(PendingGovernanceDecisionView {
+            run_id: run.run_id.clone(),
+            decision_id: decision_id.clone(),
+            view: view.clone(),
+        });
+        self.set_agent_status("orchestrator", "waiting_for_user");
+        // `record_event` applies the event to the chat projection and publishes
+        // the (already-set) paused state, so the decision card renders.
+        self.record_event(
+            Some(run.run_id.clone()),
+            None,
+            GOVERNANCE_DECISION_REQUESTED,
+            serde_json::to_value(&view)?,
+            "Confirm intent before this run edits files.",
+        )?;
+        Ok(())
+    }
+
+    /// The workspace write-roots this run may touch, rendered for display: the
+    /// working directory plus any configured extra write roots (ADR-004 — no new
+    /// per-step `file_scope`).
+    fn governance_write_scope(&self) -> Vec<String> {
+        let mut roots = vec![self.config.working_directory.display().to_string()];
+        for root in &self.config.workspace.extra_write_roots {
+            roots.push(root.display().to_string());
+        }
+        roots
     }
 
     async fn handle_orchestrator_decision(
@@ -5637,6 +5708,58 @@ fn agent_roster_rank(agent_id: &str) -> u8 {
 
 fn limit_reached(limit: &Limit, count: u32) -> bool {
     limit.is_reached_by(count)
+}
+
+/// True when the governance early-abort should pause this decision (ADR-004),
+/// independent of the feature flag (the caller checks the flag). It fires only on
+/// the **first orchestrator turn** of a non-trivial single-agent write run:
+///
+/// - `status == Continue`,
+/// - first orchestrator turn — `step_count == 1` (the orchestrator step bumps the
+///   count to 1 before returning its decision) with no agent results yet,
+/// - not a subtask,
+/// - the next step is a `SingleAgent`,
+/// - and the decision's `required_capabilities` carry a write-class tool.
+///
+/// Because `step_count` keeps climbing on each orchestrator turn, this is false
+/// on the Accept / reject-redirect re-drive, so the gate never re-fires.
+fn early_abort_triggers(
+    run: &RunDriveContext,
+    decision: &crate::orchestrator::OrchestratorDecision,
+) -> bool {
+    decision.status == DecisionStatus::Continue
+        && run.step_count == 1
+        && run.previous_results.is_empty()
+        && run.subtask.is_none()
+        && matches!(
+            decision.normalized_next_step(),
+            Ok(Some(DecisionNextStep::SingleAgent(_)))
+        )
+        && decision_requires_write(decision)
+}
+
+/// The complexity signal: the decision intends to write if its required
+/// capabilities include a write-class tool. No `is_write()` helper exists on
+/// `Capability`, so match `Edit`/`Command` directly.
+fn decision_requires_write(decision: &crate::orchestrator::OrchestratorDecision) -> bool {
+    decision
+        .required_capabilities
+        .iter()
+        .any(|capability| matches!(capability, Capability::Edit | Capability::Command))
+}
+
+/// Plain-language risk label (words, never color) describing what the run may do.
+fn early_abort_risk_label(decision: &crate::orchestrator::OrchestratorDecision) -> String {
+    let edits = decision.required_capabilities.contains(&Capability::Edit);
+    let commands = decision
+        .required_capabilities
+        .contains(&Capability::Command);
+    match (edits, commands) {
+        (true, true) => "This run may edit files and run commands in your workspace".to_string(),
+        (true, false) => "This run intends to edit files in your workspace".to_string(),
+        (false, true) => "This run may run commands in your workspace".to_string(),
+        (false, false) => "This run may modify your workspace".to_string(),
+    }
 }
 
 fn command_timeout(limit: &Limit) -> Option<Duration> {
@@ -12107,6 +12230,264 @@ runtime = "fake"
 
         assert!(app.state.pending_governance_decision.is_none());
         assert_eq!(app.state.run_state, RunState::Completed);
+    }
+
+    // ── task_05 early-abort gate ──
+
+    fn first_turn_run() -> RunDriveContext {
+        let mut run = RunDriveContext::new(
+            "run".to_string(),
+            None,
+            "do work".to_string(),
+            "do work".to_string(),
+            None,
+            None,
+            None,
+        );
+        // The orchestrator step bumps step_count to 1 before the decision is
+        // returned, so the gate hook sees step_count == 1 on the first turn.
+        run.step_count = 1;
+        run
+    }
+
+    fn single_agent_decision(
+        required_capabilities: Vec<Capability>,
+    ) -> crate::orchestrator::OrchestratorDecision {
+        crate::orchestrator::OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "dec".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: vec!["Apply the change".to_string()],
+            next_agent: Some("fixer".to_string()),
+            next_step: None,
+            reason: "Edit the config loader".to_string(),
+            required_capabilities,
+            stop_condition: "done".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            multi_select: false,
+            final_summary: None,
+        }
+    }
+
+    #[test]
+    fn early_abort_triggers_on_first_turn_single_agent_write() {
+        let run = first_turn_run();
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        assert!(early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_triggers_on_command_capability() {
+        let run = first_turn_run();
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Command]);
+        assert!(early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_for_read_only_decision() {
+        let run = first_turn_run();
+        let decision = single_agent_decision(vec![Capability::Read]);
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_past_the_first_turn() {
+        let mut run = first_turn_run();
+        run.step_count = 2;
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_with_previous_results() {
+        let mut run = first_turn_run();
+        run.previous_results.push(RunStepResult::Agent {
+            result: AgentResult::completed("explorer", "step", "done"),
+        });
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_for_a_subtask() {
+        let mut run = first_turn_run();
+        run.subtask = Some(SubtaskContext {
+            agent_id: "fixer".to_string(),
+            request: "do it".to_string(),
+            submitted_request: "do it".to_string(),
+        });
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_for_a_parallel_group() {
+        let run = first_turn_run();
+        let mut decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        // A parallel group uses schema_version 2 with next_step (no next_agent).
+        decision.schema_version = 2;
+        decision.next_agent = None;
+        decision.next_step = Some(DecisionNextStep::ParallelGroup(ParallelGroupPlan {
+            group_id: "g".to_string(),
+            reason: "split".to_string(),
+            steps: Vec::new(),
+        }));
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_for_non_continue_status() {
+        let run = first_turn_run();
+        let mut decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        decision.status = DecisionStatus::Complete;
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    async fn app_with_early_abort(dir: &std::path::Path) -> App {
+        let mut config = fake_config(dir);
+        config.features.governance_early_abort = true;
+        App::new(config).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn early_abort_pauses_first_turn_write_run_before_any_write() {
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_governance_decision.is_some());
+        assert!(app.pending_governance_decision.is_some());
+
+        let history = app.history.read_events().unwrap();
+        assert!(history
+            .iter()
+            .any(|event| event.kind == "governance_decision_requested"));
+        // Nothing was written before the pause.
+        assert!(!history
+            .iter()
+            .any(|event| event.kind == "file_edit_applied"));
+        // The single agent never started.
+        assert!(!history.iter().any(|event| {
+            event.kind == "agent_step_started"
+                && event.payload.get("agent").and_then(|v| v.as_str()) == Some("fixer")
+        }));
+    }
+
+    #[tokio::test]
+    async fn early_abort_accept_lets_the_write_proceed() {
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+        let decision_id = app
+            .state
+            .pending_governance_decision
+            .as_ref()
+            .unwrap()
+            .decision_id
+            .clone();
+
+        app.resolve_pending_governance_decision(&decision_id, GovernanceAnswer::Accept)
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let history = app.history.read_events().unwrap();
+        assert!(history
+            .iter()
+            .any(|event| event.kind == "file_edit_applied"));
+        assert!(dir.path().join("multiagent-action-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn early_abort_reject_redirect_redrives_without_regating() {
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+        let decision_id = app
+            .state
+            .pending_governance_decision
+            .as_ref()
+            .unwrap()
+            .decision_id
+            .clone();
+
+        app.resolve_pending_governance_decision(
+            &decision_id,
+            GovernanceAnswer::Reject {
+                redirect: Some("only touch the readme".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        let history = app.history.read_events().unwrap();
+        let resolved = history
+            .iter()
+            .find(|event| event.kind == "governance_decision_resolved")
+            .unwrap();
+        assert_eq!(
+            resolved.payload.get("outcome").and_then(|v| v.as_str()),
+            Some("reject")
+        );
+        assert_eq!(
+            resolved.payload.get("redirect").and_then(|v| v.as_str()),
+            Some("only touch the readme")
+        );
+        // Exactly one pause — the re-drive does not re-gate.
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.kind == "governance_decision_requested")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn early_abort_does_not_pause_read_only_first_turn() {
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+
+        app.submit_prompt("explore the project").await.unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        let history = app.history.read_events().unwrap();
+        assert!(!history
+            .iter()
+            .any(|event| event.kind == "governance_decision_requested"));
+    }
+
+    #[tokio::test]
+    async fn early_abort_no_pause_when_flag_off() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let history = app.history.read_events().unwrap();
+        assert!(!history
+            .iter()
+            .any(|event| event.kind == "governance_decision_requested"));
     }
 
     #[tokio::test]

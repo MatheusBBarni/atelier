@@ -325,6 +325,17 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             "Fixer reports the scoped edit result.".to_string(),
             None,
         ),
+        // Drives the governance early-abort gate: a first-turn single-agent run
+        // that intends to write (Edit), so the gate (when flagged on) pauses
+        // before any action runs.
+        None if prompt.contains("governance early abort") => (
+            DecisionStatus::Continue,
+            Some("fixer".to_string()),
+            vec![Capability::Read, Capability::Edit, Capability::Verify],
+            "Apply the requested scoped edit directly on the first turn.".to_string(),
+            "Fixer reports the scoped edit result.".to_string(),
+            None,
+        ),
         None => (
             DecisionStatus::Continue,
             Some("explorer".to_string()),
