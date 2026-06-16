@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Keybindings foundation module
 type: backend
 complexity: medium
@@ -41,12 +41,12 @@ other task in this feature builds on it.
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Create `src/keybindings.rs` and declare the module in `src/lib.rs`.
-- [ ] 1.2 Implement `KeyChord`, `parse_key`, and `format_key` (case-insensitive parse, canonical lowercase output).
-- [ ] 1.3 Implement `is_portable` and reject keys outside the allowlist.
-- [ ] 1.4 Define `KeyAction` (10), the `DEFAULTS` table, and `KeybindingOverrides`.
-- [ ] 1.5 Implement `Keymap::resolve`/`action_for`/`entries` and `validate_overrides`.
-- [ ] 1.6 Add unit tests covering parse/format, allowlist, resolve, and each validation failure class.
+- [x] 1.1 Create `src/keybindings.rs` and declare the module in `src/lib.rs`.
+- [x] 1.2 Implement `KeyChord`, `parse_key`, and `format_key` (case-insensitive parse, canonical lowercase output).
+- [x] 1.3 Implement `is_portable` and reject keys outside the allowlist.
+- [x] 1.4 Define `KeyAction` (10), the `DEFAULTS` table, and `KeybindingOverrides`.
+- [x] 1.5 Implement `Keymap::resolve`/`action_for`/`entries` and `validate_overrides`.
+- [x] 1.6 Add unit tests covering parse/format, allowlist, resolve, and each validation failure class.
 
 ## Implementation Details
 New module file `src/keybindings.rs`, declared in `src/lib.rs` next to `pub mod config;`. The
@@ -77,14 +77,14 @@ module free of `tui`/`config` imports.
 
 ## Tests
 - Unit tests:
-  - [ ] `parse_key("ctrl+k")` yields `Char('k')`+CONTROL; `parse_key("CTRL+K")` equals it (case-insensitive); `parse_key("pageup")` yields `PageUp`.
-  - [ ] `format_key` round-trips each allowlisted chord to its canonical lowercase form (`ctrl+k`, `pageup`, `home`, `f5`).
-  - [ ] `parse_key("ctrl+")` and `parse_key("squiggle")` return an error.
-  - [ ] `is_portable`: `ctrl+a` true; `ctrl+c`, `ctrl+i`, `ctrl+m` false; `ctrl+1` false; `alt+a` false; `f5`/`pageup` true.
-  - [ ] `validate_overrides`: ToggleRoster→`ctrl+c` errors (reserved); →`ctrl+1` errors (non-portable); two actions →`ctrl+g` errors (duplicate); a valid map is Ok.
-  - [ ] `Keymap::resolve`: overriding ToggleRoster→`ctrl+g` removes the `ctrl+l` default; unbinding it removes the action; untouched actions keep defaults; `action_for` returns the expected action.
+  - [x] `parse_key("ctrl+k")` yields `Char('k')`+CONTROL; `parse_key("CTRL+K")` equals it (case-insensitive); `parse_key("pageup")` yields `PageUp`.
+  - [x] `format_key` round-trips each allowlisted chord to its canonical lowercase form (`ctrl+k`, `pageup`, `home`, `f5`).
+  - [x] `parse_key("ctrl+")` and `parse_key("squiggle")` return an error.
+  - [x] `is_portable`: `ctrl+a` true; `ctrl+c`, `ctrl+i`, `ctrl+m` false; `ctrl+1` false; `alt+a` false; `f5`/`pageup` true.
+  - [x] `validate_overrides`: ToggleRoster→`ctrl+c` errors (reserved); →`ctrl+1` errors (non-portable); two actions →`ctrl+g` errors (duplicate); a valid map is Ok.
+  - [x] `Keymap::resolve`: overriding ToggleRoster→`ctrl+g` removes the `ctrl+l` default; unbinding it removes the action; untouched actions keep defaults; `action_for` returns the expected action.
 - Integration tests:
-  - [ ] `Keymap::resolve(DEFAULTS, {ToggleRoster:Some(ctrl+g), ScrollTop:None})` produces a lookup with `ctrl+g`→ToggleRoster, no `ctrl+l`, and no `home`.
+  - [x] `Keymap::resolve(DEFAULTS, {ToggleRoster:Some(ctrl+g), ScrollTop:None})` produces a lookup with `ctrl+g`→ToggleRoster, no `ctrl+l`, and no `home`.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -93,3 +93,17 @@ module free of `tui`/`config` imports.
 - Test coverage >=80%
 - Module compiles with no `tui`/`config` dependency; `cargo clippy --all-targets` and `cargo fmt --check` clean.
 - `DEFAULTS` reproduces today's bindings plus the five editing actions, per the TechSpec table.
+
+## Implementation Notes
+- `parse_key` and `validate_overrides` return `anyhow::Result<…>` with precise
+  `action`/`key` context messages, per the binding requirement (no new `thiserror`
+  dependency). The TechSpec's `KeyParseError`/`KeybindingError` names were
+  illustrative sketches; the `anyhow` requirement takes precedence. Downstream
+  consumers (task_06/task_07) should treat the public surface as `anyhow`-based.
+- Added `pub fn action_name(KeyAction) -> &'static str` (exhaustive match) for
+  diagnostics/Keys-tab use, and an extra regression test asserting a rebind that
+  collides with an *untouched* default is rejected (the "merged defaults+overrides"
+  duplicate rule).
+- Verified `2026-06-16`: `cargo test --lib keybindings` (13 passed),
+  `cargo test --test keybindings` (2 passed), `cargo clippy --all-targets` clean,
+  `cargo fmt --check` clean on touched files.

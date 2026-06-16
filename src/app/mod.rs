@@ -5,11 +5,16 @@ use self::chat::{ChatItemView, ChatProjection};
 use self::git::{fetch_git_context, GitContext};
 use crate::actions::{
     execute_action_request, is_vcs_mutation, vcs_action_explicitly_requested, ActionDecision,
-    ActionExecutionContext, ActionKind, ActionRequest, ActionResult, ActionStatus,
+    ActionExecutionContext, ActionKind, ActionRequest, ActionResult, ActionStatus, GateOutcome,
+    RiskNote, RiskTier, TrustTarget,
 };
 use crate::config::{
-    AgentProfile, AgentPromptMetadata, ApprovalMode, Capability, CouncilExecutionMode,
-    CouncilMemberProfile, EffectiveConfig, Limit,
+    AgentProfile, AgentPromptMetadata, Capability, CouncilExecutionMode, CouncilMemberProfile,
+    EffectiveConfig, Limit,
+};
+use crate::governance::{
+    GovernanceAnswer, GovernanceDecisionView, GovernanceKind, GOVERNANCE_DECISION_REQUESTED,
+    GOVERNANCE_DECISION_RESOLVED,
 };
 use crate::history::{HistoryEvent, HistoryStore};
 use crate::ids::new_id;
@@ -33,10 +38,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::env;
 use std::future::{pending, Future};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -122,6 +128,7 @@ pub struct AppState {
     #[serde(default)]
     pub show_first_approval_explainer: bool,
     pub pending_clarification: Option<PendingClarificationView>,
+    pub pending_governance_decision: Option<PendingGovernanceDecisionView>,
     pub agents: Vec<AgentView>,
     /// Live-activity-first roster view-model, rebuilt on every publish (ADR-003).
     /// Empty until the roster builder (task 03) populates it.
@@ -196,7 +203,7 @@ pub struct ConfigStatusView {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PendingApprovalView {
     pub run_id: String,
     pub group_id: Option<String>,
@@ -205,6 +212,29 @@ pub struct PendingApprovalView {
     pub agent: String,
     pub summary: String,
     pub diagnostic: Option<String>,
+    /// Risk fields for the rich modal (ADR-003), populated from the action's
+    /// `RiskNote` at approval-creation time. `#[serde(default)]` keeps older
+    /// snapshots/records deserializing.
+    #[serde(default)]
+    pub tier: Option<RiskTier>,
+    #[serde(default)]
+    pub catastrophic: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub resolved_command: Option<String>,
+    #[serde(default)]
+    pub diff: Option<String>,
+    #[serde(default)]
+    pub affected_paths: Vec<String>,
+    #[serde(default)]
+    pub boundary_crossed: Option<String>,
+    #[serde(default)]
+    pub reversible: Option<bool>,
+    /// The exact target the "approve-and-trust" option would grant; `None` hides
+    /// that option (e.g. for catastrophic actions).
+    #[serde(default)]
+    pub trust_target: Option<TrustTarget>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -220,6 +250,16 @@ pub struct PendingClarificationView {
     pub multi_select: bool,
 }
 
+/// The user-facing snapshot of a pending governance decision, mirroring
+/// `PendingClarificationView`. The full decision payload lives in `view`; the
+/// `decision_id` is what the resolver matches an answer against (ADR-003).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingGovernanceDecisionView {
+    pub run_id: String,
+    pub decision_id: String,
+    pub view: GovernanceDecisionView,
+}
+
 #[derive(Clone, Debug)]
 pub struct InterruptHandle {
     sender: watch::Sender<u64>,
@@ -232,17 +272,41 @@ impl InterruptHandle {
     }
 }
 
+/// The user's answer at the approval modal (ADR-004). Replaces the former bare
+/// `bool`: "approve" and "approve-and-trust" must never share a keystroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalResolution {
+    Deny,
+    ApproveOnce,
+    ApproveAndTrust,
+}
+
+impl ApprovalResolution {
+    /// Whether the action should run (either approve variant).
+    pub fn approves(self) -> bool {
+        matches!(
+            self,
+            ApprovalResolution::ApproveOnce | ApprovalResolution::ApproveAndTrust
+        )
+    }
+
+    /// Whether the action's target should be added to the session trust list.
+    pub fn grants_trust(self) -> bool {
+        matches!(self, ApprovalResolution::ApproveAndTrust)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ApprovalHandle {
     sender: watch::Sender<ApprovalSignal>,
 }
 
 impl ApprovalHandle {
-    pub fn answer(&self, approved: bool) {
+    pub fn resolve(&self, resolution: ApprovalResolution) {
         let current = *self.sender.borrow();
         let _ = self.sender.send(ApprovalSignal {
             sequence: current.sequence.wrapping_add(1),
-            approved,
+            resolution,
         });
     }
 }
@@ -288,8 +352,12 @@ impl PromptSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
     PromptSubmitted(String, PromptSource),
-    ApprovalAnswered(bool),
+    ApprovalAnswered(ApprovalResolution),
     ClarificationAnswered(ClarificationAnswer),
+    /// Resolve the pending governance decision `decision_id` with `answer`
+    /// (governance spine, ADR-003). The `decision_id` lets the resolver reject a
+    /// stale answer that does not match the pending decision.
+    GovernanceDecisionResolved(String, GovernanceAnswer),
     FollowUpCancelled(String),
     FollowUpResumeRequested(String),
     InputCharacter(char),
@@ -326,6 +394,7 @@ pub struct App {
     chat_projection: ChatProjection,
     pending_approval: Option<PendingApproval>,
     pending_clarification: Option<PendingClarification>,
+    pending_governance_decision: Option<PendingGovernanceDecision>,
     active_step: Option<ActiveStep>,
     active_steps: Vec<ActiveStep>,
     follow_up_queue: VecDeque<QueuedFollowUp>,
@@ -336,6 +405,64 @@ pub struct App {
     interrupt_receiver: watch::Receiver<u64>,
     approval_sender: watch::Sender<ApprovalSignal>,
     approval_receiver: watch::Receiver<ApprovalSignal>,
+    /// Session-scoped trust list (ADR-004): in-memory only, never persisted, and
+    /// gone when the process exits. A `Vec` preserves grant order so the `/trust`
+    /// listing and 1-based `revoke_index` line up.
+    trust_store: TrustStore,
+}
+
+/// In-memory, session-scoped allow-list of exact trust targets (ADR-004). Granted
+/// via `ApproveAndTrust` (task_05), managed by `/trust` (task_08), and snapshotted
+/// into each `ActionExecutionContext` so the enforcement matrix can auto-approve a
+/// repeat of an already-trusted target.
+#[derive(Clone, Debug, Default)]
+pub struct TrustStore {
+    entries: Vec<TrustTarget>,
+}
+
+impl TrustStore {
+    pub fn contains(&self, target: &TrustTarget) -> bool {
+        self.entries.iter().any(|entry| entry == target)
+    }
+
+    /// Insert a target if absent. Returns `true` when it was newly granted.
+    pub fn grant(&mut self, target: TrustTarget) -> bool {
+        if self.contains(&target) {
+            false
+        } else {
+            self.entries.push(target);
+            true
+        }
+    }
+
+    /// Remove the entry at a 1-based index from the most recent listing order.
+    /// Returns the removed target, or `None` for an out-of-range index (the store
+    /// is left unchanged).
+    pub fn revoke_index(&mut self, one_based: usize) -> Option<TrustTarget> {
+        if one_based == 0 || one_based > self.entries.len() {
+            return None;
+        }
+        Some(self.entries.remove(one_based - 1))
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// The trusted targets in grant order (the order `/trust` lists and
+    /// `revoke_index` addresses).
+    pub fn list(&self) -> &[TrustTarget] {
+        &self.entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// A cheap, shareable snapshot for one action's `ActionExecutionContext`.
+    pub fn snapshot(&self) -> Arc<HashSet<TrustTarget>> {
+        Arc::new(self.entries.iter().cloned().collect())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -365,6 +492,14 @@ struct PendingParallelApproval {
 
 #[derive(Clone, Debug)]
 struct PendingClarification {
+    run: RunDriveContext,
+}
+
+/// The captured run context behind a pending governance decision, mirroring
+/// `PendingClarification`. Held on `App` (not `AppState`) so the resume can ride
+/// the clarification transport (`RunDriveContext` capture + `drive_and_replay`).
+#[derive(Clone, Debug)]
+struct PendingGovernanceDecision {
     run: RunDriveContext,
 }
 
@@ -789,7 +924,7 @@ struct ParallelRuntimeResumeHandle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ApprovalSignal {
     sequence: u64,
-    approved: bool,
+    resolution: ApprovalResolution,
 }
 
 #[derive(Clone, Debug)]
@@ -842,7 +977,7 @@ impl App {
         let (interrupt_sender, interrupt_receiver) = watch::channel(0);
         let (approval_sender, approval_receiver) = watch::channel(ApprovalSignal {
             sequence: 0,
-            approved: false,
+            resolution: ApprovalResolution::Deny,
         });
         let state = AppState {
             session_id: history.session_id().to_string(),
@@ -855,6 +990,7 @@ impl App {
             pending_approval: None,
             show_first_approval_explainer: false,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: build_agent_views(&config, &availability),
             roster_rows: Vec::new(),
             // Branded welcome item present from the first frame (ADR-005);
@@ -874,6 +1010,7 @@ impl App {
             chat_projection: ChatProjection::new(),
             pending_approval: None,
             pending_clarification: None,
+            pending_governance_decision: None,
             active_step: None,
             active_steps: Vec::new(),
             follow_up_queue: VecDeque::new(),
@@ -884,6 +1021,7 @@ impl App {
             interrupt_receiver,
             approval_sender,
             approval_receiver,
+            trust_store: TrustStore::default(),
         };
         app.record_event(
             None,
@@ -941,16 +1079,22 @@ impl App {
                 self.publish_state();
                 self.submit_prompt_with_source(prompt, source).await
             }
-            AppEvent::ApprovalAnswered(approved) => {
+            AppEvent::ApprovalAnswered(resolution) => {
                 self.state.input.clear();
                 self.publish_state();
-                self.resolve_pending_approval(approved).await?;
+                self.resolve_pending_approval(resolution).await?;
                 Ok(())
             }
             AppEvent::ClarificationAnswered(answer) => {
                 self.state.input.clear();
                 self.publish_state();
                 self.resolve_pending_clarification(answer).await
+            }
+            AppEvent::GovernanceDecisionResolved(decision_id, answer) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resolve_pending_governance_decision(&decision_id, answer)
+                    .await
             }
             AppEvent::FollowUpCancelled(id) => {
                 self.state.input.clear();
@@ -1028,6 +1172,9 @@ impl App {
             return Ok(());
         }
         if self.handle_config_command(&prompt)? {
+            return Ok(());
+        }
+        if self.handle_trust_command(&prompt)? {
             return Ok(());
         }
         if self.handle_subtask_command(&prompt).await? {
@@ -1212,6 +1359,103 @@ impl App {
         Ok(true)
     }
 
+    /// `/trust` session-trust management (ADR-004): list entries, revoke one by
+    /// 1-based index from the last listing, or clear all. Malformed input reports
+    /// a usage error and never mutates the store. Follows the
+    /// `handle_config_command`/`handle_goal_command` pattern.
+    fn handle_trust_command(&mut self, prompt: &str) -> Result<bool> {
+        let trimmed = prompt.trim();
+        if trimmed != "/trust" && !trimmed.starts_with("/trust ") {
+            if trimmed.starts_with("/trust") {
+                bail!("usage: /trust | /trust revoke <n> | /trust clear");
+            }
+            return Ok(false);
+        }
+
+        let args = trimmed.strip_prefix("/trust").unwrap_or("").trim();
+        if args.is_empty() {
+            return self.trust_list();
+        }
+        let mut parts = args.split_whitespace();
+        match parts.next() {
+            Some("revoke") => {
+                let token = parts.next();
+                if parts.next().is_some() {
+                    bail!("usage: /trust revoke <n>");
+                }
+                let Some(token) = token else {
+                    bail!("usage: /trust revoke <n>");
+                };
+                let Ok(index) = token.parse::<usize>() else {
+                    bail!("usage: /trust revoke <n> (n must be a positive number)");
+                };
+                self.trust_revoke(index)
+            }
+            Some("clear") => {
+                if parts.next().is_some() {
+                    bail!("usage: /trust clear");
+                }
+                self.trust_clear()
+            }
+            _ => bail!("usage: /trust | /trust revoke <n> | /trust clear"),
+        }
+    }
+
+    fn trust_list(&mut self) -> Result<bool> {
+        let entries = self.trust_store.list();
+        let display = if entries.is_empty() {
+            "No trusted actions this session.".to_string()
+        } else {
+            let mut lines = vec![format!(
+                "{} trusted action(s), this session only:",
+                entries.len()
+            )];
+            for (index, target) in entries.iter().enumerate() {
+                lines.push(format!("  {}. {}", index + 1, trust_target_label(target)));
+            }
+            lines.join("\n")
+        };
+        let payload = json!({
+            "count": entries.len(),
+            "entries": entries.iter().map(trust_target_payload).collect::<Vec<_>>(),
+            "message": display.clone(),
+        });
+        self.record_event(None, None, "trust_listed", payload, display)?;
+        Ok(true)
+    }
+
+    fn trust_revoke(&mut self, one_based: usize) -> Result<bool> {
+        let Some(target) = self.trust_store.revoke_index(one_based) else {
+            bail!(
+                "no trusted entry at index {one_based}; run /trust to see the current numbered list"
+            );
+        };
+        self.record_event(
+            None,
+            None,
+            "trust_revoked",
+            json!({ "target": trust_target_payload(&target) }),
+            format!("Trust revoked: {}", trust_target_label(&target)),
+        )?;
+        Ok(true)
+    }
+
+    fn trust_clear(&mut self) -> Result<bool> {
+        let count = self.trust_store.list().len();
+        self.trust_store.clear();
+        self.record_event(
+            None,
+            None,
+            "trust_cleared",
+            json!({ "count": count }),
+            format!(
+                "Cleared {count} trusted entr{}",
+                if count == 1 { "y" } else { "ies" }
+            ),
+        )?;
+        Ok(true)
+    }
+
     async fn handle_provider_status_command(&mut self, prompt: &str) -> Result<bool> {
         let trimmed = prompt.trim();
         if trimmed != "/provider:status" {
@@ -1299,6 +1543,7 @@ impl App {
             && self.state.active_run_id.is_none()
             && self.pending_approval.is_none()
             && self.pending_clarification.is_none()
+            && self.pending_governance_decision.is_none()
     }
 
     /// React to the Run that just ended: drain queued follow-ups FIFO after a
@@ -1402,6 +1647,8 @@ impl App {
                     "run is waiting for action approval"
                 } else if self.pending_clarification.is_some() {
                     "run is waiting for clarification"
+                } else if self.pending_governance_decision.is_some() {
+                    "run is waiting for a governance decision"
                 } else {
                     "run is waiting for user"
                 }
@@ -1586,12 +1833,13 @@ impl App {
 
     pub async fn resolve_pending_approval(
         &mut self,
-        approved: bool,
+        resolution: ApprovalResolution,
     ) -> Result<Option<ActionResult>> {
         let Some(mut pending) = self.pending_approval.take() else {
             return Ok(None);
         };
         self.state.pending_approval = None;
+        let approved = resolution.approves();
         // Keep the explainer flag in sync with approval presence (none pending → false).
         self.state.show_first_approval_explainer = false;
         self.record_event(
@@ -1600,7 +1848,8 @@ impl App {
             "approval_resolved",
             json!({
                 "action_id": pending.action_request.action_id.clone(),
-                "approved": approved
+                "approved": approved,
+                "resolution": approval_resolution_label(resolution),
             }),
             if approved {
                 "Action approval granted."
@@ -1608,6 +1857,25 @@ impl App {
                 "Action approval denied."
             },
         )?;
+
+        // Approve-and-trust grants the exact target into the session trust list,
+        // but only for non-catastrophic actions (catastrophic exposes no target,
+        // ADR-004). Recorded as `trust_granted` so trust stays auditable.
+        if resolution.grants_trust() {
+            if let Some(target) =
+                crate::actions::assess_risk(&pending.action_request, &pending.context).target
+            {
+                if self.trust_store.grant(target.clone()) {
+                    self.record_event(
+                        Some(pending.run_id.clone()),
+                        Some(pending.step_id.clone()),
+                        "trust_granted",
+                        json!({ "target": trust_target_payload(&target) }),
+                        format!("Trusted for this session: {}", trust_target_label(&target)),
+                    )?;
+                }
+            }
+        }
 
         if self.wall_clock_limit_reached(&pending.run) {
             self.stop_for_wall_clock_limit(&pending.run)?;
@@ -1625,7 +1893,10 @@ impl App {
         }
 
         let result = if approved {
-            pending.context.approval_mode = ApprovalMode::Yolo;
+            // The user approved this exact action; mark the context pre-approved so
+            // the re-run runs it even when catastrophic or floor=Enforce (which
+            // would otherwise re-prompt).
+            pending.context.pre_approved = true;
             self.record_command_started_if_executable(
                 &pending.run.run_id,
                 &pending.step_id,
@@ -1735,6 +2006,109 @@ impl App {
         Ok(())
     }
 
+    /// Resolve the pending governance decision, mirroring
+    /// `resolve_pending_clarification` over the same pause/resume transport.
+    ///
+    /// `decision_id` is the id the user is answering; it must match the pending
+    /// decision (the shared `GovernanceAnswer` carries no id, so the caller
+    /// threads it through — ADR-003). `Accept` resumes the captured run via
+    /// `drive_and_replay`; `Reject { redirect: Some }` appends the redirect to
+    /// the prompt and re-drives; `Reject { redirect: None }` aborts the run.
+    pub async fn resolve_pending_governance_decision(
+        &mut self,
+        decision_id: &str,
+        answer: GovernanceAnswer,
+    ) -> Result<()> {
+        let Some(view) = self.state.pending_governance_decision.as_ref() else {
+            bail!("no governance decision is pending");
+        };
+
+        if view.decision_id != decision_id {
+            return Err(anyhow!(
+                "decision id does not match pending governance decision (expected: {}, got: {})",
+                view.decision_id,
+                decision_id
+            ));
+        }
+
+        let Some(pending) = self.pending_governance_decision.take() else {
+            bail!("no governance decision is pending");
+        };
+        let run_id = pending.run.run_id.clone();
+
+        match answer {
+            GovernanceAnswer::Accept => {
+                self.record_event(
+                    Some(run_id.clone()),
+                    None,
+                    GOVERNANCE_DECISION_RESOLVED,
+                    json!({ "decision_id": decision_id, "outcome": "accept" }),
+                    "Governance decision accepted; run continues.",
+                )?;
+
+                self.state.pending_governance_decision = None;
+                self.state.run_state = RunState::Planning;
+                self.publish_state();
+
+                self.drive_and_replay(pending.run, None).await?;
+            }
+            GovernanceAnswer::Reject {
+                redirect: Some(redirect),
+            } => {
+                self.record_event(
+                    Some(run_id.clone()),
+                    None,
+                    GOVERNANCE_DECISION_RESOLVED,
+                    json!({
+                        "decision_id": decision_id,
+                        "outcome": "reject",
+                        "redirect": redirect.clone(),
+                    }),
+                    user_event_display(&redirect),
+                )?;
+
+                let mut run = pending.run;
+                let redirect = redirect.trim();
+                if !redirect.is_empty() {
+                    run.prompt = format!("{}\n\nUser redirect: {}", run.prompt, redirect);
+                }
+
+                self.state.pending_governance_decision = None;
+                self.state.run_state = RunState::Planning;
+                self.publish_state();
+
+                self.drive_and_replay(run, None).await?;
+            }
+            GovernanceAnswer::Reject { redirect: None } => {
+                self.record_event(
+                    Some(run_id.clone()),
+                    None,
+                    GOVERNANCE_DECISION_RESOLVED,
+                    json!({ "decision_id": decision_id, "outcome": "reject" }),
+                    "Governance decision rejected; run aborted.",
+                )?;
+                self.record_event(
+                    Some(run_id.clone()),
+                    None,
+                    "run_interrupted",
+                    json!({ "reason": "governance_decision_rejected" }),
+                    "Run aborted before any action.",
+                )?;
+                self.write_run_record(&pending.run)?;
+
+                self.state.pending_governance_decision = None;
+                self.state.active_run_id = None;
+                self.state.live_step = None;
+                self.state.live_steps.clear();
+                self.state.run_state = RunState::Interrupted;
+                self.sync_chat_items();
+                self.publish_state();
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn interrupt(&mut self) -> Result<()> {
         if self.state.active_run_id.is_some() {
             self.state.run_state = RunState::Interrupted;
@@ -1745,6 +2119,11 @@ impl App {
                 .map(|pending| pending.run.clone())
                 .or_else(|| {
                     self.pending_clarification
+                        .as_ref()
+                        .map(|pending| pending.run.clone())
+                })
+                .or_else(|| {
+                    self.pending_governance_decision
                         .as_ref()
                         .map(|pending| pending.run.clone())
                 });
@@ -1766,8 +2145,10 @@ impl App {
             // Keep the explainer flag in sync with approval presence (none pending → false).
             self.state.show_first_approval_explainer = false;
             self.state.pending_clarification = None;
+            self.state.pending_governance_decision = None;
             self.pending_approval = None;
             self.pending_clarification = None;
+            self.pending_governance_decision = None;
             self.active_step = None;
             self.active_steps.clear();
             self.sync_chat_items();
@@ -1858,6 +2239,16 @@ impl App {
         loop {
             match self.run_orchestrator_step(run, None).await? {
                 OrchestratorStepOutcome::Decision(decision) => {
+                    // Governance early-abort (ADR-004): on the first orchestrator
+                    // turn of a non-trivial single-agent write run, pause for an
+                    // intent check before `handle_orchestrator_decision` runs any
+                    // agent/action. Gated entirely behind the feature flag.
+                    if self.config.features.governance_early_abort
+                        && early_abort_triggers(run, decision.as_ref())
+                    {
+                        self.pause_for_early_abort(run, decision.as_ref())?;
+                        break;
+                    }
                     if !self.handle_orchestrator_decision(run, *decision).await? {
                         break;
                     }
@@ -1868,6 +2259,64 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Build the governance decision view and pause the run into
+    /// `pending_governance_decision`, recording the `governance_decision_requested`
+    /// event. Mirrors the clarification pause; no agent or action has run yet, so
+    /// nothing is written before the user resolves the decision.
+    fn pause_for_early_abort(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+    ) -> Result<()> {
+        let agent = match decision.normalized_next_step() {
+            Ok(Some(DecisionNextStep::SingleAgent(plan))) => Some(plan.agent),
+            _ => None,
+        };
+        let decision_id = new_id();
+        let view = GovernanceDecisionView {
+            run_id: run.run_id.clone(),
+            decision_id: decision_id.clone(),
+            kind: GovernanceKind::EarlyAbort,
+            title: "Confirm intent before this run edits files".to_string(),
+            intent: decision.reason.clone(),
+            approach: decision.plan.clone(),
+            agent,
+            write_scope: self.governance_write_scope(),
+            risk_label: early_abort_risk_label(decision),
+            plan: None,
+        };
+
+        self.state.run_state = RunState::WaitingForUser;
+        self.pending_governance_decision = Some(PendingGovernanceDecision { run: run.clone() });
+        self.state.pending_governance_decision = Some(PendingGovernanceDecisionView {
+            run_id: run.run_id.clone(),
+            decision_id: decision_id.clone(),
+            view: view.clone(),
+        });
+        self.set_agent_status("orchestrator", "waiting_for_user");
+        // `record_event` applies the event to the chat projection and publishes
+        // the (already-set) paused state, so the decision card renders.
+        self.record_event(
+            Some(run.run_id.clone()),
+            None,
+            GOVERNANCE_DECISION_REQUESTED,
+            serde_json::to_value(&view)?,
+            "Confirm intent before this run edits files.",
+        )?;
+        Ok(())
+    }
+
+    /// The workspace write-roots this run may touch, rendered for display: the
+    /// working directory plus any configured extra write roots (ADR-004 — no new
+    /// per-step `file_scope`).
+    fn governance_write_scope(&self) -> Vec<String> {
+        let mut roots = vec![self.config.working_directory.display().to_string()];
+        for root in &self.config.workspace.extra_write_roots {
+            roots.push(root.display().to_string());
+        }
+        roots
     }
 
     async fn handle_orchestrator_decision(
@@ -2167,7 +2616,7 @@ impl App {
                                     run,
                                     child,
                                     pending,
-                                    approval.approved,
+                                    approval.resolution,
                                     resume_handle.clone(),
                                 )
                                 .await?;
@@ -2481,6 +2930,9 @@ impl App {
             command_timeout: command_timeout(&self.config.limits.max_command_minutes),
             user_prompt: Some(run.prompt.clone()),
             action_scope: crate::actions::ActionScope::ParallelFileScope(child.file_scope.clone()),
+            floor: self.config.approval.floor,
+            trusted_targets: self.trust_store.snapshot(),
+            pre_approved: false,
         };
         self.record_command_started_if_executable_with_group(
             &run.run_id,
@@ -2576,9 +3028,10 @@ impl App {
         run: &RunDriveContext,
         child: &mut ParallelChildRuntimeState,
         mut pending: PendingParallelApproval,
-        approved: bool,
+        resolution: ApprovalResolution,
         resume_handle: ParallelRuntimeResumeHandle,
     ) -> Result<()> {
+        let approved = resolution.approves();
         self.record_event_with_group(
             Some(pending.run_id.clone()),
             Some(pending.group_id.clone()),
@@ -2586,7 +3039,8 @@ impl App {
             "approval_resolved",
             json!({
                 "action_id": pending.action_request.action_id.clone(),
-                "approved": approved
+                "approved": approved,
+                "resolution": approval_resolution_label(resolution),
             }),
             if approved {
                 "Action approval granted."
@@ -2594,6 +3048,24 @@ impl App {
                 "Action approval denied."
             },
         )?;
+
+        // Approve-and-trust grants the non-catastrophic target (ADR-004).
+        if resolution.grants_trust() {
+            if let Some(target) =
+                crate::actions::assess_risk(&pending.action_request, &pending.context).target
+            {
+                if self.trust_store.grant(target.clone()) {
+                    self.record_event_with_group(
+                        Some(pending.run_id.clone()),
+                        Some(pending.group_id.clone()),
+                        Some(pending.step_id.clone()),
+                        "trust_granted",
+                        json!({ "target": trust_target_payload(&target) }),
+                        format!("Trusted for this session: {}", trust_target_label(&target)),
+                    )?;
+                }
+            }
+        }
 
         if self.wall_clock_limit_reached(run) {
             self.stop_for_wall_clock_limit(run)?;
@@ -2617,7 +3089,9 @@ impl App {
         }
 
         let result = if approved {
-            pending.context.approval_mode = ApprovalMode::Yolo;
+            // Pre-approve the re-run so catastrophic / floor=Enforce actions execute
+            // instead of re-prompting (mirrors the serial path).
+            pending.context.pre_approved = true;
             self.record_command_started_if_executable_with_group(
                 &pending.run_id,
                 Some(&pending.group_id),
@@ -2711,14 +3185,17 @@ impl App {
             .pending_approval
             .as_ref()
             .map(|pending| pending.step_id.clone());
-        self.state.pending_approval = queue.front().map(|pending| PendingApprovalView {
-            run_id: pending.run_id.clone(),
-            group_id: Some(pending.group_id.clone()),
-            step_id: pending.step_id.clone(),
-            action_id: pending.action_request.action_id.clone(),
-            agent: pending.agent_profile.id.clone(),
-            summary: action_requested_display(&pending.action_request).to_string(),
-            diagnostic: pending.reason.clone(),
+        self.state.pending_approval = queue.front().map(|pending| {
+            build_pending_approval_view(
+                pending.run_id.clone(),
+                Some(pending.group_id.clone()),
+                pending.step_id.clone(),
+                pending.agent_profile.id.clone(),
+                action_requested_display(&pending.action_request).to_string(),
+                pending.reason.clone(),
+                &pending.action_request,
+                &pending.context,
+            )
         });
         // First-approval explainer (ADR-004), mirroring the serial path: consult the
         // persisted latch only when the *surfaced* approval changes (a new head, not a
@@ -3992,6 +4469,9 @@ impl App {
                         command_timeout: command_timeout(&self.config.limits.max_command_minutes),
                         user_prompt: Some(run.prompt.clone()),
                         action_scope: crate::actions::ActionScope::Unrestricted,
+                        floor: self.config.approval.floor,
+                        trusted_targets: self.trust_store.snapshot(),
+                        pre_approved: false,
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -4019,15 +4499,16 @@ impl App {
                     if matches!(result.status, ActionStatus::ApprovalRequired) {
                         self.set_live_step_status(&step_id, LiveStepStatus::WaitingForApproval);
                         self.set_agent_status(&request.agent_profile.id, "waiting_approval");
-                        let view = PendingApprovalView {
-                            run_id: run_id.to_string(),
-                            group_id: None,
-                            step_id: step_id.clone(),
-                            action_id: action_request.action_id.clone(),
-                            agent: request.agent_profile.id.clone(),
-                            summary: result.summary.clone(),
-                            diagnostic: result.diagnostic.clone(),
-                        };
+                        let view = build_pending_approval_view(
+                            run_id.to_string(),
+                            None,
+                            step_id.clone(),
+                            request.agent_profile.id.clone(),
+                            result.summary.clone(),
+                            result.diagnostic.clone(),
+                            &action_request,
+                            &context,
+                        );
                         self.pending_approval = Some(PendingApproval {
                             run_id: run_id.to_string(),
                             step_id: step_id.clone(),
@@ -4739,6 +5220,7 @@ impl App {
         request: &ActionRequest,
         result: &ActionResult,
     ) -> Result<()> {
+        self.record_gate_outcome_event_with_group(run_id, group_id, step_id, request, result)?;
         match request.kind {
             ActionKind::RunCommand => {
                 self.record_command_completed_with_group(run_id, group_id, step_id, request, result)
@@ -4747,6 +5229,55 @@ impl App {
                 self.record_file_edit_applied_with_group(run_id, group_id, step_id, request, result)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Audit the floor/trust gate outcome stamped by the enforcement point
+    /// (ADR-002/003): a trust auto-approval emits `approval_auto_resolved`; a
+    /// gray-area warn-and-run under Yolo+Warn emits `floor_warned`.
+    fn record_gate_outcome_event_with_group(
+        &mut self,
+        run_id: &str,
+        group_id: Option<&str>,
+        step_id: &str,
+        request: &ActionRequest,
+        result: &ActionResult,
+    ) -> Result<()> {
+        match result.gate_outcome {
+            GateOutcome::AutoApprovedByTrust => {
+                let target = result.risk.as_ref().and_then(|risk| risk.target.as_ref());
+                self.record_event_with_group(
+                    Some(run_id.to_string()),
+                    group_id.map(str::to_string),
+                    Some(step_id.to_string()),
+                    "approval_auto_resolved",
+                    json!({
+                        "action_id": request.action_id.clone(),
+                        "target": target.map(trust_target_payload),
+                    }),
+                    "Auto-approved by session trust.",
+                )
+            }
+            GateOutcome::WarnedAllowed => {
+                let (tier, reason) = result
+                    .risk
+                    .as_ref()
+                    .map(|risk| (risk_tier_label(risk.tier), risk.reason.clone()))
+                    .unwrap_or(("medium", "gray-area action".to_string()));
+                self.record_event_with_group(
+                    Some(run_id.to_string()),
+                    group_id.map(str::to_string),
+                    Some(step_id.to_string()),
+                    "floor_warned",
+                    json!({
+                        "action_id": request.action_id.clone(),
+                        "tier": tier,
+                        "reason": reason,
+                    }),
+                    format!("Floor warning ({tier}): {reason}"),
+                )
+            }
+            GateOutcome::Normal | GateOutcome::ApprovalRequired => Ok(()),
         }
     }
 
@@ -5449,20 +5980,23 @@ fn build_config_status(
 }
 
 fn config_warning_messages(config: &EffectiveConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
     let agents_without_fallbacks = config
         .agents
         .values()
         .filter(|agent| agent.enabled && agent.model_fallbacks.is_empty())
         .map(|agent| agent.id.clone())
         .collect::<Vec<_>>();
-    if agents_without_fallbacks.is_empty() {
-        Vec::new()
-    } else {
-        vec![format!(
+    if !agents_without_fallbacks.is_empty() {
+        warnings.push(format!(
             "enabled agents without model_fallbacks: {}",
             agents_without_fallbacks.join(", ")
-        )]
+        ));
     }
+    // Keybinding trust-boundary + soft-fail notes (ADR-004): surfaced at startup
+    // and via /config alongside the model-fallback warning.
+    warnings.extend(config.keybinding_warnings.iter().cloned());
+    warnings
 }
 
 fn runtime_warning_messages(availability: &BTreeMap<String, RuntimeAvailability>) -> Vec<String> {
@@ -5491,6 +6025,58 @@ fn agent_roster_rank(agent_id: &str) -> u8 {
 
 fn limit_reached(limit: &Limit, count: u32) -> bool {
     limit.is_reached_by(count)
+}
+
+/// True when the governance early-abort should pause this decision (ADR-004),
+/// independent of the feature flag (the caller checks the flag). It fires only on
+/// the **first orchestrator turn** of a non-trivial single-agent write run:
+///
+/// - `status == Continue`,
+/// - first orchestrator turn — `step_count == 1` (the orchestrator step bumps the
+///   count to 1 before returning its decision) with no agent results yet,
+/// - not a subtask,
+/// - the next step is a `SingleAgent`,
+/// - and the decision's `required_capabilities` carry a write-class tool.
+///
+/// Because `step_count` keeps climbing on each orchestrator turn, this is false
+/// on the Accept / reject-redirect re-drive, so the gate never re-fires.
+fn early_abort_triggers(
+    run: &RunDriveContext,
+    decision: &crate::orchestrator::OrchestratorDecision,
+) -> bool {
+    decision.status == DecisionStatus::Continue
+        && run.step_count == 1
+        && run.previous_results.is_empty()
+        && run.subtask.is_none()
+        && matches!(
+            decision.normalized_next_step(),
+            Ok(Some(DecisionNextStep::SingleAgent(_)))
+        )
+        && decision_requires_write(decision)
+}
+
+/// The complexity signal: the decision intends to write if its required
+/// capabilities include a write-class tool. No `is_write()` helper exists on
+/// `Capability`, so match `Edit`/`Command` directly.
+fn decision_requires_write(decision: &crate::orchestrator::OrchestratorDecision) -> bool {
+    decision
+        .required_capabilities
+        .iter()
+        .any(|capability| matches!(capability, Capability::Edit | Capability::Command))
+}
+
+/// Plain-language risk label (words, never color) describing what the run may do.
+fn early_abort_risk_label(decision: &crate::orchestrator::OrchestratorDecision) -> String {
+    let edits = decision.required_capabilities.contains(&Capability::Edit);
+    let commands = decision
+        .required_capabilities
+        .contains(&Capability::Command);
+    match (edits, commands) {
+        (true, true) => "This run may edit files and run commands in your workspace".to_string(),
+        (true, false) => "This run intends to edit files in your workspace".to_string(),
+        (false, true) => "This run may run commands in your workspace".to_string(),
+        (false, false) => "This run may modify your workspace".to_string(),
+    }
 }
 
 fn command_timeout(limit: &Limit) -> Option<Duration> {
@@ -5703,15 +6289,13 @@ fn action_executable_without_approval(
     context: &ActionExecutionContext,
     request: &ActionRequest,
 ) -> bool {
+    // The allowed-ish decisions all run without a pending approval (ADR-003):
+    // plain `Allowed`, trust auto-approval, and gray-area warn-and-run.
     if !matches!(
-        crate::actions::validate_action_request_with_scope(
-            agent_profile,
-            &context.workspace,
-            &context.approval_mode,
-            &context.action_scope,
-            request
-        ),
+        crate::actions::validate_action_request_with_scope(agent_profile, context, request),
         ActionDecision::Allowed
+            | ActionDecision::AllowedByTrust(_)
+            | ActionDecision::AllowedWithWarning(_)
     ) {
         return false;
     }
@@ -5789,6 +6373,103 @@ async fn wait_for_approval(
         if receiver.changed().await.is_err() {
             pending::<()>().await;
         }
+    }
+}
+
+/// Wire label for the `tier` field on risk-bearing events / views.
+pub(crate) fn risk_tier_label(tier: RiskTier) -> &'static str {
+    match tier {
+        RiskTier::Low => "low",
+        RiskTier::Medium => "medium",
+        RiskTier::High => "high",
+    }
+}
+
+/// Wire label for the `approval_resolved.resolution` field.
+fn approval_resolution_label(resolution: ApprovalResolution) -> &'static str {
+    match resolution {
+        ApprovalResolution::Deny => "deny",
+        ApprovalResolution::ApproveOnce => "approve_once",
+        ApprovalResolution::ApproveAndTrust => "approve_and_trust",
+    }
+}
+
+/// Human-readable description of a trust target for chat/event display.
+fn trust_target_label(target: &TrustTarget) -> String {
+    match target {
+        TrustTarget::Command(command) => format!("command `{command}`"),
+        TrustTarget::WritePath(path) => format!("writes to {}", path.display()),
+    }
+}
+
+/// Stable structured payload for trust targets in `trust_granted` /
+/// `approval_auto_resolved` events (projected in task_06).
+fn trust_target_payload(target: &TrustTarget) -> serde_json::Value {
+    match target {
+        TrustTarget::Command(command) => json!({ "kind": "command", "value": command }),
+        TrustTarget::WritePath(path) => {
+            json!({ "kind": "write_path", "value": path.display().to_string() })
+        }
+    }
+}
+
+/// Cap a preview string (command/diff) before it enters `AppState`, so a huge
+/// diff can't bloat the snapshot channel (TechSpec "Known Risks").
+fn capped_preview(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 4000;
+    if text.chars().count() <= MAX_PREVIEW_CHARS {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(MAX_PREVIEW_CHARS).collect();
+    format!("{truncated}\n… (truncated)")
+}
+
+/// Build the rich `PendingApprovalView` for the modal (ADR-003). Risk fields are
+/// derived from `assess_risk` (the same pure assessment the gate used), with the
+/// command/diff previews capped before they enter `AppState`.
+#[allow(clippy::too_many_arguments)]
+fn build_pending_approval_view(
+    run_id: String,
+    group_id: Option<String>,
+    step_id: String,
+    agent: String,
+    summary: String,
+    diagnostic: Option<String>,
+    request: &ActionRequest,
+    context: &ActionExecutionContext,
+) -> PendingApprovalView {
+    let risk: RiskNote = crate::actions::assess_risk(request, context);
+    let resolved_command = request
+        .params
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(|command| capped_preview(&crate::actions::normalize_command(command)));
+    let diff = request
+        .params
+        .get("diff")
+        .and_then(serde_json::Value::as_str)
+        .map(capped_preview);
+    let affected_paths = match &risk.target {
+        Some(TrustTarget::WritePath(path)) => vec![path.display().to_string()],
+        _ => Vec::new(),
+    };
+    PendingApprovalView {
+        run_id,
+        group_id,
+        step_id,
+        action_id: request.action_id.clone(),
+        agent,
+        summary,
+        diagnostic,
+        tier: Some(risk.tier),
+        catastrophic: risk.catastrophic,
+        reason: Some(risk.reason),
+        resolved_command,
+        diff,
+        affected_paths,
+        boundary_crossed: None,
+        reversible: None,
+        trust_target: risk.target,
     }
 }
 
@@ -6543,6 +7224,26 @@ runtime = "fake"
         .unwrap()
     }
 
+    #[test]
+    fn config_warning_messages_includes_keybinding_warnings() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        // No keybinding warnings ⇒ none surfaced for that source.
+        assert!(!config_warning_messages(&config)
+            .iter()
+            .any(|w| w.contains("[keybindings]")));
+
+        // A recorded keybinding warning is surfaced at startup / via /config.
+        config
+            .keybinding_warnings
+            .push("ignored [keybindings] in ./atelier.toml".to_string());
+        let warnings = config_warning_messages(&config);
+        assert!(
+            warnings.iter().any(|w| w.contains("ignored [keybindings]")),
+            "expected keybinding warning, got: {warnings:?}"
+        );
+    }
+
     fn write_project_skill(
         project_root: &Path,
         directory_name: &str,
@@ -6895,6 +7596,9 @@ runtime = "fake"
             command_timeout: None,
             user_prompt: Some("inspect README".to_string()),
             action_scope: crate::actions::ActionScope::Unrestricted,
+            floor: app.config.approval.floor,
+            trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
+            pre_approved: false,
         };
         let rendered_context = ActionExecutionContext {
             user_prompt: Some(request.prompt.clone()),
@@ -8281,7 +8985,7 @@ prompt = "{reviewer_prompt}"
 
         assert!(saw_pending_approval);
         assert!(saw_reviewer_complete_while_pending);
-        approval_handle.answer(false);
+        approval_handle.resolve(ApprovalResolution::Deny);
 
         let app = tokio::time::timeout(Duration::from_secs(2), run)
             .await
@@ -10010,7 +10714,10 @@ runtime = "fake"
 
         // Resolving the approval clears the flag so it never lingers true while no
         // approval is pending — the flag stays in sync with approval state (F1).
-        first.resolve_pending_approval(false).await.unwrap();
+        first
+            .resolve_pending_approval(ApprovalResolution::Deny)
+            .await
+            .unwrap();
         assert!(first.state.pending_approval.is_none());
         assert!(!first.state.show_first_approval_explainer);
 
@@ -10333,7 +11040,7 @@ runtime = "fake"
                 }
             }
         }
-        approval_handle.answer(false);
+        approval_handle.resolve(ApprovalResolution::Deny);
 
         let app = tokio::time::timeout(Duration::from_secs(2), run)
             .await
@@ -11356,6 +12063,8 @@ runtime = "fake"
             content: None,
             artifact: None,
             diagnostic: Some("failed to search src: permission denied".to_string()),
+            risk: None,
+            gate_outcome: crate::actions::GateOutcome::Normal,
         };
 
         assert_eq!(
@@ -11725,6 +12434,8 @@ runtime = "fake"
         assert!(app.state.pending_clarification.is_none());
         assert!(app.pending_clarification.is_none());
         assert_eq!(agent_status(&app, "fixer"), "waiting_approval");
+        // Diagnostic keeps the "requires action approval" phrasing and now appends
+        // the plain-language risk reason that drove the gate (ADR-003).
         assert!(pending
             .diagnostic
             .as_ref()
@@ -11743,6 +12454,439 @@ runtime = "fake"
         assert_eq!(approval_item.severity, ChatSeverity::Warning);
     }
 
+    // ---- Session TrustStore (task_04) ---------------------------------
+
+    #[test]
+    fn trust_store_grant_contains_and_dedupes() {
+        let mut store = TrustStore::default();
+        let target = TrustTarget::Command("echo trusted-run".to_string());
+        assert!(store.grant(target.clone()));
+        assert!(store.contains(&target));
+        // A second grant of the same target is a no-op.
+        assert!(!store.grant(target.clone()));
+        assert_eq!(store.list().len(), 1);
+        // A different target is not trusted.
+        assert!(!store.contains(&TrustTarget::Command("ls".to_string())));
+    }
+
+    #[test]
+    fn trust_store_revoke_index_is_one_based_and_order_preserving() {
+        let mut store = TrustStore::default();
+        let first = TrustTarget::Command("cargo build".to_string());
+        let second = TrustTarget::WritePath(PathBuf::from("/tmp/x.rs"));
+        store.grant(first.clone());
+        store.grant(second.clone());
+
+        // Out-of-range indices return None and leave the store unchanged.
+        assert_eq!(store.revoke_index(0), None);
+        assert_eq!(store.revoke_index(3), None);
+        assert_eq!(store.list().len(), 2);
+
+        // 1-based removal of the first-listed entry.
+        assert_eq!(store.revoke_index(1), Some(first));
+        assert_eq!(store.list(), &[second]);
+    }
+
+    #[test]
+    fn trust_store_clear_and_snapshot_reflect_entries() {
+        let mut store = TrustStore::default();
+        let target = TrustTarget::Command("cargo build".to_string());
+        store.grant(target.clone());
+        let snapshot = store.snapshot();
+        assert!(snapshot.contains(&target));
+
+        store.clear();
+        assert!(store.is_empty());
+        // The earlier snapshot is independent of later mutations.
+        assert!(snapshot.contains(&target));
+        assert!(store.snapshot().is_empty());
+    }
+
+    fn yolo_enforce_fake_config(dir: &Path) -> EffectiveConfig {
+        let config_path = dir.join("atelier.toml");
+        fs::write(
+            &config_path,
+            r#"
+approval_mode = "yolo"
+
+[approval]
+floor = "enforce"
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn untrusted_gray_area_command_raises_pending_approval() {
+        // Control case: with nothing trusted, the gray-area command pauses.
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        let pending = app.state.pending_approval.as_ref().unwrap();
+        assert_eq!(pending.agent, "fixer");
+    }
+
+    #[tokio::test]
+    async fn trusted_gray_area_command_auto_runs_without_pending_approval() {
+        // Pre-grant the exact command the fixer will emit; the enforcement matrix
+        // returns AllowedByTrust, so the run completes with no modal.
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("echo trusted-run".to_string()));
+
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_approval.is_none());
+        assert_ne!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    #[tokio::test]
+    async fn enforce_floor_from_config_makes_gray_area_prompt_under_yolo() {
+        // Proves config.approval.floor flows into the per-action context: under
+        // Yolo a gray-area command would normally warn-and-run, but floor=enforce
+        // turns it into a pending approval.
+        let dir = tempdir().unwrap();
+        let config = yolo_enforce_fake_config(dir.path());
+        assert_eq!(config.approval.floor, crate::config::FloorPolicy::Enforce);
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_approval.is_some());
+    }
+
+    // ---- Approval resolution, trust grant & audit events (task_05) ----
+
+    #[test]
+    fn capped_preview_truncates_long_input() {
+        assert_eq!(capped_preview("short"), "short");
+        let long = "x".repeat(10_000);
+        let capped = capped_preview(&long);
+        assert!(capped.chars().count() < long.chars().count());
+        assert!(capped.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn pending_view_is_populated_with_risk_fields() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        let pending = app.state.pending_approval.as_ref().unwrap();
+        assert_eq!(pending.tier, Some(RiskTier::Medium));
+        assert!(!pending.catastrophic);
+        assert!(pending.reason.as_ref().is_some_and(|r| !r.is_empty()));
+        assert_eq!(
+            pending.resolved_command.as_deref(),
+            Some("echo trusted-run")
+        );
+        assert_eq!(
+            pending.trust_target,
+            Some(TrustTarget::Command("echo trusted-run".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_and_trust_grants_target_and_records_event() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_some());
+
+        app.resolve_pending_approval(ApprovalResolution::ApproveAndTrust)
+            .await
+            .unwrap();
+
+        assert!(app
+            .trust_store
+            .contains(&TrustTarget::Command("echo trusted-run".to_string())));
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "trust_granted"));
+    }
+
+    #[tokio::test]
+    async fn approve_and_trust_is_noop_for_catastrophic_action() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("secret read action create a feature")
+            .await
+            .unwrap();
+
+        let pending = app.state.pending_approval.as_ref().unwrap();
+        assert!(pending.catastrophic);
+        assert_eq!(pending.trust_target, None);
+
+        app.resolve_pending_approval(ApprovalResolution::ApproveAndTrust)
+            .await
+            .unwrap();
+        // Catastrophic exposes no target, so nothing is granted.
+        assert!(app.trust_store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn approve_once_runs_without_granting_trust() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        app.resolve_pending_approval(ApprovalResolution::ApproveOnce)
+            .await
+            .unwrap();
+        assert!(app.trust_store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deny_produces_reason_and_resumes_the_run() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        let result = app
+            .resolve_pending_approval(ApprovalResolution::Deny)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, ActionStatus::Denied);
+        assert!(result.diagnostic.is_some_and(|reason| !reason.is_empty()));
+        // Deny-and-continue: the run is no longer waiting on the user.
+        assert!(app.state.pending_approval.is_none());
+        assert_ne!(app.state.run_state, RunState::WaitingForUser);
+    }
+
+    #[tokio::test]
+    async fn trusted_auto_run_records_approval_auto_resolved_event() {
+        let dir = tempdir().unwrap();
+        let config = approval_mode_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("echo trusted-run".to_string()));
+
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_approval.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "approval_auto_resolved"));
+    }
+
+    #[tokio::test]
+    async fn gray_area_under_yolo_warn_records_floor_warned_event() {
+        let dir = tempdir().unwrap();
+        // fake_config is Yolo with the default Warn floor.
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+
+        // The gray-area command ran (no modal) and a warning was audited.
+        assert!(app.state.pending_approval.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "floor_warned"));
+    }
+
+    // ---- /trust list & revoke command (task_08) -----------------------
+
+    #[tokio::test]
+    async fn trust_list_empty_reports_no_trusted_actions() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(app.handle_trust_command("/trust").unwrap());
+        let events = app.history.read_events().unwrap();
+        let listed = events
+            .iter()
+            .find(|event| event.kind == "trust_listed")
+            .unwrap();
+        assert_eq!(listed.payload["count"], 0);
+        assert!(listed.payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("No trusted actions"));
+    }
+
+    #[tokio::test]
+    async fn trust_list_numbers_entries_with_session_scope() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("cargo build".to_string()));
+        app.trust_store
+            .grant(TrustTarget::WritePath(PathBuf::from("src/lib.rs")));
+
+        assert!(app.handle_trust_command("/trust").unwrap());
+        let events = app.history.read_events().unwrap();
+        let message = events
+            .iter()
+            .find(|event| event.kind == "trust_listed")
+            .unwrap()
+            .payload["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("this session only"));
+        assert!(message.contains("1."));
+        assert!(message.contains("2."));
+        assert!(message.contains("cargo build"));
+    }
+
+    #[tokio::test]
+    async fn trust_revoke_removes_first_entry_and_emits_event() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("cargo build".to_string()));
+        app.trust_store
+            .grant(TrustTarget::Command("npm install x".to_string()));
+
+        assert!(app.handle_trust_command("/trust revoke 1").unwrap());
+        assert!(!app
+            .trust_store
+            .contains(&TrustTarget::Command("cargo build".to_string())));
+        assert!(app
+            .trust_store
+            .contains(&TrustTarget::Command("npm install x".to_string())));
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "trust_revoked"));
+    }
+
+    #[tokio::test]
+    async fn trust_malformed_input_is_rejected_without_mutation() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("cargo build".to_string()));
+
+        assert!(app.handle_trust_command("/trust revoke abc").is_err());
+        assert!(app.handle_trust_command("/trust revoke 9").is_err());
+        // The store is untouched by malformed input.
+        assert_eq!(app.trust_store.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trust_clear_empties_store_and_emits_count() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("cargo build".to_string()));
+        app.trust_store
+            .grant(TrustTarget::Command("npm install x".to_string()));
+
+        assert!(app.handle_trust_command("/trust clear").unwrap());
+        assert!(app.trust_store.is_empty());
+        let events = app.history.read_events().unwrap();
+        let cleared = events
+            .iter()
+            .find(|event| event.kind == "trust_cleared")
+            .unwrap();
+        assert_eq!(cleared.payload["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn trust_revoke_re_arms_the_approval_prompt() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(approval_mode_config(dir.path())).await.unwrap();
+        // Pre-trust so the first occurrence auto-runs without a modal.
+        app.trust_store
+            .grant(TrustTarget::Command("echo trusted-run".to_string()));
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_none());
+
+        // Revoke the trust, then the same action prompts again (re-armed).
+        assert!(app.handle_trust_command("/trust revoke 1").unwrap());
+        assert!(app.trust_store.is_empty());
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_some());
+    }
+
+    // ---- First-run onboarding & Approvals help (task_09) --------------
+
+    #[test]
+    fn first_approval_explainer_copy_is_tier_aware() {
+        let copy = crate::app::chat::FIRST_APPROVAL_EXPLAINER;
+        assert!(copy.contains("risk-tiered"), "copy: {copy}");
+        assert!(copy.to_lowercase().contains("catastrophic"), "copy: {copy}");
+        assert!(copy.to_lowercase().contains("yolo"), "copy: {copy}");
+    }
+
+    #[tokio::test]
+    async fn first_catastrophic_prompt_under_yolo_shows_explainer_once() {
+        let dir = tempdir().unwrap();
+        // fake_config is Yolo; a catastrophic action still surfaces an approval.
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.submit_prompt("secret read action create a feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_some());
+        assert!(
+            app.state.show_first_approval_explainer,
+            "first surfaced approval should show the explainer"
+        );
+
+        // Resolve and trigger a second approval; the once-only latch suppresses it.
+        app.resolve_pending_approval(ApprovalResolution::Deny)
+            .await
+            .unwrap();
+        app.submit_prompt("secret read action create another feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_some());
+        assert!(
+            !app.state.show_first_approval_explainer,
+            "explainer must not repeat once the latch is set"
+        );
+    }
+
     #[tokio::test]
     async fn app_state_defaults_to_no_pending_clarification() {
         let dir = tempdir().unwrap();
@@ -11751,6 +12895,493 @@ runtime = "fake"
 
         assert!(app.state.pending_clarification.is_none());
         assert!(app.pending_clarification.is_none());
+    }
+
+    /// Seed an active run paused on a governance decision, mirroring the state
+    /// the early-abort gate (task_05) will produce. Returns the decision id.
+    fn seed_pending_governance_decision(app: &mut App, prompt: &str) -> String {
+        let run = app.build_follow_up_run(prompt.to_string()).unwrap();
+        let run_id = run.run_id.clone();
+        let decision_id = "gov-decision-1".to_string();
+        let view = GovernanceDecisionView {
+            run_id: run_id.clone(),
+            decision_id: decision_id.clone(),
+            kind: crate::governance::GovernanceKind::EarlyAbort,
+            title: "Confirm intent before this run edits files".to_string(),
+            intent: "Create a feature".to_string(),
+            approach: vec!["Implement it".to_string()],
+            agent: Some("fixer".to_string()),
+            write_scope: vec!["src".to_string()],
+            risk_label: "Edits source files".to_string(),
+            plan: None,
+        };
+        app.pending_governance_decision = Some(PendingGovernanceDecision { run });
+        app.state.pending_governance_decision = Some(PendingGovernanceDecisionView {
+            run_id,
+            decision_id: decision_id.clone(),
+            view,
+        });
+        app.state.run_state = RunState::WaitingForUser;
+        app.publish_state();
+        decision_id
+    }
+
+    #[tokio::test]
+    async fn app_state_defaults_to_no_pending_governance_decision() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let app = App::new(config).await.unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert!(app.pending_governance_decision.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_with_no_pending_errors() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        let err = app
+            .resolve_pending_governance_decision("any-id", GovernanceAnswer::Accept)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("no governance decision is pending"));
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_mismatched_id_errors() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        seed_pending_governance_decision(&mut app, "create a feature");
+
+        let err = app
+            .resolve_pending_governance_decision("wrong-id", GovernanceAnswer::Accept)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not match pending governance decision"));
+        // The pending decision is left untouched after a mismatch.
+        assert!(app.state.pending_governance_decision.is_some());
+        assert!(app.pending_governance_decision.is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_accept_resumes_run() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let decision_id = seed_pending_governance_decision(&mut app, "create a feature");
+
+        app.resolve_pending_governance_decision(&decision_id, GovernanceAnswer::Accept)
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert!(app.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        let history = app.history.read_events().unwrap();
+        assert!(history.iter().any(|event| {
+            event.kind == "governance_decision_resolved"
+                && event.payload.get("outcome").and_then(|v| v.as_str()) == Some("accept")
+        }));
+        // The run was actually driven after acceptance.
+        assert!(history
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision"));
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_reject_redirect_redrives() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let decision_id = seed_pending_governance_decision(&mut app, "create a feature");
+
+        app.resolve_pending_governance_decision(
+            &decision_id,
+            GovernanceAnswer::Reject {
+                redirect: Some("focus on tests".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        let history = app.history.read_events().unwrap();
+        let resolved = history
+            .iter()
+            .find(|event| event.kind == "governance_decision_resolved")
+            .unwrap();
+        assert_eq!(
+            resolved.payload.get("outcome").and_then(|v| v.as_str()),
+            Some("reject")
+        );
+        assert_eq!(
+            resolved.payload.get("redirect").and_then(|v| v.as_str()),
+            Some("focus on tests")
+        );
+        // The redirected run was re-driven.
+        assert!(history
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision"));
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_governance_decision_reject_abort_does_not_resume() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let decision_id = seed_pending_governance_decision(&mut app, "create a feature");
+
+        app.resolve_pending_governance_decision(
+            &decision_id,
+            GovernanceAnswer::Reject { redirect: None },
+        )
+        .await
+        .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert!(app.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        assert!(app.state.active_run_id.is_none());
+
+        let history = app.history.read_events().unwrap();
+        assert!(history.iter().any(|event| {
+            event.kind == "governance_decision_resolved"
+                && event.payload.get("outcome").and_then(|v| v.as_str()) == Some("reject")
+                && event.payload.get("redirect").is_none()
+        }));
+        assert!(history.iter().any(|event| event.kind == "run_interrupted"));
+        // The run was aborted before any orchestration ran.
+        assert!(!history
+            .iter()
+            .any(|event| event.kind == "orchestrator_decision"));
+    }
+
+    #[tokio::test]
+    async fn interrupt_clears_pending_governance_decision_state() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        seed_pending_governance_decision(&mut app, "create a feature");
+        assert!(app.state.pending_governance_decision.is_some());
+        assert!(app.pending_governance_decision.is_some());
+
+        app.interrupt().unwrap();
+
+        assert_eq!(app.state.run_state, RunState::Interrupted);
+        assert!(app.state.active_run_id.is_none());
+        assert!(app.state.pending_governance_decision.is_none());
+        assert!(app.pending_governance_decision.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_governance_decision_exposed_on_app_state_and_cleared_after_accept() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+        let decision_id = seed_pending_governance_decision(&mut app, "create a feature");
+
+        // The pause is visible to the render path via AppState.
+        let view = app.state.pending_governance_decision.as_ref().unwrap();
+        assert_eq!(view.decision_id, decision_id);
+        assert_eq!(
+            Some(view.run_id.as_str()),
+            app.state.active_run_id.as_deref()
+        );
+        assert_eq!(view.view.intent, "Create a feature");
+
+        app.resolve_pending_governance_decision(&decision_id, GovernanceAnswer::Accept)
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+    }
+
+    // ── task_05 early-abort gate ──
+
+    fn first_turn_run() -> RunDriveContext {
+        let mut run = RunDriveContext::new(
+            "run".to_string(),
+            None,
+            "do work".to_string(),
+            "do work".to_string(),
+            None,
+            None,
+            None,
+        );
+        // The orchestrator step bumps step_count to 1 before the decision is
+        // returned, so the gate hook sees step_count == 1 on the first turn.
+        run.step_count = 1;
+        run
+    }
+
+    fn single_agent_decision(
+        required_capabilities: Vec<Capability>,
+    ) -> crate::orchestrator::OrchestratorDecision {
+        crate::orchestrator::OrchestratorDecision {
+            schema_version: 1,
+            decision_id: "dec".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: vec!["Apply the change".to_string()],
+            next_agent: Some("fixer".to_string()),
+            next_step: None,
+            reason: "Edit the config loader".to_string(),
+            required_capabilities,
+            stop_condition: "done".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            multi_select: false,
+            final_summary: None,
+        }
+    }
+
+    #[test]
+    fn early_abort_triggers_on_first_turn_single_agent_write() {
+        let run = first_turn_run();
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        assert!(early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_triggers_on_command_capability() {
+        let run = first_turn_run();
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Command]);
+        assert!(early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_for_read_only_decision() {
+        let run = first_turn_run();
+        let decision = single_agent_decision(vec![Capability::Read]);
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_past_the_first_turn() {
+        let mut run = first_turn_run();
+        run.step_count = 2;
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_with_previous_results() {
+        let mut run = first_turn_run();
+        run.previous_results.push(RunStepResult::Agent {
+            result: AgentResult::completed("explorer", "step", "done"),
+        });
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_for_a_subtask() {
+        let mut run = first_turn_run();
+        run.subtask = Some(SubtaskContext {
+            agent_id: "fixer".to_string(),
+            request: "do it".to_string(),
+            submitted_request: "do it".to_string(),
+        });
+        let decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_for_a_parallel_group() {
+        let run = first_turn_run();
+        let mut decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        // A parallel group uses schema_version 2 with next_step (no next_agent).
+        decision.schema_version = 2;
+        decision.next_agent = None;
+        decision.next_step = Some(DecisionNextStep::ParallelGroup(ParallelGroupPlan {
+            group_id: "g".to_string(),
+            reason: "split".to_string(),
+            steps: Vec::new(),
+        }));
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    #[test]
+    fn early_abort_does_not_trigger_for_non_continue_status() {
+        let run = first_turn_run();
+        let mut decision = single_agent_decision(vec![Capability::Read, Capability::Edit]);
+        decision.status = DecisionStatus::Complete;
+        assert!(!early_abort_triggers(&run, &decision));
+    }
+
+    async fn app_with_early_abort(dir: &std::path::Path) -> App {
+        let mut config = fake_config(dir);
+        config.features.governance_early_abort = true;
+        App::new(config).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn early_abort_pauses_first_turn_write_run_before_any_write() {
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.state.pending_governance_decision.is_some());
+        assert!(app.pending_governance_decision.is_some());
+
+        let history = app.history.read_events().unwrap();
+        assert!(history
+            .iter()
+            .any(|event| event.kind == "governance_decision_requested"));
+        // Nothing was written before the pause.
+        assert!(!history
+            .iter()
+            .any(|event| event.kind == "file_edit_applied"));
+        // The single agent never started.
+        assert!(!history.iter().any(|event| {
+            event.kind == "agent_step_started"
+                && event.payload.get("agent").and_then(|v| v.as_str()) == Some("fixer")
+        }));
+    }
+
+    #[tokio::test]
+    async fn early_abort_accept_lets_the_write_proceed() {
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+        let decision_id = app
+            .state
+            .pending_governance_decision
+            .as_ref()
+            .unwrap()
+            .decision_id
+            .clone();
+
+        app.resolve_pending_governance_decision(&decision_id, GovernanceAnswer::Accept)
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let history = app.history.read_events().unwrap();
+        assert!(history
+            .iter()
+            .any(|event| event.kind == "file_edit_applied"));
+        assert!(dir.path().join("multiagent-action-output.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn early_abort_reject_redirect_redrives_without_regating() {
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+        let decision_id = app
+            .state
+            .pending_governance_decision
+            .as_ref()
+            .unwrap()
+            .decision_id
+            .clone();
+
+        app.resolve_pending_governance_decision(
+            &decision_id,
+            GovernanceAnswer::Reject {
+                redirect: Some("only touch the readme".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        let history = app.history.read_events().unwrap();
+        let resolved = history
+            .iter()
+            .find(|event| event.kind == "governance_decision_resolved")
+            .unwrap();
+        assert_eq!(
+            resolved.payload.get("outcome").and_then(|v| v.as_str()),
+            Some("reject")
+        );
+        assert_eq!(
+            resolved.payload.get("redirect").and_then(|v| v.as_str()),
+            Some("only touch the readme")
+        );
+        // Exactly one pause — the re-drive does not re-gate.
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.kind == "governance_decision_requested")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn early_abort_does_not_pause_read_only_first_turn() {
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+
+        app.submit_prompt("explore the project").await.unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        let history = app.history.read_events().unwrap();
+        assert!(!history
+            .iter()
+            .any(|event| event.kind == "governance_decision_requested"));
+    }
+
+    #[tokio::test]
+    async fn early_abort_no_pause_when_flag_off() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+
+        assert!(app.state.pending_governance_decision.is_none());
+        assert_eq!(app.state.run_state, RunState::Completed);
+        let history = app.history.read_events().unwrap();
+        assert!(!history
+            .iter()
+            .any(|event| event.kind == "governance_decision_requested"));
+    }
+
+    #[tokio::test]
+    async fn early_abort_card_carries_a_legible_intent_and_approach() {
+        // The orchestrator prompt nudges turn-one reason/plan (task_06); with a
+        // well-formed decision the gate's card shows a non-empty intent and at
+        // least one approach bullet.
+        let dir = tempdir().unwrap();
+        let mut app = app_with_early_abort(dir.path()).await;
+        app.submit_prompt("governance early abort write action")
+            .await
+            .unwrap();
+
+        let view = &app.state.pending_governance_decision.as_ref().unwrap().view;
+        assert!(!view.intent.trim().is_empty(), "intent must be legible");
+        assert!(
+            !view.approach.is_empty(),
+            "the card must show at least one approach bullet"
+        );
     }
 
     #[tokio::test]
@@ -12320,7 +13951,11 @@ runtime = "fake"
             .await
             .unwrap();
 
-        let result = app.resolve_pending_approval(false).await.unwrap().unwrap();
+        let result = app
+            .resolve_pending_approval(ApprovalResolution::Deny)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result.status, ActionStatus::Denied);
         assert_eq!(app.state.run_state, RunState::Completed);
         assert!(app.state.active_run_id.is_none());
@@ -12412,6 +14047,8 @@ runtime = "fake"
             })),
             artifact: None,
             diagnostic: None,
+            risk: None,
+            gate_outcome: crate::actions::GateOutcome::Normal,
         };
 
         let durable = app

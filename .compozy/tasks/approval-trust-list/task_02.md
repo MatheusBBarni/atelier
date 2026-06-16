@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Approval floor configuration
 type: backend
 complexity: low
@@ -29,11 +29,11 @@ Introduce the `[approval]` config section that controls the gray-area floor's po
 </requirements>
 
 ## Subtasks
-- [ ] 02.1 Add `FloorPolicy` and `ApprovalConfig` types with defaults.
-- [ ] 02.2 Wire `approval` into `EffectiveConfig`, `RawConfig`, and the merge path.
-- [ ] 02.3 Ensure `--print-config` renders the `[approval]` section and `approval_mode`.
-- [ ] 02.4 Add a `--doctor` check reporting `approval_mode` and `floor`.
-- [ ] 02.5 Add config-merge and default tests.
+- [x] 02.1 Add `FloorPolicy` and `ApprovalConfig` types with defaults.
+- [x] 02.2 Wire `approval` into `EffectiveConfig`, `RawConfig`, and the merge path.
+- [x] 02.3 Ensure `--print-config` renders the `[approval]` section and `approval_mode`.
+- [x] 02.4 Add a `--doctor` check reporting `approval_mode` and `floor`.
+- [x] 02.5 Add config-merge and default tests.
 
 ## Implementation Details
 Work is in `src/config/mod.rs` (mirroring `Features` ~196 and `UiConfig` ~203, and `EffectiveConfig` ~402 / `RawConfig` ~419), plus the doctor check in `src/doctor/mod.rs` and print-config in `src/cli.rs`/config render. No new files. See TechSpec "Data Models" for the config shape and "Monitoring and Observability" for the doctor/print-config surfacing.
@@ -58,12 +58,12 @@ Work is in `src/config/mod.rs` (mirroring `Features` ~196 and `UiConfig` ~203, a
 
 ## Tests
 - Unit tests:
-  - [ ] Absent `[approval]` → `floor == Warn` (default preserved).
-  - [ ] `[approval] floor = "enforce"` in local config overrides home `warn`.
-  - [ ] Invalid `floor` value → config load error names the field.
-  - [ ] `--doctor` check reports the resolved `approval_mode` and `floor`.
+  - [x] Absent `[approval]` → `floor == Warn` (default preserved).
+  - [x] `[approval] floor = "enforce"` in local config overrides home `warn`.
+  - [x] Invalid `floor` value → config load error names the field.
+  - [x] `--doctor` check reports the resolved `approval_mode` and `floor`.
 - Integration tests:
-  - [ ] `atelier --print-config` output contains `[approval]` with the resolved `floor` (via the `tests/cli` suite).
+  - [x] `atelier --print-config` output contains `[approval]` with the resolved `floor` (via the `tests/cli` suite).
 - Test coverage target: >=80%
 - All tests must pass
 

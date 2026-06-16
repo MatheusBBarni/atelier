@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Orchestrator prompt nudge for turn-one intent
 type: backend
 complexity: low
@@ -28,9 +28,9 @@ Make the early-abort echo legible by nudging the orchestrator to emit a clear in
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Add the turn-one interpreted-goal/approach instruction to the orchestrator prompt.
-- [ ] 6.2 Confirm it does not regress existing orchestrator tests.
-- [ ] 6.3 Verify the early-abort card shows a non-empty intent + at least one approach bullet.
+- [x] 6.1 Add the turn-one interpreted-goal/approach instruction to the orchestrator prompt.
+- [x] 6.2 Confirm it does not regress existing orchestrator tests.
+- [x] 6.3 Verify the early-abort card shows a non-empty intent + at least one approach bullet.
 
 ## Implementation Details
 Modify `src/orchestrator/mod.rs` `build_orchestrator_prompt` (~672) to append the instruction. Keep it concise and additive. Reference TechSpec "Known Risks" (echo quality is best-effort) and ADR-004.
@@ -53,10 +53,10 @@ Modify `src/orchestrator/mod.rs` `build_orchestrator_prompt` (~672) to append th
 
 ## Tests
 - Unit tests:
-  - [ ] `build_orchestrator_prompt` output contains the turn-one interpreted-goal/approach instruction.
-  - [ ] Existing orchestrator-prompt tests still pass (no regression to other sections).
+  - [x] `build_orchestrator_prompt` output contains the turn-one interpreted-goal/approach instruction.
+  - [x] Existing orchestrator-prompt tests still pass (no regression to other sections — all 7 `generated_orchestrator_prompt_*` tests green).
 - Integration tests:
-  - [ ] An early-abort run (via `FakeRuntime` emitting a `reason`+`plan`) renders a card with a non-empty intent line and at least one approach bullet.
+  - [x] An early-abort run (via `FakeRuntime` emitting a `reason`+`plan`) renders a card with a non-empty intent line and at least one approach bullet.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -65,3 +65,9 @@ Modify `src/orchestrator/mod.rs` `build_orchestrator_prompt` (~672) to append th
 - Test coverage >=80%
 - The early-abort echo is reliably legible without any schema change; existing orchestrator behavior is unregressed.
 - `cargo fmt --check` and `cargo clippy --all-targets` are clean.
+
+## Completion Notes
+- Added a single additive routing-rule line to `build_orchestrator_prompt`: "On the first turn, write `reason` as a one-line restatement of your interpreted goal … and `plan` as a short list of concrete approach bullets …". Prompt-only, no schema/decision-field change (ADR-004).
+- Placed it just before the "Mark the run complete …" rule so it doesn't reorder existing lines; all 7 `generated_orchestrator_prompt_*` tests still pass (they use `contains` assertions). The instruction is scoped to "the first turn", so later-turn behavior is unchanged.
+- Graceful degradation is inherent: the task_05 gate renders `reason`→intent and `plan`→approach verbatim; if they are thin the card still shows whatever exists and never blocks on echo quality.
+- Verified: `turn_one_intent_nudge` unit test, `early_abort_card_carries_a_legible_intent_and_approach` integration test, 7 existing prompt tests, `cargo fmt --check` clean, `cargo clippy --all-targets` clean (0 warnings). Full `cargo test --lib` = 903 passed / 12 failed; the 12 are exactly the pre-existing skill tests (proven on the clean task_01 commit; codex/cursor passed this run). Zero failures attributable to this task.

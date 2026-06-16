@@ -1,4 +1,5 @@
-use crate::config::{EffectiveConfig, RuntimeKind};
+use crate::config::{ApprovalMode, EffectiveConfig, FloorPolicy, RuntimeKind};
+use crate::history::{list_session_event_paths, read_events_from_path, HistoryEvent};
 use crate::runtime::{check_runtime_availability, RuntimeAvailabilityStatus};
 use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
@@ -50,6 +51,15 @@ impl DoctorReport {
             .iter()
             .any(|check| matches!(check.status, DoctorStatus::Error))
     }
+
+    /// Number of `Error`-status checks in the report — companion to
+    /// [`has_errors`](Self::has_errors), used by the CLI nudge/gate (task_05).
+    pub fn error_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|check| matches!(check.status, DoctorStatus::Error))
+            .count()
+    }
 }
 
 pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
@@ -60,15 +70,21 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
     checks.push(selected_preset_check(config));
     checks.push(prompt_files_check(config));
     checks.push(model_fallback_check(config));
+    checks.push(keybindings_check(config));
     checks.push(tool_access_check(config));
+    checks.push(approval_check(config));
+    checks.push(governance_metrics_check(config));
 
+    // Runtimes guaranteed to run on every prompt (V1: the orchestrator's). An
+    // unavailable one is a hard error; everything else stays a warning (ADR-003).
+    // Decoupled from --strict: the report always reflects true severity.
+    let required = config.required_runtime_ids();
     for runtime in config.runtimes.values() {
         let availability = check_runtime_availability(runtime).await;
-        let (status, severity) = match availability.status {
-            RuntimeAvailabilityStatus::Available => (DoctorStatus::Ok, DoctorSeverity::Info),
-            RuntimeAvailabilityStatus::Unknown => (DoctorStatus::Warn, DoctorSeverity::Warning),
-            RuntimeAvailabilityStatus::Unavailable => (DoctorStatus::Warn, DoctorSeverity::Warning),
-        };
+        let (status, severity) = runtime_availability_severity(
+            availability.status,
+            required.contains(runtime.id.as_str()),
+        );
         let title = match runtime.kind {
             RuntimeKind::Codex => "Codex Runtime",
             RuntimeKind::Claude => "Claude Runtime",
@@ -103,6 +119,26 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         working_directory: config.working_directory.display().to_string(),
         checks,
+    }
+}
+
+/// The doctor status/severity for a runtime's availability (ADR-003). An
+/// `Unavailable` runtime that is `required` (the orchestrator's — guaranteed to
+/// run on every prompt) elevates to `Error`; an `Unknown` probe (inconclusive)
+/// and any non-required runtime stay `Warn`. Pure so the elevation matrix is
+/// testable without availability probing.
+fn runtime_availability_severity(
+    status: RuntimeAvailabilityStatus,
+    required: bool,
+) -> (DoctorStatus, DoctorSeverity) {
+    match status {
+        RuntimeAvailabilityStatus::Available => (DoctorStatus::Ok, DoctorSeverity::Info),
+        RuntimeAvailabilityStatus::Unavailable if required => {
+            (DoctorStatus::Error, DoctorSeverity::Error)
+        }
+        RuntimeAvailabilityStatus::Unavailable | RuntimeAvailabilityStatus::Unknown => {
+            (DoctorStatus::Warn, DoctorSeverity::Warning)
+        }
     }
 }
 
@@ -161,6 +197,42 @@ fn prompt_files_check(config: &EffectiveConfig) -> DoctorCheck {
     }
 }
 
+/// Surfaces the keybinding diagnostics collected at config load (ADR-004):
+/// trust-boundary "ignored local [keybindings]" notes and soft-fail (unknown
+/// action) warnings. `Ok` when there are none, `Warn` otherwise — never an error,
+/// since every offending entry already fell back to its default.
+fn keybindings_check(config: &EffectiveConfig) -> DoctorCheck {
+    if config.keybinding_warnings.is_empty() {
+        DoctorCheck {
+            id: "config.keybindings".to_string(),
+            title: "Keybindings".to_string(),
+            status: DoctorStatus::Ok,
+            severity: DoctorSeverity::Info,
+            message: "no keybinding warnings".to_string(),
+            remediation: None,
+            context: None,
+        }
+    } else {
+        DoctorCheck {
+            id: "config.keybindings".to_string(),
+            title: "Keybindings".to_string(),
+            status: DoctorStatus::Warn,
+            severity: DoctorSeverity::Warning,
+            message: format!(
+                "{} keybinding warning(s): {}",
+                config.keybinding_warnings.len(),
+                config.keybinding_warnings.join("; ")
+            ),
+            remediation: Some(
+                "Review [keybindings] in your home/--config file; ignored or unknown entries fall \
+                 back to their defaults."
+                    .to_string(),
+            ),
+            context: Some(serde_json::json!({ "warnings": config.keybinding_warnings })),
+        }
+    }
+}
+
 fn model_fallback_check(config: &EffectiveConfig) -> DoctorCheck {
     let missing = config
         .agents
@@ -216,6 +288,31 @@ fn tool_access_check(config: &EffectiveConfig) -> DoctorCheck {
         message: "effective tool access computed from capabilities and tool allowlists".to_string(),
         remediation: None,
         context: Some(serde_json::json!({ "agents": agents })),
+    }
+}
+
+fn approval_check(config: &EffectiveConfig) -> DoctorCheck {
+    let mode = match config.approval_mode {
+        ApprovalMode::Yolo => "yolo",
+        ApprovalMode::Normal => "normal",
+    };
+    let floor = match config.approval.floor {
+        FloorPolicy::Warn => "warn",
+        FloorPolicy::Enforce => "enforce",
+    };
+    DoctorCheck {
+        id: "config.approval".to_string(),
+        title: "Approval Policy".to_string(),
+        status: DoctorStatus::Ok,
+        severity: DoctorSeverity::Info,
+        message: format!(
+            "approval_mode = {mode}; gray-area floor = {floor} (catastrophic core always prompts)"
+        ),
+        remediation: None,
+        context: Some(serde_json::json!({
+            "approval_mode": mode,
+            "floor": floor,
+        })),
     }
 }
 
@@ -407,11 +504,476 @@ fn permission_check(id: &str, title: &str, path: &std::path::Path) -> DoctorChec
     }
 }
 
+/// Intervention rate above this fraction of all runs raises the high-band alarm:
+/// the gate is firing on too many runs.
+const GOVERNANCE_INTERVENTION_HIGH_BAND: f64 = 0.5;
+
+/// Aggregated governance signals derived from the local event log. All counts
+/// are exact; only the trusted-outcome figure is a labeled proxy (ADR-005).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct GovernanceMetrics {
+    total_runs: usize,
+    governed_runs: usize,
+    early_aborts_fired: usize,
+    accepts: usize,
+    rejects: usize,
+    write_intent_runs: usize,
+    aborts_on_write_runs: usize,
+    kept: usize,
+    against: usize,
+    reverts: usize,
+}
+
+impl GovernanceMetrics {
+    /// Trusted Outcome Rate **proxy**: kept governed runs ÷ governed runs.
+    /// `None` when no run has been governed yet.
+    fn trusted_outcome_rate_proxy(&self) -> Option<f64> {
+        (self.governed_runs > 0).then(|| self.kept as f64 / self.governed_runs as f64)
+    }
+
+    /// Early-abort catch rate: rejects ÷ early-aborts fired. `None` with no fires.
+    fn early_abort_catch_rate(&self) -> Option<f64> {
+        (self.early_aborts_fired > 0).then(|| self.rejects as f64 / self.early_aborts_fired as f64)
+    }
+
+    /// Intervention rate: early-aborts fired ÷ all runs. `0.0` with no runs.
+    fn intervention_rate(&self) -> f64 {
+        if self.total_runs == 0 {
+            0.0
+        } else {
+            self.early_aborts_fired as f64 / self.total_runs as f64
+        }
+    }
+
+    /// Gate precision: fired aborts that landed on genuine write-intent runs ÷
+    /// all fired aborts. Read-only runs that never fired are excluded from the
+    /// denominator. `None` with no fires.
+    fn gate_precision(&self) -> Option<f64> {
+        (self.early_aborts_fired > 0)
+            .then(|| self.aborts_on_write_runs as f64 / self.early_aborts_fired as f64)
+    }
+
+    /// Dual-alarm: too many interventions (high band) OR none while runs went
+    /// bad (near-zero with reverts present — the gate is not catching problems).
+    fn raises_alarm(&self) -> bool {
+        self.intervention_rate() > GOVERNANCE_INTERVENTION_HIGH_BAND
+            || (self.early_aborts_fired == 0 && self.reverts > 0)
+    }
+}
+
+fn decision_payload_requires_write(payload: &Value) -> bool {
+    payload
+        .get("required_capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|capability| capability == "edit" || capability == "command")
+        })
+}
+
+/// Aggregate governance signals from a flat, ordered event stream. Pure over the
+/// events so it is unit-testable without touching the filesystem; safe (all
+/// zeros) on an empty stream.
+fn governance_metrics_from_events(events: &[HistoryEvent]) -> GovernanceMetrics {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct RunAgg {
+        started: bool,
+        first_decision_seen: bool,
+        write_intent: bool,
+        early_abort: bool,
+        accepted: bool,
+        rejected: bool,
+        completed: bool,
+        reverted: bool,
+    }
+
+    let mut runs: BTreeMap<String, RunAgg> = BTreeMap::new();
+    let mut early_aborts_fired = 0usize;
+    let mut accepts = 0usize;
+    let mut rejects = 0usize;
+    let mut reverts = 0usize;
+
+    for event in events {
+        let Some(run_id) = event.run_id.clone() else {
+            continue;
+        };
+        let run = runs.entry(run_id).or_default();
+        match event.kind.as_str() {
+            "run_started" => run.started = true,
+            // The complexity signal is read from the run's *first* decision.
+            "orchestrator_decision" if !run.first_decision_seen => {
+                run.first_decision_seen = true;
+                run.write_intent = decision_payload_requires_write(&event.payload);
+            }
+            "governance_decision_requested" => {
+                run.early_abort = true;
+                early_aborts_fired += 1;
+            }
+            "governance_decision_resolved" => {
+                match event.payload.get("outcome").and_then(Value::as_str) {
+                    Some("accept") => {
+                        run.accepted = true;
+                        accepts += 1;
+                    }
+                    Some("reject") => {
+                        run.rejected = true;
+                        rejects += 1;
+                    }
+                    _ => {}
+                }
+            }
+            "run_completed" => run.completed = true,
+            "run_interrupted" | "run_failed" => {
+                run.reverted = true;
+                reverts += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut metrics = GovernanceMetrics {
+        early_aborts_fired,
+        accepts,
+        rejects,
+        reverts,
+        ..Default::default()
+    };
+    for run in runs.values() {
+        if run.started {
+            metrics.total_runs += 1;
+        }
+        if run.write_intent {
+            metrics.write_intent_runs += 1;
+        }
+        if run.early_abort {
+            metrics.governed_runs += 1;
+            if run.write_intent {
+                metrics.aborts_on_write_runs += 1;
+            }
+            // Proxy classification (governed runs only): an early-abort reject,
+            // or an abort/interrupt after an accept, count against; an accepted
+            // run that completed clean counts as kept.
+            if run.rejected || (run.accepted && run.reverted) {
+                metrics.against += 1;
+            } else if run.accepted && run.completed && !run.reverted {
+                metrics.kept += 1;
+            }
+        }
+    }
+    metrics
+}
+
+fn read_all_session_events(root: &Path) -> Vec<HistoryEvent> {
+    let Ok(paths) = list_session_event_paths(root) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for path in paths {
+        // A single unreadable/corrupt session log degrades to "skip it" rather
+        // than failing the whole doctor check.
+        if let Ok(mut session_events) = read_events_from_path(&path) {
+            events.append(&mut session_events);
+        }
+    }
+    events
+}
+
+/// Local-only governance health: the Trusted Outcome Rate **proxy** plus the
+/// exact calibration metrics (intervention rate with a dual-alarm band,
+/// early-abort catch rate, gate precision). Reads only the `.atelier` event log;
+/// no network, no telemetry (ADR-005).
+fn governance_metrics_check(config: &EffectiveConfig) -> DoctorCheck {
+    let root = config.working_directory.join(".atelier");
+    let metrics = governance_metrics_from_events(&read_all_session_events(&root));
+
+    let proxy = metrics.trusted_outcome_rate_proxy();
+    let context = serde_json::json!({
+        "trusted_outcome_rate_proxy": proxy,
+        "trusted_outcome_rate_is_proxy": true,
+        "trusted_outcome_rate_note": "Proxy derived from local events (kept vs reverted); not a measured revert signal.",
+        "governed_runs": metrics.governed_runs,
+        "kept": metrics.kept,
+        "against": metrics.against,
+        "early_aborts_fired": metrics.early_aborts_fired,
+        "accepts": metrics.accepts,
+        "rejects": metrics.rejects,
+        "early_abort_catch_rate": metrics.early_abort_catch_rate(),
+        "intervention_rate": metrics.intervention_rate(),
+        "intervention_high_band": GOVERNANCE_INTERVENTION_HIGH_BAND,
+        "gate_precision": metrics.gate_precision(),
+        "write_intent_runs": metrics.write_intent_runs,
+        "total_runs": metrics.total_runs,
+        "reverts": metrics.reverts,
+        "source": "local .atelier event log",
+    });
+
+    let (status, severity, message) = if metrics.early_aborts_fired == 0 && metrics.reverts == 0 {
+        (
+            DoctorStatus::Ok,
+            DoctorSeverity::Info,
+            "no governance activity recorded yet".to_string(),
+        )
+    } else if metrics.raises_alarm() {
+        (
+            DoctorStatus::Warn,
+            DoctorSeverity::Warning,
+            format!(
+                "governance calibration alarm: intervention rate {:.2} over {} runs ({} aborts, {} reverts)",
+                metrics.intervention_rate(),
+                metrics.total_runs,
+                metrics.early_aborts_fired,
+                metrics.reverts,
+            ),
+        )
+    } else {
+        (
+            DoctorStatus::Ok,
+            DoctorSeverity::Info,
+            format!(
+                "trusted-outcome proxy {} over {} governed runs",
+                proxy
+                    .map(|rate| format!("{rate:.2}"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                metrics.governed_runs,
+            ),
+        )
+    };
+
+    DoctorCheck {
+        id: "governance.metrics".to_string(),
+        title: "Governance Metrics".to_string(),
+        status,
+        severity,
+        message,
+        remediation: None,
+        context: Some(context),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{load_effective_config, ConfigLoadOptions};
+    use serde_json::json;
     use tempfile::tempdir;
+
+    fn gov_event(run_id: &str, kind: &str, payload: Value) -> HistoryEvent {
+        HistoryEvent::new("session", Some(run_id.to_string()), None, kind, payload)
+    }
+
+    /// A complete kept governed run: write-intent, fired, accepted, completed.
+    fn kept_run_events(run_id: &str) -> Vec<HistoryEvent> {
+        vec![
+            gov_event(run_id, "run_started", json!({})),
+            gov_event(
+                run_id,
+                "orchestrator_decision",
+                json!({ "required_capabilities": ["read", "edit"] }),
+            ),
+            gov_event(run_id, "governance_decision_requested", json!({})),
+            gov_event(
+                run_id,
+                "governance_decision_resolved",
+                json!({ "outcome": "accept" }),
+            ),
+            gov_event(run_id, "run_completed", json!({})),
+        ]
+    }
+
+    #[test]
+    fn proxy_counts_completed_accepted_run_as_kept() {
+        let metrics = governance_metrics_from_events(&kept_run_events("run-1"));
+        assert_eq!(metrics.governed_runs, 1);
+        assert_eq!(metrics.kept, 1);
+        assert_eq!(metrics.against, 0);
+        assert_eq!(metrics.trusted_outcome_rate_proxy(), Some(1.0));
+    }
+
+    #[test]
+    fn proxy_counts_early_abort_reject_against() {
+        let events = vec![
+            gov_event("run-1", "run_started", json!({})),
+            gov_event(
+                "run-1",
+                "orchestrator_decision",
+                json!({ "required_capabilities": ["edit"] }),
+            ),
+            gov_event("run-1", "governance_decision_requested", json!({})),
+            gov_event(
+                "run-1",
+                "governance_decision_resolved",
+                json!({ "outcome": "reject" }),
+            ),
+        ];
+        let metrics = governance_metrics_from_events(&events);
+        assert_eq!(metrics.governed_runs, 1);
+        assert_eq!(metrics.kept, 0);
+        assert_eq!(metrics.against, 1);
+        assert_eq!(metrics.trusted_outcome_rate_proxy(), Some(0.0));
+    }
+
+    #[test]
+    fn proxy_counts_abort_after_accept_against() {
+        let events = vec![
+            gov_event("run-1", "run_started", json!({})),
+            gov_event(
+                "run-1",
+                "orchestrator_decision",
+                json!({ "required_capabilities": ["edit"] }),
+            ),
+            gov_event("run-1", "governance_decision_requested", json!({})),
+            gov_event(
+                "run-1",
+                "governance_decision_resolved",
+                json!({ "outcome": "accept" }),
+            ),
+            gov_event("run-1", "run_interrupted", json!({})),
+        ];
+        let metrics = governance_metrics_from_events(&events);
+        assert_eq!(metrics.kept, 0);
+        assert_eq!(metrics.against, 1);
+    }
+
+    #[test]
+    fn early_abort_catch_rate_is_rejects_over_fires() {
+        let mut events = kept_run_events("run-keep"); // accept (fired)
+        events.extend(vec![
+            gov_event("run-rej", "run_started", json!({})),
+            gov_event(
+                "run-rej",
+                "orchestrator_decision",
+                json!({ "required_capabilities": ["edit"] }),
+            ),
+            gov_event("run-rej", "governance_decision_requested", json!({})),
+            gov_event(
+                "run-rej",
+                "governance_decision_resolved",
+                json!({ "outcome": "reject" }),
+            ),
+        ]);
+        let metrics = governance_metrics_from_events(&events);
+        assert_eq!(metrics.early_aborts_fired, 2);
+        assert_eq!(metrics.rejects, 1);
+        assert_eq!(metrics.early_abort_catch_rate(), Some(0.5));
+    }
+
+    #[test]
+    fn gate_precision_excludes_read_only_runs() {
+        // One write-intent run fired; one read-only run never fired. The
+        // read-only run must not lower precision.
+        let mut events = vec![
+            gov_event("write-run", "run_started", json!({})),
+            gov_event(
+                "write-run",
+                "orchestrator_decision",
+                json!({ "required_capabilities": ["edit"] }),
+            ),
+            gov_event("write-run", "governance_decision_requested", json!({})),
+            gov_event(
+                "write-run",
+                "governance_decision_resolved",
+                json!({ "outcome": "accept" }),
+            ),
+            gov_event("write-run", "run_completed", json!({})),
+        ];
+        events.extend(vec![
+            gov_event("read-run", "run_started", json!({})),
+            gov_event(
+                "read-run",
+                "orchestrator_decision",
+                json!({ "required_capabilities": ["read"] }),
+            ),
+            gov_event("read-run", "run_completed", json!({})),
+        ]);
+        let metrics = governance_metrics_from_events(&events);
+        assert_eq!(metrics.early_aborts_fired, 1);
+        assert_eq!(metrics.aborts_on_write_runs, 1);
+        assert_eq!(metrics.write_intent_runs, 1);
+        assert_eq!(metrics.gate_precision(), Some(1.0));
+    }
+
+    #[test]
+    fn intervention_rate_high_band_raises_alarm() {
+        // Two runs, both fired → intervention rate 1.0 (> high band).
+        let mut events = kept_run_events("run-1");
+        events.extend(kept_run_events("run-2"));
+        let metrics = governance_metrics_from_events(&events);
+        assert!(metrics.intervention_rate() > GOVERNANCE_INTERVENTION_HIGH_BAND);
+        assert!(metrics.raises_alarm());
+    }
+
+    #[test]
+    fn intervention_rate_near_zero_with_reverts_raises_alarm() {
+        // A run that went bad with no governance pause at all.
+        let events = vec![
+            gov_event("run-1", "run_started", json!({})),
+            gov_event(
+                "run-1",
+                "orchestrator_decision",
+                json!({ "required_capabilities": ["edit"] }),
+            ),
+            gov_event("run-1", "run_failed", json!({})),
+        ];
+        let metrics = governance_metrics_from_events(&events);
+        assert_eq!(metrics.early_aborts_fired, 0);
+        assert!(metrics.reverts > 0);
+        assert!(metrics.raises_alarm());
+    }
+
+    #[test]
+    fn empty_event_log_is_safe() {
+        let metrics = governance_metrics_from_events(&[]);
+        assert_eq!(metrics, GovernanceMetrics::default());
+        assert_eq!(metrics.trusted_outcome_rate_proxy(), None);
+        assert_eq!(metrics.early_abort_catch_rate(), None);
+        assert_eq!(metrics.gate_precision(), None);
+        assert_eq!(metrics.intervention_rate(), 0.0);
+        assert!(!metrics.raises_alarm());
+    }
+
+    #[tokio::test]
+    async fn doctor_json_includes_governance_metrics_with_labeled_proxy() {
+        let dir = tempdir().unwrap();
+        // Seed a session log with one kept governed run.
+        let sessions = dir.path().join(".atelier").join("sessions").join("s1");
+        fs::create_dir_all(&sessions).unwrap();
+        let body = kept_run_events("run-1")
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(sessions.join("events.jsonl"), body).unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+        let report = run_doctor(&config).await;
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "governance.metrics")
+            .expect("governance metrics check present");
+        let context = check.context.as_ref().unwrap();
+        assert_eq!(context["trusted_outcome_rate_is_proxy"], json!(true));
+        assert_eq!(context["trusted_outcome_rate_proxy"], json!(1.0));
+        assert_eq!(context["governed_runs"], json!(1));
+        assert_eq!(context["kept"], json!(1));
+        // Calibration figures present.
+        assert!(context.get("intervention_rate").is_some());
+        assert!(context.get("early_abort_catch_rate").is_some());
+        assert!(context.get("gate_precision").is_some());
+
+        // The proxy label survives JSON rendering.
+        let rendered = render_json(&report).unwrap();
+        assert!(rendered.contains("trusted_outcome_rate_is_proxy"));
+    }
 
     #[tokio::test]
     async fn doctor_json_is_structured() {
@@ -428,6 +990,75 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.id == "runtime.codex"));
+    }
+
+    #[tokio::test]
+    async fn doctor_keybindings_check_reflects_warnings() {
+        let dir = tempdir().unwrap();
+        let mut config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        // Clean config: the check is Ok.
+        let report = run_doctor(&config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "config.keybindings")
+            .expect("config.keybindings check present");
+        assert_eq!(check.status, DoctorStatus::Ok);
+
+        // With a (soft-fail) warning recorded at load, the check warns.
+        config
+            .keybinding_warnings
+            .push("ignored unknown keybinding action `frobnicate`".to_string());
+        let report = run_doctor(&config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "config.keybindings")
+            .expect("config.keybindings check present");
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert_eq!(check.severity, DoctorSeverity::Warning);
+        assert!(check.message.contains("frobnicate"), "{}", check.message);
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_approval_mode_and_floor() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("atelier.toml");
+        fs::write(
+            &config_path,
+            "schema_version = 1\napproval_mode = \"normal\"\n[approval]\nfloor = \"enforce\"\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        let report = run_doctor(&config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "config.approval")
+            .expect("approval check present");
+        assert_eq!(check.status, DoctorStatus::Ok);
+        assert!(
+            check.message.contains("normal"),
+            "message: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("enforce"),
+            "message: {}",
+            check.message
+        );
+        let context = check.context.as_ref().unwrap();
+        assert_eq!(context["approval_mode"], "normal");
+        assert_eq!(context["floor"], "enforce");
     }
 
     #[tokio::test]
@@ -707,5 +1338,89 @@ command = "{}"
         assert!(json.contains("stream-json enabled"));
         assert!(json.contains("Cursor tools must not bypass Harness Actions"));
         assert!(!json.contains("CURSOR_API_KEY"));
+    }
+
+    // ---- Orchestrator-runtime elevation (task_04) ---------------------
+
+    fn check_with_status(status: DoctorStatus) -> DoctorCheck {
+        DoctorCheck {
+            id: "runtime.x".to_string(),
+            title: "X".to_string(),
+            status,
+            severity: DoctorSeverity::Info,
+            message: String::new(),
+            remediation: None,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn elevation_matrix_holds() {
+        assert_eq!(
+            runtime_availability_severity(RuntimeAvailabilityStatus::Available, true),
+            (DoctorStatus::Ok, DoctorSeverity::Info)
+        );
+        // Required + Unavailable is the only Warn→Error elevation.
+        assert_eq!(
+            runtime_availability_severity(RuntimeAvailabilityStatus::Unavailable, true),
+            (DoctorStatus::Error, DoctorSeverity::Error)
+        );
+        // A non-required unavailable runtime stays a warning.
+        assert_eq!(
+            runtime_availability_severity(RuntimeAvailabilityStatus::Unavailable, false),
+            (DoctorStatus::Warn, DoctorSeverity::Warning)
+        );
+        // An inconclusive probe stays a warning even for a required runtime.
+        assert_eq!(
+            runtime_availability_severity(RuntimeAvailabilityStatus::Unknown, true),
+            (DoctorStatus::Warn, DoctorSeverity::Warning)
+        );
+    }
+
+    #[test]
+    fn error_count_counts_only_error_checks() {
+        let report = DoctorReport {
+            schema_version: 1,
+            generated_at: String::new(),
+            working_directory: String::new(),
+            checks: vec![
+                check_with_status(DoctorStatus::Error),
+                check_with_status(DoctorStatus::Warn),
+                check_with_status(DoctorStatus::Error),
+                check_with_status(DoctorStatus::Ok),
+            ],
+        };
+        assert_eq!(report.error_count(), 2);
+        assert!(report.has_errors());
+    }
+
+    #[tokio::test]
+    async fn run_doctor_errors_when_orchestrator_runtime_command_missing() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("atelier.toml");
+        // Point the orchestrator at a codex runtime whose command does not exist:
+        // its availability is deterministically Unavailable, so it must elevate.
+        fs::write(
+            &config_path,
+            "schema_version = 1\n\
+             [runtimes.codex]\ncommand = \"atelier-nonexistent-binary-xyz-12345\"\n\
+             [agents.orchestrator]\nruntime = \"codex\"\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let report = run_doctor(&config).await;
+        assert!(report.has_errors());
+        assert!(report.error_count() >= 1);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "runtime.codex")
+            .unwrap();
+        assert_eq!(check.status, DoctorStatus::Error);
     }
 }

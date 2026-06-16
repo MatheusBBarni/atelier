@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Data-driven Keys help tab
 type: frontend
 complexity: low
@@ -36,11 +36,11 @@ and completes Wave 1.
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Change `keys_tab_lines` to render from the active `Keymap` via `format_key`.
-- [ ] 5.2 Mark reserved/fixed keys as locked, distinct from remappable bindings.
-- [ ] 5.3 Pass `ui_state.keymap` at the render dispatch site.
-- [ ] 5.4 Rewrite the Keys-tab test to assert defaults render from the keymap.
-- [ ] 5.5 Confirm theme-token compliance (no new `Color::` literals).
+- [x] 5.1 Change `keys_tab_lines` to render from the active `Keymap` via `format_key`.
+- [x] 5.2 Mark reserved/fixed keys as locked, distinct from remappable bindings.
+- [x] 5.3 Pass `ui_state.keymap` at the render dispatch site.
+- [x] 5.4 Rewrite the Keys-tab test to assert defaults render from the keymap.
+- [x] 5.5 Confirm theme-token compliance (no new `Color::` literals).
 
 ## Implementation Details
 Within `src/tui/mod.rs`: `keys_tab_lines` (`:3737`), the help-modal render dispatch (`HelpTab::Keys`
@@ -68,11 +68,12 @@ the existing test (`:11685`). Consumes `keybindings::{Keymap, format_key}` and r
 
 ## Tests
 - Unit tests:
-  - [ ] `keys_tab_lines(default_keymap, theme)` output contains `ctrl+l` with a toggle-roster label and the scroll/editing default keys.
-  - [ ] Reserved `Ctrl-C` is rendered with the locked/non-rebindable marker.
-  - [ ] No `Color::` literal is introduced (the `colors_live_only_in_theme_module` test still passes).
+  - [x] `keys_tab_lines(default_keymap, theme)` output contains `ctrl+l` with a toggle-roster label and the scroll/editing default keys — `keys_tab_lines_contains_expected_keybindings` (rewritten).
+  - [x] Reserved `Ctrl-C` is rendered with the locked/non-rebindable marker (`(locked)` + "Fixed keys (not rebindable)" section).
+  - [x] No `Color::` literal is introduced (`colors_live_only_in_theme_module` still passes).
+  - [x] A remapped keymap is reflected (ctrl+g shown, displaced ctrl+l gone) — `keys_tab_reflects_a_remapped_keymap`.
 - Integration tests:
-  - [ ] `render_help_modal` on the Keys tab renders a default `TuiUiState` via `TestBackend` without panic.
+  - [x] The help modal Keys tab renders a default `TuiUiState` via the render path without panic — `keys_tab_renders_via_test_backend_without_panic`.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -81,3 +82,22 @@ the existing test (`:11685`). Consumes `keybindings::{Keymap, format_key}` and r
 - Test coverage >=80%
 - Keys tab reflects the active keymap with reserved keys locked; theme-token test passes.
 - Wave 1 is shippable (parity + safety chokepoint + data-driven Keys tab) with no config dependency.
+
+## Implementation Notes
+- `keys_tab_lines(keymap, theme)`: a "Remappable keys" section data-driven from
+  `keymap.entries()` (sorted by `KeyAction` for stable order) via `format_key` +
+  `keys_action_label`, then a "Fixed keys (not rebindable)" section (`FIXED_KEY_ROWS`)
+  rendered muted with a `(locked)` marker.
+- The approval-resolution keys (y/approve, t/trust, n/deny) are non-rebindable, so
+  they were relocated into the fixed-keys section (the old Keys tab listed them as
+  prose). This keeps `keys_help_tab_lists_approval_resolution_keys` meaningful.
+- **Three sibling tests** that asserted the old hardcoded Keys-tab strings were updated
+  to the new canonical lowercase output: `renders_help_modal_commands` and
+  `help_modal_command_rows_are_catalog_derived` (`Ctrl-L`→`ctrl+l`, `Mouse wheel`→
+  `mouse wheel`, `Arrow keys`→`arrows`, `PageUp/PageDown`→`pageup`, `Home/End`→`home`),
+  and the arrows fixed-row keeps the wording "recall recent prompts" so
+  `help_overlay_documents_recall_keys` stays green.
+- Verified `2026-06-16`: keys-tab tests + the 3 updated sibling tests pass;
+  `colors_live_only_in_theme_module` passes; clippy `--all-targets` clean; fmt clean;
+  full `cargo test --lib` passed 1015 → 1017, with only the pre-existing environmental
+  failures (skill discovery + flaky codex/cursor/claude-timeout) remaining.

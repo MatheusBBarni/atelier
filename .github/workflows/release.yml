@@ -180,6 +180,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
+      - name: Dogfood doctor --strict health gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Validate against a config whose orchestrator runs on an available
+          # runtime (fake); a red step means atelier's config/runtime health
+          # regressed. zai (the default orchestrator runtime) needs an API key
+          # that CI does not carry, so the gate uses fake here.
+          CONFIG="$(mktemp)"
+          cat > "${CONFIG}" <<'TOML'
+          schema_version = 1
+          [runtimes.fake]
+          type = "fake"
+          [agents.orchestrator]
+          runtime = "fake"
+          TOML
+          cargo run --locked --quiet --bin atelier -- --doctor --strict --config "${CONFIG}"
 
   build-native:
     name: Build ${{ matrix.target }}

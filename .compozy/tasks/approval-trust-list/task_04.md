@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Session TrustStore & per-action context wiring
 type: backend
 complexity: medium
@@ -29,10 +29,10 @@ Add the in-memory, session-scoped `TrustStore` to `App` and feed each action's `
 - SHOULD keep the snapshot cheap (clone into a set per action or share via `Arc`).
 
 ## Subtasks
-- [ ] 04.1 Implement `TrustStore` and add it as a field on `App`.
-- [ ] 04.2 Build `ActionExecutionContext` with `floor` (from config) and a trust snapshot at all construction sites.
-- [ ] 04.3 Confirm trusted non-catastrophic actions auto-run via the task_03 matrix (no `pending_approval`).
-- [ ] 04.4 Add `TrustStore` unit tests and a FakeRuntime test for auto-run-when-trusted.
+- [x] 04.1 Implement `TrustStore` and add it as a field on `App`.
+- [x] 04.2 Build `ActionExecutionContext` with `floor` (from config) and a trust snapshot at all construction sites.
+- [x] 04.3 Confirm trusted non-catastrophic actions auto-run via the task_03 matrix (no `pending_approval`).
+- [x] 04.4 Add `TrustStore` unit tests and a FakeRuntime test for auto-run-when-trusted.
 
 ## Implementation Details
 `TrustStore` and the `App` field live in `src/app/mod.rs`; context construction happens where the serial step path (`process_step_action` ~4000) and the parallel path build `ActionExecutionContext`. Reuse `TrustTarget` (task_01) and the enriched context (task_03). See TechSpec "Core Interfaces" (`TrustStore`) and "System Architecture → Data flow".
@@ -55,13 +55,13 @@ Add the in-memory, session-scoped `TrustStore` to `App` and feed each action's `
 
 ## Tests
 - Unit tests:
-  - [ ] `grant` then `contains` returns true for the same `TrustTarget`; a different target returns false.
-  - [ ] `revoke_index(1)` removes the first-listed entry; out-of-range index returns `None` and leaves the store unchanged.
-  - [ ] `clear` empties the store; `snapshot` reflects the current entries.
-  - [ ] Context built from `config.approval.floor = enforce` carries `FloorPolicy::Enforce`.
+  - [x] `grant` then `contains` returns true for the same `TrustTarget`; a different target returns false.
+  - [x] `revoke_index(1)` removes the first-listed entry; out-of-range index returns `None` and leaves the store unchanged.
+  - [x] `clear` empties the store; `snapshot` reflects the current entries.
+  - [x] Context built from `config.approval.floor = enforce` carries `FloorPolicy::Enforce` (verified behaviorally: gray-area prompts under Yolo+Enforce).
 - Integration tests:
-  - [ ] FakeRuntime run where a `cargo test` target is pre-granted, then emitted by the agent → action completes with no `pending_approval` raised.
-  - [ ] Same target NOT granted → `pending_approval` is raised (control case).
+  - [x] FakeRuntime run where a gray-area command target is pre-granted, then emitted by the agent → action completes with no `pending_approval` raised. (Uses a harmless `echo` gray-area command — `cargo test` is safe-tier and would auto-run without trust, so it can't demonstrate the trust path.)
+  - [x] Same target NOT granted → `pending_approval` is raised (control case).
 - Test coverage target: >=80%
 - All tests must pass
 

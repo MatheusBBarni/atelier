@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Early-abort gate in the drive loop with feature flag
 type: backend
 complexity: high
@@ -31,11 +31,11 @@ Add the spine's net-new capability: on the first orchestrator turn of a non-triv
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Add the `governance_early_abort` flag through config + merge.
-- [ ] 5.2 Implement the `early_abort_triggers` predicate (first-turn ∧ single-agent ∧ write).
-- [ ] 5.3 Build the `GovernanceDecisionView` from the decision + workspace write-roots.
-- [ ] 5.4 Pause into `pending_governance_decision` + record the requested event, before any write.
-- [ ] 5.5 Add a `fake` runtime control phrase to drive the gate in tests.
+- [x] 5.1 Add the `governance_early_abort` flag through config + merge.
+- [x] 5.2 Implement the `early_abort_triggers` predicate (first-turn ∧ single-agent ∧ write).
+- [x] 5.3 Build the `GovernanceDecisionView` from the decision + workspace write-roots.
+- [x] 5.4 Pause into `pending_governance_decision` + record the requested event, before any write.
+- [x] 5.5 Add a `fake` runtime control phrase to drive the gate in tests.
 
 ## Implementation Details
 Modify `src/app/mod.rs` (the gate in/around `drive_run_inner` ~1858, reading `RunDriveContext` + the first decision), `src/config/mod.rs` (`Features` ~197, `RawFeatures` ~449, merge ~939), and `src/runtime/fake.rs` (control phrase). Write capability = `required_capabilities` contains `Capability::Edit` or `Capability::Command` (no `is_write()` helper exists). Reference TechSpec "Core Interfaces" (the predicate) and ADR-004.
@@ -63,13 +63,13 @@ Modify `src/app/mod.rs` (the gate in/around `drive_run_inner` ~1858, reading `Ru
 
 ## Tests
 - Unit tests:
-  - [ ] `early_abort_triggers` is true for a first-turn `SingleAgent` decision whose `required_capabilities` include `Edit`.
-  - [ ] It is false for a read-only decision (no write capability), false when `step_count > 0`, false for a subtask, and false for a `ParallelGroup`/`Dag` next step.
-  - [ ] With the flag off, the predicate path is skipped entirely.
+  - [x] `early_abort_triggers` is true for a first-turn `SingleAgent` decision whose `required_capabilities` include `Edit` (also `Command`).
+  - [x] It is false for a read-only decision (no write capability), false when past the first turn (`step_count > 1` and with previous results), false for a subtask, false for a `ParallelGroup` next step, and false for a non-`Continue` status.
+  - [x] With the flag off, the predicate path is skipped entirely (covered by the flag-off integration test — the predicate is flag-independent by design; the caller gates on the flag).
 - Integration tests:
-  - [ ] `FakeRuntime` first-turn single-agent write run (flag on) pauses into `pending_governance_decision` before any write event is recorded.
-  - [ ] After `resolve(Accept)` the write proceeds; after `resolve(Reject { redirect })` the orchestrator re-drives.
-  - [ ] A read-only first-turn run does not pause; with the flag off, no pause occurs.
+  - [x] `FakeRuntime` first-turn single-agent write run (flag on) pauses into `pending_governance_decision` before any write event is recorded.
+  - [x] After `resolve(Accept)` the write proceeds; after `resolve(Reject { redirect })` the orchestrator re-drives.
+  - [x] A read-only first-turn run does not pause; with the flag off, no pause occurs.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -78,3 +78,10 @@ Modify `src/app/mod.rs` (the gate in/around `drive_run_inner` ~1858, reading `Ru
 - Test coverage >=80%
 - A non-trivial single-agent run pauses for an intent check before any write, only when flagged on; trivial/read-only runs are untouched.
 - `cargo fmt --check` and `cargo clippy --all-targets` are clean.
+
+## Completion Notes
+- **`step_count == 1`, not `0`.** The techspec/ADR-004 pseudocode uses `run.step_count == 0`, but `run_orchestrator_step` increments `step_count` to 1 *before* returning the decision, so at the gate hook (after the orchestrator step, before `handle_orchestrator_decision`) the first orchestrator turn is `step_count == 1`. Using `== 1` also means the gate never re-fires on the Accept / reject-redirect re-drive, because each re-drive runs another orchestrator step and the count climbs to 2+. (A turn-1 parse-retry would bump it to 2 and gracefully skip the gate — acceptable per ADR-004's "degrade gracefully; never block on echo quality".) `early_abort_triggers(run, decision)` is a flag-independent free function; the call site gates on `features.governance_early_abort`.
+- **Write signal:** `Capability::Edit | Capability::Command` on the decision's top-level `required_capabilities` (no `is_write()` helper exists). Write-scope is rendered from the workspace write-roots already on the run (working directory + `extra_write_roots`) — no new `SingleAgentStepPlan`/`file_scope` field (ADR-004).
+- **Pause mechanics:** `pause_for_early_abort` sets `WaitingForUser` + both pending fields, then records `governance_decision_requested` (whose payload is the serialized `GovernanceDecisionView`). `record_event` already applies the event to the chat projection and publishes state, so the task_02 decision card renders automatically. The gate `break`s the loop *before* `handle_orchestrator_decision`, so no agent/action runs and nothing is written before the user resolves.
+- **Fake control phrase:** `"governance early abort"` → a first-turn single-agent (fixer) `Edit` decision. The E2E tests combine it with `"write action"` so Accept actually writes `multiagent-action-output.txt`.
+- Verified: `cargo test --lib early_abort` (14 passed: 8 predicate + 5 E2E + helpers), `governance_early_abort` config test (1), full governance filter (32), `cargo fmt --check` clean, `cargo clippy --all-targets` clean (0 warnings). Full `cargo test --lib` = 894 passed / 19 failed; the 19 are 12 pre-existing skill tests (proven on the clean task_01 commit) + 7 `runtime::codex`/`cursor` CLI tests that pass in isolation and fail only under the parallel suite (flaky/env per CLAUDE.md, in untouched `src/runtime/`). Zero failures attributable to this task.

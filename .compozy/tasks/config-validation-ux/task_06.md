@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Document strict and exit-code contract and dogfood in release CI"
 type: docs
 complexity: low
@@ -30,10 +30,10 @@ Document the new `--strict` flag and the exit-code contract in the README, add a
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Update the README CLI list and Notes with `--strict` and the exit-code contract.
-- [ ] 6.2 Add the copy-paste CI snippet to the README.
-- [ ] 6.3 Add the dogfood `--doctor --strict` step to the release workflow.
-- [ ] 6.4 Verify the docs link-check passes and the workflow YAML is valid.
+- [x] 6.1 Update the README CLI list and Notes with `--strict` and the exit-code contract.
+- [x] 6.2 Add the copy-paste CI snippet to the README.
+- [x] 6.3 Add the dogfood `--doctor --strict` step to the release workflow.
+- [x] 6.4 Verify the docs link-check passes and the workflow YAML is valid.
 
 ## Implementation Details
 See PRD "User Experience" and "High-Level Technical Constraints", and ADR-001/ADR-002. The README CLI section is ~86-112 (flag list + "Notes:" block); the release workflow mirrors the pre-commit gate (`cargo fmt --check && cargo clippy --all-targets && cargo test --locked`). This task touches documentation and CI configuration only — no crate source changes.
@@ -57,10 +57,10 @@ See PRD "User Experience" and "High-Level Technical Constraints", and ADR-001/AD
 
 ## Tests
 - Unit tests:
-  - [ ] N/A — documentation and CI configuration only; no unit-testable crate code.
+  - [x] N/A — documentation and CI configuration only; no unit-testable crate code.
 - Integration tests:
-  - [ ] The repository docs link-check passes for the edited README.
-  - [ ] The release workflow parses as valid YAML and its `--doctor --strict` step runs and exits 0 against the repo's own config.
+  - [x] The repository docs link-check passes for the edited README.
+  - [x] The release workflow parses as valid YAML and its `--doctor --strict` step runs and exits 0 against the repo's own config.
 - Test coverage target: >=80% (N/A for this docs/CI task — no source code changes; verification is the link-check and workflow run).
 - All checks must pass
 

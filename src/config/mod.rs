@@ -1,8 +1,11 @@
+use crate::keybindings::{
+    self, key_action_from_name, parse_key, validate_overrides, KeybindingOverrides,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -21,6 +24,25 @@ pub enum ApprovalMode {
     #[default]
     Yolo,
     Normal,
+}
+
+/// Posture for the gray-area floor (ADR-002's phased-rollout lever). `Warn`
+/// surfaces the risk and records an audit annotation but still runs under `Yolo`;
+/// `Enforce` re-prompts instead. This controls ONLY the gray-area tier — the
+/// catastrophic core is non-bypassable and not configurable off.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FloorPolicy {
+    #[default]
+    Warn,
+    Enforce,
+}
+
+/// Approval-system posture. Today it carries only the gray-area `floor`; the
+/// `approval_mode` (`Yolo`/`Normal`) stays a top-level field for back-compat.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalConfig {
+    pub floor: FloorPolicy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -196,6 +218,10 @@ impl Default for Limits {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Features {
     pub parallel_step_groups: bool,
+    /// Pause a first-turn single-agent run that intends to write, so the user
+    /// can confirm the interpreted intent before any edit (governance spine,
+    /// ADR-004). Off by default.
+    pub governance_early_abort: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -405,6 +431,7 @@ pub struct EffectiveConfig {
     pub config_sources: Vec<PathBuf>,
     pub active_preset: Option<String>,
     pub approval_mode: ApprovalMode,
+    pub approval: ApprovalConfig,
     pub workspace: WorkspacePolicy,
     pub features: Features,
     pub ui: UiConfig,
@@ -412,6 +439,33 @@ pub struct EffectiveConfig {
     pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
     pub agents: BTreeMap<String, AgentProfile>,
+    /// Validated, post-merge keybinding overrides from user-scope config
+    /// (home/CLI). Empty when no `[keybindings]` is present ⇒ default keymap.
+    /// Resolved into the active `Keymap` at TUI init (task_08).
+    pub keybindings: KeybindingOverrides,
+    /// Non-fatal keybinding diagnostics: the trust-boundary "ignored local
+    /// [keybindings]" notes plus soft-fail (unknown-action) warnings (ADR-004).
+    /// Surfaced by `--doctor`/startup; never blocks a run.
+    pub keybinding_warnings: Vec<String>,
+}
+
+impl EffectiveConfig {
+    /// Runtime ids whose unavailability is a hard error: the runtimes guaranteed
+    /// to run on every prompt-driven run (ADR-003). V1 is exactly the orchestrator
+    /// agent's primary runtime — the only runtime the orchestrator chain resolves
+    /// unconditionally. Council, inactive-preset, and model-fallback runtimes are
+    /// deliberately excluded (their absence does not guarantee a failed run).
+    ///
+    /// Pure: reads only the already-merged config (no I/O, no availability probe).
+    /// An absent `orchestrator` agent yields an empty set rather than panicking.
+    /// The set may broaden in V2 (e.g. model-fallback / selected-preset coverage).
+    pub fn required_runtime_ids(&self) -> BTreeSet<&str> {
+        self.agents
+            .get("orchestrator")
+            .map(|agent| agent.runtime.as_str())
+            .into_iter()
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -420,6 +474,7 @@ struct RawConfig {
     schema_version: Option<u32>,
     preset: Option<String>,
     approval_mode: Option<ApprovalMode>,
+    approval: Option<RawApprovalConfig>,
     workspace: Option<RawWorkspacePolicy>,
     features: Option<RawFeatures>,
     ui: Option<RawUiConfig>,
@@ -428,6 +483,32 @@ struct RawConfig {
     runtimes: Option<BTreeMap<String, RawRuntimeConfig>>,
     presets: Option<BTreeMap<String, RawPreset>>,
     agents: Option<BTreeMap<String, RawAgentProfile>>,
+    /// `[keybindings.<context>]` → action → key string or `false` (unbind).
+    /// Honored only from user-scope layers (home / explicit `--config`); a
+    /// project-local config's `[keybindings]` is ignored with a warning
+    /// (ADR-004). Parsed + validated in task_07.
+    keybindings: Option<BTreeMap<String, BTreeMap<String, RawKeyBinding>>>,
+}
+
+/// A single `[keybindings]` entry: either a key string (`"ctrl+g"`) to rebind an
+/// action, or `false` to unbind it. Untagged so TOML accepts both forms inline.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum RawKeyBinding {
+    Key(String),
+    Disabled(bool),
+}
+
+/// Which config layer a `RawConfig` came from. Used to gate `[keybindings]` to
+/// user scope (ADR-004): `Cli`/`Home` are trusted; a project-local `Local` file
+/// cannot rebind keys. `Builtin` is the in-code default base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigLayer {
+    #[allow(dead_code)] // base defaults are constructed directly, not via apply_raw
+    Builtin,
+    Cli,
+    Home,
+    Local,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -446,8 +527,15 @@ struct RawWorkspacePolicy {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawApprovalConfig {
+    floor: Option<FloorPolicy>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFeatures {
     parallel_step_groups: Option<bool>,
+    governance_early_abort: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -608,6 +696,7 @@ struct MergedConfig {
     config_sources: Vec<PathBuf>,
     active_preset: Option<PendingPresetSelection>,
     approval_mode: ApprovalMode,
+    approval: ApprovalConfig,
     workspace: WorkspacePolicy,
     features: Features,
     ui: UiConfig,
@@ -617,6 +706,15 @@ struct MergedConfig {
     presets: BTreeMap<String, RawPresetDefinition>,
     agents: BTreeMap<String, MergedAgentProfile>,
     agent_layers: Vec<PendingAgentLayer>,
+    /// Validated keybinding overrides accumulated from user-scope layers
+    /// (home/CLI), merged per action — later layers override earlier ones.
+    /// Each user-scope layer is parsed and hard-validated as it is applied
+    /// (ADR-004), so this is always a clean override set.
+    keybindings: KeybindingOverrides,
+    /// Warnings from the keybindings trust boundary: the "ignored local
+    /// [keybindings]" notes plus soft-fail (unknown-action) notes (ADR-004).
+    /// Surfaced on `EffectiveConfig.keybinding_warnings`.
+    keybinding_warnings: Vec<String>,
 }
 
 /// Canonical default system prompts for the six core structured-runtime agents.
@@ -894,6 +992,7 @@ impl MergedConfig {
             config_sources: Vec::new(),
             active_preset: None,
             approval_mode: ApprovalMode::Yolo,
+            approval: ApprovalConfig::default(),
             workspace: WorkspacePolicy::default(),
             features: Features::default(),
             ui: UiConfig::default(),
@@ -903,10 +1002,18 @@ impl MergedConfig {
             presets: BTreeMap::new(),
             agents,
             agent_layers: Vec::new(),
+            keybindings: KeybindingOverrides::new(),
+            keybinding_warnings: Vec::new(),
         }
     }
 
-    fn apply_raw(&mut self, raw: RawConfig, source_dir: &Path, source_name: &str) -> Result<()> {
+    fn apply_raw(
+        &mut self,
+        raw: RawConfig,
+        source_dir: &Path,
+        source_name: &str,
+        layer: ConfigLayer,
+    ) -> Result<()> {
         if let Some(version) = raw.schema_version {
             if version != 1 {
                 bail!("unsupported schema_version {version} in {source_name}; expected 1");
@@ -915,6 +1022,12 @@ impl MergedConfig {
 
         if let Some(approval_mode) = raw.approval_mode {
             self.approval_mode = approval_mode;
+        }
+
+        if let Some(approval) = raw.approval {
+            if let Some(floor) = approval.floor {
+                self.approval.floor = floor;
+            }
         }
 
         if let Some(workspace) = raw.workspace {
@@ -938,6 +1051,9 @@ impl MergedConfig {
         if let Some(features) = raw.features {
             if let Some(value) = features.parallel_step_groups {
                 self.features.parallel_step_groups = value;
+            }
+            if let Some(value) = features.governance_early_abort {
+                self.features.governance_early_abort = value;
             }
         }
 
@@ -1014,6 +1130,75 @@ impl MergedConfig {
                 agents,
             });
         }
+
+        // Trust boundary (ADR-004): keybindings are honored only from user-scope
+        // layers. A project-local config's `[keybindings]` is ignored with a
+        // warning — an untrusted repo must not be able to rebind control keys.
+        if let Some(keybindings) = raw.keybindings {
+            if layer == ConfigLayer::Local {
+                self.keybinding_warnings.push(format!(
+                    "ignored [keybindings] in {source_name}: keybindings are honored only from your \
+                     home config or an explicit --config, not a project-local config"
+                ));
+            } else {
+                self.apply_keybindings(keybindings, source_name)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse + severity-split-validate a user-scope `[keybindings]` table into the
+    /// accumulated overrides (ADR-004). Hard-fails (with a file/field/value
+    /// message) on an unknown context, malformed key, reserved or non-portable
+    /// key, or a duplicate; soft-fails (drop + warn) on an unknown action.
+    fn apply_keybindings(
+        &mut self,
+        keybindings: BTreeMap<String, BTreeMap<String, RawKeyBinding>>,
+        source_name: &str,
+    ) -> Result<()> {
+        for (context, actions) in keybindings {
+            // V1 wires only the `normal` context; any other is a precise hard error.
+            if context != "normal" {
+                bail!(
+                    "invalid [keybindings.{context}] in {source_name}: only the `normal` context \
+                     is supported (use [keybindings.normal])"
+                );
+            }
+            for (action_name, binding) in actions {
+                let Some(action) = key_action_from_name(&action_name) else {
+                    // Cosmetic mistake: drop the entry, keep the rest, warn.
+                    self.keybinding_warnings.push(format!(
+                        "ignored unknown keybinding action `{action_name}` in [keybindings.normal] \
+                         ({source_name})"
+                    ));
+                    continue;
+                };
+                let value = match binding {
+                    RawKeyBinding::Disabled(false) => None, // unbind
+                    RawKeyBinding::Disabled(true) => bail!(
+                        "invalid keybinding `{action_name} = true` in {source_name}: use a key \
+                         string like \"ctrl+g\", or `false` to unbind"
+                    ),
+                    RawKeyBinding::Key(value) => {
+                        let chord = parse_key(&value).map_err(|err| {
+                            anyhow!(
+                                "invalid keybinding `{action_name} = \"{value}\"` in \
+                                 {source_name}: {err}"
+                            )
+                        })?;
+                        Some(chord)
+                    }
+                };
+                self.keybindings.insert(action, value);
+            }
+        }
+
+        // Hard-fail reserved / non-portable / duplicate (against the merged
+        // defaults). Run after merging this layer so cross-layer collisions are
+        // caught too; the file is named for a precise diagnostic.
+        validate_overrides(&self.keybindings)
+            .map_err(|err| anyhow!("{err} (in [keybindings.normal], {source_name})"))?;
 
         Ok(())
     }
@@ -1307,10 +1492,16 @@ impl MergedConfig {
             .map(|preset| preset.name.clone());
 
         let mut runtimes = BTreeMap::new();
+        // Sibling runtime ids for near-miss "did you mean?" hints (ADR-004),
+        // captured before the map is consumed by the loop below.
+        let runtime_ids: Vec<String> = self.runtimes.keys().cloned().collect();
         for (id, runtime) in self.runtimes {
-            let kind = runtime
-                .kind
-                .ok_or_else(|| anyhow!("runtime {id} is missing required field type"))?;
+            let kind = runtime.kind.ok_or_else(|| {
+                anyhow!(
+                    "runtime {id} is missing required field type{}",
+                    did_you_mean(&id, runtime_ids.iter().map(String::as_str))
+                )
+            })?;
 
             let config = match kind {
                 RuntimeKind::Codex => RuntimeConfig {
@@ -1404,21 +1595,33 @@ impl MergedConfig {
         }
 
         let mut agents = BTreeMap::new();
+        // Sibling agent ids for near-miss hints, captured before the loop consumes
+        // the map (ADR-004).
+        let agent_ids: Vec<String> = self.agents.keys().cloned().collect();
         for (id, agent) in self.agents {
-            let runtime = agent
-                .runtime
-                .ok_or_else(|| anyhow!("agent {id} is missing required field runtime"))?;
+            let runtime = agent.runtime.ok_or_else(|| {
+                anyhow!(
+                    "agent {id} is missing required field runtime{}",
+                    did_you_mean(&id, agent_ids.iter().map(String::as_str))
+                )
+            })?;
             if !runtimes.contains_key(&runtime) {
-                bail!("agent {id} points at undefined runtime {runtime}");
+                bail!(
+                    "agent {id} points at undefined runtime {runtime}{}",
+                    did_you_mean(&runtime, runtimes.keys().map(String::as_str))
+                );
             }
 
             let model = agent.model.unwrap_or_else(|| "default".to_string());
             validate_model_name(&model).with_context(|| format!("invalid model for agent {id}"))?;
             let model_fallbacks = agent.model_fallbacks.unwrap_or_default();
             validate_model_fallbacks(&id, &model, &model_fallbacks)?;
-            let capabilities = agent
-                .capabilities
-                .ok_or_else(|| anyhow!("agent {id} is missing required field capabilities"))?;
+            let capabilities = agent.capabilities.ok_or_else(|| {
+                anyhow!(
+                    "agent {id} is missing required field capabilities{}",
+                    did_you_mean(&id, agent_ids.iter().map(String::as_str))
+                )
+            })?;
             let instruction_source = agent
                 .instruction_source
                 .ok_or_else(|| anyhow!("agent {id} is missing instructions"))?;
@@ -1472,6 +1675,7 @@ impl MergedConfig {
             config_sources: self.config_sources,
             active_preset,
             approval_mode: self.approval_mode,
+            approval: self.approval,
             workspace: self.workspace,
             features: self.features,
             ui: self.ui,
@@ -1479,6 +1683,8 @@ impl MergedConfig {
             council,
             runtimes,
             agents,
+            keybindings: self.keybindings,
+            keybinding_warnings: self.keybinding_warnings,
         })
     }
 
@@ -1658,10 +1864,17 @@ pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConf
         .map(PathBuf::from);
     let config_path = options.config_path.or(env_config_path);
 
+    // Canonical path of the explicit --config/env file, so the local-override pass
+    // below can skip re-applying that very file as an (untrusted) Local layer — which
+    // would otherwise ignore + warn about its own honored [keybindings].
+    let explicit_canonical = config_path
+        .as_ref()
+        .and_then(|path| path.canonicalize().ok());
+
     if let Some(home_config) = config_path {
-        // Explicit path (CLI flag or env var): it must exist.
+        // Explicit path (CLI flag or env var): user-scope, must exist.
         if home_config.exists() {
-            apply_config_file(&mut merged, &home_config)?;
+            apply_config_file(&mut merged, &home_config, ConfigLayer::Cli)?;
         } else {
             bail!(
                 "configured harness configuration file does not exist: {}",
@@ -1674,15 +1887,25 @@ pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConf
         // No explicit path: prefer ~/.config/.atelier/atelier.toml, but still
         // load the legacy ~/.config/.multiagent/multiagent.toml if that's all
         // that exists.
-        apply_config_file(&mut merged, &home_config)?;
+        apply_config_file(&mut merged, &home_config, ConfigLayer::Home)?;
     }
 
     // Local override: prefer ./atelier.toml, fall back to legacy ./multiagent.toml.
+    // This layer is untrusted for keybindings (project-shipped config).
     if let Some(local_config) = first_existing([
         working_directory.join("atelier.toml"),
         working_directory.join("multiagent.toml"),
     ]) {
-        apply_config_file(&mut merged, &local_config)?;
+        // Skip when the local file IS the explicit --config file already applied as
+        // a user-scope (Cli) layer; re-applying it as Local would double-apply every
+        // section and falsely report its honored [keybindings] as ignored.
+        let already_applied_as_user_scope = explicit_canonical
+            .as_ref()
+            .zip(local_config.canonicalize().ok().as_ref())
+            .is_some_and(|(explicit, local)| explicit == local);
+        if !already_applied_as_user_scope {
+            apply_config_file(&mut merged, &local_config, ConfigLayer::Local)?;
+        }
     }
 
     merged.into_effective()
@@ -1702,6 +1925,19 @@ fn first_existing<I: IntoIterator<Item = PathBuf>>(candidates: I) -> Option<Path
     candidates.into_iter().find(|path| path.exists())
 }
 
+/// Format a "; did you mean `x`?" fragment for an unknown config name, or an
+/// empty string when no sibling key is within the edit-distance threshold
+/// (ADR-004). The unknown name is excluded from the candidates so a typo'd key
+/// that is itself present in the merged map can't suggest itself (distance 0).
+/// Purely additive: callers append this to errors that already fire.
+fn did_you_mean<'a>(unknown: &str, siblings: impl IntoIterator<Item = &'a str>) -> String {
+    let candidates = siblings.into_iter().filter(|name| *name != unknown);
+    match crate::util::suggest_nearby_name(unknown, candidates) {
+        Some(name) => format!("; did you mean `{name}`?"),
+        None => String::new(),
+    }
+}
+
 pub fn default_home_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1710,13 +1946,13 @@ pub fn default_home_config_path() -> PathBuf {
         .join("atelier.toml")
 }
 
-fn apply_config_file(merged: &mut MergedConfig, path: &Path) -> Result<()> {
+fn apply_config_file(merged: &mut MergedConfig, path: &Path, layer: ConfigLayer) -> Result<()> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read configuration file {}", path.display()))?;
     let raw: RawConfig = toml::from_str(&contents)
         .with_context(|| format!("failed to parse configuration file {}", path.display()))?;
     let source_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    merged.apply_raw(raw, source_dir, &path.display().to_string())?;
+    merged.apply_raw(raw, source_dir, &path.display().to_string(), layer)?;
     merged
         .config_sources
         .push(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
@@ -1960,11 +2196,16 @@ pub(crate) struct PrintableConfig {
     pub(crate) approval_mode: ApprovalMode,
     pub(crate) workspace: WorkspacePolicy,
     pub(crate) features: Features,
+    pub(crate) approval: ApprovalConfig,
     pub(crate) ui: UiConfig,
     pub(crate) limits: Limits,
     pub(crate) council: PrintableCouncilConfig,
     pub(crate) runtimes: BTreeMap<String, PrintableRuntime>,
     pub(crate) agents: BTreeMap<String, PrintableAgent>,
+    /// The effective keymap (defaults + user overrides), as `context → action →
+    /// key`. Emitted in `--print-config` so the resolved bindings are visible.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) keybindings: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2039,6 +2280,7 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
         approval_mode: config.approval_mode.clone(),
         workspace: config.workspace.clone(),
         features: config.features.clone(),
+        approval: config.approval.clone(),
         ui: config.ui.clone(),
         limits: config.limits.clone(),
         council: PrintableCouncilConfig {
@@ -2133,7 +2375,29 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
                 )
             })
             .collect(),
+        keybindings: effective_keybindings_table(config),
     }
+}
+
+/// The effective keymap as a printable `context → action → key` table: defaults
+/// resolved against the user overrides, each chord rendered with `format_key`.
+/// Unbound actions are omitted. Drives the `[keybindings]` block in `--print-config`.
+fn effective_keybindings_table(
+    config: &EffectiveConfig,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    let resolved = keybindings::Keymap::resolve(&keybindings::DEFAULTS, &config.keybindings);
+    let mut normal = BTreeMap::new();
+    for (action, chord) in resolved.entries() {
+        normal.insert(
+            keybindings::action_name(action).to_string(),
+            keybindings::format_key(&chord),
+        );
+    }
+    let mut table = BTreeMap::new();
+    if !normal.is_empty() {
+        table.insert("normal".to_string(), normal);
+    }
+    table
 }
 
 /// Renders the redacted effective configuration as TOML for `--print-config`. Thin
@@ -2199,11 +2463,32 @@ approval_mode = "yolo"
 [features]
 parallel_step_groups = false
 
+# Approval floor posture for gray-area actions (ADR-002). "warn" (default)
+# surfaces the risk but still auto-runs under yolo; "enforce" re-prompts
+# instead. The catastrophic core always prompts and cannot be disabled here.
+# [approval]
+# floor = "warn"
+
 # Optional UI tweaks. Uncomment to adjust the input experience.
 # [ui]
 # hide_banner = true             # suppress the welcome banner
 # prompt_history_enabled = true  # ↑/↓ recall of past prompts (on by default)
 # prompt_history_max = 200       # how many past prompts to keep for recall
+
+# Optional keybinding remaps. USER SCOPE ONLY: honored from this home config or
+# an explicit --config; a project-local ./atelier.toml [keybindings] is ignored
+# (so an untrusted repo can't rebind your keys). Maps an action to a key with the
+# `ctrl+k` syntax (lowercase, case-insensitive, `+`-separated); set an action to
+# `false` to unbind it (hand the key back to the terminal). Only the `normal`
+# context is honored in V1. Bindable keys: Ctrl+letter (except C/D/I/M), F1-F12,
+# arrows, PageUp/PageDown/Home/End. Note: Ctrl-U is kill-to-line-start (readline
+# unix-line-discard), NOT kill-whole-line. Ctrl-C (interrupt) is reserved and
+# cannot be rebound. Run `atelier --print-config` to see the effective keymap.
+# [keybindings.normal]
+# toggle-roster        = "ctrl+g"   # default: ctrl+l
+# input-kill-to-end    = "ctrl+k"   # default: ctrl+k
+# scroll-top           = "home"     # default: home
+# input-kill-word-back = false       # unbind (example)
 
 [runtimes.codex]
 type = "codex"
@@ -2424,6 +2709,262 @@ mod tests {
         })
     }
 
+    /// Load an explicit `--config`/home-scope file. The file is named differently
+    /// from `atelier.toml` so it is applied only as the `Cli` layer and never
+    /// re-discovered as the local override (mirrors `builtin_config_resolves...`).
+    fn load_user_scope_config(contents: &str) -> Result<EffectiveConfig> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("home-config.toml");
+        fs::write(&config_path, contents)?;
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+    }
+
+    // ── keybindings config + ConfigLayer trust boundary (task_06) ──
+
+    #[test]
+    fn raw_keybinding_deserializes_key_string_and_false() {
+        let parsed: BTreeMap<String, BTreeMap<String, RawKeyBinding>> =
+            toml::from_str("[normal]\ntoggle-roster = \"ctrl+g\"\nhelp-open = false\n").unwrap();
+        let normal = &parsed["normal"];
+        match &normal["toggle-roster"] {
+            RawKeyBinding::Key(s) => assert_eq!(s, "ctrl+g"),
+            other => panic!("expected key string, got {other:?}"),
+        }
+        assert!(matches!(
+            &normal["help-open"],
+            RawKeyBinding::Disabled(false)
+        ));
+    }
+
+    #[test]
+    fn deny_unknown_fields_still_rejects_unknown_top_level_key() {
+        // A typo'd top-level section is still rejected (deny_unknown_fields intact).
+        assert!(toml::from_str::<RawConfig>("keybingings = {}\n").is_err());
+    }
+
+    #[test]
+    fn user_scope_keybindings_are_accepted_without_warning() {
+        let config = load_user_scope_config(
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\ninput-kill-to-end = \"ctrl+k\"\n",
+        )
+        .unwrap();
+        // Honored from user scope (Cli layer) — no ignore warning is recorded.
+        assert!(
+            config.keybinding_warnings.is_empty(),
+            "user-scope keybindings should be accepted, got: {:?}",
+            config.keybinding_warnings
+        );
+    }
+
+    #[test]
+    fn local_keybindings_are_ignored_with_a_warning_naming_the_file() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("atelier.toml"),
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n\n[ui]\nhide_banner = true\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        // The local [keybindings] is ignored, with a warning naming the local file.
+        assert!(
+            config
+                .keybinding_warnings
+                .iter()
+                .any(|w| w.contains("ignored [keybindings]") && w.contains("atelier.toml")),
+            "expected an ignored-local warning, got: {:?}",
+            config.keybinding_warnings
+        );
+        // A non-keybinding section in that same local file still merges unchanged.
+        assert!(config.ui.hide_banner);
+    }
+
+    // ── keybinding validation + EffectiveConfig wiring (task_07) ──
+
+    #[test]
+    fn valid_keybinding_yields_an_override() {
+        use crate::keybindings::{format_key, KeyAction};
+        let config =
+            load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n").unwrap();
+        let chord = config
+            .keybindings
+            .get(&KeyAction::ToggleRoster)
+            .expect("toggle-roster override present")
+            .expect("rebound, not unbound");
+        assert_eq!(format_key(&chord), "ctrl+g");
+        assert!(config.keybinding_warnings.is_empty());
+    }
+
+    #[test]
+    fn unbind_keybinding_yields_a_none_override() {
+        use crate::keybindings::KeyAction;
+        let config =
+            load_user_scope_config("[keybindings.normal]\ntoggle-roster = false\n").unwrap();
+        assert_eq!(
+            config.keybindings.get(&KeyAction::ToggleRoster),
+            Some(&None),
+            "false unbinds the action"
+        );
+    }
+
+    #[test]
+    fn no_keybindings_section_leaves_overrides_and_warnings_empty() {
+        let config = load_user_scope_config("schema_version = 1\n").unwrap();
+        assert!(config.keybindings.is_empty());
+        assert!(config.keybinding_warnings.is_empty());
+    }
+
+    #[test]
+    fn reserved_key_bind_hard_fails_with_file_field_value() {
+        let err = load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+c\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("toggle-roster"), "field: {msg}");
+        assert!(msg.contains("ctrl+c"), "value: {msg}");
+        assert!(msg.contains("home-config.toml"), "file: {msg}");
+        assert!(msg.contains("reserved"), "reason: {msg}");
+    }
+
+    #[test]
+    fn non_portable_key_hard_fails() {
+        let err = load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+1\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("portable"), "{msg}");
+        assert!(msg.contains("ctrl+1"));
+    }
+
+    #[test]
+    fn unknown_context_hard_fails() {
+        let err = load_user_scope_config("[keybindings.approval]\ntoggle-roster = \"ctrl+g\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("approval"), "{msg}");
+        assert!(msg.contains("normal"), "names the supported context: {msg}");
+    }
+
+    #[test]
+    fn duplicate_key_hard_fails() {
+        let err = load_user_scope_config(
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\nscroll-top = \"ctrl+g\"\n",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ctrl+g"), "{msg}");
+        assert!(
+            msg.contains("two actions") || msg.contains("multiple"),
+            "duplicate reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn malformed_key_hard_fails() {
+        let err = load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("toggle-roster"), "field: {msg}");
+        assert!(msg.contains("home-config.toml"), "file: {msg}");
+    }
+
+    #[test]
+    fn unknown_action_soft_fails_with_a_warning() {
+        let config = load_user_scope_config(
+            "[keybindings.normal]\nfrobnicate = \"ctrl+g\"\ntoggle-roster = \"ctrl+g\"\n",
+        )
+        .unwrap();
+        use crate::keybindings::KeyAction;
+        // The unknown action is dropped (so ctrl+g is free for the real rebind)...
+        assert!(config.keybindings.contains_key(&KeyAction::ToggleRoster));
+        // ...and a warning names it.
+        assert!(
+            config
+                .keybinding_warnings
+                .iter()
+                .any(|w| w.contains("frobnicate")),
+            "expected unknown-action warning, got: {:?}",
+            config.keybinding_warnings
+        );
+    }
+
+    // ── doctor / print-config / init-config surfaces (task_09) ──
+
+    #[test]
+    fn starter_config_text_documents_keybindings() {
+        let text = starter_config_text();
+        assert!(text.contains("[keybindings"), "section header present");
+        assert!(text.contains("ctrl+"), "ctrl+k syntax documented");
+        assert!(text.contains("false"), "unbind via false documented");
+        assert!(
+            text.contains("Ctrl-U") || text.contains("unix-line-discard"),
+            "Ctrl-U semantics noted"
+        );
+        assert!(
+            text.contains("project-local") || text.contains("USER SCOPE"),
+            "user-scope-only documented"
+        );
+    }
+
+    #[test]
+    fn print_config_emits_the_effective_keymap() {
+        // A rebind shows through to the redacted TOML as the effective key.
+        let config =
+            load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n").unwrap();
+        let toml = to_redacted_toml(&config).unwrap();
+        assert!(
+            toml.contains("[keybindings.normal]"),
+            "table emitted: {toml}"
+        );
+        assert!(
+            toml.contains("toggle-roster = \"ctrl+g\""),
+            "effective rebind shown: {toml}"
+        );
+        // Untouched defaults are part of the effective keymap too.
+        assert!(toml.contains("input-kill-to-end = \"ctrl+k\""), "{toml}");
+    }
+
+    #[test]
+    fn print_config_emits_defaults_with_no_overrides() {
+        // Even with no [keybindings] config, the effective (default) keymap is shown.
+        let config = load_user_scope_config("schema_version = 1\n").unwrap();
+        let toml = to_redacted_toml(&config).unwrap();
+        assert!(toml.contains("[keybindings.normal]"));
+        assert!(toml.contains("toggle-roster = \"ctrl+l\""), "{toml}");
+    }
+
+    #[test]
+    fn explicit_config_pointing_at_the_local_file_is_not_re_applied_as_local() {
+        // `--config ./atelier.toml` where that file is ALSO the working-dir local file:
+        // it must be honored as user-scope (Cli) exactly once, not re-applied as an
+        // (untrusted) Local layer that would falsely ignore + warn about its keybindings.
+        use crate::keybindings::KeyAction;
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("atelier.toml");
+        fs::write(
+            &config_path,
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        assert!(
+            config.keybinding_warnings.is_empty(),
+            "no spurious ignore warning expected, got: {:?}",
+            config.keybinding_warnings
+        );
+        assert!(config.keybindings.contains_key(&KeyAction::ToggleRoster));
+    }
+
     #[test]
     fn builtin_config_resolves_without_files() {
         let dir = tempdir().unwrap();
@@ -2517,6 +3058,21 @@ max_parallel_agent_steps = 0
     }
 
     #[test]
+    fn governance_early_abort_defaults_off_and_parses_true() {
+        let default = load_from_temp("schema_version = 1\n").unwrap();
+        assert!(!default.features.governance_early_abort);
+
+        let enabled = load_from_temp(
+            r#"
+[features]
+governance_early_abort = true
+"#,
+        )
+        .unwrap();
+        assert!(enabled.features.governance_early_abort);
+    }
+
+    #[test]
     fn ui_section_absent_defaults_hide_banner_false() {
         let config = load_from_temp("schema_version = 1\n").unwrap();
 
@@ -2601,6 +3157,170 @@ prompt_history_max = 50
         .unwrap();
 
         assert!(config.ui.prompt_history_enabled);
+    }
+
+    #[test]
+    fn approval_floor_defaults_to_warn_when_section_absent() {
+        // Omitting [approval] preserves today's gray-area behavior (ADR-002).
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+        assert_eq!(config.approval.floor, FloorPolicy::Warn);
+    }
+
+    #[test]
+    fn approval_floor_can_be_set_to_enforce() {
+        let config =
+            load_from_temp("schema_version = 1\n[approval]\nfloor = \"enforce\"\n").unwrap();
+        assert_eq!(config.approval.floor, FloorPolicy::Enforce);
+    }
+
+    #[test]
+    fn approval_floor_local_enforce_overrides_home_warn() {
+        // Layer precedence (built-in → home → local): home warns, the project file
+        // opts into enforce; local wins.
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(
+            &home_path,
+            "schema_version = 1\n[approval]\nfloor = \"warn\"\n",
+        )
+        .unwrap();
+
+        let local_dir = tempdir().unwrap();
+        fs::write(
+            local_dir.path().join("atelier.toml"),
+            "[approval]\nfloor = \"enforce\"\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: local_dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        assert_eq!(config.approval.floor, FloorPolicy::Enforce);
+    }
+
+    #[test]
+    fn approval_invalid_floor_value_names_the_field() {
+        let error = load_from_temp("schema_version = 1\n[approval]\nfloor = \"block\"\n")
+            .expect_err("invalid floor value should fail to load");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("floor"),
+            "error should name the floor field, got: {message}"
+        );
+    }
+
+    #[test]
+    fn redacted_toml_includes_approval_floor() {
+        let config =
+            load_from_temp("schema_version = 1\n[approval]\nfloor = \"enforce\"\n").unwrap();
+        let rendered = to_redacted_toml(&config).unwrap();
+        assert!(rendered.contains("[approval]"));
+        assert!(rendered.contains("floor = \"enforce\""));
+    }
+
+    // ---- Near-miss "did you mean?" config hints (task_02) -------------
+
+    #[test]
+    fn runtime_missing_type_suggests_nearby_runtime() {
+        let error = load_from_temp("schema_version = 1\n[runtimes.codx]\n")
+            .expect_err("runtime missing type should fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("did you mean `codex`?"),
+            "expected codex hint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn agent_undefined_runtime_suggests_nearby_runtime() {
+        let error = load_from_temp("schema_version = 1\n[agents.fixer]\nruntime = \"codx\"\n")
+            .expect_err("agent pointing at an undefined runtime should fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("undefined runtime codx"),
+            "expected the base error, got: {message}"
+        );
+        assert!(
+            message.contains("did you mean `codex`?"),
+            "expected codex hint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn agent_missing_field_suggests_nearby_agent() {
+        let error = load_from_temp("schema_version = 1\n[agents.fixr]\n")
+            .expect_err("agent missing required fields should fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("did you mean `fixer`?"),
+            "expected fixer hint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn valid_custom_runtime_name_loads_with_no_hint() {
+        // False-positive lock: an unconventional but valid custom runtime loads
+        // cleanly and is present — no error, so no near-miss hint can fire.
+        let config =
+            load_from_temp("schema_version = 1\n[runtimes.my_custom_thing]\ntype = \"codex\"\n")
+                .expect("a valid custom runtime should load");
+        assert!(config.runtimes.contains_key("my_custom_thing"));
+    }
+
+    #[test]
+    fn wild_typo_runtime_gets_no_suggestion() {
+        let error = load_from_temp("schema_version = 1\n[runtimes.zzzzzz]\n")
+            .expect_err("runtime missing type should fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("runtime zzzzzz is missing required field type"),
+            "expected the base error, got: {message}"
+        );
+        assert!(
+            !message.contains("did you mean"),
+            "a wild typo must not get a suggestion, got: {message}"
+        );
+    }
+
+    // ---- required_runtime_ids (task_03) -------------------------------
+
+    #[test]
+    fn required_runtime_ids_default_is_exactly_orchestrator_runtime() {
+        // Guardrail: the elevated set is exactly the orchestrator's runtime and
+        // must not broaden silently (ADR-003).
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+        assert_eq!(config.required_runtime_ids(), BTreeSet::from(["zai"]));
+    }
+
+    #[test]
+    fn required_runtime_ids_follows_orchestrator_runtime_override() {
+        let config =
+            load_from_temp("schema_version = 1\n[agents.orchestrator]\nruntime = \"codex\"\n")
+                .unwrap();
+        assert_eq!(config.required_runtime_ids(), BTreeSet::from(["codex"]));
+    }
+
+    #[test]
+    fn required_runtime_ids_is_empty_when_orchestrator_absent() {
+        let mut config = load_from_temp("schema_version = 1\n").unwrap();
+        config.agents.remove("orchestrator");
+        assert!(config.required_runtime_ids().is_empty());
+    }
+
+    #[test]
+    fn approval_section_cannot_disable_catastrophic_core() {
+        // The catastrophic core is intentionally not configurable; any attempt to
+        // add such a key is rejected by deny_unknown_fields.
+        let error = load_from_temp("schema_version = 1\n[approval]\ncatastrophic = false\n")
+            .expect_err("unknown approval keys must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("catastrophic") || message.contains("unknown"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]

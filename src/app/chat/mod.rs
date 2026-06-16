@@ -33,6 +33,9 @@ pub enum ChatItemKind {
     FileEdit,
     Approval,
     Clarification,
+    /// A governance decision (e.g. the turn-1 early-abort) paused for the user
+    /// to accept or reject before the run proceeds (governance spine, ADR-003).
+    GovernanceDecision,
     Diagnostic,
     SkillContext,
     AgentResult,
@@ -125,6 +128,12 @@ pub enum ChatLifecycleKey {
         run_id: String,
         question_id: String,
     },
+    /// A governance decision paused for user input; one chat item per decision
+    /// (governance spine, ADR-003).
+    GovernanceDecision {
+        run_id: String,
+        decision_id: String,
+    },
     Workflow {
         run_id: String,
     },
@@ -211,6 +220,10 @@ impl ChatLifecycleKey {
                 run_id,
                 question_id,
             } => format!("chat:clarification:{run_id}:{question_id}"),
+            ChatLifecycleKey::GovernanceDecision {
+                run_id,
+                decision_id,
+            } => format!("chat:governance_decision:{run_id}:{decision_id}"),
             ChatLifecycleKey::Workflow { run_id } => format!("chat:workflow:{run_id}"),
             ChatLifecycleKey::Step {
                 run_id,
@@ -240,6 +253,7 @@ impl ChatItemKind {
             ChatItemKind::FileEdit => "file_edit",
             ChatItemKind::Approval => "approval",
             ChatItemKind::Clarification => "clarification",
+            ChatItemKind::GovernanceDecision => "governance_decision",
             ChatItemKind::Diagnostic => "diagnostic",
             ChatItemKind::SkillContext => "skill_context",
             ChatItemKind::AgentResult => "agent_result",
@@ -288,5 +302,27 @@ impl ChatItemStatus {
             ChatItemStatus::Interrupted => "interrupted",
             ChatItemStatus::Skipped => "skipped",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn governance_decision_kind_slug_is_governance_decision() {
+        assert_eq!(
+            ChatItemKind::GovernanceDecision.slug(),
+            "governance_decision"
+        );
+    }
+
+    #[test]
+    fn governance_decision_lifecycle_key_item_id_is_stable() {
+        let key = ChatLifecycleKey::GovernanceDecision {
+            run_id: "run-7".to_string(),
+            decision_id: "dec-9".to_string(),
+        };
+        assert_eq!(key.item_id(), "chat:governance_decision:run-7:dec-9");
     }
 }

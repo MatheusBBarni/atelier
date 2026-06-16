@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Chat projection for trust & floor events
 type: backend
 complexity: medium
@@ -28,10 +28,10 @@ Make trust and floor activity visible in the transcript by projecting the new ev
 - MUST tolerate events missing the newer fields (older sessions) without panicking.
 
 ## Subtasks
-- [ ] 06.1 Add `apply_history_event` arms for the five new event kinds.
-- [ ] 06.2 Map each to a `ChatItemView` with the right kind/severity and human-readable text.
-- [ ] 06.3 Add the tier to the projected `Approval` item.
-- [ ] 06.4 Add projection unit tests for each event and the tiered approval item.
+- [x] 06.1 Add `apply_history_event` arms for the five new event kinds.
+- [x] 06.2 Map each to a `ChatItemView` with the right kind/severity and human-readable text.
+- [x] 06.3 Add the tier to the projected `Approval` item.
+- [x] 06.4 Add projection unit tests for each event and the tiered approval item.
 
 ## Implementation Details
 Work in `src/app/chat/projection.rs`: `apply_history_event` (~58, dispatch on `event.kind`), `apply_pending_approval` (~192), and the existing `apply_approval_requested`/`apply_approval_resolved` arms (~72–73). Use `ChatItemView`/`ChatItemKind`/`ChatSeverity`/`ChatLineStyle` from `src/app/chat/mod.rs` (~11–85). See TechSpec "System Architecture → Component Overview (projection)" and "Data Models (event payloads)".
@@ -54,13 +54,13 @@ Work in `src/app/chat/projection.rs`: `apply_history_event` (~58, dispatch on `e
 
 ## Tests
 - Unit tests:
-  - [ ] `approval_auto_resolved { target }` → a `Diagnostic` item, `Info`, text naming the trusted target.
-  - [ ] `floor_warned { tier, reason }` → a `Diagnostic` item, `Warning`, text containing the reason and a "warn-only" marker.
-  - [ ] `trust_granted`/`trust_revoked` → `Info` items naming the target; `trust_cleared { count }` names the count.
-  - [ ] `apply_pending_approval` produces an `Approval` item whose body includes the tier label.
-  - [ ] An `approval_resolved` event missing the `tier` field projects without panic.
+  - [x] `approval_auto_resolved { target }` → a `Diagnostic` item, `Info`, text naming the trusted target.
+  - [x] `floor_warned { tier, reason }` → a `Diagnostic` item, `Warning`, text containing the reason and a "warn-only" marker.
+  - [x] `trust_granted`/`trust_revoked` → `Info` items naming the target; `trust_cleared { count }` names the count.
+  - [x] `apply_pending_approval` produces an `Approval` item whose body includes the tier label.
+  - [x] An `approval_requested` event missing the `risk`/`tier` field projects without panic.
 - Integration tests:
-  - [ ] Replaying a recorded sequence (approval_requested → floor_warned → trust_granted) yields the expected ordered `ChatItemView` set.
+  - [x] Replaying a recorded sequence (approval_requested → floor_warned → trust_granted) yields the expected ordered `ChatItemView` set.
 - Test coverage target: >=80%
 - All tests must pass
 

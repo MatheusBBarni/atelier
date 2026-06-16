@@ -7,12 +7,15 @@ pub mod diagnostics;
 pub mod docgen;
 pub mod doctor;
 pub mod file_index;
+pub mod governance;
 pub mod history;
 pub mod ids;
+pub mod keybindings;
 pub mod orchestrator;
 pub mod runtime;
 pub mod skills;
 pub mod slash_commands;
 pub mod tui;
+pub mod util;
 
 pub use cli::{run_cli, Cli};

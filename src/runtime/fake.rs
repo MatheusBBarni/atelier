@@ -103,6 +103,30 @@ impl Runtime for FakeRuntime {
                     params: serde_json::json!({ "command": "cargo install pretend-package" }),
                 },
             }
+        } else if should_emit_fake_trusted_command_action_request(&request) {
+            // A gray-area command that is harmless to actually run, so trust
+            // tests can let it auto-execute instead of pausing.
+            RuntimeOutput::ActionRequest {
+                request: ActionRequest {
+                    schema_version: 1,
+                    action_id: new_id(),
+                    step_id: request.step_id.clone(),
+                    kind: ActionKind::RunCommand,
+                    params: serde_json::json!({ "command": "echo trusted-run" }),
+                },
+            }
+        } else if should_emit_fake_catastrophic_action_request(&request) {
+            // Catastrophic (secret-read) classification, but harmless to execute:
+            // a relative `id_rsa` that does not exist in the test's temp workspace.
+            RuntimeOutput::ActionRequest {
+                request: ActionRequest {
+                    schema_version: 1,
+                    action_id: new_id(),
+                    step_id: request.step_id.clone(),
+                    kind: ActionKind::RunCommand,
+                    params: serde_json::json!({ "command": "cat id_rsa" }),
+                },
+            }
         } else if should_emit_fake_action_request(&request) {
             RuntimeOutput::ActionRequest {
                 request: ActionRequest {
@@ -325,6 +349,17 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             "Fixer reports the scoped edit result.".to_string(),
             None,
         ),
+        // Drives the governance early-abort gate: a first-turn single-agent run
+        // that intends to write (Edit), so the gate (when flagged on) pauses
+        // before any action runs.
+        None if prompt.contains("governance early abort") => (
+            DecisionStatus::Continue,
+            Some("fixer".to_string()),
+            vec![Capability::Read, Capability::Edit, Capability::Verify],
+            "Apply the requested scoped edit directly on the first turn.".to_string(),
+            "Fixer reports the scoped edit result.".to_string(),
+            None,
+        ),
         None => (
             DecisionStatus::Continue,
             Some("explorer".to_string()),
@@ -536,6 +571,20 @@ fn should_emit_fake_command_action_request(request: &RuntimeRequest) -> bool {
         && request.agent_profile.id == "fixer"
         && request.agent_profile.has_capability(&Capability::Command)
         && fake_control_text(request).contains("command action")
+}
+
+fn should_emit_fake_trusted_command_action_request(request: &RuntimeRequest) -> bool {
+    request.action_results.is_empty()
+        && request.agent_profile.id == "fixer"
+        && request.agent_profile.has_capability(&Capability::Command)
+        && fake_control_text(request).contains("trusted run action")
+}
+
+fn should_emit_fake_catastrophic_action_request(request: &RuntimeRequest) -> bool {
+    request.action_results.is_empty()
+        && request.agent_profile.id == "fixer"
+        && request.agent_profile.has_capability(&Capability::Command)
+        && fake_control_text(request).contains("secret read action")
 }
 
 fn should_emit_fake_write_action_request(request: &RuntimeRequest) -> bool {

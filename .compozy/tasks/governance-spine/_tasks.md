@@ -4,14 +4,14 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Governance module with shared decision and plan types | pending | medium | — |
-| 02 | Add chat governance-decision variants and projection arm | pending | medium | task_01 |
-| 03 | Pending governance decision state and resolver | pending | medium | task_01 |
-| 04 | TUI governance decision card and key routing | pending | medium | task_02, task_03 |
-| 05 | Early-abort gate in the drive loop with feature flag | pending | high | task_02, task_03 |
-| 06 | Orchestrator prompt nudge for turn-one intent | pending | low | task_05 |
-| 07 | Governance outcome proxy and calibration metrics in doctor | pending | medium | task_05 |
-| 08 | Sibling conformance contract and test | pending | low | task_01 |
+| 01 | Governance module with shared decision and plan types | completed | medium | — |
+| 02 | Add chat governance-decision variants and projection arm | completed | medium | task_01 |
+| 03 | Pending governance decision state and resolver | completed | medium | task_01 |
+| 04 | TUI governance decision card and key routing | completed | medium | task_02, task_03 |
+| 05 | Early-abort gate in the drive loop with feature flag | completed | high | task_02, task_03 |
+| 06 | Orchestrator prompt nudge for turn-one intent | completed | low | task_05 |
+| 07 | Governance outcome proxy and calibration metrics in doctor | completed | medium | task_05 |
+| 08 | Sibling conformance contract and test | completed | low | task_01 |
 
 ## Build Waves
 

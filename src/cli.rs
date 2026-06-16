@@ -28,6 +28,12 @@ pub struct Cli {
     #[arg(long)]
     pub json: bool,
 
+    /// With `--doctor`, exit non-zero when the report has any error (CI gate).
+    /// The report's severity is unaffected by this flag (ADR-003); it only gates
+    /// the process exit.
+    #[arg(long)]
+    pub strict: bool,
+
     #[arg(long)]
     pub print_config: bool,
 
@@ -62,6 +68,9 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
     if cli.json && !cli.doctor {
         bail!("--json is only valid with --doctor");
     }
+    if cli.strict && !cli.doctor {
+        bail!("--strict is only valid with --doctor");
+    }
     if cli.yes && !cli.clean_sessions {
         bail!("--yes is only valid with --clean-sessions");
     }
@@ -70,6 +79,7 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
             || cli.config.is_some()
             || cli.doctor
             || cli.json
+            || cli.strict
             || cli.print_config
             || cli.init_config
             || cli.clean_sessions
@@ -160,6 +170,17 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
         } else {
             print!("{}", render_human(&report));
         }
+        // Exit code is a pure function of report severity (ADR-001/003): stdout
+        // and --json stay clean; the gate and nudge go to stderr only.
+        if report.has_errors() {
+            if cli.strict {
+                bail!("doctor reported {} error(s)", report.error_count());
+            }
+            eprintln!(
+                "{} error(s) found; re-run with --doctor --strict to fail CI",
+                report.error_count()
+            );
+        }
         return Ok(());
     }
 
@@ -215,6 +236,7 @@ mod tests {
             config: None,
             doctor: false,
             json: false,
+            strict: false,
             print_config: true,
             init_config: false,
             clean_sessions: false,
@@ -236,6 +258,7 @@ mod tests {
             config: None,
             doctor: false,
             json: false,
+            strict: false,
             print_config: false,
             init_config: false,
             clean_sessions: false,
@@ -258,6 +281,7 @@ mod tests {
             config: None,
             doctor: false,
             json: false,
+            strict: false,
             print_config: false,
             init_config: false,
             clean_sessions: false,
@@ -299,5 +323,29 @@ mod tests {
 
         let error = run_cli_with(cli).await.unwrap_err();
         assert!(error.to_string().contains("--update cannot be combined"));
+    }
+
+    #[tokio::test]
+    async fn strict_requires_doctor() {
+        let dir = tempdir().unwrap();
+        let cli = Cli {
+            cwd: Some(dir.path().to_path_buf()),
+            config: None,
+            doctor: false,
+            json: false,
+            strict: true,
+            print_config: false,
+            init_config: false,
+            clean_sessions: false,
+            update: false,
+            codemap: None,
+            emit_docs: None,
+            yes: false,
+            debug: false,
+        };
+        let error = run_cli_with(cli).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--strict is only valid with --doctor"));
     }
 }

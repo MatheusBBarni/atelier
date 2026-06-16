@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Keybinding doctor check and config surfaces
 type: backend
 complexity: medium
@@ -38,11 +38,11 @@ documentation surfaces.
 </requirements>
 
 ## Subtasks
-- [ ] 9.1 Add the `config.keybindings` doctor check driven by `keybinding_warnings`.
-- [ ] 9.2 Extend `config_warning_messages()` to surface keybinding warnings at startup.
-- [ ] 9.3 Add `PrintableConfig.keybindings` and populate it in `build_printable_config` via `format_key`.
-- [ ] 9.4 Add the commented `[keybindings]` block to the `--init-config` starter template.
-- [ ] 9.5 Add tests for the doctor check, print-config emission, init-config block, and startup notice.
+- [x] 9.1 Add the `config.keybindings` doctor check driven by `keybinding_warnings`.
+- [x] 9.2 Extend `config_warning_messages()` to surface keybinding warnings at startup.
+- [x] 9.3 Add `PrintableConfig.keybindings` and populate it in `build_printable_config` via `format_key`.
+- [x] 9.4 Add the commented `[keybindings]` block to the `--init-config` starter template.
+- [x] 9.5 Add tests for the doctor check, print-config emission, init-config block, and startup notice.
 
 ## Implementation Details
 `src/doctor/mod.rs`: `run_doctor` (`:55`) and the `DoctorCheck` type (`:11-45`); follow the
@@ -73,11 +73,11 @@ See TechSpec "Monitoring and Observability" and "API Endpoints"; ADR-004 (diagno
 
 ## Tests
 - Unit tests:
-  - [ ] `config_warning_messages()` includes a keybinding warning when `keybinding_warnings` is non-empty.
-  - [ ] `starter_config_text()` contains `[keybindings` and the `ctrl+k`/`false`/`Ctrl-U` syntax comments.
+  - [x] `config_warning_messages()` includes a keybinding warning when `keybinding_warnings` is non-empty — `config_warning_messages_includes_keybinding_warnings` (app).
+  - [x] `starter_config_text()` contains `[keybindings` and the `ctrl+k`/`false`/`Ctrl-U` syntax comments — `starter_config_text_documents_keybindings`.
 - Integration tests:
-  - [ ] A config with a soft warning yields a `config.keybindings` doctor check with status `Warn` (tokio test via `load_effective_config` + `run_doctor`); a clean config yields `Ok`.
-  - [ ] `to_redacted_toml` of a config with `toggle-roster = "ctrl+g"` contains a `[keybindings]` table showing the effective `ctrl+g` mapping.
+  - [x] A config with a soft warning yields a `config.keybindings` doctor check with status `Warn` (tokio test via `load_effective_config` + `run_doctor`); a clean config yields `Ok` — `doctor_keybindings_check_reflects_warnings`.
+  - [x] `to_redacted_toml` of a config with `toggle-roster = "ctrl+g"` contains a `[keybindings]` table showing the effective `ctrl+g` mapping — `print_config_emits_the_effective_keymap` (+ `print_config_emits_defaults_with_no_overrides`).
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -86,3 +86,23 @@ See TechSpec "Monitoring and Observability" and "API Endpoints"; ADR-004 (diagno
 - Test coverage >=80%
 - Doctor warns on keybinding issues; `--print-config` shows the effective keymap; `--init-config` documents the section.
 - Wave 2 is complete (remap engine + config + unbind + diagnostics).
+
+## Implementation Notes
+- `config.keybindings` `DoctorCheck` (new `keybindings_check`): `Ok`/`Info` when
+  `keybinding_warnings` is empty, `Warn`/`Warning` otherwise (never `Error` — every
+  offending entry already fell back to its default), with the warnings in `message`
+  and `context`.
+- `config_warning_messages()` now appends `config.keybinding_warnings` to the model-
+  fallback warning, so they reach `ConfigStatusView.warnings` / `/config` / the startup
+  notice.
+- `PrintableConfig.keybindings` (`context → action → key`) is built by
+  `effective_keybindings_table` — the full **resolved** keymap (defaults + overrides) via
+  `format_key`, so `--print-config` always shows the effective bindings (not just the
+  overrides). `#[serde(skip_serializing_if)]` guards the empty case (never hit in practice).
+- `starter_config_text` gained a commented `[keybindings.normal]` block documenting the
+  `ctrl+k` syntax, `action → key`, `false`-to-unbind, the `Ctrl-U` = unix-line-discard
+  note, the portable-key set, the reserved `Ctrl-C`, and the user-scope-only boundary.
+- Verified `2026-06-16`: doctor/print-config/init-config/startup tests pass; the existing
+  golden printable tests still pass with the new section; clippy `--all-targets` clean;
+  fmt clean; full `cargo test --lib` 1038 passed (only environmental failures); `cli`
+  integration suite (10) green.

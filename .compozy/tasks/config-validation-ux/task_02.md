@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Append near-miss did-you-mean hints at config-load error sites"
 type: backend
 complexity: low
@@ -30,11 +30,11 @@ Enrich the three existing config-load errors that fire on a typo'd table name wi
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add a small formatter turning a `suggest_nearby_name` result into "; did you mean `x`?" or an empty string.
-- [ ] 2.2 Apply it at the runtime-missing-type error site.
-- [ ] 2.3 Apply it at the agent-undefined-runtime error site.
-- [ ] 2.4 Apply it at the agent-missing-field error site(s).
-- [ ] 2.5 Add unit tests, including the false-positive lock.
+- [x] 2.1 Add a small formatter turning a `suggest_nearby_name` result into "; did you mean `x`?" or an empty string.
+- [x] 2.2 Apply it at the runtime-missing-type error site.
+- [x] 2.3 Apply it at the agent-undefined-runtime error site.
+- [x] 2.4 Apply it at the agent-missing-field error site(s).
+- [x] 2.5 Add unit tests, including the false-positive lock.
 
 ## Implementation Details
 See TechSpec "Implementation Design" and ADR-004. The "known" set is the sibling keys already present in the merged map (the four builtin runtimes / eight builtin agents are always present), so no hardcoded const is needed. All edits are in `into_effective`; the `anyhow` error types are unchanged — only the message string is enriched.
@@ -57,13 +57,13 @@ See TechSpec "Implementation Design" and ADR-004. The "known" set is the sibling
 
 ## Tests
 - Unit tests:
-  - [ ] `[runtimes.codx]` with no `type` → error message contains "did you mean `codex`?".
-  - [ ] An agent with `runtime = "codx"` → error contains "did you mean `codex`?".
-  - [ ] `[agents.fixr]` missing required fields → error contains "did you mean `fixer`?".
-  - [ ] False-positive lock: a valid `[runtimes.my_custom_thing]` with all required fields loads successfully with no hint and no new warning.
-  - [ ] A wild typo `[runtimes.zzzzzz]` missing `type` → base error with NO suggestion appended.
+  - [x] `[runtimes.codx]` with no `type` → error message contains "did you mean `codex`?".
+  - [x] An agent with `runtime = "codx"` → error contains "did you mean `codex`?".
+  - [x] `[agents.fixr]` missing required fields → error contains "did you mean `fixer`?".
+  - [x] False-positive lock: a valid `[runtimes.my_custom_thing]` with all required fields loads successfully with no hint and no new warning.
+  - [x] A wild typo `[runtimes.zzzzzz]` missing `type` → base error with NO suggestion appended.
 - Integration tests:
-  - [ ] `load_effective_config` on a temp config containing a typo'd runtime returns an error whose message includes the suggestion.
+  - [x] `load_effective_config` on a temp config containing a typo'd runtime returns an error whose message includes the suggestion.
 - Test coverage target: >=80%
 - All tests must pass
 

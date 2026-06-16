@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: /trust list & revoke command
 type: backend
 complexity: medium
@@ -29,10 +29,10 @@ Add the `/trust` command so users can inspect and revoke their session trust ent
 - MUST report a clear usage message for malformed input (e.g., `/trust revoke abc`, out-of-range index) without mutating the store.
 
 ## Subtasks
-- [ ] 08.1 Add the `/trust` catalog entry and keep `slash_command_catalog` tests aligned.
-- [ ] 08.2 Implement `handle_trust_command` (list / revoke / clear) and dispatch it from the command handler.
-- [ ] 08.3 Record the trust list/revoke/clear events.
-- [ ] 08.4 Add unit tests for each subcommand and a FakeRuntime re-arm test.
+- [x] 08.1 Add the `/trust` catalog entry and keep `slash_command_catalog` tests aligned.
+- [x] 08.2 Implement `handle_trust_command` (list / revoke / clear) and dispatch it from the command handler.
+- [x] 08.3 Record the trust list/revoke/clear events.
+- [x] 08.4 Add unit tests for each subcommand and a FakeRuntime re-arm test.
 
 ## Implementation Details
 Work in `src/slash_commands.rs` (`CATALOG` ~48, `SlashCommandKind` ~13) and `src/app/mod.rs` (`handle_config_command` ~1196 as the pattern; dispatch alongside it; `record_event` ~4164). Operate on the `TrustStore` from task_04; events are projected by task_06. See TechSpec "Command & Signal Surface".
@@ -55,14 +55,14 @@ Work in `src/slash_commands.rs` (`CATALOG` ~48, `SlashCommandKind` ~13) and `src
 
 ## Tests
 - Unit tests:
-  - [ ] `/trust` with an empty store reports "no trusted actions".
-  - [ ] `/trust` with two entries lists both, numbered, with "this session only".
-  - [ ] `/trust revoke 1` removes the first entry and emits `trust_revoked`.
-  - [ ] `/trust revoke 9` (out of range) and `/trust revoke abc` report usage and leave the store unchanged.
-  - [ ] `/trust clear` empties the store and emits `trust_cleared` with the count.
-  - [ ] The catalog contains `/trust` as an `AppCommand` (catalog test).
+  - [x] `/trust` with an empty store reports "no trusted actions".
+  - [x] `/trust` with two entries lists both, numbered, with "this session only".
+  - [x] `/trust revoke 1` removes the first entry and emits `trust_revoked`.
+  - [x] `/trust revoke 9` (out of range) and `/trust revoke abc` report usage and leave the store unchanged.
+  - [x] `/trust clear` empties the store and emits `trust_cleared` with the count.
+  - [x] The catalog contains `/trust` as an `AppCommand` (catalog test).
 - Integration tests:
-  - [ ] FakeRuntime: approve-and-trust an action, `/trust revoke 1`, then the agent re-emits it → the modal is raised again (re-armed).
+  - [x] FakeRuntime: approve-and-trust an action, `/trust revoke 1`, then the agent re-emits it → the modal is raised again (re-armed).
 - Test coverage target: >=80%
 - All tests must pass
 

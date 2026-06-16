@@ -91,6 +91,7 @@ atelier --config <path>
 atelier --cwd <path>
 atelier --doctor
 atelier --doctor --json
+atelier --doctor --strict
 atelier --print-config
 atelier --init-config
 atelier --codemap init
@@ -105,11 +106,46 @@ atelier --debug
 Notes:
 
 - `--json` is valid only with `--doctor`.
+- `--strict` is valid only with `--doctor`; it makes `--doctor` exit non-zero
+  when the report has any error (a CI gate). Plain `--doctor` always exits `0`
+  and, when errors are present, prints a one-line nudge to stderr pointing at
+  `--strict`. `--strict --json` keeps stdout clean JSON; the gate/nudge are
+  stderr-only.
 - `--yes` is valid only with `--clean-sessions`.
 - `--print-config` prints merged config with secrets redacted.
 - `--init-config` creates starter config/instruction files if missing.
 - `--codemap changes` reports stale maps without writing files.
 - `--update` is handled by the npm launcher and updates the global npm package.
+
+### Doctor exit codes
+
+`atelier --doctor --strict` is the scriptable health gate. Branch on **`!= 0`,
+not on a specific code**:
+
+- `0` — healthy (no errors in the report).
+- non-zero — unhealthy (the report has at least one error, e.g. the orchestrator
+  runtime is unavailable).
+
+Exit codes `1` (found problems) and `2` (config could not be evaluated) are
+**reserved** for future use and are not separately emitted in V1 — V1 returns
+`0` or a generic non-zero. Do not branch on `== 1` or `== 2`.
+
+CI example (GitHub Actions):
+
+```yaml
+- name: Validate atelier config
+  run: atelier --doctor --strict
+```
+
+Or in any shell script:
+
+```bash
+atelier --doctor --strict || { echo "atelier config/runtime health check failed"; exit 1; }
+```
+
+The near-miss config hints (`did you mean \`codex\`?`) are **better hints on
+errors that already occur** — they enrich existing config-load failures, not a
+standalone typo-detection pass; a config that loads cleanly is never flagged.
 
 ## Codemaps
 

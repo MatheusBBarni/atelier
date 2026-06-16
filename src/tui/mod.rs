@@ -3,11 +3,14 @@ use crate::app::chat::{
 };
 use crate::app::git::GitContext;
 use crate::app::{
-    ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, InterruptHandle,
-    PendingClarificationView, PromptSource, QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
+    ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, ApprovalResolution,
+    InterruptHandle, PendingApprovalView, PendingClarificationView, PromptSource,
+    QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
+use crate::governance::{GovernanceAnswer, GovernanceDecisionView};
+use crate::keybindings::{self, KeyAction, Keymap};
 use crate::orchestrator::RunState;
 use crate::skills::{
     self, SkillSourceTag, SkillSuggestion, SKILL_DISCOVERY_MAX_DEPTH, SKILL_FILE_NAME,
@@ -15,8 +18,8 @@ use crate::skills::{
 };
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -87,6 +90,8 @@ const CLARIFICATION_HINT_SINGLE: &str =
     "↑/↓ or 1-9 move · type for custom · Enter confirm · Ctrl-C interrupt";
 const CLARIFICATION_HINT_MULTI: &str =
     "↑/↓ or 1-9 move · Space toggle · type for custom · Enter confirm · Ctrl-C interrupt";
+const GOVERNANCE_DECISION_HINT: &str =
+    "Ctrl-Y accept · Esc reject · type a redirect then Enter to reject with guidance · Ctrl-C interrupt";
 const QUEUE_VISIBLE_MAX: usize = 6;
 const QUEUE_SELECTED_MARKER: &str = "> ";
 const QUEUE_UNSELECTED_MARKER: &str = "  ";
@@ -188,6 +193,7 @@ enum TuiCommand {
     ReloadSkills,
     InputCharacter(char),
     InputBackspace,
+    InputKill(InputKillCommand),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +212,24 @@ enum InputCursorCommand {
     Right,
     Up,
     Down,
+    /// Jump the cursor to the start of the composer line (readline `Ctrl-A`).
+    LineStart,
+    /// Jump the cursor to the end of the composer line (readline `Ctrl-E`).
+    LineEnd,
+}
+
+/// Readline-style kill operations over the single-line composer. Kills discard
+/// text (no kill-ring/yank in V1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputKillCommand {
+    /// Delete from the cursor to the end of the line (readline `Ctrl-K`).
+    ToLineEnd,
+    /// Delete from the start of the line up to the cursor (readline `Ctrl-U`,
+    /// `unix-line-discard`).
+    ToLineStart,
+    /// Delete the whitespace-and-word immediately before the cursor (readline
+    /// `Ctrl-W`).
+    WordBack,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,6 +362,11 @@ struct TuiUiState {
     work_spinner_frame: usize,
     theme: Theme,
     hide_banner: bool,
+    /// Resolved key → action map consulted in the normal-input branch only
+    /// (ADR-003). Built once at TUI init; Wave 1 uses `DEFAULTS` (no config),
+    /// task_08 swaps in the config-resolved map. No overrides ⇒ byte-identical
+    /// default routing.
+    keymap: Keymap,
 }
 
 impl Default for TuiUiState {
@@ -385,7 +414,36 @@ impl Default for TuiUiState {
                 truecolor: true,
             }),
             hide_banner: false,
+            keymap: default_keymap(),
         }
+    }
+}
+
+/// The Wave-1 keymap: `DEFAULTS` resolved with no user overrides. Byte-identical
+/// to the pre-feature routing for the keys it owns. task_08 replaces the call site
+/// at TUI init with the config-resolved map.
+fn default_keymap() -> Keymap {
+    Keymap::resolve(
+        &keybindings::DEFAULTS,
+        &keybindings::KeybindingOverrides::new(),
+    )
+}
+
+/// The single bridge from a remappable [`KeyAction`] to its concrete [`TuiCommand`]
+/// (ADR-003). Exhaustive by construction: adding a `KeyAction` variant forces a new
+/// arm here, so action names can never drift from the command enum.
+fn command_for_action(action: KeyAction) -> TuiCommand {
+    match action {
+        KeyAction::ToggleRoster => TuiCommand::ToggleRoster,
+        KeyAction::ScrollPageUp => TuiCommand::ScrollEvents(EventScrollCommand::PageUp),
+        KeyAction::ScrollPageDown => TuiCommand::ScrollEvents(EventScrollCommand::PageDown),
+        KeyAction::ScrollTop => TuiCommand::ScrollEvents(EventScrollCommand::Top),
+        KeyAction::ScrollBottom => TuiCommand::ScrollEvents(EventScrollCommand::Bottom),
+        KeyAction::InputLineStart => TuiCommand::MoveInputCursor(InputCursorCommand::LineStart),
+        KeyAction::InputLineEnd => TuiCommand::MoveInputCursor(InputCursorCommand::LineEnd),
+        KeyAction::InputKillToEnd => TuiCommand::InputKill(InputKillCommand::ToLineEnd),
+        KeyAction::InputKillToStart => TuiCommand::InputKill(InputKillCommand::ToLineStart),
+        KeyAction::InputKillWordBack => TuiCommand::InputKill(InputKillCommand::WordBack),
     }
 }
 
@@ -478,6 +536,9 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let hide_banner = config.ui.hide_banner;
     let prompt_history_enabled = config.ui.prompt_history_enabled;
     let prompt_history_max = config.ui.prompt_history_max;
+    // Resolve the active keymap from defaults + validated config overrides (task_08).
+    // Captured before `config` is moved into the app; no overrides ⇒ default keymap.
+    let keymap = Keymap::resolve(&keybindings::DEFAULTS, &config.keybindings);
     let theme = Theme::resolve(TerminalCaps::detect());
     let mut app = App::new_with_debug(config, debug_enabled).await?;
     let (state_sender, state_receiver) = watch::channel(app.state().clone());
@@ -522,6 +583,8 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     ui_state.hide_banner = hide_banner;
     ui_state.prompt_history_enabled = prompt_history_enabled;
     ui_state.prompt_history_max = prompt_history_max;
+    // Replace the DEFAULTS-only keymap (task_04) with the config-resolved one.
+    ui_state.keymap = keymap;
     let result = run_loop(
         &mut terminal,
         state_receiver,
@@ -722,6 +785,10 @@ async fn execute_tui_command_with_interrupt(
             remove_input_character_before_cursor(state, ui_state);
             Ok(true)
         }
+        TuiCommand::InputKill(command) => {
+            kill_input(state, ui_state, command);
+            Ok(true)
+        }
         TuiCommand::Dispatch(event) => {
             if matches_help_command(&event) {
                 ui_state.help_visible = !ui_state.help_visible;
@@ -748,11 +815,11 @@ async fn execute_tui_command_with_interrupt(
                 event,
                 AppEvent::PromptSubmitted(_, _) | AppEvent::ApprovalAnswered(_)
             );
-            if let AppEvent::ApprovalAnswered(approved) = &event {
+            if let AppEvent::ApprovalAnswered(resolution) = &event {
                 if let (Some(approval_handle), Some(pending)) =
                     (approval_handle, state.pending_approval.as_ref())
                 {
-                    approval_handle.answer(*approved);
+                    approval_handle.resolve(*resolution);
                     if pending.group_id.is_some() {
                         if clears_input {
                             clear_input(state, ui_state);
@@ -1058,16 +1125,30 @@ fn key_event_to_tui_command_with_ui(
     ui_state: &TuiUiState,
     key: KeyEvent,
 ) -> Option<TuiCommand> {
+    // Ignore key-RELEASE events. crossterm reports them on Windows (always) and
+    // under the Kitty keyboard protocol; since `KeyChord` lookups and the modal
+    // arms match on code+modifiers regardless of `kind`, routing a release would
+    // fire every action twice (e.g. Ctrl-W deleting two words). Press and Repeat
+    // (held-key autorepeat) still route. On Unix without enhancement flags every
+    // event is already a Press, so this is a no-op there.
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+
+    // Reserved-key chokepoint (ADR-004): Ctrl-C is the interrupt/quit kill-switch.
+    // It is enforced here — before the modal cascade, normal routing, and (task_04)
+    // any user-keymap lookup — so no context or future config can shadow it. This is
+    // the single runtime definition of the reserved binding; the bindable allowlist
+    // (`keybindings::is_portable`) excludes Ctrl-C on the validation side.
+    if is_reserved_interrupt(&key) {
+        return Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested));
+    }
+
     if ui_state.help_visible {
         match key {
             KeyEvent {
                 code: KeyCode::Esc, ..
             } => Some(TuiCommand::ToggleHelp),
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
             // Tab navigation is handled entirely within the help-visible branch so
             // these keys never leak to the base handler. Right/Tab advance; Left/
             // Shift-Tab retreat. Shift-Tab is distinguished by the SHIFT modifier.
@@ -1115,31 +1196,48 @@ fn key_event_to_tui_command_with_ui(
             _ => None,
         }
     } else if state.pending_clarification.is_some() {
-        clarification_key_command(state, ui_state, key).or(match key {
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
-            _ => None,
-        })
+        // Ctrl-C is handled by the reserved-key guard above.
+        clarification_key_command(state, ui_state, key)
+    } else if state.pending_governance_decision.is_some() {
+        // Ctrl-C is handled by the reserved-key guard above.
+        governance_decision_key_command(state, key)
     } else if state.pending_approval.is_some() {
-        key_event_to_tui_command(state, key)
+        // Modal contexts keep default chat-scroll (PageUp/PageDown/Home/End) as a
+        // fallback so keyboard users can still scroll while the modal is open, but the
+        // rebindable keymap is not consulted here (ADR-003). Same for the dropdowns.
+        key_event_to_tui_command(state, key).or_else(|| chat_scroll_command(&key))
     } else if agent_dropdown(state, ui_state).is_some() {
-        agent_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+        agent_dropdown_key_command(key)
+            .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else if skill_dropdown(&state.input, ui_state).is_some() {
-        skill_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+        skill_dropdown_key_command(key)
+            .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else if let Some(dropdown) = file_mention_dropdown(state, ui_state) {
         file_mention_dropdown_key_command(&dropdown, key)
             .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else if let Some(dropdown) = command_dropdown(state, ui_state) {
         command_dropdown_key_command(&dropdown, key)
             .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else if queue_control_active(state, ui_state) {
         queue_control_key_command(state, ui_state, key)
             .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else {
-        key_event_to_tui_command(state, key)
+        // Normal-input context only (ADR-003): consult the active keymap first. A hit
+        // maps through the exhaustive `command_for_action` bridge; a miss falls through
+        // to the hardcoded handler. For keys the keymap does not own, default routing is
+        // unchanged; the remappable actions (scroll/toggle/editing) are owned solely by
+        // the keymap here so rebinds and unbinds take effect. The keymap is never
+        // consulted in the modal branches above.
+        if let Some(action) = ui_state.keymap.action_for(&key) {
+            Some(command_for_action(action))
+        } else {
+            key_event_to_tui_command(state, key)
+        }
     }
 }
 
@@ -1152,6 +1250,7 @@ fn queue_control_active(state: &AppState, ui_state: &TuiUiState) -> bool {
         && !state.queued_follow_ups.is_empty()
         && !ui_state.help_visible
         && state.pending_clarification.is_none()
+        && state.pending_governance_decision.is_none()
         && state.pending_approval.is_none()
 }
 
@@ -1385,18 +1484,107 @@ fn clarification_key_command(
     }
 }
 
-fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiCommand> {
+/// Key routing while a governance decision is pending. Accept is deliberately a
+/// Ctrl-modified key so it can never be hit by accident (or while composing a
+/// redirect); the safe default keys (Enter on an empty line, unknown keys) never
+/// accept. A redirect is composed in the normal input line and sent with Enter;
+/// Esc rejects/aborts outright.
+fn governance_decision_key_command(state: &AppState, key: KeyEvent) -> Option<TuiCommand> {
+    let decision_id = state
+        .pending_governance_decision
+        .as_ref()?
+        .decision_id
+        .clone();
     match key {
+        // Explicit, deliberate accept — Ctrl-modified so it cannot collide with
+        // typed redirect text or be triggered accidentally.
+        KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+            decision_id,
+            GovernanceAnswer::Accept,
+        ))),
+        // Esc rejects/aborts the run (any composed redirect is discarded).
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        } => Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+            decision_id,
+            GovernanceAnswer::Reject { redirect: None },
+        ))),
+        // Enter rejects *with* the composed redirect when one was typed; with an
+        // empty line it is a no-op, so the default key never accepts.
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        } => {
+            let redirect = state.input.trim();
+            (!redirect.is_empty()).then(|| {
+                TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                    decision_id,
+                    GovernanceAnswer::Reject {
+                        redirect: Some(redirect.to_string()),
+                    },
+                ))
+            })
+        }
+        // Compose the optional redirect in the normal input line.
+        KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        } => Some(TuiCommand::InputBackspace),
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            ..
+        } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            Some(TuiCommand::InputCharacter(ch))
+        }
+        _ => None,
+    }
+}
+
+/// The reserved interrupt/quit chord: `Ctrl-C`. Matched at the single chokepoint in
+/// `key_event_to_tui_command_with_ui` so it can never be shadowed by a modal context
+/// or a user keymap. Structurally non-bindable (excluded from `keybindings::is_portable`).
+fn is_reserved_interrupt(key: &KeyEvent) -> bool {
+    matches!(
+        key,
         KeyEvent {
             code: KeyCode::Char('c'),
             modifiers: KeyModifiers::CONTROL,
             ..
-        } => Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested)),
-        KeyEvent {
-            code: KeyCode::Char('l'),
-            modifiers: KeyModifiers::CONTROL,
-            ..
-        } => Some(TuiCommand::ToggleRoster),
+        }
+    )
+}
+
+/// Chat-viewport scroll for the default navigation keys (`PageUp`/`PageDown`/
+/// `Home`/`End`), modifier-agnostic. Used as a fallback in the modal/dropdown
+/// contexts — where the rebindable keymap is deliberately not consulted (ADR-003)
+/// — so keyboard-only users keep chat scrollback while an approval or dropdown is
+/// open, matching the pre-keymap behavior. The normal-input branch does NOT use
+/// this (the keymap owns scroll there, honoring rebinds/unbinds).
+fn chat_scroll_command(key: &KeyEvent) -> Option<TuiCommand> {
+    match key.code {
+        KeyCode::PageUp => Some(TuiCommand::ScrollEvents(EventScrollCommand::PageUp)),
+        KeyCode::PageDown => Some(TuiCommand::ScrollEvents(EventScrollCommand::PageDown)),
+        KeyCode::Home => Some(TuiCommand::ScrollEvents(EventScrollCommand::Top)),
+        KeyCode::End => Some(TuiCommand::ScrollEvents(EventScrollCommand::Bottom)),
+        _ => None,
+    }
+}
+
+fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiCommand> {
+    match key {
+        // Ctrl-C (interrupt/quit) is owned by the reserved-key guard in
+        // `key_event_to_tui_command_with_ui`; it never reaches this handler in prod.
+        //
+        // The remappable normal-mode actions (Ctrl-L toggle-roster, PageUp/PageDown
+        // and Home/End scroll) are NOT handled here: they are owned by the active
+        // `Keymap`, consulted in the normal-input branch of the wrapper (task_04/08).
+        // Keeping them here would shadow a user rebind/unbind of their default key,
+        // and would also leak them into modal fallbacks (the keymap is normal-only).
         KeyEvent {
             code: KeyCode::Up, ..
         } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up)),
@@ -1413,21 +1601,6 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
             ..
         } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Right)),
         KeyEvent {
-            code: KeyCode::PageUp,
-            ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::PageUp)),
-        KeyEvent {
-            code: KeyCode::PageDown,
-            ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::PageDown)),
-        KeyEvent {
-            code: KeyCode::Home,
-            ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::Top)),
-        KeyEvent {
-            code: KeyCode::End, ..
-        } => Some(TuiCommand::ScrollEvents(EventScrollCommand::Bottom)),
-        KeyEvent {
             code: KeyCode::Enter,
             ..
         } if state.input.trim() == "/help" => Some(TuiCommand::ToggleHelp),
@@ -1438,9 +1611,17 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
         KeyEvent {
             code: KeyCode::Enter,
             ..
-        } if state.pending_approval.is_some() => Some(TuiCommand::Dispatch(
-            AppEvent::ApprovalAnswered(approval_input_is_yes(&state.input)),
-        )),
+        } if state.pending_approval.is_some() => {
+            // Tier-aware resolution (ADR-001/002): approve-once, a distinct
+            // approve-and-trust token, deny — with the High tier requiring the
+            // explicit word and the catastrophic core requiring type-to-confirm.
+            let resolution = state
+                .pending_approval
+                .as_ref()
+                .map(|view| parse_approval_resolution(&state.input, view))
+                .unwrap_or(ApprovalResolution::Deny);
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(resolution)))
+        }
         KeyEvent {
             code: KeyCode::Enter,
             ..
@@ -1489,11 +1670,149 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
-fn approval_input_is_yes(input: &str) -> bool {
-    matches!(
-        input.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes" | "approve" | "approved"
-    )
+/// Map the typed approval input to a resolution, honoring the habituation
+/// controls (ADR-001/002): a distinct approve-and-trust token (only when a trust
+/// target exists); the catastrophic core requires retyping the exact resolved
+/// command (type-to-confirm); the High tier requires the explicit word `approve`
+/// (a reflexive `y`/Enter denies); Low/Medium accept the usual short affirmations.
+fn parse_approval_resolution(input: &str, view: &PendingApprovalView) -> ApprovalResolution {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if view.trust_target.is_some() && matches!(lower.as_str(), "t" | "trust") {
+        return ApprovalResolution::ApproveAndTrust;
+    }
+
+    if view.catastrophic {
+        let confirmed = match view.resolved_command.as_deref() {
+            Some(command) => trimmed == command,
+            None => lower == "confirm",
+        };
+        return if confirmed {
+            ApprovalResolution::ApproveOnce
+        } else {
+            ApprovalResolution::Deny
+        };
+    }
+
+    let is_high = view.tier.map(crate::app::risk_tier_label) == Some("high");
+    if is_high {
+        return if matches!(lower.as_str(), "approve" | "approved") {
+            ApprovalResolution::ApproveOnce
+        } else {
+            ApprovalResolution::Deny
+        };
+    }
+
+    if matches!(lower.as_str(), "y" | "yes" | "approve" | "approved") {
+        ApprovalResolution::ApproveOnce
+    } else {
+        ApprovalResolution::Deny
+    }
+}
+
+/// Render the rich decision-support modal lines from the enriched
+/// `PendingApprovalView` (ADR-001). The tier is conveyed by an explicit text
+/// label (so it survives `NO_COLOR`) plus a tier-colored accent; details
+/// (resolved command, affected paths, boundary, reversibility) follow the lead
+/// line, and the key hint adapts to the tier.
+fn approval_modal_lines(
+    pending: &PendingApprovalView,
+    theme: &Theme,
+    show_first_approval_explainer: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if show_first_approval_explainer {
+        lines.push(Line::styled(
+            crate::app::chat::FIRST_APPROVAL_EXPLAINER,
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+
+    let tier_label = pending.tier.map(crate::app::risk_tier_label);
+    let (tier_text, tier_color) = match tier_label {
+        Some("low") => ("LOW", theme.risk_low),
+        Some("medium") => ("MEDIUM", theme.risk_medium),
+        Some("high") => ("HIGH", theme.risk_high),
+        _ => ("RISK", theme.text_muted),
+    };
+    // Lead line: explicit tier label (+ catastrophic marker) then the agent.
+    let mut lead = format!("[{tier_text}]");
+    if pending.catastrophic {
+        lead.push_str(" [CATASTROPHIC]");
+    }
+    lead.push_str(&format!(" Approval required for {}", pending.agent));
+    lines.push(Line::styled(
+        lead,
+        Style::default().fg(tier_color).add_modifier(Modifier::BOLD),
+    ));
+
+    // One-line reason.
+    if let Some(reason) = pending.reason.as_deref() {
+        lines.push(Line::styled(
+            reason.to_string(),
+            Style::default().fg(theme.text),
+        ));
+    } else if let Some(diagnostic) = pending.diagnostic.as_deref() {
+        lines.push(Line::styled(
+            diagnostic.to_string(),
+            Style::default().fg(theme.text),
+        ));
+    }
+
+    // Detail: resolved command, or a diff preview when present.
+    if let Some(command) = pending.resolved_command.as_deref() {
+        lines.push(Line::styled(
+            format!("$ {command}"),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+    if let Some(diff) = pending.diff.as_deref() {
+        for diff_line in diff.lines().take(8) {
+            lines.push(Line::styled(
+                diff_line.to_string(),
+                Style::default().fg(theme.text_dim),
+            ));
+        }
+    }
+    if !pending.affected_paths.is_empty() {
+        lines.push(Line::styled(
+            format!("Affected: {}", pending.affected_paths.join(", ")),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+    if let Some(boundary) = pending.boundary_crossed.as_deref() {
+        lines.push(Line::styled(
+            format!("Boundary: {boundary}"),
+            Style::default().fg(theme.status_warn),
+        ));
+    }
+    if let Some(reversible) = pending.reversible {
+        lines.push(Line::styled(
+            format!("Reversible: {}", if reversible { "yes" } else { "no" }),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+
+    // Key hint, adapted to the tier and trust availability.
+    let trust_hint = if pending.trust_target.is_some() {
+        " · t = approve & trust"
+    } else {
+        ""
+    };
+    let hint = if pending.catastrophic {
+        match pending.resolved_command.as_deref() {
+            Some(command) => format!("Type the command exactly to confirm: {command} · n = deny"),
+            None => "Type confirm to approve · n = deny".to_string(),
+        }
+    } else if tier_label == Some("high") {
+        format!("Type approve to allow{trust_hint} · n = deny")
+    } else {
+        format!("y = approve{trust_hint} · n = deny")
+    };
+    lines.push(Line::styled(hint, Style::default().fg(theme.accent)));
+
+    lines
 }
 
 fn clear_input(state: &mut AppState, ui_state: &mut TuiUiState) {
@@ -1561,6 +1880,59 @@ fn remove_input_character_before_cursor(state: &mut AppState, ui_state: &mut Tui
     reset_dropdown_selections(ui_state);
 }
 
+/// Apply a readline-style kill to the composer, mutating `state.input` and the
+/// char-indexed `input_cursor`. UTF-8 safe (char-indexed logic, byte-indexed
+/// `replace_range`) and a no-op at edge cursors / on empty input. Mirrors the
+/// dropdown/status/history housekeeping of the other input mutators.
+fn kill_input(state: &mut AppState, ui_state: &mut TuiUiState, command: InputKillCommand) {
+    clamp_input_cursor(ui_state, &state.input);
+    let cursor = ui_state.input_cursor;
+    let char_count = input_char_count(&state.input);
+    // Char-index half-open range [start, end) to delete, and the resulting cursor.
+    let (start_char, end_char, new_cursor) = match command {
+        InputKillCommand::ToLineEnd => (cursor, char_count, cursor),
+        InputKillCommand::ToLineStart => (0, cursor, 0),
+        InputKillCommand::WordBack => {
+            let start = word_back_start(&state.input, cursor);
+            (start, cursor, start)
+        }
+    };
+    if start_char >= end_char {
+        return; // empty range: nothing to kill (covers empty input + edge cursors)
+    }
+
+    let start_byte = byte_index_for_char(&state.input, start_char);
+    let end_byte = byte_index_for_char(&state.input, end_char);
+    state.input.replace_range(start_byte..end_byte, "");
+    ui_state.input_cursor = new_cursor;
+    ui_state.input_preferred_col = None;
+    ui_state.status_message = None;
+    // Killing a recalled composition down to empty returns to a fresh draft, matching
+    // `remove_input_character_before_cursor`.
+    if state.input.is_empty() {
+        ui_state.prompt_history_cursor = 0;
+        ui_state.prompt_history_draft.clear();
+    }
+    clear_command_dropdown_dismissal(ui_state);
+    clear_file_mention_dropdown_dismissal(ui_state);
+    reset_dropdown_selections(ui_state);
+}
+
+/// The char index where the word before `cursor` begins, for `WordBack`: skip a
+/// trailing run of whitespace, then the run of non-whitespace word characters
+/// (readline `unix-word-rubout`).
+fn word_back_start(input: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = cursor.min(chars.len());
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
 fn move_input_cursor(ui_state: &mut TuiUiState, input: &str, command: InputCursorCommand) {
     clamp_input_cursor(ui_state, input);
     let input_len = input_char_count(input);
@@ -1575,6 +1947,14 @@ fn move_input_cursor(ui_state: &mut TuiUiState, input: &str, command: InputCurso
         }
         InputCursorCommand::Up | InputCursorCommand::Down => {
             move_input_cursor_vertically(ui_state, input_len, command);
+        }
+        InputCursorCommand::LineStart => {
+            ui_state.input_cursor = 0;
+            ui_state.input_preferred_col = None;
+        }
+        InputCursorCommand::LineEnd => {
+            ui_state.input_cursor = input_len;
+            ui_state.input_preferred_col = None;
         }
     }
     reset_dropdown_selections(ui_state);
@@ -1668,7 +2048,10 @@ fn try_recall_history(
             set_recalled_input(ui_state, state, text);
             true
         }
-        InputCursorCommand::Left | InputCursorCommand::Right => false,
+        InputCursorCommand::Left
+        | InputCursorCommand::Right
+        | InputCursorCommand::LineStart
+        | InputCursorCommand::LineEnd => false,
     }
 }
 
@@ -2587,6 +2970,22 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
         return;
     }
 
+    if let Some(pending) = &state.pending_governance_decision {
+        let areas = clarification_input_areas(composer_area);
+        render_governance_decision_composer(
+            frame,
+            areas.input,
+            &pending.view,
+            &state.input,
+            ui_state,
+        );
+        render_governance_decision_status(frame, areas.status, &theme);
+        if ui_state.help_visible {
+            render_help_modal(frame, state, ui_state, &theme);
+        }
+        return;
+    }
+
     let work_active = work_indicator_active(state);
     let input_areas = input_areas(composer_area);
     let input_layout = input_layout(input_areas.input, &state.input, ui_state.input_cursor);
@@ -2763,27 +3162,7 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
             &welcome_facts,
         )
     } else if let Some(pending) = &state.pending_approval {
-        let mut lines = Vec::new();
-        // First-approval explainer: a single muted line shown at most once per
-        // user (ADR-004), gated by the persisted latch via `AppState`. Additive —
-        // the approval prompt below is unchanged.
-        if state.show_first_approval_explainer {
-            lines.push(Line::styled(
-                crate::app::chat::FIRST_APPROVAL_EXPLAINER,
-                Style::default().fg(theme.text_muted),
-            ));
-        }
-        lines.push(Line::from(format!(
-            "Approval required for {} action {}.",
-            pending.agent, pending.action_id
-        )));
-        lines.push(Line::from(
-            pending
-                .diagnostic
-                .as_deref()
-                .unwrap_or("Approve or deny the pending action."),
-        ));
-        lines
+        approval_modal_lines(pending, &theme, state.show_first_approval_explainer)
     } else if state.events.is_empty() {
         vec![Line::from("No chat yet.")]
     } else {
@@ -3640,6 +4019,7 @@ fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
         ChatItemKind::FileEdit => "file edit",
         ChatItemKind::Approval => "approval",
         ChatItemKind::Clarification => "clarification",
+        ChatItemKind::GovernanceDecision => "governance",
         ChatItemKind::Diagnostic => "diagnostic",
         ChatItemKind::SkillContext => "skills",
         ChatItemKind::AgentResult => "agent",
@@ -3705,7 +4085,7 @@ fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState,
     let body = match active {
         HelpTab::GettingStarted => getting_started_lines(state, theme),
         HelpTab::Commands => commands_tab_lines(&ui_state.help_filter, theme),
-        HelpTab::Keys => keys_tab_lines(theme),
+        HelpTab::Keys => keys_tab_lines(&ui_state.keymap, theme),
         HelpTab::Skills => skills_tab_lines(ui_state, theme),
         HelpTab::Approvals => approvals_tab_lines(theme),
         HelpTab::Cli => cli_tab_lines(theme),
@@ -3731,22 +4111,87 @@ fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState,
     frame.render_widget(help, area);
 }
 
-/// Keybinding rows for the Keys help tab. Relocated verbatim from the pre-tab
-/// `render_help_modal` literals; pure builder consumed by the tabbed render
-/// (task 06). No `AppState`/`TuiUiState` reads.
-fn keys_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
-    vec![
-        Line::from("Enter                submit prompt or answer approval"),
-        Line::from("Ctrl-L               show or hide Agent Roster"),
-        Line::from("Arrow keys           move input cursor"),
-        Line::from("↑/↓ at input edges   recall recent prompts"),
-        Line::from("PageUp/PageDown     scroll Chat by page"),
-        Line::from("Mouse wheel         scroll Chat by line"),
-        Line::from("Home/End            jump Chat to top/latest"),
-        Line::from("Ctrl-C               interrupt active run and exit"),
-        Line::from("Backspace            delete input character"),
-        Line::from("Text                 edit the input composer"),
-    ]
+/// Human-readable label for a remappable action, shown beside its key in the
+/// Keys tab. (Distinct from `keybindings::action_name`, which is the kebab-case
+/// config identifier.)
+fn keys_action_label(action: KeyAction) -> &'static str {
+    match action {
+        KeyAction::ToggleRoster => "show or hide the Agent Roster",
+        KeyAction::ScrollPageUp => "scroll Chat up one page",
+        KeyAction::ScrollPageDown => "scroll Chat down one page",
+        KeyAction::ScrollTop => "jump Chat to the top",
+        KeyAction::ScrollBottom => "jump Chat to the latest",
+        KeyAction::InputLineStart => "move cursor to line start",
+        KeyAction::InputLineEnd => "move cursor to line end",
+        KeyAction::InputKillToEnd => "delete to end of line",
+        KeyAction::InputKillToStart => "delete to start of line",
+        KeyAction::InputKillWordBack => "delete the previous word",
+    }
+}
+
+/// Structurally fixed keys: reserved (`Ctrl-C`), composer-structural, and
+/// approval-context keys. None are rebindable, so they are rendered locked,
+/// separate from the data-driven remappable section.
+const FIXED_KEY_ROWS: &[(&str, &str)] = &[
+    ("ctrl+c", "interrupt active run and exit"),
+    ("enter", "submit prompt or answer an approval"),
+    ("backspace", "delete the character before the cursor"),
+    (
+        "arrows",
+        "move the input cursor; ↑/↓ at edges recall recent prompts",
+    ),
+    ("mouse wheel", "scroll Chat by line"),
+    (
+        "y / approve",
+        "approve a pending action (high tier: type approve)",
+    ),
+    (
+        "t / trust",
+        "approve & trust for this session, when offered",
+    ),
+    ("n", "deny a pending action"),
+];
+
+/// Keybinding rows for the Keys help tab, rendered from the active [`Keymap`]
+/// (ADR-003): one line per remappable binding via `keybindings::format_key` plus
+/// a short label, then the structurally fixed keys shown locked. Reflects user
+/// customizations automatically once the keymap is config-resolved (task_08).
+/// Theme tokens only (honors `colors_live_only_in_theme_module`).
+fn keys_tab_lines(keymap: &Keymap, theme: &Theme) -> Vec<Line<'static>> {
+    let header = |label: &'static str| {
+        Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let body = |text: String| Line::from(Span::styled(text, Style::default().fg(theme.text)));
+    let locked =
+        |text: String| Line::from(Span::styled(text, Style::default().fg(theme.text_muted)));
+
+    // Active remappable bindings, sorted by action for a stable display order.
+    let mut entries: Vec<_> = keymap.entries().collect();
+    entries.sort_by_key(|(action, _)| *action);
+
+    let mut lines = vec![header("Remappable keys")];
+    if entries.is_empty() {
+        lines.push(locked("  (every action unbound)".to_string()));
+    }
+    for (action, chord) in entries {
+        lines.push(body(format!(
+            "{:<14} {}",
+            keybindings::format_key(&chord),
+            keys_action_label(action)
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(header("Fixed keys (not rebindable)"));
+    for (keys, desc) in FIXED_KEY_ROWS {
+        lines.push(locked(format!("{keys:<14} {desc}  (locked)")));
+    }
+    lines
 }
 
 /// CLI flag rows for the CLI help tab. Relocated verbatim from the pre-tab
@@ -3787,6 +4232,24 @@ fn approvals_tab_lines(theme: &Theme) -> Vec<Line<'static>> {
         body("commands run automatically. Best for trusted, fast iteration."),
         body("normal: every write or command pauses for your approval before"),
         body("it runs. Read-only actions still proceed without a prompt."),
+        Line::from(""),
+        header("Risk tiers"),
+        body("Each gated action is tiered low / medium / high, with a small"),
+        body("catastrophic core (home/root deletion, force-push, secret reads,"),
+        body("fetch-and-run). A catastrophic action ALWAYS prompts — even in"),
+        body("yolo — and requires retyping the command to confirm; it can never"),
+        body("be trusted away. High-tier prompts need the explicit word approve."),
+        Line::from(""),
+        header("Gray-area floor"),
+        body("The gray-area floor governs the in-between actions. [approval]"),
+        body("floor = warn (default) surfaces a 'would have blocked' note but"),
+        body("still runs them in yolo; floor = enforce makes them prompt instead."),
+        Line::from(""),
+        header("Session trust"),
+        body("approve & trust (the t key) remembers an exact command or write"),
+        body("path for this session only, so identical repeats auto-run without"),
+        body("a prompt. Trust is in-memory and never persisted. Manage it with"),
+        body("/trust (list), /trust revoke <n>, and /trust clear."),
         Line::from(""),
         header("Capabilities"),
         body("Each agent is granted only the capabilities it needs (read,"),
@@ -4551,12 +5014,20 @@ fn clarification_inner_width(area: Rect) -> u16 {
 }
 
 fn composer_height(state: &AppState, ui_state: &TuiUiState, area: Rect, reserved_rows: u16) -> u16 {
-    let Some(clarification) = &state.pending_clarification else {
+    let inner_width = clarification_inner_width(area);
+    let content_rows = if let Some(clarification) = &state.pending_clarification {
+        let layout = clarification_layout(clarification, ui_state, &ui_state.theme);
+        wrapped_event_line_count(&layout.lines, inner_width)
+    } else if let Some(pending) = &state.pending_governance_decision {
+        // Mirror the lines the governance composer renders (card + redirect echo)
+        // so the composer is tall enough to show the decision.
+        let mut lines = governance_decision_card_lines(&pending.view, &ui_state.theme);
+        lines.push(Line::from(String::new()));
+        lines.push(Line::from(format!("Redirect (optional): {}", state.input)));
+        wrapped_event_line_count(&lines, inner_width)
+    } else {
         return INPUT_COMPOSER_HEIGHT;
     };
-    let inner_width = clarification_inner_width(area);
-    let layout = clarification_layout(clarification, ui_state, &ui_state.theme);
-    let content_rows = wrapped_event_line_count(&layout.lines, inner_width);
     // borders (2) + wrapped content + status hint line.
     let desired = content_rows
         .saturating_add(2)
@@ -4834,6 +5305,140 @@ fn render_clarification_status(
     );
 }
 
+/// Build the governance decision card body: the headline, the interpreted
+/// intent, the approach bullets, the responsible agent, the write-scope, and the
+/// plain-language risk label. Risk is an explicit text label (words, never color
+/// alone) so it stays legible under monochrome / `NO_COLOR`.
+fn governance_decision_card_lines(
+    view: &GovernanceDecisionView,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    // The headline, a spacer, the interpreted intent, and the risk label are
+    // always present. Risk sits right after the intent — an explicit text label,
+    // not color alone, so it reads under NO_COLOR and survives the body cap on
+    // short terminals.
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            view.title.clone(),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(String::new()),
+        Line::from(vec![
+            Span::styled("Intent: ", Style::default().fg(theme.text_muted)),
+            Span::styled(view.intent.clone(), Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("Risk: ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                view.risk_label.clone(),
+                Style::default()
+                    .fg(theme.status_warn)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+
+    if !view.approach.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Approach:".to_string(),
+            Style::default().fg(theme.text_muted),
+        )));
+        for bullet in &view.approach {
+            lines.push(Line::from(Span::styled(
+                format!("  - {bullet}"),
+                Style::default().fg(theme.text_dim),
+            )));
+        }
+    }
+
+    if let Some(agent) = view
+        .agent
+        .as_deref()
+        .filter(|agent| !agent.trim().is_empty())
+    {
+        lines.push(Line::from(vec![
+            Span::styled("Agent: ", Style::default().fg(theme.text_muted)),
+            Span::styled(agent.to_string(), Style::default().fg(theme.text)),
+        ]));
+    }
+
+    if !view.write_scope.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Write scope: ", Style::default().fg(theme.text_muted)),
+            Span::styled(view.write_scope.join(", "), Style::default().fg(theme.text)),
+        ]));
+    }
+
+    lines
+}
+
+fn render_governance_decision_composer(
+    frame: &mut Frame,
+    area: Rect,
+    view: &GovernanceDecisionView,
+    input: &str,
+    ui_state: &TuiUiState,
+) {
+    let theme = ui_state.theme;
+    let mut lines = governance_decision_card_lines(view, &theme);
+    // Echo the redirect being composed so the user sees what Enter will send.
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Redirect (optional): ",
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(input.to_string(), Style::default().fg(theme.text)),
+    ]));
+
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    // When the user is composing a redirect, keep the redirect line (the last
+    // line) visible; otherwise show the decision content from the top so the
+    // intent and risk are never scrolled away.
+    let focus_line = if input.is_empty() {
+        0
+    } else {
+        lines.len().saturating_sub(1)
+    };
+    let scroll = clarification_scroll_offset(
+        &lines,
+        focus_line,
+        clarification_inner_width(area),
+        inner_height,
+    );
+    let composer = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll.min(usize::from(u16::MAX)) as u16, 0))
+        .block(
+            Block::default()
+                .title(" Confirm intent · governance ")
+                .title_style(Style::default().fg(theme.accent))
+                .border_style(Style::default().fg(theme.accent))
+                .borders(Borders::ALL),
+        );
+    frame.render_widget(composer, area);
+}
+
+fn render_governance_decision_status(frame: &mut Frame, status_area: Rect, theme: &Theme) {
+    if status_area.width == 0 || status_area.height == 0 {
+        return;
+    }
+    let line_area = Rect {
+        x: status_area.x + 1,
+        y: status_area.y,
+        width: status_area.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(Clear, status_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            GOVERNANCE_DECISION_HINT,
+            Style::default().fg(theme.text_muted),
+        ))),
+        line_area,
+    );
+}
+
 fn set_clarification_cursor(
     frame: &mut Frame,
     area: Rect,
@@ -4927,9 +5532,10 @@ mod tests {
     use crate::app::chat::ChatProjection;
     use crate::app::{
         AgentView, ConfigStatusView, LiveStepStatus, LiveStepView, LiveStreamView,
-        PendingClarificationView,
+        PendingClarificationView, PendingGovernanceDecisionView,
     };
     use crate::config::{load_effective_config, ConfigLoadOptions};
+    use crate::governance::GovernanceKind;
     use crate::history::HistoryEvent;
     use crate::orchestrator::{ClarificationOption, RunState};
     use crate::runtime::{RuntimeAvailability, RuntimeAvailabilityStatus};
@@ -5244,6 +5850,7 @@ mod tests {
             pending_approval: None,
             show_first_approval_explainer: false,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: vec![
                 AgentView {
                     runtime: "codex".to_string(),
@@ -5288,6 +5895,7 @@ mod tests {
             pending_approval: None,
             show_first_approval_explainer: false,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -5317,6 +5925,7 @@ mod tests {
             pending_approval: None,
             show_first_approval_explainer: false,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
                 name: "Fixer".to_string(),
@@ -5542,6 +6151,7 @@ mod tests {
             pending_approval: None,
             show_first_approval_explainer: false,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -5642,9 +6252,11 @@ mod tests {
                 agent: "fixer".to_string(),
                 summary: "Action requires action approval.".to_string(),
                 diagnostic: Some("command requires action approval: cargo install x".to_string()),
+                ..Default::default()
             }),
             show_first_approval_explainer: false,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -5654,7 +6266,7 @@ mod tests {
             git_context: None,
         };
         let text = render_to_text(&state, 100, 24);
-        assert!(text.contains("Approval required for fixer action action."));
+        assert!(text.contains("Approval required for fixer"));
         assert!(text.contains("command requires action approval"));
         // No explainer when the show-once latch is already set.
         assert!(!text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
@@ -5677,9 +6289,11 @@ mod tests {
                 agent: "fixer".to_string(),
                 summary: "Action requires action approval.".to_string(),
                 diagnostic: Some("command requires action approval: cargo install x".to_string()),
+                ..Default::default()
             }),
             show_first_approval_explainer,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             // Empty so the pending-approval fallback render path is exercised.
@@ -5696,10 +6310,10 @@ mod tests {
         let state = fallback_approval_state(true);
         // Wide enough that the single explainer line is not wrapped by the
         // paragraph renderer, so the full text is contiguous in the output.
-        let text = render_to_text(&state, 200, 24);
+        let text = render_to_text(&state, 260, 24);
         // The explainer line shows alongside the (unchanged) approval prompt.
         assert!(text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
-        assert!(text.contains("Approval required for fixer action action."));
+        assert!(text.contains("Approval required for fixer"));
     }
 
     #[test]
@@ -5707,7 +6321,187 @@ mod tests {
         let state = fallback_approval_state(false);
         let text = render_to_text(&state, 100, 24);
         assert!(!text.contains(crate::app::chat::FIRST_APPROVAL_EXPLAINER));
-        assert!(text.contains("Approval required for fixer action action."));
+        assert!(text.contains("Approval required for fixer"));
+    }
+
+    // ---- Rich approval modal & resolution key routing (task_07) -------
+
+    fn approval_view(
+        tier: Option<crate::actions::RiskTier>,
+        catastrophic: bool,
+        trust_target: Option<crate::actions::TrustTarget>,
+    ) -> PendingApprovalView {
+        PendingApprovalView {
+            agent: "fixer".to_string(),
+            reason: Some("installs software".to_string()),
+            resolved_command: Some("npm install left-pad".to_string()),
+            tier,
+            catastrophic,
+            trust_target,
+            ..Default::default()
+        }
+    }
+
+    fn modal_text(view: &PendingApprovalView, no_color: bool) -> String {
+        let theme = Theme::resolve(TerminalCaps {
+            no_color,
+            truecolor: !no_color,
+        });
+        approval_modal_lines(view, &theme, false)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn medium_tier_modal_shows_label_reason_and_command() {
+        let view = approval_view(Some(crate::actions::RiskTier::Medium), false, None);
+        let text = modal_text(&view, false);
+        assert!(text.contains("MEDIUM"));
+        assert!(text.contains("installs software"));
+        assert!(text.contains("npm install left-pad"));
+    }
+
+    #[test]
+    fn trust_option_visible_only_when_target_present() {
+        let with_trust = approval_view(
+            Some(crate::actions::RiskTier::Medium),
+            false,
+            Some(crate::actions::TrustTarget::Command(
+                "npm install left-pad".to_string(),
+            )),
+        );
+        assert!(modal_text(&with_trust, false).contains("approve & trust"));
+
+        let without = approval_view(Some(crate::actions::RiskTier::Medium), false, None);
+        assert!(!modal_text(&without, false).contains("approve & trust"));
+    }
+
+    #[test]
+    fn high_tier_requires_explicit_approve_word() {
+        let view = approval_view(Some(crate::actions::RiskTier::High), false, None);
+        // A reflexive "y" / empty Enter must not approve a High-tier action.
+        assert_eq!(
+            parse_approval_resolution("y", &view),
+            ApprovalResolution::Deny
+        );
+        assert_eq!(
+            parse_approval_resolution("", &view),
+            ApprovalResolution::Deny
+        );
+        assert_eq!(
+            parse_approval_resolution("approve", &view),
+            ApprovalResolution::ApproveOnce
+        );
+    }
+
+    #[test]
+    fn catastrophic_requires_type_to_confirm() {
+        let view = approval_view(Some(crate::actions::RiskTier::High), true, None);
+        assert_eq!(
+            parse_approval_resolution("y", &view),
+            ApprovalResolution::Deny
+        );
+        assert_eq!(
+            parse_approval_resolution("approve", &view),
+            ApprovalResolution::Deny
+        );
+        // Only retyping the exact resolved command confirms.
+        assert_eq!(
+            parse_approval_resolution("npm install left-pad", &view),
+            ApprovalResolution::ApproveOnce
+        );
+    }
+
+    #[test]
+    fn resolution_keys_map_to_distinct_outcomes() {
+        let view = approval_view(
+            Some(crate::actions::RiskTier::Medium),
+            false,
+            Some(crate::actions::TrustTarget::Command(
+                "npm install left-pad".to_string(),
+            )),
+        );
+        assert_eq!(
+            parse_approval_resolution("y", &view),
+            ApprovalResolution::ApproveOnce
+        );
+        assert_eq!(
+            parse_approval_resolution("t", &view),
+            ApprovalResolution::ApproveAndTrust
+        );
+        assert_eq!(
+            parse_approval_resolution("n", &view),
+            ApprovalResolution::Deny
+        );
+    }
+
+    #[test]
+    fn tier_label_survives_no_color() {
+        let view = approval_view(Some(crate::actions::RiskTier::Medium), false, None);
+        // Under NO_COLOR the tier must still be conveyed by its text label.
+        assert!(modal_text(&view, true).contains("MEDIUM"));
+    }
+
+    #[test]
+    fn approvals_help_tab_documents_tiers_trust_and_floor() {
+        let theme = Theme::resolve(TerminalCaps {
+            no_color: false,
+            truecolor: true,
+        });
+        let text = help_tab_text(&approvals_tab_lines(&theme));
+        assert!(text.contains("/trust"), "missing /trust: {text}");
+        assert!(text.contains("trust"));
+        assert!(text.contains("floor"), "missing floor posture");
+        assert!(text.contains("catastrophic"));
+        assert!(text.contains("tier"), "missing risk tiers");
+    }
+
+    #[test]
+    fn keys_help_tab_lists_approval_resolution_keys() {
+        let theme = Theme::resolve(TerminalCaps {
+            no_color: false,
+            truecolor: true,
+        });
+        // Approval-resolution keys are non-rebindable, so they live in the Keys tab's
+        // fixed-keys section.
+        let text = help_tab_text(&keys_tab_lines(&default_keymap(), &theme));
+        assert!(text.contains("approve"));
+        assert!(text.contains("trust"));
+        assert!(text.contains("deny"));
+    }
+
+    #[test]
+    fn high_tier_enter_routing_denies_then_dedicated_word_approves() {
+        // Integration through the key router: a High-tier pending approval is not
+        // approved by Enter+"y", but is by Enter+"approve".
+        let mut state = state_with_input("y", true);
+        if let Some(view) = state.pending_approval.as_mut() {
+            view.tier = Some(crate::actions::RiskTier::High);
+            view.reason = Some("matches a high-risk pattern".to_string());
+            view.resolved_command = Some("sudo rm file".to_string());
+        }
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            key_event_to_tui_command(&state, enter),
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::Deny
+            )))
+        );
+
+        state.input = "approve".to_string();
+        assert_eq!(
+            key_event_to_tui_command(&state, enter),
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::ApproveOnce
+            )))
+        );
     }
 
     #[test]
@@ -5915,11 +6709,12 @@ mod tests {
             ..commands_ui.clone()
         };
         let keys_text = render_to_text_with_ui(&state, &keys_ui, 120, 32);
-        assert!(keys_text.contains("Mouse wheel"));
-        assert!(keys_text.contains("Ctrl-L"));
-        assert!(keys_text.contains("Arrow keys"));
-        assert!(keys_text.contains("PageUp/PageDown"));
-        assert!(keys_text.contains("Home/End"));
+        // Keys tab is data-driven from the keymap (canonical lowercase via format_key).
+        assert!(keys_text.contains("mouse wheel"));
+        assert!(keys_text.contains("ctrl+l"));
+        assert!(keys_text.contains("arrows"));
+        assert!(keys_text.contains("pageup"));
+        assert!(keys_text.contains("home"));
 
         // CLI flag rows live on the CLI tab.
         let cli_ui = TuiUiState {
@@ -5969,9 +6764,9 @@ mod tests {
             ..ui_state
         };
         let keys_text = render_to_text_with_ui(&state, &keys_ui, 120, 40);
-        assert!(keys_text.contains("Ctrl-L"));
-        assert!(keys_text.contains("Arrow keys"));
-        assert!(keys_text.contains("Mouse wheel"));
+        assert!(keys_text.contains("ctrl+l"));
+        assert!(keys_text.contains("arrows"));
+        assert!(keys_text.contains("mouse wheel"));
     }
 
     #[test]
@@ -7304,11 +8099,15 @@ mod tests {
                 &yes_state,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
-            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(true)))
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::ApproveOnce
+            )))
         );
         assert_eq!(
             key_event_to_tui_command(&no_state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(false)))
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::Deny
+            )))
         );
     }
 
@@ -7333,7 +8132,7 @@ mod tests {
             &sender,
             None,
             Some(&approval_handle),
-            TuiCommand::Dispatch(AppEvent::ApprovalAnswered(true)),
+            TuiCommand::Dispatch(AppEvent::ApprovalAnswered(ApprovalResolution::ApproveOnce)),
         )
         .await
         .unwrap();
@@ -7563,12 +8362,464 @@ mod tests {
             key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             None
         );
+        // Ctrl-C is now owned by the single reserved-key guard in the wrapper, not the
+        // base handler — assert it via the real entry point.
         assert_eq!(
-            key_event_to_tui_command(
+            key_event_to_tui_command_with_ui(
                 &state,
+                &TuiUiState::default(),
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
             ),
             Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_in_every_context() {
+        let ctrl_c = key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let interrupt = Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested));
+
+        // help visible
+        let help_state = state_with_input("", false);
+        let help_ui = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&help_state, &help_ui, ctrl_c),
+            interrupt,
+            "help context"
+        );
+
+        // clarification pending
+        let mut clar_state = state_with_input("draft", false);
+        clar_state.pending_clarification = Some(clarification_view(vec![clarification_option(
+            "opt1", "Option 1",
+        )]));
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&clar_state, &TuiUiState::default(), ctrl_c),
+            interrupt,
+            "clarification context"
+        );
+
+        // governance decision pending
+        let gov_state = state_with_governance_decision("draft");
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&gov_state, &TuiUiState::default(), ctrl_c),
+            interrupt,
+            "governance context"
+        );
+
+        // approval pending
+        let appr_state = state_with_input("", true);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&appr_state, &TuiUiState::default(), ctrl_c),
+            interrupt,
+            "approval context"
+        );
+
+        // plain normal input
+        let normal_state = state_with_input("typing", false);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&normal_state, &TuiUiState::default(), ctrl_c),
+            interrupt,
+            "normal context"
+        );
+    }
+
+    #[test]
+    fn non_ctrl_c_keys_route_normally_in_each_context() {
+        // help: Esc still toggles the modal
+        let help_state = state_with_input("", false);
+        let help_ui = TuiUiState {
+            help_visible: true,
+            ..TuiUiState::default()
+        };
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&help_state, &help_ui, key(KeyCode::Esc)),
+            Some(TuiCommand::ToggleHelp),
+            "help Esc"
+        );
+
+        // normal: a plain char still inserts
+        let normal_state = state_with_input("", false);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &normal_state,
+                &TuiUiState::default(),
+                key(KeyCode::Char('q'))
+            ),
+            Some(TuiCommand::InputCharacter('q')),
+            "normal char"
+        );
+
+        // clarification: Up still cycles options (unaffected by the reserved guard)
+        let mut clar_state = state_with_input("", false);
+        clar_state.pending_clarification = Some(clarification_view(vec![
+            clarification_option("opt1", "Option 1"),
+            clarification_option("opt2", "Option 2"),
+        ]));
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&clar_state, &TuiUiState::default(), key(KeyCode::Up)),
+            Some(TuiCommand::Clarification(
+                ClarificationCommand::PreviousOption
+            )),
+            "clarification Up"
+        );
+    }
+
+    // ── default keymap wiring (config-driven-keybindings task_04) ──
+
+    #[test]
+    fn command_for_action_maps_all_ten_actions() {
+        use KeyAction::*;
+        assert_eq!(command_for_action(ToggleRoster), TuiCommand::ToggleRoster);
+        assert_eq!(
+            command_for_action(ScrollPageUp),
+            TuiCommand::ScrollEvents(EventScrollCommand::PageUp)
+        );
+        assert_eq!(
+            command_for_action(ScrollPageDown),
+            TuiCommand::ScrollEvents(EventScrollCommand::PageDown)
+        );
+        assert_eq!(
+            command_for_action(ScrollTop),
+            TuiCommand::ScrollEvents(EventScrollCommand::Top)
+        );
+        assert_eq!(
+            command_for_action(ScrollBottom),
+            TuiCommand::ScrollEvents(EventScrollCommand::Bottom)
+        );
+        assert_eq!(
+            command_for_action(InputLineStart),
+            TuiCommand::MoveInputCursor(InputCursorCommand::LineStart)
+        );
+        assert_eq!(
+            command_for_action(InputLineEnd),
+            TuiCommand::MoveInputCursor(InputCursorCommand::LineEnd)
+        );
+        assert_eq!(
+            command_for_action(InputKillToEnd),
+            TuiCommand::InputKill(InputKillCommand::ToLineEnd)
+        );
+        assert_eq!(
+            command_for_action(InputKillToStart),
+            TuiCommand::InputKill(InputKillCommand::ToLineStart)
+        );
+        assert_eq!(
+            command_for_action(InputKillWordBack),
+            TuiCommand::InputKill(InputKillCommand::WordBack)
+        );
+    }
+
+    #[test]
+    fn default_keymap_routes_all_ten_actions_by_their_default_keys() {
+        let state = state_with_input("hello", false);
+        let ui = TuiUiState::default(); // built from DEFAULTS
+        let route = |k: KeyEvent| key_event_to_tui_command_with_ui(&state, &ui, k);
+        let ctrl = |c: char| key_with_modifiers(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        assert_eq!(route(ctrl('l')), Some(TuiCommand::ToggleRoster));
+        assert_eq!(
+            route(key(KeyCode::PageUp)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::PageUp))
+        );
+        assert_eq!(
+            route(key(KeyCode::PageDown)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::PageDown))
+        );
+        assert_eq!(
+            route(key(KeyCode::Home)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::Top))
+        );
+        assert_eq!(
+            route(key(KeyCode::End)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::Bottom))
+        );
+        assert_eq!(
+            route(ctrl('a')),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::LineStart))
+        );
+        assert_eq!(
+            route(ctrl('e')),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::LineEnd))
+        );
+        assert_eq!(
+            route(ctrl('k')),
+            Some(TuiCommand::InputKill(InputKillCommand::ToLineEnd))
+        );
+        assert_eq!(
+            route(ctrl('u')),
+            Some(TuiCommand::InputKill(InputKillCommand::ToLineStart))
+        );
+        assert_eq!(
+            route(ctrl('w')),
+            Some(TuiCommand::InputKill(InputKillCommand::WordBack))
+        );
+    }
+
+    #[test]
+    fn default_keymap_preserves_pre_feature_routing() {
+        let state = state_with_input("draft", false);
+        let ui = TuiUiState::default();
+        let route = |k: KeyEvent| key_event_to_tui_command_with_ui(&state, &ui, k);
+
+        // Remappable keys (now resolved via the keymap) — identical commands to before.
+        assert_eq!(
+            route(key_with_modifiers(
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL
+            )),
+            Some(TuiCommand::ToggleRoster)
+        );
+        assert_eq!(
+            route(key(KeyCode::PageUp)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::PageUp))
+        );
+        assert_eq!(
+            route(key(KeyCode::Home)),
+            Some(TuiCommand::ScrollEvents(EventScrollCommand::Top))
+        );
+        // Keys the keymap does not own — unchanged via the fallback handler.
+        assert_eq!(
+            route(key(KeyCode::Up)),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up))
+        );
+        assert_eq!(
+            route(key(KeyCode::Left)),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::Left))
+        );
+        assert_eq!(
+            route(key(KeyCode::Backspace)),
+            Some(TuiCommand::InputBackspace)
+        );
+    }
+
+    #[test]
+    fn unmapped_key_falls_through_to_input_character() {
+        let state = state_with_input("", false);
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui, key(KeyCode::Char('z'))),
+            Some(TuiCommand::InputCharacter('z'))
+        );
+    }
+
+    #[test]
+    fn keymap_is_gated_to_the_normal_context() {
+        let ui = TuiUiState::default();
+        let ctrl_a = key_with_modifiers(KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        // In the approval modal, the normal-mode Ctrl-A editing binding must NOT be
+        // interpreted by the keymap — it stays inert (the base handler returns None).
+        let appr_state = state_with_input("", true);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&appr_state, &ui, ctrl_a),
+            None,
+            "Ctrl-A must not trigger line-start inside the approval modal"
+        );
+
+        // In the normal context the same key resolves via the keymap.
+        let normal_state = state_with_input("", false);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&normal_state, &ui, ctrl_a),
+            Some(TuiCommand::MoveInputCursor(InputCursorCommand::LineStart))
+        );
+    }
+
+    // ── resolve customizations end-to-end (config-driven-keybindings task_08) ──
+
+    fn ui_state_with_overrides(overrides: keybindings::KeybindingOverrides) -> TuiUiState {
+        TuiUiState {
+            keymap: Keymap::resolve(&keybindings::DEFAULTS, &overrides),
+            ..TuiUiState::default()
+        }
+    }
+
+    #[test]
+    fn rebind_routes_new_key_and_drops_old_default() {
+        let mut overrides = keybindings::KeybindingOverrides::new();
+        overrides.insert(
+            KeyAction::ToggleRoster,
+            Some(keybindings::parse_key("ctrl+g").unwrap()),
+        );
+        let ui = ui_state_with_overrides(overrides);
+        let state = state_with_input("", false);
+
+        // The new key toggles the roster…
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('g'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::ToggleRoster)
+        );
+        // …and the displaced default no longer does (falls through to None).
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unbind_removes_the_action_key_entirely() {
+        let mut overrides = keybindings::KeybindingOverrides::new();
+        overrides.insert(KeyAction::ToggleRoster, None);
+        let ui = ui_state_with_overrides(overrides);
+        let state = state_with_input("", false);
+
+        // The old default no longer toggles, and nothing else picks it up.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn reserved_ctrl_c_survives_keybinding_overrides() {
+        let mut overrides = keybindings::KeybindingOverrides::new();
+        overrides.insert(
+            KeyAction::ToggleRoster,
+            Some(keybindings::parse_key("ctrl+g").unwrap()),
+        );
+        let ui = ui_state_with_overrides(overrides);
+        let state = state_with_input("", false);
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::DispatchAndQuit(AppEvent::RunInterruptRequested))
+        );
+    }
+
+    #[test]
+    fn config_keybindings_resolve_into_routing_and_keys_tab() {
+        use crate::config::{load_effective_config, ConfigLoadOptions};
+        // A user-scope config (explicit --config) rebinds toggle-roster to ctrl+g.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("home-config.toml");
+        std::fs::write(
+            &config_path,
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: work_dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        // Resolve exactly as `run_tui` does.
+        let ui = TuiUiState {
+            keymap: Keymap::resolve(&keybindings::DEFAULTS, &config.keybindings),
+            ..TuiUiState::default()
+        };
+        let state = state_with_input("", false);
+
+        // Routing reflects the rebind end-to-end.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('g'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::ToggleRoster)
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                key_with_modifiers(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            None
+        );
+
+        // And the Keys tab shows the customized binding, not the old default.
+        let theme = Theme::resolve(TerminalCaps::detect());
+        let text = help_tab_text(&keys_tab_lines(&ui.keymap, &theme));
+        assert!(text.contains("ctrl+g"), "keys tab shows rebound key");
+        assert!(
+            !text.contains("ctrl+l"),
+            "old default key gone from keys tab"
+        );
+    }
+
+    // ── code-review fixes (config-driven-keybindings) ──
+
+    #[test]
+    fn release_key_events_are_ignored_to_avoid_double_fire() {
+        // crossterm emits Release events on Windows / under the Kitty protocol; routing
+        // one would fire the action a second time. Press still routes; Release does not.
+        let state = state_with_input("", false);
+        let ui = TuiUiState::default();
+        let press = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui, press),
+            Some(TuiCommand::InputKill(InputKillCommand::WordBack))
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui, release),
+            None,
+            "release events must not route"
+        );
+        // The reserved interrupt also must not double-fire on release.
+        let ctrl_c_release = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui, ctrl_c_release),
+            None
+        );
+    }
+
+    #[test]
+    fn chat_scroll_keys_still_work_in_modal_contexts() {
+        let ui = TuiUiState::default();
+        // The approval branch forces the modal path (the keymap is not consulted), so
+        // these assertions prove the dedicated chat-scroll fallback, not the keymap.
+        let approval = state_with_input("", true);
+
+        for (code, expected) in [
+            (KeyCode::PageUp, EventScrollCommand::PageUp),
+            (KeyCode::PageDown, EventScrollCommand::PageDown),
+            (KeyCode::Home, EventScrollCommand::Top),
+            (KeyCode::End, EventScrollCommand::Bottom),
+        ] {
+            assert_eq!(
+                key_event_to_tui_command_with_ui(&approval, &ui, key(code)),
+                Some(TuiCommand::ScrollEvents(expected)),
+                "{code:?} should scroll the chat in the approval modal"
+            );
+        }
+
+        // But a normal-mode editing key (Ctrl-A) stays inert in the approval modal —
+        // the rebindable keymap is still gated out of modal contexts.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &approval,
+                &ui,
+                key_with_modifiers(KeyCode::Char('a'), KeyModifiers::CONTROL)
+            ),
+            None
         );
     }
 
@@ -7729,9 +8980,11 @@ mod tests {
         let mut ui_state = TuiUiState::default();
         let (sender, mut receiver) = mpsc::channel(1);
 
+        // Ctrl-L is owned by the active keymap (default), routed via the wrapper.
         assert_eq!(
-            key_event_to_tui_command(
+            key_event_to_tui_command_with_ui(
                 &state,
+                &ui_state,
                 KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)
             ),
             Some(TuiCommand::ToggleRoster)
@@ -7764,6 +9017,7 @@ mod tests {
             pending_approval: None,
             show_first_approval_explainer: false,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
                 name: "Fixer".to_string(),
@@ -7881,9 +9135,11 @@ mod tests {
                 agent: "fixer".to_string(),
                 summary: "Action requires approval.".to_string(),
                 diagnostic: None,
+                ..Default::default()
             }),
             show_first_approval_explainer: false,
             pending_clarification: None,
+            pending_governance_decision: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -7892,6 +9148,173 @@ mod tests {
             input: input.to_string(),
             git_context: None,
         }
+    }
+
+    fn governance_decision_view(decision_id: &str) -> GovernanceDecisionView {
+        GovernanceDecisionView {
+            run_id: "run".to_string(),
+            decision_id: decision_id.to_string(),
+            kind: GovernanceKind::EarlyAbort,
+            title: "Confirm intent before this run edits files".to_string(),
+            intent: "Refactor the config loader".to_string(),
+            approach: vec!["Split the loader".to_string()],
+            agent: Some("fixer".to_string()),
+            write_scope: vec!["src/config".to_string()],
+            risk_label: "High - edits source files".to_string(),
+            plan: None,
+        }
+    }
+
+    fn state_with_governance_decision(input: &str) -> AppState {
+        let mut state = state_with_input(input, false);
+        state.run_state = RunState::WaitingForUser;
+        state.active_run_id = Some("run".to_string());
+        state.pending_governance_decision = Some(PendingGovernanceDecisionView {
+            run_id: "run".to_string(),
+            decision_id: "gov-1".to_string(),
+            view: governance_decision_view("gov-1"),
+        });
+        state
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.clone())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn governance_accept_key_routes_to_resolve_accept() {
+        let state = state_with_governance_decision("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                "gov-1".to_string(),
+                GovernanceAnswer::Accept
+            )))
+        );
+    }
+
+    #[test]
+    fn governance_reject_key_routes_to_resolve_reject() {
+        let state = state_with_governance_decision("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                "gov-1".to_string(),
+                GovernanceAnswer::Reject { redirect: None }
+            )))
+        );
+    }
+
+    #[test]
+    fn governance_reject_redirect_comes_from_the_input_line() {
+        let state = state_with_governance_decision("focus on tests");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                "gov-1".to_string(),
+                GovernanceAnswer::Reject {
+                    redirect: Some("focus on tests".to_string())
+                }
+            )))
+        );
+    }
+
+    #[test]
+    fn governance_enter_on_empty_line_never_accepts() {
+        let state = state_with_governance_decision("");
+        let ui = TuiUiState::default();
+        let cmd = key_event_to_tui_command_with_ui(
+            &state,
+            &ui,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        // The safe default must never land on Accept; an empty line is a no-op.
+        assert_ne!(
+            cmd,
+            Some(TuiCommand::Dispatch(AppEvent::GovernanceDecisionResolved(
+                "gov-1".to_string(),
+                GovernanceAnswer::Accept
+            )))
+        );
+        assert_eq!(cmd, None);
+    }
+
+    #[test]
+    fn governance_typing_routes_to_the_input_line() {
+        let state = state_with_governance_decision("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::InputCharacter('x'))
+        );
+    }
+
+    #[test]
+    fn queue_control_inactive_during_pending_governance_decision() {
+        let mut state = state_with_governance_decision("");
+        state.queued_follow_ups = vec![QueuedFollowUpView {
+            id: "q1".to_string(),
+            prompt: "later".to_string(),
+            created_at: "t".to_string(),
+            status: QueuedFollowUpStatus::Pending,
+            pause_reason: None,
+        }];
+        // A pending governance decision suppresses queue keys even with an empty
+        // composer and queued items present.
+        assert!(!queue_control_active(&state, &TuiUiState::default()));
+    }
+
+    #[test]
+    fn governance_decision_card_lines_show_intent_agent_scope_and_risk() {
+        let theme = TuiUiState::default().theme;
+        let lines = governance_decision_card_lines(&governance_decision_view("gov-1"), &theme);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Refactor the config loader"));
+        assert!(text.contains("Split the loader"));
+        assert!(text.contains("fixer"));
+        assert!(text.contains("src/config"));
+        // Risk is an explicit tier word, not color alone.
+        assert!(text.contains("Risk:"));
+        assert!(text.contains("High"));
+    }
+
+    #[test]
+    fn governance_decision_card_renders_in_frame_under_no_color() {
+        let state = state_with_governance_decision("");
+        let no_color_ui = TuiUiState {
+            theme: Theme::resolve(TerminalCaps {
+                no_color: true,
+                truecolor: false,
+            }),
+            ..TuiUiState::default()
+        };
+        let text = render_to_text_with_ui(&state, &no_color_ui, 100, 24);
+        assert!(text.contains("Refactor the config loader"));
+        assert!(text.contains("fixer"));
+        assert!(text.contains("src/config"));
+        assert!(text.contains("High"));
     }
 
     fn render_to_text(state: &AppState, width: u16, height: u16) -> String {
@@ -8275,11 +9698,15 @@ mod tests {
         assert!(yes_state.pending_clarification.is_none());
         assert_eq!(
             key_event_to_tui_command_with_ui(&yes_state, &ui_state, key(KeyCode::Enter)),
-            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(true)))
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::ApproveOnce
+            )))
         );
         assert_eq!(
             key_event_to_tui_command_with_ui(&no_state, &ui_state, key(KeyCode::Enter)),
-            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(false)))
+            Some(TuiCommand::Dispatch(AppEvent::ApprovalAnswered(
+                ApprovalResolution::Deny
+            )))
         );
     }
 
@@ -8839,7 +10266,7 @@ mod tests {
 
         let text = render_to_text(&state, 100, 24);
 
-        assert!(text.contains("Approval required for fixer action action."));
+        assert!(text.contains("Approval required for fixer"));
         assert!(!text.contains("Clarifying question"));
         assert!(!text.contains("Custom:"));
         assert!(!text.contains("★ recommended"));
@@ -8912,6 +10339,14 @@ runtime = "fake"
         assert_ne!(
             chat_kind_label(&ChatItemKind::Clarification),
             chat_kind_label(&ChatItemKind::Approval)
+        );
+    }
+
+    #[test]
+    fn governance_decision_chat_kind_label_is_governance() {
+        assert_eq!(
+            chat_kind_label(&ChatItemKind::GovernanceDecision),
+            "governance"
         );
     }
 
@@ -10073,6 +11508,125 @@ runtime = "fake"
         };
         let text = render_to_text_with_ui(&state, &ui_state, 120, 32);
         assert!(text.contains("recall recent prompts"));
+    }
+
+    // ── composer line-editing: cursor jumps + kills (config-driven-keybindings task_02) ──
+
+    fn ui_state_with_cursor(cursor: usize) -> TuiUiState {
+        TuiUiState {
+            input_cursor: cursor,
+            ..TuiUiState::default()
+        }
+    }
+
+    #[test]
+    fn kill_to_line_end_deletes_suffix_and_keeps_cursor() {
+        let mut state = state_with_input("hello world", false);
+        let mut ui = ui_state_with_cursor(5); // just after "hello"
+        kill_input(&mut state, &mut ui, InputKillCommand::ToLineEnd);
+        assert_eq!(state.input, "hello");
+        assert_eq!(ui.input_cursor, 5);
+    }
+
+    #[test]
+    fn kill_to_line_start_deletes_prefix_and_moves_cursor_to_zero() {
+        let mut state = state_with_input("hello world", false);
+        let mut ui = ui_state_with_cursor(6); // just before "world"
+        kill_input(&mut state, &mut ui, InputKillCommand::ToLineStart);
+        assert_eq!(state.input, "world");
+        assert_eq!(ui.input_cursor, 0);
+    }
+
+    #[test]
+    fn kill_word_back_deletes_word_and_trailing_spaces() {
+        let mut state = state_with_input("foo bar ", false);
+        let mut ui = ui_state_with_cursor(input_char_count("foo bar ")); // 8, at end
+        kill_input(&mut state, &mut ui, InputKillCommand::WordBack);
+        // The trailing space + the word "bar" are both removed.
+        assert_eq!(state.input, "foo ");
+        assert_eq!(ui.input_cursor, 4);
+    }
+
+    #[test]
+    fn line_start_and_line_end_move_cursor_without_changing_text() {
+        let input = "hello";
+        let mut ui = ui_state_with_cursor(2);
+        move_input_cursor(&mut ui, input, InputCursorCommand::LineEnd);
+        assert_eq!(ui.input_cursor, input_char_count(input));
+        move_input_cursor(&mut ui, input, InputCursorCommand::LineStart);
+        assert_eq!(ui.input_cursor, 0);
+    }
+
+    #[test]
+    fn kills_are_utf8_safe_for_multibyte_input() {
+        let text = "héllo🚀 wörld";
+        let mut state = state_with_input(text, false);
+        let mut ui = ui_state_with_cursor(input_char_count(text)); // 12, at end
+        kill_input(&mut state, &mut ui, InputKillCommand::WordBack);
+        assert_eq!(state.input, "héllo🚀 ");
+        assert_eq!(ui.input_cursor, 7);
+        // Cursor (char index) must still map to a valid byte boundary at the end.
+        assert_eq!(
+            byte_index_for_char(&state.input, ui.input_cursor),
+            state.input.len()
+        );
+    }
+
+    #[test]
+    fn kills_are_noops_at_edges_and_on_empty_input() {
+        // Empty input: every kill is a no-op.
+        for cmd in [
+            InputKillCommand::ToLineEnd,
+            InputKillCommand::ToLineStart,
+            InputKillCommand::WordBack,
+        ] {
+            let mut state = state_with_input("", false);
+            let mut ui = ui_state_with_cursor(0);
+            kill_input(&mut state, &mut ui, cmd);
+            assert_eq!(state.input, "");
+            assert_eq!(ui.input_cursor, 0);
+        }
+
+        // ToLineEnd with the cursor already at the end is a no-op.
+        let mut state = state_with_input("abc", false);
+        let mut ui = ui_state_with_cursor(3);
+        kill_input(&mut state, &mut ui, InputKillCommand::ToLineEnd);
+        assert_eq!(state.input, "abc");
+        assert_eq!(ui.input_cursor, 3);
+
+        // ToLineStart with the cursor at 0 is a no-op.
+        let mut ui = ui_state_with_cursor(0);
+        kill_input(&mut state, &mut ui, InputKillCommand::ToLineStart);
+        assert_eq!(state.input, "abc");
+        assert_eq!(ui.input_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn line_start_then_kill_to_end_clears_the_line_through_the_handler() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = state_with_input("hello world", false);
+        let mut ui = ui_state_with_cursor_at_end(&state.input);
+
+        execute_tui_command(
+            &mut state,
+            &mut ui,
+            &sender,
+            TuiCommand::MoveInputCursor(InputCursorCommand::LineStart),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ui.input_cursor, 0);
+
+        execute_tui_command(
+            &mut state,
+            &mut ui,
+            &sender,
+            TuiCommand::InputKill(InputKillCommand::ToLineEnd),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.input, "");
+        assert_eq!(ui.input_cursor, 0);
     }
 
     // ── task_05 TUI file-index state and consumer ──
@@ -11684,13 +13238,60 @@ runtime = "fake"
     #[test]
     fn keys_tab_lines_contains_expected_keybindings() {
         let theme = Theme::resolve(TerminalCaps::detect());
-        let text = help_tab_text(&keys_tab_lines(&theme));
-        assert!(text.contains("Ctrl-L"));
-        assert!(text.contains("PageUp/PageDown"));
-        assert!(text.contains("Home/End"));
-        // Verbatim relocation: the full keybinding set is present.
-        assert!(text.contains("Enter"));
-        assert!(text.contains("Backspace"));
+        // No config ⇒ the default keymap renders its bindings via `format_key`.
+        let text = help_tab_text(&keys_tab_lines(&default_keymap(), &theme));
+
+        // Remappable defaults, rendered by their canonical key strings + labels.
+        assert!(text.contains("ctrl+l"), "toggle-roster default key");
+        assert!(text.contains("show or hide the Agent Roster"));
+        assert!(text.contains("pageup"));
+        assert!(text.contains("pagedown"));
+        assert!(text.contains("home"));
+        assert!(text.contains("end"));
+        // Editing defaults from task_02/04 are present.
+        assert!(text.contains("ctrl+a"));
+        assert!(text.contains("ctrl+e"));
+        assert!(text.contains("ctrl+k"));
+        assert!(text.contains("ctrl+u"));
+        assert!(text.contains("ctrl+w"));
+
+        // Reserved / fixed keys are shown locked, distinct from remappable ones.
+        assert!(text.contains("ctrl+c"));
+        assert!(
+            text.contains("(locked)"),
+            "fixed keys carry a locked marker"
+        );
+        assert!(text.contains("Fixed keys (not rebindable)"));
+    }
+
+    #[test]
+    fn keys_tab_reflects_a_remapped_keymap() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        // Rebind toggle-roster to ctrl+g; the tab should show the new key, not ctrl+l.
+        let mut overrides = keybindings::KeybindingOverrides::new();
+        overrides.insert(
+            KeyAction::ToggleRoster,
+            Some(keybindings::parse_key("ctrl+g").unwrap()),
+        );
+        let keymap = Keymap::resolve(&keybindings::DEFAULTS, &overrides);
+        let text = help_tab_text(&keys_tab_lines(&keymap, &theme));
+        assert!(text.contains("ctrl+g"), "remapped key shown");
+        // The displaced default is gone from the remappable section. (`ctrl+l` does
+        // not appear anywhere else in the tab.)
+        assert!(!text.contains("ctrl+l"), "old default key removed");
+    }
+
+    #[test]
+    fn keys_tab_renders_via_test_backend_without_panic() {
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Keys,
+            ..TuiUiState::default()
+        };
+        // Renders the full help modal (Keys tab) through the real render path.
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 32);
+        assert!(text.contains("ctrl+l"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Sibling conformance contract and test
 type: docs
 complexity: low
@@ -28,10 +28,10 @@ Prove the spine's central claim: that the shared `GovernanceDecisionView` can re
 </requirements>
 
 ## Subtasks
-- [ ] 8.1 Write the conformance contract notes (how siblings populate the view).
-- [ ] 8.2 Add the approval-shaped → `GovernanceDecisionView` mapping test.
-- [ ] 8.3 Add the graph-shaped → `GovernancePlanView` mapping test.
-- [ ] 8.4 Confirm no sibling code is touched.
+- [x] 8.1 Write the conformance contract notes (how siblings populate the view).
+- [x] 8.2 Add the approval-shaped → `GovernanceDecisionView` mapping test.
+- [x] 8.3 Add the graph-shaped → `GovernancePlanView` mapping test.
+- [x] 8.4 Confirm no sibling code is touched.
 
 ## Implementation Details
 Add `tests/governance_conformance.rs` (or a `#[cfg(test)]` module in `src/governance.rs`) with synthetic fixtures mirroring the sibling techspec types (`RiskNote`, `ExecutionGraph`) — defined locally in the test, not imported, since V1 must not couple to sibling code. Document the contract inline or in the packet. Reference TechSpec "Integration Points" and the sibling techspecs.
@@ -57,11 +57,11 @@ Add `tests/governance_conformance.rs` (or a `#[cfg(test)]` module in `src/govern
 
 ## Tests
 - Unit tests:
-  - [ ] A synthetic approval (action="force-push", target=branch, tier=High, reason set) maps into `GovernanceDecisionView` with intent, risk label, and target preserved.
-  - [ ] A synthetic `ExecutionGraph` of 3 nodes + 2 edges maps into `GovernancePlanView` preserving all 3 steps and both edges.
-  - [ ] A read-only single-step intent maps into a one-step `GovernancePlanView` with no edges.
+  - [x] A synthetic approval (action="force-push", target=branch, tier=High, reason set) maps into `GovernanceDecisionView` with intent, risk label, and target preserved.
+  - [x] A synthetic `ExecutionGraph` of 3 nodes + 2 edges maps into `GovernancePlanView` preserving all 3 steps and both edges.
+  - [x] A read-only single-step intent maps into a one-step `GovernancePlanView` with no edges.
 - Integration tests:
-  - [ ] The conformance test file builds and runs as part of `cargo test`, demonstrating both sibling shapes are representable.
+  - [x] The conformance test file builds and runs as part of `cargo test`, demonstrating both sibling shapes are representable.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -70,3 +70,9 @@ Add `tests/governance_conformance.rs` (or a `#[cfg(test)]` module in `src/govern
 - Test coverage >=80%
 - The shared view is proven to represent both siblings; no sibling code is modified.
 - `cargo fmt --check` and `cargo clippy --all-targets` are clean.
+
+## Completion Notes
+- Added `tests/governance_conformance.rs` (5 tests). The sibling shapes (`RiskTier`/`RiskNote`/`TrustTarget`, `ExecutionGraph`/`ExecutionNode`/`ExecutionEdge`) are mirrored as **local synthetic fixtures**, not imported — V1 must not couple to sibling code (verified: the only changed file is the new test; no sibling packet code touched).
+- The conformance **contract is documented inline** as the module doc, and *realized* by the two `map_*` functions (the interface siblings adopt in Phase 2). Mapping: an action approval → intent (`action + target`), `write_scope` = the trust target, `risk_label` = `tier + reason`; an `ExecutionGraph` → `GovernancePlanView` (nodes→steps with per-node write scope, edges→`(from,to)` pairs).
+- The `kind` discriminator stays `EarlyAbort` in the fixtures because V1's `GovernanceKind` only has that variant; the contract notes that Phase-2 migration adds `ActionApproval`/`PlanApproval` variants and is additive — the envelope fields are already a superset of both siblings (ADR-003 risk: "design it as an envelope … validated against both sibling techspecs").
+- Verified: `cargo test --test governance_conformance` (5 passed), `cargo fmt --check` clean, `cargo clippy --all-targets` clean (0 warnings). No `src` changes, so the full `cargo test --lib` baseline is unchanged (912 passed / 12 pre-existing skill failures). Zero failures attributable to this task.

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Config keybindings section and ConfigLayer trust boundary
 type: backend
 complexity: medium
@@ -36,11 +36,11 @@ repo from reconfiguring control keys.
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Define `RawKeyBinding` (untagged key-string | `false`) and add the `keybindings` field to `RawConfig`.
-- [ ] 6.2 Add the `ConfigLayer` enum.
-- [ ] 6.3 Thread `ConfigLayer` through `apply_config_file`/`apply_raw` and all `load_effective_config` call sites.
-- [ ] 6.4 Gate `[keybindings]` on `layer != Local`; record a warning when ignored from local config.
-- [ ] 6.5 Add tests for user-scope parsing and local-layer ignore-with-warning.
+- [x] 6.1 Define `RawKeyBinding` (untagged key-string | `false`) and add the `keybindings` field to `RawConfig`.
+- [x] 6.2 Add the `ConfigLayer` enum.
+- [x] 6.3 Thread `ConfigLayer` through `apply_config_file`/`apply_raw` and all `load_effective_config` call sites.
+- [x] 6.4 Gate `[keybindings]` on `layer != Local`; record a warning when ignored from local config.
+- [x] 6.5 Add tests for user-scope parsing and local-layer ignore-with-warning.
 
 ## Implementation Details
 Within `src/config/mod.rs`: `RawConfig` (`:417`, keep `deny_unknown_fields`), `apply_raw` (`:909`),
@@ -69,12 +69,12 @@ config tests; for the local layer, write `working_directory/atelier.toml` and ca
 
 ## Tests
 - Unit tests:
-  - [ ] `RawKeyBinding` deserializes both a key string (`"ctrl+g"`) and `false`.
-  - [ ] `deny_unknown_fields` still rejects a typo'd top-level section.
+  - [x] `RawKeyBinding` deserializes both a key string (`"ctrl+g"`) and `false` — `raw_keybinding_deserializes_key_string_and_false`.
+  - [x] `deny_unknown_fields` still rejects a typo'd top-level section — `deny_unknown_fields_still_rejects_unknown_top_level_key`.
 - Integration tests:
-  - [ ] A home/`--config` `[keybindings.normal]` is parsed into the merged config (via `load_from_temp`).
-  - [ ] A `working_directory/atelier.toml` `[keybindings]` with `config_path: None` is ignored and a warning naming the file is recorded.
-  - [ ] An existing section (e.g. `[ui]`) in that same local file still merges (unchanged behavior).
+  - [x] A user-scope (`--config`/home) `[keybindings.normal]` is accepted without an ignore warning — `user_scope_keybindings_are_accepted_without_warning`. (Full parse into overrides is asserted end-to-end in task_07.)
+  - [x] A `working_directory/atelier.toml` `[keybindings]` with `config_path: None` is ignored and a warning naming the file is recorded — `local_keybindings_are_ignored_with_a_warning_naming_the_file`.
+  - [x] An existing section (`[ui]`) in that same local file still merges (unchanged behavior) — same test asserts `config.ui.hide_banner`.
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -83,3 +83,27 @@ config tests; for the local layer, write `working_directory/atelier.toml` and ca
 - Test coverage >=80%
 - Keybindings parse only from user scope; local config is ignored with a precise warning.
 - `deny_unknown_fields` preserved; other sections' merge behavior unchanged.
+
+## Implementation Notes
+- `apply_raw`/`apply_config_file` gained a `ConfigLayer` param; the three
+  `load_effective_config` call sites pass `Cli` (explicit `--config`/env), `Home`
+  (default home), and `Local` (`./atelier.toml`). `Builtin` exists for completeness
+  (`#[allow(dead_code)]` — base defaults are built directly, not via `apply_raw`).
+- Raw `[keybindings]` is accumulated on `MergedConfig.keybindings` (merged per
+  context/action, later user-scope layers win) for task_07 to parse — the field is
+  `#[allow(dead_code)]` until task_07 reads it. `RawKeyBinding` payloads likewise carry
+  `allow(dead_code)` (deserialized now, read in task_07). A `Local`-layer `[keybindings]`
+  is skipped with a warning pushed to `MergedConfig.keybinding_warnings`, surfaced on the
+  new `EffectiveConfig.keybinding_warnings`.
+- **Scope boundary with task_07:** task_06 proves the trust boundary (accept user-scope,
+  ignore+warn local) and the schema/`deny_unknown_fields`; the actual parse+validate of
+  the accumulated raw map into `EffectiveConfig.keybindings` (KeybindingOverrides) is
+  task_07, so the user-scope test asserts "accepted, no warning" rather than the resolved
+  overrides.
+- **`load_from_temp` caveat:** it passes the temp file as both `config_path` (Cli) and the
+  working-dir local file, so it double-applies. The user-scope test uses a separate
+  `load_user_scope_config` helper (config file named `home-config.toml`, not re-discovered
+  as local) to exercise the Cli layer cleanly.
+- Verified `2026-06-16`: 4 new tests pass; clippy `--all-targets` clean; fmt clean; full
+  `cargo test --lib` shows only pre-existing environmental failures (no config/keybindings
+  regression).

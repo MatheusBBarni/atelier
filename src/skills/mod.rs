@@ -1,3 +1,4 @@
+use crate::util::edit_distance;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -904,25 +905,6 @@ fn skill_name_suggestions(requested_name: &str, metadata: &[SkillMetadata]) -> V
         .take(3)
         .map(|(_distance, alias)| alias)
         .collect()
-}
-
-fn edit_distance(left: &str, right: &str) -> usize {
-    let right_chars = right.chars().collect::<Vec<_>>();
-    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
-    let mut current = vec![0; right_chars.len() + 1];
-
-    for (left_index, left_character) in left.chars().enumerate() {
-        current[0] = left_index + 1;
-        for (right_index, right_character) in right_chars.iter().enumerate() {
-            let substitution_cost = usize::from(left_character != *right_character);
-            current[right_index + 1] = (previous[right_index + 1] + 1)
-                .min(current[right_index] + 1)
-                .min(previous[right_index] + substitution_cost);
-        }
-        previous.clone_from(&current);
-    }
-
-    previous[right_chars.len()]
 }
 
 fn empty_reference_error() -> SkillLoadError {
