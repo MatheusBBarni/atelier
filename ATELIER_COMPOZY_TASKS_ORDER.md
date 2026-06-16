@@ -9,10 +9,10 @@ _Last updated: 2026-06-15_
 
 | # | Packet | Tasks | Role | Why this position |
 |---|--------|-------|------|-------------------|
-| 1 | `governance-spine` | 8 | Foundation | Ships the shared `GovernanceDecisionView` contract that #2 and #7 are meant to consume. Doing it first lets them build on it directly instead of building their own surface and migrating later. |
-| 2 | `approval-trust-list` | 9 | Foundation (safety floor) | The non-bypassable destructive-action gate — highest safety value. Consumes the spine from #1. |
-| 3 | `config-validation-ux` | 6 | Leaf (CI hygiene) | Small, no deps, introduces `--doctor --strict`; unblocks #9. Good early momentum + cheap win. |
-| 4 | `config-driven-keybindings` | 9 | Foundation (low-risk) | Self-contained keybindings module; natural precursor to #6 (which hardcodes `Ctrl-R`). |
+| 1 | `X governance-spine` | 8 | Foundation | Ships the shared `GovernanceDecisionView` contract that #2 and #7 are meant to consume. Doing it first lets them build on it directly instead of building their own surface and migrating later. |
+| 2 | `X approval-trust-list` | 9 | Foundation (safety floor) | The non-bypassable destructive-action gate — highest safety value. Consumes the spine from #1. |
+| 3 | `X config-validation-ux` | 6 | Leaf (CI hygiene) | Small, no deps, introduces `--doctor --strict`; unblocks #9. Good early momentum + cheap win. |
+| 4 | `X config-driven-keybindings` | 9 | Foundation (low-risk) | Self-contained keybindings module; natural precursor to #6 (which hardcodes `Ctrl-R`). |
 | 5 | `lifecycle-hooks` | 9 | Foundation | Clean standalone extension point; no deps. |
 | 6 | `session-browser-resume` | 13 | Foundation | Activates the event-sourcing replay path; high user value; no deps. |
 | 7 | `subtask-dag-execution` | 8 | Foundation | Parallel execution graph; consumes the spine from #1 (like #2). |
