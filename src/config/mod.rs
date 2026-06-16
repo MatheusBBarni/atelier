@@ -436,6 +436,10 @@ pub struct EffectiveConfig {
     pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
     pub agents: BTreeMap<String, AgentProfile>,
+    /// Non-fatal keybinding diagnostics: the trust-boundary "ignored local
+    /// [keybindings]" notes (ADR-004), plus (task_07) soft-fail validation
+    /// warnings. Surfaced by `--doctor`/startup; never blocks a run.
+    pub keybinding_warnings: Vec<String>,
 }
 
 impl EffectiveConfig {
@@ -472,6 +476,36 @@ struct RawConfig {
     runtimes: Option<BTreeMap<String, RawRuntimeConfig>>,
     presets: Option<BTreeMap<String, RawPreset>>,
     agents: Option<BTreeMap<String, RawAgentProfile>>,
+    /// `[keybindings.<context>]` → action → key string or `false` (unbind).
+    /// Honored only from user-scope layers (home / explicit `--config`); a
+    /// project-local config's `[keybindings]` is ignored with a warning
+    /// (ADR-004). Parsed + validated in task_07.
+    keybindings: Option<BTreeMap<String, BTreeMap<String, RawKeyBinding>>>,
+}
+
+/// A single `[keybindings]` entry: either a key string (`"ctrl+g"`) to rebind an
+/// action, or `false` to unbind it. Untagged so TOML accepts both forms inline.
+///
+/// The payloads are deserialized + accumulated here (task_06) but only read when
+/// task_07 parses them into validated overrides — hence `allow(dead_code)`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum RawKeyBinding {
+    Key(String),
+    Disabled(bool),
+}
+
+/// Which config layer a `RawConfig` came from. Used to gate `[keybindings]` to
+/// user scope (ADR-004): `Cli`/`Home` are trusted; a project-local `Local` file
+/// cannot rebind keys. `Builtin` is the in-code default base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigLayer {
+    #[allow(dead_code)] // base defaults are constructed directly, not via apply_raw
+    Builtin,
+    Cli,
+    Home,
+    Local,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -669,6 +703,15 @@ struct MergedConfig {
     presets: BTreeMap<String, RawPresetDefinition>,
     agents: BTreeMap<String, MergedAgentProfile>,
     agent_layers: Vec<PendingAgentLayer>,
+    /// Raw `[keybindings]` accumulated from user-scope layers (home/CLI), merged
+    /// per (context, action) — later layers override earlier ones. Parsed and
+    /// validated into `EffectiveConfig.keybindings` by task_07; only written here.
+    #[allow(dead_code)]
+    keybindings: BTreeMap<String, BTreeMap<String, RawKeyBinding>>,
+    /// Warnings from the keybindings trust boundary — currently the
+    /// "ignored local [keybindings]" notes (ADR-004). Surfaced on
+    /// `EffectiveConfig.keybinding_warnings`; task_07 appends soft-fail notes.
+    keybinding_warnings: Vec<String>,
 }
 
 /// Canonical default system prompts for the six core structured-runtime agents.
@@ -956,10 +999,18 @@ impl MergedConfig {
             presets: BTreeMap::new(),
             agents,
             agent_layers: Vec::new(),
+            keybindings: BTreeMap::new(),
+            keybinding_warnings: Vec::new(),
         }
     }
 
-    fn apply_raw(&mut self, raw: RawConfig, source_dir: &Path, source_name: &str) -> Result<()> {
+    fn apply_raw(
+        &mut self,
+        raw: RawConfig,
+        source_dir: &Path,
+        source_name: &str,
+        layer: ConfigLayer,
+    ) -> Result<()> {
         if let Some(version) = raw.schema_version {
             if version != 1 {
                 bail!("unsupported schema_version {version} in {source_name}; expected 1");
@@ -1075,6 +1126,26 @@ impl MergedConfig {
                 source_name: source_name.to_string(),
                 agents,
             });
+        }
+
+        // Trust boundary (ADR-004): keybindings are honored only from user-scope
+        // layers. A project-local config's `[keybindings]` is ignored with a
+        // warning — an untrusted repo must not be able to rebind control keys.
+        if let Some(keybindings) = raw.keybindings {
+            if layer == ConfigLayer::Local {
+                self.keybinding_warnings.push(format!(
+                    "ignored [keybindings] in {source_name}: keybindings are honored only from your \
+                     home config or an explicit --config, not a project-local config"
+                ));
+            } else {
+                // Merge per (context, action); later user-scope layers win.
+                for (context, actions) in keybindings {
+                    let entry = self.keybindings.entry(context).or_default();
+                    for (action, binding) in actions {
+                        entry.insert(action, binding);
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1560,6 +1631,7 @@ impl MergedConfig {
             council,
             runtimes,
             agents,
+            keybinding_warnings: self.keybinding_warnings,
         })
     }
 
@@ -1740,9 +1812,9 @@ pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConf
     let config_path = options.config_path.or(env_config_path);
 
     if let Some(home_config) = config_path {
-        // Explicit path (CLI flag or env var): it must exist.
+        // Explicit path (CLI flag or env var): user-scope, must exist.
         if home_config.exists() {
-            apply_config_file(&mut merged, &home_config)?;
+            apply_config_file(&mut merged, &home_config, ConfigLayer::Cli)?;
         } else {
             bail!(
                 "configured harness configuration file does not exist: {}",
@@ -1755,15 +1827,16 @@ pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConf
         // No explicit path: prefer ~/.config/.atelier/atelier.toml, but still
         // load the legacy ~/.config/.multiagent/multiagent.toml if that's all
         // that exists.
-        apply_config_file(&mut merged, &home_config)?;
+        apply_config_file(&mut merged, &home_config, ConfigLayer::Home)?;
     }
 
     // Local override: prefer ./atelier.toml, fall back to legacy ./multiagent.toml.
+    // This layer is untrusted for keybindings (project-shipped config).
     if let Some(local_config) = first_existing([
         working_directory.join("atelier.toml"),
         working_directory.join("multiagent.toml"),
     ]) {
-        apply_config_file(&mut merged, &local_config)?;
+        apply_config_file(&mut merged, &local_config, ConfigLayer::Local)?;
     }
 
     merged.into_effective()
@@ -1804,13 +1877,13 @@ pub fn default_home_config_path() -> PathBuf {
         .join("atelier.toml")
 }
 
-fn apply_config_file(merged: &mut MergedConfig, path: &Path) -> Result<()> {
+fn apply_config_file(merged: &mut MergedConfig, path: &Path, layer: ConfigLayer) -> Result<()> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read configuration file {}", path.display()))?;
     let raw: RawConfig = toml::from_str(&contents)
         .with_context(|| format!("failed to parse configuration file {}", path.display()))?;
     let source_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    merged.apply_raw(raw, source_dir, &path.display().to_string())?;
+    merged.apply_raw(raw, source_dir, &path.display().to_string(), layer)?;
     merged
         .config_sources
         .push(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
@@ -2524,6 +2597,83 @@ mod tests {
             working_directory: dir.path().to_path_buf(),
             config_path: Some(config_path),
         })
+    }
+
+    /// Load an explicit `--config`/home-scope file. The file is named differently
+    /// from `atelier.toml` so it is applied only as the `Cli` layer and never
+    /// re-discovered as the local override (mirrors `builtin_config_resolves...`).
+    fn load_user_scope_config(contents: &str) -> Result<EffectiveConfig> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("home-config.toml");
+        fs::write(&config_path, contents)?;
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+    }
+
+    // ── keybindings config + ConfigLayer trust boundary (task_06) ──
+
+    #[test]
+    fn raw_keybinding_deserializes_key_string_and_false() {
+        let parsed: BTreeMap<String, BTreeMap<String, RawKeyBinding>> =
+            toml::from_str("[normal]\ntoggle-roster = \"ctrl+g\"\nhelp-open = false\n").unwrap();
+        let normal = &parsed["normal"];
+        match &normal["toggle-roster"] {
+            RawKeyBinding::Key(s) => assert_eq!(s, "ctrl+g"),
+            other => panic!("expected key string, got {other:?}"),
+        }
+        assert!(matches!(
+            &normal["help-open"],
+            RawKeyBinding::Disabled(false)
+        ));
+    }
+
+    #[test]
+    fn deny_unknown_fields_still_rejects_unknown_top_level_key() {
+        // A typo'd top-level section is still rejected (deny_unknown_fields intact).
+        assert!(toml::from_str::<RawConfig>("keybingings = {}\n").is_err());
+    }
+
+    #[test]
+    fn user_scope_keybindings_are_accepted_without_warning() {
+        let config = load_user_scope_config(
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\ninput-kill-to-end = \"ctrl+k\"\n",
+        )
+        .unwrap();
+        // Honored from user scope (Cli layer) — no ignore warning is recorded.
+        assert!(
+            config.keybinding_warnings.is_empty(),
+            "user-scope keybindings should be accepted, got: {:?}",
+            config.keybinding_warnings
+        );
+    }
+
+    #[test]
+    fn local_keybindings_are_ignored_with_a_warning_naming_the_file() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("atelier.toml"),
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n\n[ui]\nhide_banner = true\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        // The local [keybindings] is ignored, with a warning naming the local file.
+        assert!(
+            config
+                .keybinding_warnings
+                .iter()
+                .any(|w| w.contains("ignored [keybindings]") && w.contains("atelier.toml")),
+            "expected an ignored-local warning, got: {:?}",
+            config.keybinding_warnings
+        );
+        // A non-keybinding section in that same local file still merges unchanged.
+        assert!(config.ui.hide_banner);
     }
 
     #[test]

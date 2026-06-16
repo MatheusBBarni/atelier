@@ -9,7 +9,7 @@
 | 03 | Reserved-key single chokepoint | completed | medium | — |
 | 04 | Default keymap wiring into key routing | completed | high | task_01, task_02, task_03 |
 | 05 | Data-driven Keys help tab | completed | low | task_04 |
-| 06 | Config keybindings section and ConfigLayer trust boundary | pending | medium | task_01 |
+| 06 | Config keybindings section and ConfigLayer trust boundary | completed | medium | task_01 |
 | 07 | Keybinding validation and EffectiveConfig wiring | pending | medium | task_06 |
 | 08 | Resolve keybinding customizations end-to-end | pending | medium | task_04, task_05, task_07 |
 | 09 | Keybinding doctor check and config surfaces | pending | medium | task_07 |
