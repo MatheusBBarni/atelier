@@ -1,5 +1,5 @@
 use crate::keybindings::{
-    key_action_from_name, parse_key, validate_overrides, KeybindingOverrides,
+    self, key_action_from_name, parse_key, validate_overrides, KeybindingOverrides,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::{self, Visitor};
@@ -2186,6 +2186,10 @@ pub(crate) struct PrintableConfig {
     pub(crate) council: PrintableCouncilConfig,
     pub(crate) runtimes: BTreeMap<String, PrintableRuntime>,
     pub(crate) agents: BTreeMap<String, PrintableAgent>,
+    /// The effective keymap (defaults + user overrides), as `context → action →
+    /// key`. Emitted in `--print-config` so the resolved bindings are visible.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) keybindings: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2355,7 +2359,29 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
                 )
             })
             .collect(),
+        keybindings: effective_keybindings_table(config),
     }
+}
+
+/// The effective keymap as a printable `context → action → key` table: defaults
+/// resolved against the user overrides, each chord rendered with `format_key`.
+/// Unbound actions are omitted. Drives the `[keybindings]` block in `--print-config`.
+fn effective_keybindings_table(
+    config: &EffectiveConfig,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    let resolved = keybindings::Keymap::resolve(&keybindings::DEFAULTS, &config.keybindings);
+    let mut normal = BTreeMap::new();
+    for (action, chord) in resolved.entries() {
+        normal.insert(
+            keybindings::action_name(action).to_string(),
+            keybindings::format_key(&chord),
+        );
+    }
+    let mut table = BTreeMap::new();
+    if !normal.is_empty() {
+        table.insert("normal".to_string(), normal);
+    }
+    table
 }
 
 /// Renders the redacted effective configuration as TOML for `--print-config`. Thin
@@ -2432,6 +2458,21 @@ parallel_step_groups = false
 # hide_banner = true             # suppress the welcome banner
 # prompt_history_enabled = true  # ↑/↓ recall of past prompts (on by default)
 # prompt_history_max = 200       # how many past prompts to keep for recall
+
+# Optional keybinding remaps. USER SCOPE ONLY: honored from this home config or
+# an explicit --config; a project-local ./atelier.toml [keybindings] is ignored
+# (so an untrusted repo can't rebind your keys). Maps an action to a key with the
+# `ctrl+k` syntax (lowercase, case-insensitive, `+`-separated); set an action to
+# `false` to unbind it (hand the key back to the terminal). Only the `normal`
+# context is honored in V1. Bindable keys: Ctrl+letter (except C/D/I/M), F1-F12,
+# arrows, PageUp/PageDown/Home/End. Note: Ctrl-U is kill-to-line-start (readline
+# unix-line-discard), NOT kill-whole-line. Ctrl-C (interrupt) is reserved and
+# cannot be rebound. Run `atelier --print-config` to see the effective keymap.
+# [keybindings.normal]
+# toggle-roster        = "ctrl+g"   # default: ctrl+l
+# input-kill-to-end    = "ctrl+k"   # default: ctrl+k
+# scroll-top           = "home"     # default: home
+# input-kill-word-back = false       # unbind (example)
 
 [runtimes.codex]
 type = "codex"
@@ -2834,6 +2875,51 @@ mod tests {
             "expected unknown-action warning, got: {:?}",
             config.keybinding_warnings
         );
+    }
+
+    // ── doctor / print-config / init-config surfaces (task_09) ──
+
+    #[test]
+    fn starter_config_text_documents_keybindings() {
+        let text = starter_config_text();
+        assert!(text.contains("[keybindings"), "section header present");
+        assert!(text.contains("ctrl+"), "ctrl+k syntax documented");
+        assert!(text.contains("false"), "unbind via false documented");
+        assert!(
+            text.contains("Ctrl-U") || text.contains("unix-line-discard"),
+            "Ctrl-U semantics noted"
+        );
+        assert!(
+            text.contains("project-local") || text.contains("USER SCOPE"),
+            "user-scope-only documented"
+        );
+    }
+
+    #[test]
+    fn print_config_emits_the_effective_keymap() {
+        // A rebind shows through to the redacted TOML as the effective key.
+        let config =
+            load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n").unwrap();
+        let toml = to_redacted_toml(&config).unwrap();
+        assert!(
+            toml.contains("[keybindings.normal]"),
+            "table emitted: {toml}"
+        );
+        assert!(
+            toml.contains("toggle-roster = \"ctrl+g\""),
+            "effective rebind shown: {toml}"
+        );
+        // Untouched defaults are part of the effective keymap too.
+        assert!(toml.contains("input-kill-to-end = \"ctrl+k\""), "{toml}");
+    }
+
+    #[test]
+    fn print_config_emits_defaults_with_no_overrides() {
+        // Even with no [keybindings] config, the effective (default) keymap is shown.
+        let config = load_user_scope_config("schema_version = 1\n").unwrap();
+        let toml = to_redacted_toml(&config).unwrap();
+        assert!(toml.contains("[keybindings.normal]"));
+        assert!(toml.contains("toggle-roster = \"ctrl+l\""), "{toml}");
     }
 
     #[test]

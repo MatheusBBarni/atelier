@@ -12,7 +12,7 @@
 | 06 | Config keybindings section and ConfigLayer trust boundary | completed | medium | task_01 |
 | 07 | Keybinding validation and EffectiveConfig wiring | completed | medium | task_06 |
 | 08 | Resolve keybinding customizations end-to-end | completed | medium | task_04, task_05, task_07 |
-| 09 | Keybinding doctor check and config surfaces | pending | medium | task_07 |
+| 09 | Keybinding doctor check and config surfaces | completed | medium | task_07 |
 
 ## Waves
 

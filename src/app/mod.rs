@@ -5980,20 +5980,23 @@ fn build_config_status(
 }
 
 fn config_warning_messages(config: &EffectiveConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
     let agents_without_fallbacks = config
         .agents
         .values()
         .filter(|agent| agent.enabled && agent.model_fallbacks.is_empty())
         .map(|agent| agent.id.clone())
         .collect::<Vec<_>>();
-    if agents_without_fallbacks.is_empty() {
-        Vec::new()
-    } else {
-        vec![format!(
+    if !agents_without_fallbacks.is_empty() {
+        warnings.push(format!(
             "enabled agents without model_fallbacks: {}",
             agents_without_fallbacks.join(", ")
-        )]
+        ));
     }
+    // Keybinding trust-boundary + soft-fail notes (ADR-004): surfaced at startup
+    // and via /config alongside the model-fallback warning.
+    warnings.extend(config.keybinding_warnings.iter().cloned());
+    warnings
 }
 
 fn runtime_warning_messages(availability: &BTreeMap<String, RuntimeAvailability>) -> Vec<String> {
@@ -7219,6 +7222,26 @@ runtime = "fake"
             config_path: Some(config_path),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn config_warning_messages_includes_keybinding_warnings() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        // No keybinding warnings ⇒ none surfaced for that source.
+        assert!(!config_warning_messages(&config)
+            .iter()
+            .any(|w| w.contains("[keybindings]")));
+
+        // A recorded keybinding warning is surfaced at startup / via /config.
+        config
+            .keybinding_warnings
+            .push("ignored [keybindings] in ./atelier.toml".to_string());
+        let warnings = config_warning_messages(&config);
+        assert!(
+            warnings.iter().any(|w| w.contains("ignored [keybindings]")),
+            "expected keybinding warning, got: {warnings:?}"
+        );
     }
 
     fn write_project_skill(

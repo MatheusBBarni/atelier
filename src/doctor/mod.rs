@@ -70,6 +70,7 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
     checks.push(selected_preset_check(config));
     checks.push(prompt_files_check(config));
     checks.push(model_fallback_check(config));
+    checks.push(keybindings_check(config));
     checks.push(tool_access_check(config));
     checks.push(approval_check(config));
     checks.push(governance_metrics_check(config));
@@ -193,6 +194,42 @@ fn prompt_files_check(config: &EffectiveConfig) -> DoctorCheck {
         },
         remediation: None,
         context: Some(serde_json::json!({ "agents": agents })),
+    }
+}
+
+/// Surfaces the keybinding diagnostics collected at config load (ADR-004):
+/// trust-boundary "ignored local [keybindings]" notes and soft-fail (unknown
+/// action) warnings. `Ok` when there are none, `Warn` otherwise — never an error,
+/// since every offending entry already fell back to its default.
+fn keybindings_check(config: &EffectiveConfig) -> DoctorCheck {
+    if config.keybinding_warnings.is_empty() {
+        DoctorCheck {
+            id: "config.keybindings".to_string(),
+            title: "Keybindings".to_string(),
+            status: DoctorStatus::Ok,
+            severity: DoctorSeverity::Info,
+            message: "no keybinding warnings".to_string(),
+            remediation: None,
+            context: None,
+        }
+    } else {
+        DoctorCheck {
+            id: "config.keybindings".to_string(),
+            title: "Keybindings".to_string(),
+            status: DoctorStatus::Warn,
+            severity: DoctorSeverity::Warning,
+            message: format!(
+                "{} keybinding warning(s): {}",
+                config.keybinding_warnings.len(),
+                config.keybinding_warnings.join("; ")
+            ),
+            remediation: Some(
+                "Review [keybindings] in your home/--config file; ignored or unknown entries fall \
+                 back to their defaults."
+                    .to_string(),
+            ),
+            context: Some(serde_json::json!({ "warnings": config.keybinding_warnings })),
+        }
     }
 }
 
@@ -953,6 +990,39 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.id == "runtime.codex"));
+    }
+
+    #[tokio::test]
+    async fn doctor_keybindings_check_reflects_warnings() {
+        let dir = tempdir().unwrap();
+        let mut config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        // Clean config: the check is Ok.
+        let report = run_doctor(&config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "config.keybindings")
+            .expect("config.keybindings check present");
+        assert_eq!(check.status, DoctorStatus::Ok);
+
+        // With a (soft-fail) warning recorded at load, the check warns.
+        config
+            .keybinding_warnings
+            .push("ignored unknown keybinding action `frobnicate`".to_string());
+        let report = run_doctor(&config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "config.keybindings")
+            .expect("config.keybindings check present");
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert_eq!(check.severity, DoctorSeverity::Warning);
+        assert!(check.message.contains("frobnicate"), "{}", check.message);
     }
 
     #[tokio::test]
