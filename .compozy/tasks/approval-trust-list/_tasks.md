@@ -6,7 +6,7 @@
 |---|-------|--------|------------|--------------|
 | 01 | Risk assessment & command normalization | completed | medium | — |
 | 02 | Approval floor configuration | completed | low | — |
-| 03 | Floor + trust enforcement in the single decision point | pending | high | task_01, task_02 |
+| 03 | Floor + trust enforcement in the single decision point | completed | high | task_01, task_02 |
 | 04 | Session TrustStore & per-action context wiring | pending | medium | task_02, task_03 |
 | 05 | Approval resolution, trust grant & audit events | pending | high | task_03, task_04 |
 | 06 | Chat projection for trust & floor events | pending | medium | task_05 |

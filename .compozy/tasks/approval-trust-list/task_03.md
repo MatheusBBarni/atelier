@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Floor + trust enforcement in the single decision point
 type: backend
 complexity: high
@@ -30,11 +30,11 @@ Wire the floor and trust into atelier's single enforcement point so all gating s
 - MUST update all `ActionDecision`/`ActionResult` match sites and `ActionExecutionContext` constructors to compile with the new shape.
 
 ## Subtasks
-- [ ] 03.1 Enrich `ActionDecision`, `ActionResult` (`risk`, `gate_outcome`), and `ActionExecutionContext` (`floor`, `trusted_targets`).
-- [ ] 03.2 Implement the floor/trust/mode matrix in the enforcement point, after the hard checks.
-- [ ] 03.3 Translate the decision in `execute_action_request` and stamp the outcome onto `ActionResult`.
-- [ ] 03.4 Update affected match sites/constructors across `actions` and `app`.
-- [ ] 03.5 Add matrix unit tests covering every (tier × mode × floor) combination.
+- [x] 03.1 Enrich `ActionDecision`, `ActionResult` (`risk`, `gate_outcome`), and `ActionExecutionContext` (`floor`, `trusted_targets`).
+- [x] 03.2 Implement the floor/trust/mode matrix in the enforcement point, after the hard checks.
+- [x] 03.3 Translate the decision in `execute_action_request` and stamp the outcome onto `ActionResult`.
+- [x] 03.4 Update affected match sites/constructors across `actions` and `app`.
+- [x] 03.5 Add matrix unit tests covering every (tier × mode × floor) combination.
 
 ## Implementation Details
 Core change in `src/actions/mod.rs`: `validate_action_request_with_scope` (~145), `decision_for_command` (~356), `execute_action_request` (~278), `ActionDecision` (~90), `ActionResult` (~57). `ActionExecutionContext` is defined in `src/actions/mod.rs` (constructed in `src/app/mod.rs`). Reuse `assess_risk` from task_01. See TechSpec "Implementation Design → Core Interfaces" for the enriched enums and the enforcement-matrix table in ADR-003 "Implementation Notes".
@@ -59,16 +59,16 @@ Core change in `src/actions/mod.rs`: `validate_action_request_with_scope` (~145)
 
 ## Tests
 - Unit tests:
-  - [ ] Gray-area command + Yolo + `floor=Warn` → `AllowedWithWarning`.
-  - [ ] Gray-area command + Yolo + `floor=Enforce` → `RequiresApproval`.
-  - [ ] Gray-area command + Normal (any floor) → `RequiresApproval`.
-  - [ ] Catastrophic command + Yolo → `RequiresApproval` (mode ignored).
-  - [ ] Trusted non-catastrophic command in `trusted_targets` + Yolo → `AllowedByTrust`.
-  - [ ] Trusted command that is ALSO catastrophic → `RequiresApproval` (trust never wins over catastrophic).
-  - [ ] Safe (read-only) command → `Allowed`, no `RiskNote`.
-  - [ ] Existing denial (path outside write root / unauthorized tool) still → `Denied`.
+  - [x] Gray-area command + Yolo + `floor=Warn` → `AllowedWithWarning`.
+  - [x] Gray-area command + Yolo + `floor=Enforce` → `RequiresApproval`.
+  - [x] Gray-area command + Normal (any floor) → `RequiresApproval`.
+  - [x] Catastrophic command + Yolo → `RequiresApproval` (mode ignored).
+  - [x] Trusted non-catastrophic command in `trusted_targets` + Yolo → `AllowedByTrust`.
+  - [x] Trusted command that is ALSO catastrophic → `RequiresApproval` (trust never wins over catastrophic).
+  - [x] Safe (read-only) command → `Allowed`, no `RiskNote`.
+  - [x] Existing denial (path outside write root / unauthorized tool) still → `Denied`.
 - Integration tests:
-  - [ ] An old serialized `ActionResult` (without `risk`/`gate_outcome`) still deserializes (serde default).
+  - [x] An old serialized `ActionResult` (without `risk`/`gate_outcome`) still deserializes (serde default).
 - Test coverage target: >=80%
 - All tests must pass
 

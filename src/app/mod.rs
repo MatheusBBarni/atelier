@@ -2698,6 +2698,8 @@ impl App {
             command_timeout: command_timeout(&self.config.limits.max_command_minutes),
             user_prompt: Some(run.prompt.clone()),
             action_scope: crate::actions::ActionScope::ParallelFileScope(child.file_scope.clone()),
+            floor: self.config.approval.floor,
+            trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
         };
         self.record_command_started_if_executable_with_group(
             &run.run_id,
@@ -4209,6 +4211,8 @@ impl App {
                         command_timeout: command_timeout(&self.config.limits.max_command_minutes),
                         user_prompt: Some(run.prompt.clone()),
                         action_scope: crate::actions::ActionScope::Unrestricted,
+                        floor: self.config.approval.floor,
+                        trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -5972,15 +5976,13 @@ fn action_executable_without_approval(
     context: &ActionExecutionContext,
     request: &ActionRequest,
 ) -> bool {
+    // The allowed-ish decisions all run without a pending approval (ADR-003):
+    // plain `Allowed`, trust auto-approval, and gray-area warn-and-run.
     if !matches!(
-        crate::actions::validate_action_request_with_scope(
-            agent_profile,
-            &context.workspace,
-            &context.approval_mode,
-            &context.action_scope,
-            request
-        ),
+        crate::actions::validate_action_request_with_scope(agent_profile, context, request),
         ActionDecision::Allowed
+            | ActionDecision::AllowedByTrust(_)
+            | ActionDecision::AllowedWithWarning(_)
     ) {
         return false;
     }
@@ -7164,6 +7166,8 @@ runtime = "fake"
             command_timeout: None,
             user_prompt: Some("inspect README".to_string()),
             action_scope: crate::actions::ActionScope::Unrestricted,
+            floor: app.config.approval.floor,
+            trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
         };
         let rendered_context = ActionExecutionContext {
             user_prompt: Some(request.prompt.clone()),
@@ -11625,6 +11629,8 @@ runtime = "fake"
             content: None,
             artifact: None,
             diagnostic: Some("failed to search src: permission denied".to_string()),
+            risk: None,
+            gate_outcome: crate::actions::GateOutcome::Normal,
         };
 
         assert_eq!(
@@ -11994,6 +12000,8 @@ runtime = "fake"
         assert!(app.state.pending_clarification.is_none());
         assert!(app.pending_clarification.is_none());
         assert_eq!(agent_status(&app, "fixer"), "waiting_approval");
+        // Diagnostic keeps the "requires action approval" phrasing and now appends
+        // the plain-language risk reason that drove the gate (ADR-003).
         assert!(pending
             .diagnostic
             .as_ref()
@@ -13168,6 +13176,8 @@ runtime = "fake"
             })),
             artifact: None,
             diagnostic: None,
+            risk: None,
+            gate_outcome: crate::actions::GateOutcome::Normal,
         };
 
         let durable = app

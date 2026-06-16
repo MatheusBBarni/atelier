@@ -1,11 +1,14 @@
-use crate::config::{AgentProfile, ApprovalMode, Capability, ToolName, WorkspacePolicy};
+use crate::config::{
+    AgentProfile, ApprovalMode, Capability, FloorPolicy, ToolName, WorkspacePolicy,
+};
 use crate::orchestrator::ParallelFileScope;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -63,6 +66,14 @@ pub struct ActionResult {
     pub content: Option<Value>,
     pub artifact: Option<Value>,
     pub diagnostic: Option<String>,
+    /// Risk verdict that drove the gate decision (ADR-003). `#[serde(default)]`
+    /// so event records written before this field still deserialize.
+    #[serde(default)]
+    pub risk: Option<RiskNote>,
+    /// How the action passed the gate. `#[serde(default)]` → `Normal` for old
+    /// records.
+    #[serde(default)]
+    pub gate_outcome: GateOutcome,
 }
 
 impl ActionResult {
@@ -75,6 +86,8 @@ impl ActionResult {
             content: None,
             artifact: None,
             diagnostic: Some(reason.into()),
+            risk: None,
+            gate_outcome: GateOutcome::ApprovalRequired,
         }
     }
 }
@@ -121,11 +134,31 @@ pub enum TrustTarget {
     WritePath(PathBuf),
 }
 
+/// What the single enforcement point decided for an action (ADR-003). The
+/// allowed-ish variants all run without a prompt; `RequiresApproval` raises the
+/// modal; `Denied` is a hard block. `RequiresApproval`/`AllowedWithWarning` carry
+/// the [`RiskNote`] so the modal and the audit annotation read straight from the
+/// decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActionDecision {
     Allowed,
-    RequiresApproval(String),
+    AllowedByTrust(TrustTarget),
+    AllowedWithWarning(RiskNote),
+    RequiresApproval(RiskNote),
     Denied(String),
+}
+
+/// How an executed action passed the gate, stamped onto [`ActionResult`] so the
+/// App records the right events (ADR-003). `#[serde(default)]` keeps old event
+/// records (without this field) deserializing as `Normal`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GateOutcome {
+    #[default]
+    Normal,
+    AutoApprovedByTrust,
+    WarnedAllowed,
+    ApprovalRequired,
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +169,12 @@ pub struct ActionExecutionContext {
     pub command_timeout: Option<Duration>,
     pub user_prompt: Option<String>,
     pub action_scope: ActionScope,
+    /// Gray-area floor posture (ADR-002/003). Defaults to `Warn`; the App fills it
+    /// from `config.approval.floor` (task_04).
+    pub floor: FloorPolicy,
+    /// Per-action snapshot of the session trust list (ADR-004). Defaults to empty;
+    /// the App fills it from the `TrustStore` (task_04).
+    pub trusted_targets: Arc<HashSet<TrustTarget>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +196,8 @@ impl ActionExecutionContext {
             command_timeout: Some(Duration::from_secs(10 * 60)),
             user_prompt: None,
             action_scope: ActionScope::Unrestricted,
+            floor: FloorPolicy::default(),
+            trusted_targets: Arc::new(HashSet::new()),
         }
     }
 }
@@ -167,20 +208,18 @@ pub fn validate_action_request(
     approval_mode: &ApprovalMode,
     request: &ActionRequest,
 ) -> ActionDecision {
-    validate_action_request_with_scope(
-        agent,
-        workspace,
-        approval_mode,
-        &ActionScope::Unrestricted,
-        request,
-    )
+    let context =
+        ActionExecutionContext::new(PathBuf::from("."), workspace.clone(), approval_mode.clone());
+    validate_action_request_with_scope(agent, &context, request)
 }
 
+/// The single enforcement point (ADR-003). Runs the hard checks
+/// (schema/tool/capability/path/diff/built-in-command-policy/scope → `Denied`,
+/// unchanged), then applies the floor/trust/mode matrix from `assess_risk` +
+/// `context.floor` + `context.trusted_targets`.
 pub fn validate_action_request_with_scope(
     agent: &AgentProfile,
-    workspace: &WorkspacePolicy,
-    approval_mode: &ApprovalMode,
-    action_scope: &ActionScope,
+    context: &ActionExecutionContext,
     request: &ActionRequest,
 ) -> ActionDecision {
     if request.schema_version != 1 {
@@ -197,57 +236,113 @@ pub fn validate_action_request_with_scope(
             agent.id, tool
         ));
     }
-    let Some(required) = required_capability(&request.kind) else {
-        return ActionDecision::Allowed;
-    };
-    if !agent.has_capability(&required) {
-        return ActionDecision::Denied(format!(
-            "agent {} lacks required capability {:?}",
-            agent.id, required
-        ));
+    if let Some(required) = required_capability(&request.kind) {
+        if !agent.has_capability(&required) {
+            return ActionDecision::Denied(format!(
+                "agent {} lacks required capability {:?}",
+                agent.id, required
+            ));
+        }
     }
 
-    let base_decision = match request.kind {
+    // Per-kind hard checks: path/diff bounds, missing params, and the built-in
+    // command-policy denial — all unchanged, all returning `Denied`.
+    match request.kind {
         ActionKind::ReadFile | ActionKind::ListFiles | ActionKind::SearchText => {
             if let Some(path) = path_param(&request.params) {
-                if let Err(error) = validate_model_path(path, &workspace.read_roots()) {
+                if let Err(error) = validate_model_path(path, &context.workspace.read_roots()) {
                     return ActionDecision::Denied(error.to_string());
                 }
             }
-            ActionDecision::Allowed
         }
         ActionKind::ApplyPatch => {
             let Some(diff) = request.params.get("diff").and_then(Value::as_str) else {
                 return ActionDecision::Denied("apply_patch action is missing diff".to_string());
             };
-            if let Err(error) = validate_unified_diff_for_policy(diff, &workspace.extra_write_roots)
+            if let Err(error) =
+                validate_unified_diff_for_policy(diff, &context.workspace.extra_write_roots)
             {
                 return ActionDecision::Denied(error.to_string());
             }
-            ActionDecision::Allowed
         }
         ActionKind::WriteFile => {
             if let Some(path) = path_param(&request.params) {
-                if let Err(error) = validate_model_path(path, &workspace.extra_write_roots) {
+                if let Err(error) = validate_model_path(path, &context.workspace.extra_write_roots)
+                {
                     return ActionDecision::Denied(error.to_string());
                 }
             }
-            ActionDecision::Allowed
         }
         ActionKind::RunCommand => {
             let Some(command) = request.params.get("command").and_then(Value::as_str) else {
                 return ActionDecision::Denied("run_command action is missing command".to_string());
             };
-            decision_for_command(command, approval_mode)
+            // The built-in deny set stays a hard block (evaluated on the raw command
+            // to preserve existing behavior); catastrophic-but-allowed commands are
+            // handled by the matrix below.
+            if classify_command(command) == CommandClassification::Deny {
+                return ActionDecision::Denied(format!(
+                    "command is denied by built-in policy: {command}"
+                ));
+            }
         }
-        ActionKind::RecordNote => ActionDecision::Allowed,
-    };
-
-    if !matches!(base_decision, ActionDecision::Allowed) {
-        return base_decision;
+        ActionKind::RecordNote => {}
     }
 
-    validate_action_scope(request, action_scope, workspace)
+    // Floor + trust + mode matrix (ADR-003).
+    let decision = apply_floor_and_trust(context, request);
+
+    // Parallel-group scope is enforced only for actions that would otherwise run
+    // without a prompt. An action already bound for the approval modal keeps that
+    // outcome — mirroring the pre-floor ordering, where the approval decision
+    // short-circuited the scope check (the resolved re-run still re-validates).
+    if matches!(
+        decision,
+        ActionDecision::Allowed
+            | ActionDecision::AllowedByTrust(_)
+            | ActionDecision::AllowedWithWarning(_)
+    ) {
+        let scoped = validate_action_scope(request, &context.action_scope, &context.workspace);
+        if !matches!(scoped, ActionDecision::Allowed) {
+            return scoped;
+        }
+    }
+
+    decision
+}
+
+/// The floor/trust/mode matrix applied after the hard checks pass (ADR-003):
+/// catastrophic → `RequiresApproval` (any mode); trusted non-catastrophic →
+/// `AllowedByTrust`; gray-area → `RequiresApproval` in `Normal`/`Enforce`,
+/// `AllowedWithWarning` in `Yolo`+`Warn`; safe → `Allowed`.
+fn apply_floor_and_trust(
+    context: &ActionExecutionContext,
+    request: &ActionRequest,
+) -> ActionDecision {
+    let risk = assess_risk(request, context);
+
+    // Catastrophic always prompts and is never trustable — checked first so trust
+    // can never win over it.
+    if risk.catastrophic {
+        return ActionDecision::RequiresApproval(risk);
+    }
+
+    if let Some(target) = &risk.target {
+        if context.trusted_targets.contains(target) {
+            return ActionDecision::AllowedByTrust(target.clone());
+        }
+    }
+
+    match risk.tier {
+        RiskTier::Low => ActionDecision::Allowed,
+        RiskTier::Medium => match (&context.approval_mode, context.floor) {
+            // Gray-area auto-runs (with an audit annotation) only under Yolo+Warn.
+            (ApprovalMode::Yolo, FloorPolicy::Warn) => ActionDecision::AllowedWithWarning(risk),
+            _ => ActionDecision::RequiresApproval(risk),
+        },
+        // High-but-not-catastrophic is fail-closed: always prompt.
+        RiskTier::High => ActionDecision::RequiresApproval(risk),
+    }
 }
 
 fn validate_action_scope(
@@ -314,33 +409,43 @@ pub async fn execute_action_request(
     context: &ActionExecutionContext,
     request: &ActionRequest,
 ) -> ActionResult {
-    match validate_action_request_with_scope(
-        agent,
-        &context.workspace,
-        &context.approval_mode,
-        &context.action_scope,
-        request,
-    ) {
-        ActionDecision::Denied(reason) => {
-            return action_result(
-                request,
-                ActionStatus::Denied,
-                "Action denied by harness policy.",
-                None,
-                Some(reason),
-            );
-        }
-        ActionDecision::RequiresApproval(reason) => {
-            return action_result(
-                request,
-                ActionStatus::ApprovalRequired,
-                "Action requires action approval.",
-                None,
-                Some(reason),
-            );
-        }
-        ActionDecision::Allowed => {}
-    }
+    // Determine the gate outcome and the risk note to stamp onto the result so the
+    // App can record the right events (ADR-003). Hard `Denied` and `RequiresApproval`
+    // return immediately; the allowed-ish variants run and stamp their outcome.
+    let (gate_outcome, gate_risk) =
+        match validate_action_request_with_scope(agent, context, request) {
+            ActionDecision::Denied(reason) => {
+                return action_result(
+                    request,
+                    ActionStatus::Denied,
+                    "Action denied by harness policy.",
+                    None,
+                    Some(reason),
+                );
+            }
+            ActionDecision::RequiresApproval(risk) => {
+                // The structured `risk` carries the tier/reason for the modal
+                // (task_07); the diagnostic keeps the human "requires action
+                // approval" phrasing plus the reason so denial/audit messages
+                // derived from it stay readable.
+                let mut result = action_result(
+                    request,
+                    ActionStatus::ApprovalRequired,
+                    "Action requires action approval.",
+                    None,
+                    Some(format!("Action requires action approval: {}", risk.reason)),
+                );
+                result.gate_outcome = GateOutcome::ApprovalRequired;
+                result.risk = Some(risk);
+                return result;
+            }
+            ActionDecision::Allowed => (GateOutcome::Normal, None),
+            ActionDecision::AllowedByTrust(_) => (
+                GateOutcome::AutoApprovedByTrust,
+                Some(assess_risk(request, context)),
+            ),
+            ActionDecision::AllowedWithWarning(risk) => (GateOutcome::WarnedAllowed, Some(risk)),
+        };
 
     if let ActionKind::RunCommand = request.kind {
         let Some(command) = request.params.get("command").and_then(Value::as_str) else {
@@ -375,7 +480,7 @@ pub async fn execute_action_request(
         ActionKind::RecordNote => execute_record_note(request),
     };
 
-    match result {
+    let mut result = match result {
         Ok(result) => result,
         Err(error) => action_result(
             request,
@@ -384,22 +489,12 @@ pub async fn execute_action_request(
             None,
             Some(format!("{error:#}")),
         ),
+    };
+    result.gate_outcome = gate_outcome;
+    if result.risk.is_none() {
+        result.risk = gate_risk;
     }
-}
-
-pub fn decision_for_command(command: &str, approval_mode: &ApprovalMode) -> ActionDecision {
-    match classify_command(command) {
-        CommandClassification::Allow => ActionDecision::Allowed,
-        CommandClassification::Deny => {
-            ActionDecision::Denied(format!("command is denied by built-in policy: {command}"))
-        }
-        CommandClassification::Approve => match approval_mode {
-            ApprovalMode::Yolo => ActionDecision::Allowed,
-            ApprovalMode::Normal => ActionDecision::RequiresApproval(format!(
-                "command requires action approval: {command}"
-            )),
-        },
-    }
+    result
 }
 
 /// Pure risk assessment for a single action (ADR-003). Computes the [`RiskTier`],
@@ -1192,6 +1287,8 @@ fn action_result(
         content,
         artifact: None,
         diagnostic,
+        risk: None,
+        gate_outcome: GateOutcome::Normal,
     }
 }
 
@@ -1814,7 +1911,22 @@ mod tests {
             command_timeout: Some(Duration::from_secs(5)),
             user_prompt: None,
             action_scope: ActionScope::Unrestricted,
+            floor: config.approval.floor,
+            trusted_targets: Arc::new(HashSet::new()),
         }
+    }
+
+    fn scoped_context(
+        config: &crate::config::EffectiveConfig,
+        scope: ActionScope,
+    ) -> ActionExecutionContext {
+        let mut context = ActionExecutionContext::new(
+            PathBuf::from("."),
+            config.workspace.clone(),
+            config.approval_mode.clone(),
+        );
+        context.action_scope = scope;
+        context
     }
 
     #[test]
@@ -2107,27 +2219,185 @@ mod tests {
         ));
     }
 
+    // ---- Floor + trust enforcement matrix (task_03) -------------------
+
+    fn matrix_context(
+        approval_mode: ApprovalMode,
+        floor: FloorPolicy,
+        trusted: HashSet<TrustTarget>,
+    ) -> (
+        tempfile::TempDir,
+        crate::config::EffectiveConfig,
+        ActionExecutionContext,
+    ) {
+        let dir = tempdir().unwrap();
+        let (config, _) = fixture_agent("fixer");
+        let mut context = ActionExecutionContext::new(
+            dir.path().to_path_buf(),
+            config.workspace.clone(),
+            approval_mode,
+        );
+        context.floor = floor;
+        context.trusted_targets = Arc::new(trusted);
+        (dir, config, context)
+    }
+
+    fn matrix_decision(
+        command: &str,
+        approval_mode: ApprovalMode,
+        floor: FloorPolicy,
+        trusted: HashSet<TrustTarget>,
+    ) -> ActionDecision {
+        let (_dir, config, context) = matrix_context(approval_mode, floor, trusted);
+        let fixer = config.agents["fixer"].clone();
+        validate_action_request_with_scope(&fixer, &context, &run_command_request(command))
+    }
+
     #[test]
-    fn read_only_shell_suffix_requires_approval_in_normal_mode() {
+    fn gray_area_yolo_warn_allows_with_warning() {
+        let decision = matrix_decision(
+            "npm install left-pad",
+            ApprovalMode::Yolo,
+            FloorPolicy::Warn,
+            HashSet::new(),
+        );
+        assert!(matches!(decision, ActionDecision::AllowedWithWarning(_)));
+    }
+
+    #[test]
+    fn gray_area_yolo_enforce_requires_approval() {
+        let decision = matrix_decision(
+            "npm install left-pad",
+            ApprovalMode::Yolo,
+            FloorPolicy::Enforce,
+            HashSet::new(),
+        );
+        assert!(matches!(decision, ActionDecision::RequiresApproval(_)));
+    }
+
+    #[test]
+    fn gray_area_normal_requires_approval_under_any_floor() {
+        for floor in [FloorPolicy::Warn, FloorPolicy::Enforce] {
+            let decision = matrix_decision(
+                "npm install left-pad",
+                ApprovalMode::Normal,
+                floor,
+                HashSet::new(),
+            );
+            assert!(
+                matches!(decision, ActionDecision::RequiresApproval(_)),
+                "floor {floor:?}"
+            );
+        }
+        // A read-only suffix that adds shell control is gray-area, not safe.
+        let suffixed = matrix_decision(
+            "git rev-parse --abbrev-ref HEAD && cargo build",
+            ApprovalMode::Normal,
+            FloorPolicy::Warn,
+            HashSet::new(),
+        );
+        assert!(matches!(suffixed, ActionDecision::RequiresApproval(_)));
+    }
+
+    #[test]
+    fn catastrophic_requires_approval_even_under_yolo() {
+        let decision = matrix_decision(
+            "rm -rf ~",
+            ApprovalMode::Yolo,
+            FloorPolicy::Warn,
+            HashSet::new(),
+        );
+        match decision {
+            ActionDecision::RequiresApproval(risk) => {
+                assert!(risk.catastrophic);
+                assert_eq!(risk.target, None);
+            }
+            other => panic!("expected RequiresApproval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trusted_non_catastrophic_command_is_auto_approved() {
+        let trusted = HashSet::from([TrustTarget::Command("npm install left-pad".to_string())]);
+        // Trust is checked before the tier, so even under Yolo+Warn (which would
+        // otherwise warn-and-run) the decision is the distinct AllowedByTrust.
+        let decision = matrix_decision(
+            "npm install left-pad",
+            ApprovalMode::Yolo,
+            FloorPolicy::Warn,
+            trusted,
+        );
+        assert!(matches!(decision, ActionDecision::AllowedByTrust(_)));
+    }
+
+    #[test]
+    fn trust_never_overrides_catastrophic() {
+        // Even if a matching command string were trusted, catastrophic wins.
+        let trusted = HashSet::from([TrustTarget::Command(normalize_command("rm -rf ~"))]);
+        let decision = matrix_decision("rm -rf ~", ApprovalMode::Yolo, FloorPolicy::Warn, trusted);
+        assert!(matches!(decision, ActionDecision::RequiresApproval(_)));
+    }
+
+    #[test]
+    fn safe_command_is_allowed_with_no_risk_note() {
+        let decision = matrix_decision(
+            "cargo test",
+            ApprovalMode::Yolo,
+            FloorPolicy::Warn,
+            HashSet::new(),
+        );
+        assert_eq!(decision, ActionDecision::Allowed);
+    }
+
+    #[test]
+    fn built_in_command_policy_denial_is_unchanged() {
+        // `rm -rf /` stays a hard built-in denial regardless of the matrix.
+        let decision = matrix_decision(
+            "rm -rf /",
+            ApprovalMode::Yolo,
+            FloorPolicy::Warn,
+            HashSet::new(),
+        );
+        assert!(matches!(decision, ActionDecision::Denied(_)));
+    }
+
+    #[test]
+    fn capability_denial_still_denied_under_matrix() {
+        let (config, reviewer) = fixture_agent("reviewer");
+        let context = ActionExecutionContext::new(
+            PathBuf::from("."),
+            config.workspace.clone(),
+            ApprovalMode::Yolo,
+        );
+        let request = ActionRequest {
+            schema_version: 1,
+            action_id: "w".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::WriteFile,
+            params: json!({ "path": "src/lib.rs" }),
+        };
         assert!(matches!(
-            decision_for_command(
-                "git rev-parse --abbrev-ref HEAD && rm -rf target",
-                &ApprovalMode::Normal
-            ),
-            ActionDecision::RequiresApproval(_)
+            validate_action_request_with_scope(&reviewer, &context, &request),
+            ActionDecision::Denied(_)
         ));
     }
 
     #[test]
-    fn yolo_skips_approval_but_normal_prompts() {
-        assert_eq!(
-            decision_for_command("git commit -m test", &ApprovalMode::Yolo),
-            ActionDecision::Allowed
-        );
-        assert!(matches!(
-            decision_for_command("git commit -m test", &ApprovalMode::Normal),
-            ActionDecision::RequiresApproval(_)
-        ));
+    fn old_action_result_without_risk_fields_deserializes() {
+        // Records written before the risk/gate_outcome fields existed must still
+        // project (serde default).
+        let json = r#"{
+            "schema_version": 1,
+            "action_id": "a",
+            "status": "completed",
+            "summary": "done",
+            "content": null,
+            "artifact": null,
+            "diagnostic": null
+        }"#;
+        let result: ActionResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.risk, None);
+        assert_eq!(result.gate_outcome, GateOutcome::Normal);
     }
 
     #[tokio::test]
@@ -2370,13 +2640,8 @@ mod tests {
             read_roots: vec!["src".to_string()],
         });
 
-        let decision = validate_action_request_with_scope(
-            &fixer,
-            &config.workspace,
-            &config.approval_mode,
-            &scope,
-            &request,
-        );
+        let context = scoped_context(&config, scope);
+        let decision = validate_action_request_with_scope(&fixer, &context, &request);
 
         assert!(
             matches!(decision, ActionDecision::Denied(reason) if reason.contains("exact write_files"))
@@ -2399,13 +2664,8 @@ mod tests {
             read_roots: vec!["src".to_string()],
         });
 
-        let decision = validate_action_request_with_scope(
-            &fixer,
-            &config.workspace,
-            &config.approval_mode,
-            &scope,
-            &request,
-        );
+        let context = scoped_context(&config, scope);
+        let decision = validate_action_request_with_scope(&fixer, &context, &request);
 
         assert!(
             matches!(decision, ActionDecision::Denied(reason) if reason.contains("exact write_files"))
@@ -2427,13 +2687,8 @@ mod tests {
             read_roots: vec!["src".to_string()],
         });
 
-        let decision = validate_action_request_with_scope(
-            &fixer,
-            &config.workspace,
-            &config.approval_mode,
-            &scope,
-            &request,
-        );
+        let context = scoped_context(&config, scope);
+        let decision = validate_action_request_with_scope(&fixer, &context, &request);
 
         assert!(
             matches!(decision, ActionDecision::Denied(reason) if reason.contains("schedule after group join"))
@@ -2455,13 +2710,8 @@ mod tests {
             read_roots: vec!["src".to_string()],
         });
 
-        let decision = validate_action_request_with_scope(
-            &fixer,
-            &config.workspace,
-            &config.approval_mode,
-            &scope,
-            &request,
-        );
+        let context = scoped_context(&config, scope);
+        let decision = validate_action_request_with_scope(&fixer, &context, &request);
 
         assert!(
             matches!(decision, ActionDecision::Denied(reason) if reason.contains("schedule after group join"))
