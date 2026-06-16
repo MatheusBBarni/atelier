@@ -63,6 +63,25 @@ pub enum KeyAction {
     InputKillWordBack,
 }
 
+/// Parse a kebab-case action name back into a [`KeyAction`], the inverse of
+/// [`action_name`]. Returns `None` for an unknown name so the config layer can
+/// soft-fail (drop + warn) rather than hard-error on a typo'd action.
+pub fn key_action_from_name(name: &str) -> Option<KeyAction> {
+    Some(match name {
+        "toggle-roster" => KeyAction::ToggleRoster,
+        "scroll-page-up" => KeyAction::ScrollPageUp,
+        "scroll-page-down" => KeyAction::ScrollPageDown,
+        "scroll-top" => KeyAction::ScrollTop,
+        "scroll-bottom" => KeyAction::ScrollBottom,
+        "input-line-start" => KeyAction::InputLineStart,
+        "input-line-end" => KeyAction::InputLineEnd,
+        "input-kill-to-end" => KeyAction::InputKillToEnd,
+        "input-kill-to-start" => KeyAction::InputKillToStart,
+        "input-kill-word-back" => KeyAction::InputKillWordBack,
+        _ => return None,
+    })
+}
+
 /// The kebab-case name of an action, matching its serde rename.
 ///
 /// Kept as an exhaustive match (rather than round-tripping through serde) so it
@@ -521,5 +540,15 @@ mod tests {
             action_name(KeyAction::InputKillWordBack),
             "input-kill-word-back"
         );
+    }
+
+    #[test]
+    fn key_action_from_name_round_trips_and_rejects_unknown() {
+        // Every default action name round-trips through name <-> action.
+        for (action, _) in DEFAULTS {
+            assert_eq!(key_action_from_name(action_name(action)), Some(action));
+        }
+        assert_eq!(key_action_from_name("frobnicate"), None);
+        assert_eq!(key_action_from_name("toggle_roster"), None); // snake_case is not the contract
     }
 }

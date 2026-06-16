@@ -1,3 +1,6 @@
+use crate::keybindings::{
+    key_action_from_name, parse_key, validate_overrides, KeybindingOverrides,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -436,9 +439,13 @@ pub struct EffectiveConfig {
     pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
     pub agents: BTreeMap<String, AgentProfile>,
+    /// Validated, post-merge keybinding overrides from user-scope config
+    /// (home/CLI). Empty when no `[keybindings]` is present ⇒ default keymap.
+    /// Resolved into the active `Keymap` at TUI init (task_08).
+    pub keybindings: KeybindingOverrides,
     /// Non-fatal keybinding diagnostics: the trust-boundary "ignored local
-    /// [keybindings]" notes (ADR-004), plus (task_07) soft-fail validation
-    /// warnings. Surfaced by `--doctor`/startup; never blocks a run.
+    /// [keybindings]" notes plus soft-fail (unknown-action) warnings (ADR-004).
+    /// Surfaced by `--doctor`/startup; never blocks a run.
     pub keybinding_warnings: Vec<String>,
 }
 
@@ -485,12 +492,8 @@ struct RawConfig {
 
 /// A single `[keybindings]` entry: either a key string (`"ctrl+g"`) to rebind an
 /// action, or `false` to unbind it. Untagged so TOML accepts both forms inline.
-///
-/// The payloads are deserialized + accumulated here (task_06) but only read when
-/// task_07 parses them into validated overrides — hence `allow(dead_code)`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
-#[allow(dead_code)]
 enum RawKeyBinding {
     Key(String),
     Disabled(bool),
@@ -703,14 +706,14 @@ struct MergedConfig {
     presets: BTreeMap<String, RawPresetDefinition>,
     agents: BTreeMap<String, MergedAgentProfile>,
     agent_layers: Vec<PendingAgentLayer>,
-    /// Raw `[keybindings]` accumulated from user-scope layers (home/CLI), merged
-    /// per (context, action) — later layers override earlier ones. Parsed and
-    /// validated into `EffectiveConfig.keybindings` by task_07; only written here.
-    #[allow(dead_code)]
-    keybindings: BTreeMap<String, BTreeMap<String, RawKeyBinding>>,
-    /// Warnings from the keybindings trust boundary — currently the
-    /// "ignored local [keybindings]" notes (ADR-004). Surfaced on
-    /// `EffectiveConfig.keybinding_warnings`; task_07 appends soft-fail notes.
+    /// Validated keybinding overrides accumulated from user-scope layers
+    /// (home/CLI), merged per action — later layers override earlier ones.
+    /// Each user-scope layer is parsed and hard-validated as it is applied
+    /// (ADR-004), so this is always a clean override set.
+    keybindings: KeybindingOverrides,
+    /// Warnings from the keybindings trust boundary: the "ignored local
+    /// [keybindings]" notes plus soft-fail (unknown-action) notes (ADR-004).
+    /// Surfaced on `EffectiveConfig.keybinding_warnings`.
     keybinding_warnings: Vec<String>,
 }
 
@@ -999,7 +1002,7 @@ impl MergedConfig {
             presets: BTreeMap::new(),
             agents,
             agent_layers: Vec::new(),
-            keybindings: BTreeMap::new(),
+            keybindings: KeybindingOverrides::new(),
             keybinding_warnings: Vec::new(),
         }
     }
@@ -1138,15 +1141,64 @@ impl MergedConfig {
                      home config or an explicit --config, not a project-local config"
                 ));
             } else {
-                // Merge per (context, action); later user-scope layers win.
-                for (context, actions) in keybindings {
-                    let entry = self.keybindings.entry(context).or_default();
-                    for (action, binding) in actions {
-                        entry.insert(action, binding);
-                    }
-                }
+                self.apply_keybindings(keybindings, source_name)?;
             }
         }
+
+        Ok(())
+    }
+
+    /// Parse + severity-split-validate a user-scope `[keybindings]` table into the
+    /// accumulated overrides (ADR-004). Hard-fails (with a file/field/value
+    /// message) on an unknown context, malformed key, reserved or non-portable
+    /// key, or a duplicate; soft-fails (drop + warn) on an unknown action.
+    fn apply_keybindings(
+        &mut self,
+        keybindings: BTreeMap<String, BTreeMap<String, RawKeyBinding>>,
+        source_name: &str,
+    ) -> Result<()> {
+        for (context, actions) in keybindings {
+            // V1 wires only the `normal` context; any other is a precise hard error.
+            if context != "normal" {
+                bail!(
+                    "invalid [keybindings.{context}] in {source_name}: only the `normal` context \
+                     is supported (use [keybindings.normal])"
+                );
+            }
+            for (action_name, binding) in actions {
+                let Some(action) = key_action_from_name(&action_name) else {
+                    // Cosmetic mistake: drop the entry, keep the rest, warn.
+                    self.keybinding_warnings.push(format!(
+                        "ignored unknown keybinding action `{action_name}` in [keybindings.normal] \
+                         ({source_name})"
+                    ));
+                    continue;
+                };
+                let value = match binding {
+                    RawKeyBinding::Disabled(false) => None, // unbind
+                    RawKeyBinding::Disabled(true) => bail!(
+                        "invalid keybinding `{action_name} = true` in {source_name}: use a key \
+                         string like \"ctrl+g\", or `false` to unbind"
+                    ),
+                    RawKeyBinding::Key(value) => {
+                        let chord = parse_key(&value).map_err(|err| {
+                            anyhow!(
+                                "invalid keybinding `{action_name} = \"{value}\"` in \
+                                 {source_name}: {err}"
+                            )
+                        })?;
+                        Some(chord)
+                    }
+                };
+                self.keybindings.insert(action, value);
+            }
+        }
+
+        // Hard-fail reserved / non-portable / duplicate (against the merged
+        // defaults). Run after merging this layer so cross-layer collisions are
+        // caught too; the file is named for a precise diagnostic.
+        validate_overrides(&self.keybindings)
+            .map_err(|err| anyhow!("{err} (in [keybindings.normal], {source_name})"))?;
 
         Ok(())
     }
@@ -1631,6 +1683,7 @@ impl MergedConfig {
             council,
             runtimes,
             agents,
+            keybindings: self.keybindings,
             keybinding_warnings: self.keybinding_warnings,
         })
     }
@@ -2674,6 +2727,113 @@ mod tests {
         );
         // A non-keybinding section in that same local file still merges unchanged.
         assert!(config.ui.hide_banner);
+    }
+
+    // ── keybinding validation + EffectiveConfig wiring (task_07) ──
+
+    #[test]
+    fn valid_keybinding_yields_an_override() {
+        use crate::keybindings::{format_key, KeyAction};
+        let config =
+            load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n").unwrap();
+        let chord = config
+            .keybindings
+            .get(&KeyAction::ToggleRoster)
+            .expect("toggle-roster override present")
+            .expect("rebound, not unbound");
+        assert_eq!(format_key(&chord), "ctrl+g");
+        assert!(config.keybinding_warnings.is_empty());
+    }
+
+    #[test]
+    fn unbind_keybinding_yields_a_none_override() {
+        use crate::keybindings::KeyAction;
+        let config =
+            load_user_scope_config("[keybindings.normal]\ntoggle-roster = false\n").unwrap();
+        assert_eq!(
+            config.keybindings.get(&KeyAction::ToggleRoster),
+            Some(&None),
+            "false unbinds the action"
+        );
+    }
+
+    #[test]
+    fn no_keybindings_section_leaves_overrides_and_warnings_empty() {
+        let config = load_user_scope_config("schema_version = 1\n").unwrap();
+        assert!(config.keybindings.is_empty());
+        assert!(config.keybinding_warnings.is_empty());
+    }
+
+    #[test]
+    fn reserved_key_bind_hard_fails_with_file_field_value() {
+        let err = load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+c\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("toggle-roster"), "field: {msg}");
+        assert!(msg.contains("ctrl+c"), "value: {msg}");
+        assert!(msg.contains("home-config.toml"), "file: {msg}");
+        assert!(msg.contains("reserved"), "reason: {msg}");
+    }
+
+    #[test]
+    fn non_portable_key_hard_fails() {
+        let err = load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+1\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("portable"), "{msg}");
+        assert!(msg.contains("ctrl+1"));
+    }
+
+    #[test]
+    fn unknown_context_hard_fails() {
+        let err = load_user_scope_config("[keybindings.approval]\ntoggle-roster = \"ctrl+g\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("approval"), "{msg}");
+        assert!(msg.contains("normal"), "names the supported context: {msg}");
+    }
+
+    #[test]
+    fn duplicate_key_hard_fails() {
+        let err = load_user_scope_config(
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\nscroll-top = \"ctrl+g\"\n",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ctrl+g"), "{msg}");
+        assert!(
+            msg.contains("two actions") || msg.contains("multiple"),
+            "duplicate reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn malformed_key_hard_fails() {
+        let err = load_user_scope_config("[keybindings.normal]\ntoggle-roster = \"ctrl+\"\n")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("toggle-roster"), "field: {msg}");
+        assert!(msg.contains("home-config.toml"), "file: {msg}");
+    }
+
+    #[test]
+    fn unknown_action_soft_fails_with_a_warning() {
+        let config = load_user_scope_config(
+            "[keybindings.normal]\nfrobnicate = \"ctrl+g\"\ntoggle-roster = \"ctrl+g\"\n",
+        )
+        .unwrap();
+        use crate::keybindings::KeyAction;
+        // The unknown action is dropped (so ctrl+g is free for the real rebind)...
+        assert!(config.keybindings.contains_key(&KeyAction::ToggleRoster));
+        // ...and a warning names it.
+        assert!(
+            config
+                .keybinding_warnings
+                .iter()
+                .any(|w| w.contains("frobnicate")),
+            "expected unknown-action warning, got: {:?}",
+            config.keybinding_warnings
+        );
     }
 
     #[test]
