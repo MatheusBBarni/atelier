@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Elevate unavailable orchestrator runtime to Error in run_doctor"
 type: backend
 complexity: medium
@@ -30,11 +30,11 @@ In the doctor's runtime-availability loop, elevate a runtime that is `Unavailabl
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Compute `required_runtime_ids()` once before the runtime-availability loop.
-- [ ] 4.2 Elevate the required + `Unavailable` case to `Error` in the status/severity match.
-- [ ] 4.3 Add `error_count()` to `DoctorReport` alongside `has_errors()`.
-- [ ] 4.4 Add unit tests covering the elevation matrix.
-- [ ] 4.5 Update existing doctor tests affected by the new severity.
+- [x] 4.1 Compute `required_runtime_ids()` once before the runtime-availability loop.
+- [x] 4.2 Elevate the required + `Unavailable` case to `Error` in the status/severity match.
+- [x] 4.3 Add `error_count()` to `DoctorReport` alongside `has_errors()`.
+- [x] 4.4 Add unit tests covering the elevation matrix.
+- [x] 4.5 Update existing doctor tests affected by the new severity.
 
 ## Implementation Details
 See TechSpec "Implementation Design → Core Interfaces" (the doctor elevation block) and ADR-003. The availability loop is doctor/mod.rs ~65-99; `DoctorReport::has_errors()` already exists (~48) and is the basis for `error_count()`. Only the `Unavailable` arm for a required runtime changes; everything else keeps current mappings.
@@ -59,12 +59,12 @@ See TechSpec "Implementation Design → Core Interfaces" (the doctor elevation b
 
 ## Tests
 - Unit tests:
-  - [ ] Orchestrator runtime `Unavailable` → its check is `DoctorStatus::Error` / `DoctorSeverity::Error`.
-  - [ ] A non-orchestrator runtime `Unavailable` → its check stays `Warn`.
-  - [ ] Orchestrator runtime `Unknown` → stays `Warn`.
-  - [ ] `error_count()` returns the exact number of `Error` checks in a report.
+  - [x] Orchestrator runtime `Unavailable` → its check is `DoctorStatus::Error` / `DoctorSeverity::Error`.
+  - [x] A non-orchestrator runtime `Unavailable` → its check stays `Warn`.
+  - [x] Orchestrator runtime `Unknown` → stays `Warn`.
+  - [x] `error_count()` returns the exact number of `Error` checks in a report.
 - Integration tests:
-  - [ ] `run_doctor` on a config whose orchestrator runtime command is missing yields `has_errors() == true`.
+  - [x] `run_doctor` on a config whose orchestrator runtime command is missing yields `has_errors() == true`.
 - Test coverage target: >=80%
 - All tests must pass
 

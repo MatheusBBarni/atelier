@@ -51,6 +51,15 @@ impl DoctorReport {
             .iter()
             .any(|check| matches!(check.status, DoctorStatus::Error))
     }
+
+    /// Number of `Error`-status checks in the report — companion to
+    /// [`has_errors`](Self::has_errors), used by the CLI nudge/gate (task_05).
+    pub fn error_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|check| matches!(check.status, DoctorStatus::Error))
+            .count()
+    }
 }
 
 pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
@@ -65,13 +74,16 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
     checks.push(approval_check(config));
     checks.push(governance_metrics_check(config));
 
+    // Runtimes guaranteed to run on every prompt (V1: the orchestrator's). An
+    // unavailable one is a hard error; everything else stays a warning (ADR-003).
+    // Decoupled from --strict: the report always reflects true severity.
+    let required = config.required_runtime_ids();
     for runtime in config.runtimes.values() {
         let availability = check_runtime_availability(runtime).await;
-        let (status, severity) = match availability.status {
-            RuntimeAvailabilityStatus::Available => (DoctorStatus::Ok, DoctorSeverity::Info),
-            RuntimeAvailabilityStatus::Unknown => (DoctorStatus::Warn, DoctorSeverity::Warning),
-            RuntimeAvailabilityStatus::Unavailable => (DoctorStatus::Warn, DoctorSeverity::Warning),
-        };
+        let (status, severity) = runtime_availability_severity(
+            availability.status,
+            required.contains(runtime.id.as_str()),
+        );
         let title = match runtime.kind {
             RuntimeKind::Codex => "Codex Runtime",
             RuntimeKind::Claude => "Claude Runtime",
@@ -106,6 +118,26 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         working_directory: config.working_directory.display().to_string(),
         checks,
+    }
+}
+
+/// The doctor status/severity for a runtime's availability (ADR-003). An
+/// `Unavailable` runtime that is `required` (the orchestrator's — guaranteed to
+/// run on every prompt) elevates to `Error`; an `Unknown` probe (inconclusive)
+/// and any non-required runtime stay `Warn`. Pure so the elevation matrix is
+/// testable without availability probing.
+fn runtime_availability_severity(
+    status: RuntimeAvailabilityStatus,
+    required: bool,
+) -> (DoctorStatus, DoctorSeverity) {
+    match status {
+        RuntimeAvailabilityStatus::Available => (DoctorStatus::Ok, DoctorSeverity::Info),
+        RuntimeAvailabilityStatus::Unavailable if required => {
+            (DoctorStatus::Error, DoctorSeverity::Error)
+        }
+        RuntimeAvailabilityStatus::Unavailable | RuntimeAvailabilityStatus::Unknown => {
+            (DoctorStatus::Warn, DoctorSeverity::Warning)
+        }
     }
 }
 
@@ -1236,5 +1268,89 @@ command = "{}"
         assert!(json.contains("stream-json enabled"));
         assert!(json.contains("Cursor tools must not bypass Harness Actions"));
         assert!(!json.contains("CURSOR_API_KEY"));
+    }
+
+    // ---- Orchestrator-runtime elevation (task_04) ---------------------
+
+    fn check_with_status(status: DoctorStatus) -> DoctorCheck {
+        DoctorCheck {
+            id: "runtime.x".to_string(),
+            title: "X".to_string(),
+            status,
+            severity: DoctorSeverity::Info,
+            message: String::new(),
+            remediation: None,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn elevation_matrix_holds() {
+        assert_eq!(
+            runtime_availability_severity(RuntimeAvailabilityStatus::Available, true),
+            (DoctorStatus::Ok, DoctorSeverity::Info)
+        );
+        // Required + Unavailable is the only Warn→Error elevation.
+        assert_eq!(
+            runtime_availability_severity(RuntimeAvailabilityStatus::Unavailable, true),
+            (DoctorStatus::Error, DoctorSeverity::Error)
+        );
+        // A non-required unavailable runtime stays a warning.
+        assert_eq!(
+            runtime_availability_severity(RuntimeAvailabilityStatus::Unavailable, false),
+            (DoctorStatus::Warn, DoctorSeverity::Warning)
+        );
+        // An inconclusive probe stays a warning even for a required runtime.
+        assert_eq!(
+            runtime_availability_severity(RuntimeAvailabilityStatus::Unknown, true),
+            (DoctorStatus::Warn, DoctorSeverity::Warning)
+        );
+    }
+
+    #[test]
+    fn error_count_counts_only_error_checks() {
+        let report = DoctorReport {
+            schema_version: 1,
+            generated_at: String::new(),
+            working_directory: String::new(),
+            checks: vec![
+                check_with_status(DoctorStatus::Error),
+                check_with_status(DoctorStatus::Warn),
+                check_with_status(DoctorStatus::Error),
+                check_with_status(DoctorStatus::Ok),
+            ],
+        };
+        assert_eq!(report.error_count(), 2);
+        assert!(report.has_errors());
+    }
+
+    #[tokio::test]
+    async fn run_doctor_errors_when_orchestrator_runtime_command_missing() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("atelier.toml");
+        // Point the orchestrator at a codex runtime whose command does not exist:
+        // its availability is deterministically Unavailable, so it must elevate.
+        fs::write(
+            &config_path,
+            "schema_version = 1\n\
+             [runtimes.codex]\ncommand = \"atelier-nonexistent-binary-xyz-12345\"\n\
+             [agents.orchestrator]\nruntime = \"codex\"\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        let report = run_doctor(&config).await;
+        assert!(report.has_errors());
+        assert!(report.error_count() >= 1);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "runtime.codex")
+            .unwrap();
+        assert_eq!(check.status, DoctorStatus::Error);
     }
 }
