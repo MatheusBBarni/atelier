@@ -1174,6 +1174,9 @@ impl App {
         if self.handle_config_command(&prompt)? {
             return Ok(());
         }
+        if self.handle_trust_command(&prompt)? {
+            return Ok(());
+        }
         if self.handle_subtask_command(&prompt).await? {
             return Ok(());
         }
@@ -1352,6 +1355,103 @@ impl App {
             "config_viewed",
             serde_json::to_value(&self.state.config_status)?,
             config_status_display(&self.state.config_status),
+        )?;
+        Ok(true)
+    }
+
+    /// `/trust` session-trust management (ADR-004): list entries, revoke one by
+    /// 1-based index from the last listing, or clear all. Malformed input reports
+    /// a usage error and never mutates the store. Follows the
+    /// `handle_config_command`/`handle_goal_command` pattern.
+    fn handle_trust_command(&mut self, prompt: &str) -> Result<bool> {
+        let trimmed = prompt.trim();
+        if trimmed != "/trust" && !trimmed.starts_with("/trust ") {
+            if trimmed.starts_with("/trust") {
+                bail!("usage: /trust | /trust revoke <n> | /trust clear");
+            }
+            return Ok(false);
+        }
+
+        let args = trimmed.strip_prefix("/trust").unwrap_or("").trim();
+        if args.is_empty() {
+            return self.trust_list();
+        }
+        let mut parts = args.split_whitespace();
+        match parts.next() {
+            Some("revoke") => {
+                let token = parts.next();
+                if parts.next().is_some() {
+                    bail!("usage: /trust revoke <n>");
+                }
+                let Some(token) = token else {
+                    bail!("usage: /trust revoke <n>");
+                };
+                let Ok(index) = token.parse::<usize>() else {
+                    bail!("usage: /trust revoke <n> (n must be a positive number)");
+                };
+                self.trust_revoke(index)
+            }
+            Some("clear") => {
+                if parts.next().is_some() {
+                    bail!("usage: /trust clear");
+                }
+                self.trust_clear()
+            }
+            _ => bail!("usage: /trust | /trust revoke <n> | /trust clear"),
+        }
+    }
+
+    fn trust_list(&mut self) -> Result<bool> {
+        let entries = self.trust_store.list();
+        let display = if entries.is_empty() {
+            "No trusted actions this session.".to_string()
+        } else {
+            let mut lines = vec![format!(
+                "{} trusted action(s), this session only:",
+                entries.len()
+            )];
+            for (index, target) in entries.iter().enumerate() {
+                lines.push(format!("  {}. {}", index + 1, trust_target_label(target)));
+            }
+            lines.join("\n")
+        };
+        let payload = json!({
+            "count": entries.len(),
+            "entries": entries.iter().map(trust_target_payload).collect::<Vec<_>>(),
+            "message": display.clone(),
+        });
+        self.record_event(None, None, "trust_listed", payload, display)?;
+        Ok(true)
+    }
+
+    fn trust_revoke(&mut self, one_based: usize) -> Result<bool> {
+        let Some(target) = self.trust_store.revoke_index(one_based) else {
+            bail!(
+                "no trusted entry at index {one_based}; run /trust to see the current numbered list"
+            );
+        };
+        self.record_event(
+            None,
+            None,
+            "trust_revoked",
+            json!({ "target": trust_target_payload(&target) }),
+            format!("Trust revoked: {}", trust_target_label(&target)),
+        )?;
+        Ok(true)
+    }
+
+    fn trust_clear(&mut self) -> Result<bool> {
+        let count = self.trust_store.list().len();
+        self.trust_store.clear();
+        self.record_event(
+            None,
+            None,
+            "trust_cleared",
+            json!({ "count": count }),
+            format!(
+                "Cleared {count} trusted entr{}",
+                if count == 1 { "y" } else { "ies" }
+            ),
         )?;
         Ok(true)
     }
@@ -12607,6 +12707,123 @@ runtime = "fake"
         assert!(app.state.pending_approval.is_none());
         let events = app.history.read_events().unwrap();
         assert!(events.iter().any(|event| event.kind == "floor_warned"));
+    }
+
+    // ---- /trust list & revoke command (task_08) -----------------------
+
+    #[tokio::test]
+    async fn trust_list_empty_reports_no_trusted_actions() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(app.handle_trust_command("/trust").unwrap());
+        let events = app.history.read_events().unwrap();
+        let listed = events
+            .iter()
+            .find(|event| event.kind == "trust_listed")
+            .unwrap();
+        assert_eq!(listed.payload["count"], 0);
+        assert!(listed.payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("No trusted actions"));
+    }
+
+    #[tokio::test]
+    async fn trust_list_numbers_entries_with_session_scope() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("cargo build".to_string()));
+        app.trust_store
+            .grant(TrustTarget::WritePath(PathBuf::from("src/lib.rs")));
+
+        assert!(app.handle_trust_command("/trust").unwrap());
+        let events = app.history.read_events().unwrap();
+        let message = events
+            .iter()
+            .find(|event| event.kind == "trust_listed")
+            .unwrap()
+            .payload["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("this session only"));
+        assert!(message.contains("1."));
+        assert!(message.contains("2."));
+        assert!(message.contains("cargo build"));
+    }
+
+    #[tokio::test]
+    async fn trust_revoke_removes_first_entry_and_emits_event() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("cargo build".to_string()));
+        app.trust_store
+            .grant(TrustTarget::Command("npm install x".to_string()));
+
+        assert!(app.handle_trust_command("/trust revoke 1").unwrap());
+        assert!(!app
+            .trust_store
+            .contains(&TrustTarget::Command("cargo build".to_string())));
+        assert!(app
+            .trust_store
+            .contains(&TrustTarget::Command("npm install x".to_string())));
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "trust_revoked"));
+    }
+
+    #[tokio::test]
+    async fn trust_malformed_input_is_rejected_without_mutation() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("cargo build".to_string()));
+
+        assert!(app.handle_trust_command("/trust revoke abc").is_err());
+        assert!(app.handle_trust_command("/trust revoke 9").is_err());
+        // The store is untouched by malformed input.
+        assert_eq!(app.trust_store.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trust_clear_empties_store_and_emits_count() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.trust_store
+            .grant(TrustTarget::Command("cargo build".to_string()));
+        app.trust_store
+            .grant(TrustTarget::Command("npm install x".to_string()));
+
+        assert!(app.handle_trust_command("/trust clear").unwrap());
+        assert!(app.trust_store.is_empty());
+        let events = app.history.read_events().unwrap();
+        let cleared = events
+            .iter()
+            .find(|event| event.kind == "trust_cleared")
+            .unwrap();
+        assert_eq!(cleared.payload["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn trust_revoke_re_arms_the_approval_prompt() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(approval_mode_config(dir.path())).await.unwrap();
+        // Pre-trust so the first occurrence auto-runs without a modal.
+        app.trust_store
+            .grant(TrustTarget::Command("echo trusted-run".to_string()));
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_none());
+
+        // Revoke the trust, then the same action prompts again (re-armed).
+        assert!(app.handle_trust_command("/trust revoke 1").unwrap());
+        assert!(app.trust_store.is_empty());
+        app.submit_prompt("trusted run action create a feature")
+            .await
+            .unwrap();
+        assert!(app.state.pending_approval.is_some());
     }
 
     #[tokio::test]

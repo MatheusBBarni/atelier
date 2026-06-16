@@ -74,7 +74,9 @@ impl ChatProjection {
             "approval_resolved" => self.apply_approval_resolved(event),
             "approval_auto_resolved" => self.apply_approval_auto_resolved(event),
             "floor_warned" => self.apply_floor_warned(event),
-            "trust_granted" | "trust_revoked" | "trust_cleared" => self.apply_trust_event(event),
+            "trust_granted" | "trust_revoked" | "trust_cleared" | "trust_listed" => {
+                self.apply_trust_event(event)
+            }
             "action_denied" => self.apply_action_denied(event),
             "action_completed" => self.apply_action_completed(event),
             "artifact_written" => self.apply_artifact_written(event),
@@ -739,8 +741,9 @@ impl ChatProjection {
         });
     }
 
-    /// Trust-list lifecycle events (granted / revoked / cleared), projected as
-    /// `Info` items naming the target or count so trust stays auditable (ADR-004).
+    /// Trust-list lifecycle events (listed / granted / revoked / cleared),
+    /// projected as `Info` items naming the target or count so trust stays
+    /// auditable (ADR-004).
     fn apply_trust_event(&mut self, event: &HistoryEvent) {
         let (title, message) = match event.kind.as_str() {
             "trust_granted" => {
@@ -762,6 +765,11 @@ impl ChatProjection {
                     .unwrap_or_else(|| "an action".to_string());
                 ("Trust revoked", format!("Trust revoked: {target}"))
             }
+            "trust_listed" => {
+                let message = string_field(&event.payload, "message")
+                    .unwrap_or_else(|| "No trusted actions this session.".to_string());
+                ("Session trust list", message)
+            }
             _ => {
                 let count = event
                     .payload
@@ -777,6 +785,9 @@ impl ChatProjection {
                 )
             }
         };
+        // The listing may span several lines (one per entry); keep each as its own
+        // muted body line so the numbered list renders.
+        let body = message.lines().map(ChatLineView::muted).collect::<Vec<_>>();
         self.upsert(ItemInput {
             lifecycle_key: None,
             kind: ChatItemKind::Diagnostic,
@@ -784,7 +795,7 @@ impl ChatProjection {
             severity: ChatSeverity::Info,
             title: title.to_string(),
             summary: Some(message_summary(&message)),
-            body: vec![ChatLineView::muted(message)],
+            body,
             details: history_detail(event, "history"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),

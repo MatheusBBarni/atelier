@@ -103,6 +103,13 @@ const CATALOG: &[SlashCommandSpec] = &[
         kind: SlashCommandKind::AppCommand,
     },
     SlashCommandSpec {
+        label: "/trust",
+        insert_text: "/trust",
+        usage: "/trust | /trust revoke <n> | /trust clear",
+        description: "list, revoke, or clear session-trusted actions",
+        kind: SlashCommandKind::AppCommand,
+    },
+    SlashCommandSpec {
         label: "/agent:",
         insert_text: "/agent:",
         usage: "/agent:<agent_name>",
@@ -154,7 +161,7 @@ pub fn help_command_lines() -> Vec<String> {
 mod tests {
     use super::*;
 
-    const FIXED_V1_LABELS: [&str; 11] = [
+    const FIXED_V1_LABELS: [&str; 12] = [
         "/help",
         "/goal",
         "/goal clear",
@@ -163,6 +170,7 @@ mod tests {
         "/workflow",
         "/queue",
         "/provider:status",
+        "/trust",
         "/agent:",
         "/skill:",
         "/reload:skills",
@@ -252,7 +260,8 @@ mod tests {
                 "/subtask",
                 "/workflow",
                 "/queue",
-                "/provider:status"
+                "/provider:status",
+                "/trust"
             ]
         );
     }
