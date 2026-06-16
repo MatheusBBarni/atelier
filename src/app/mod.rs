@@ -2094,15 +2094,21 @@ impl App {
                     json!({ "reason": "governance_decision_rejected" }),
                     "Run aborted before any action.",
                 )?;
-                self.write_run_record(&pending.run)?;
 
+                // Finalize state to Interrupted BEFORE persisting and pausing the queue:
+                // write_run_record snapshots self.state.run_state, and the queue-pause
+                // reason is derived from it — both must see the interrupted state.
                 self.state.pending_governance_decision = None;
                 self.state.active_run_id = None;
                 self.state.live_step = None;
                 self.state.live_steps.clear();
                 self.state.run_state = RunState::Interrupted;
+                self.write_run_record(&pending.run)?;
                 self.sync_chat_items();
                 self.publish_state();
+                // Follow-ups queued during the governance pause must not stay stuck,
+                // mirroring the interrupt() path.
+                self.pause_oldest_pending_for_queue()?;
             }
         }
 
@@ -13041,6 +13047,12 @@ runtime = "fake"
         let mut app = App::new(config).await.unwrap();
         let decision_id = seed_pending_governance_decision(&mut app, "create a feature");
 
+        // A follow-up queued during the governance pause must not be left stuck when
+        // the run aborts (mirrors the interrupt() path).
+        app.handle_queue_command("/queue follow up later")
+            .await
+            .unwrap();
+
         app.resolve_pending_governance_decision(
             &decision_id,
             GovernanceAnswer::Reject { redirect: None },
@@ -13053,6 +13065,12 @@ runtime = "fake"
         assert_eq!(app.state.run_state, RunState::Interrupted);
         assert!(app.state.active_run_id.is_none());
 
+        // The queued follow-up was paused (not left Pending and stuck).
+        assert_eq!(
+            app.state.queued_follow_ups.first().map(|f| &f.status),
+            Some(&QueuedFollowUpStatus::Paused)
+        );
+
         let history = app.history.read_events().unwrap();
         assert!(history.iter().any(|event| {
             event.kind == "governance_decision_resolved"
@@ -13060,6 +13078,9 @@ runtime = "fake"
                 && event.payload.get("redirect").is_none()
         }));
         assert!(history.iter().any(|event| event.kind == "run_interrupted"));
+        assert!(history
+            .iter()
+            .any(|event| event.kind == "follow_up_replay_paused"));
         // The run was aborted before any orchestration ran.
         assert!(!history
             .iter()

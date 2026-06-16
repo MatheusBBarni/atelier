@@ -890,6 +890,13 @@ fn is_default_read_only_command(lower: &str) -> bool {
         return false;
     }
 
+    // `find` is read-only ONLY without a mutating predicate: `-delete` removes files
+    // and `-exec`/`-execdir`/`-ok`/`-okdir` run arbitrary commands, while
+    // `-fprint`/`-fprintf`/`-fls` write files. Such a `find` must not be Low-tier.
+    if command_has_prefix(lower, "find ") && find_command_mutates(lower) {
+        return false;
+    }
+
     let allow_prefixes = [
         "cargo test",
         "cargo check",
@@ -926,6 +933,18 @@ fn is_default_read_only_command(lower: &str) -> bool {
         .any(|prefix| command_has_prefix(lower, prefix))
         || is_read_only_git_branch_command(lower)
         || is_read_only_git_remote_command(lower)
+}
+
+/// Whether a `find` command carries a mutating predicate (`-delete`, the
+/// `-exec`/`-ok` command-runners, or the `-fprint`/`-fls` file-writers). Matched
+/// as exact whitespace-delimited tokens so a path like `./-deleted` can't trip it.
+fn find_command_mutates(lower: &str) -> bool {
+    lower.split_whitespace().any(|token| {
+        matches!(
+            token,
+            "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fprint" | "-fprintf" | "-fls"
+        )
+    })
 }
 
 fn has_shell_control_syntax(command: &str) -> bool {
@@ -2198,6 +2217,28 @@ mod tests {
             CommandClassification::Approve
         );
         assert_eq!(classify_command("rm -rf /"), CommandClassification::Deny);
+    }
+
+    #[test]
+    fn mutating_find_commands_are_not_classified_read_only() {
+        // A plain, read-only find stays Allow…
+        assert_eq!(
+            classify_command("find src -name \"*.rs\""),
+            CommandClassification::Allow
+        );
+        // …but a mutating predicate (-delete, -exec*) must not be Low/Allow.
+        assert_eq!(
+            classify_command("find . -delete"),
+            CommandClassification::Approve
+        );
+        assert_eq!(
+            classify_command("find . -type f -delete"),
+            CommandClassification::Approve
+        );
+        assert_eq!(
+            classify_command("find . -execdir rm {} +"),
+            CommandClassification::Approve
+        );
     }
 
     #[test]

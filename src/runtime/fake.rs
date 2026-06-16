@@ -116,15 +116,17 @@ impl Runtime for FakeRuntime {
                 },
             }
         } else if should_emit_fake_catastrophic_action_request(&request) {
-            // Catastrophic (secret-read) classification, but harmless to execute:
-            // a relative `id_rsa` that does not exist in the test's temp workspace.
+            // Catastrophic (secret-read) classification, but harmless to execute: an
+            // absolute path that cannot exist, so no real key is ever read even if the
+            // workspace happens to contain an `id_rsa`. Preserves the `id_rsa` token so
+            // the catastrophic secret-access classifier still fires.
             RuntimeOutput::ActionRequest {
                 request: ActionRequest {
                     schema_version: 1,
                     action_id: new_id(),
                     step_id: request.step_id.clone(),
                     kind: ActionKind::RunCommand,
-                    params: serde_json::json!({ "command": "cat id_rsa" }),
+                    params: serde_json::json!({ "command": "cat /nonexistent/id_rsa" }),
                 },
             }
         } else if should_emit_fake_action_request(&request) {

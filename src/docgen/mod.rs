@@ -111,6 +111,17 @@ only by the `--init-config` starter template, not by the merged config.\n\n",
         "Read/write roots and workspace policy that bound every filesystem action.",
     ));
     out.push_str(&render_config_section(
+        "Features",
+        "[features]",
+        "Opt-in feature flags (for example, `parallel_step_groups`, `governance_early_abort`).",
+    ));
+    out.push_str(&render_config_section(
+        "Approval",
+        "[approval]",
+        "Approval-system posture — the gray-area `floor` (`warn` / `enforce`) that governs \
+in-between actions.",
+    ));
+    out.push_str(&render_config_section(
         "UI",
         "[ui]",
         "Terminal UI preferences (for example, `hide_banner`).",
@@ -280,6 +291,8 @@ mod tests {
             "[limits]",
             "[ui]",
             "[keybindings]",
+            "[approval]",
+            "[features]",
             "[workspace]",
         ] {
             assert!(

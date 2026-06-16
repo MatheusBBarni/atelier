@@ -813,7 +813,9 @@ async fn execute_tui_command_with_interrupt(
             };
             let clears_input = matches!(
                 event,
-                AppEvent::PromptSubmitted(_, _) | AppEvent::ApprovalAnswered(_)
+                AppEvent::PromptSubmitted(_, _)
+                    | AppEvent::ApprovalAnswered(_)
+                    | AppEvent::GovernanceDecisionResolved(_, _)
             );
             if let AppEvent::ApprovalAnswered(resolution) = &event {
                 if let (Some(approval_handle), Some(pending)) =
@@ -1679,10 +1681,10 @@ fn parse_approval_resolution(input: &str, view: &PendingApprovalView) -> Approva
     let trimmed = input.trim();
     let lower = trimmed.to_ascii_lowercase();
 
-    if view.trust_target.is_some() && matches!(lower.as_str(), "t" | "trust") {
-        return ApprovalResolution::ApproveAndTrust;
-    }
-
+    // Catastrophic confirmation is checked FIRST: a catastrophic action can never be
+    // trusted away (ADR-001/002), so its type-to-confirm requirement must not be
+    // bypassable by the `t`/`trust` shortcut even if a trust_target were ever set on a
+    // catastrophic view.
     if view.catastrophic {
         let confirmed = match view.resolved_command.as_deref() {
             Some(command) => trimmed == command,
@@ -1693,6 +1695,10 @@ fn parse_approval_resolution(input: &str, view: &PendingApprovalView) -> Approva
         } else {
             ApprovalResolution::Deny
         };
+    }
+
+    if view.trust_target.is_some() && matches!(lower.as_str(), "t" | "trust") {
+        return ApprovalResolution::ApproveAndTrust;
     }
 
     let is_high = view.tier.map(crate::app::risk_tier_label) == Some("high");
@@ -6420,6 +6426,32 @@ mod tests {
     }
 
     #[test]
+    fn catastrophic_cannot_be_trusted_away() {
+        // Even if a catastrophic view carried a trust_target, the `t`/`trust` shortcut
+        // must NOT bypass type-to-confirm (ADR-001/002: catastrophic is never trusted).
+        let view = approval_view(
+            Some(crate::actions::RiskTier::High),
+            true,
+            Some(crate::actions::TrustTarget::Command(
+                "npm install left-pad".to_string(),
+            )),
+        );
+        assert_eq!(
+            parse_approval_resolution("t", &view),
+            ApprovalResolution::Deny
+        );
+        assert_eq!(
+            parse_approval_resolution("trust", &view),
+            ApprovalResolution::Deny
+        );
+        // Retyping the exact resolved command is still the only way through.
+        assert_eq!(
+            parse_approval_resolution("npm install left-pad", &view),
+            ApprovalResolution::ApproveOnce
+        );
+    }
+
+    #[test]
     fn resolution_keys_map_to_distinct_outcomes() {
         let view = approval_view(
             Some(crate::actions::RiskTier::Medium),
@@ -6541,6 +6573,37 @@ mod tests {
         assert!(matches!(
             receiver.try_recv().unwrap(),
             AppWorkerCommand::Event(AppEvent::PromptSubmitted(prompt, _)) if prompt == "slow prompt"
+        ));
+    }
+
+    #[tokio::test]
+    async fn governance_decision_resolution_clears_the_redirect_input() {
+        // The redirect composer reads state.input; resolving the decision consumes it,
+        // so the composer must reset (no stale redirect text left behind).
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = state_with_input("please redirect to X", false);
+        let mut ui_state = ui_state_with_cursor_at_end(&state.input);
+
+        let event = AppEvent::GovernanceDecisionResolved(
+            "gov-1".to_string(),
+            GovernanceAnswer::Reject {
+                redirect: Some("please redirect to X".to_string()),
+            },
+        );
+        execute_tui_command(
+            &mut state,
+            &mut ui_state,
+            &sender,
+            TuiCommand::Dispatch(event),
+        )
+        .await
+        .unwrap();
+
+        assert!(state.input.is_empty(), "redirect input should be cleared");
+        assert_eq!(ui_state.input_cursor, 0);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AppWorkerCommand::Event(AppEvent::GovernanceDecisionResolved(_, _))
         ));
     }
 
