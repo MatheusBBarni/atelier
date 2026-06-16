@@ -116,6 +116,13 @@ only by the `--init-config` starter template, not by the merged config.\n\n",
         "Terminal UI preferences (for example, `hide_banner`).",
     ));
     out.push_str(&render_config_section(
+        "Keybindings",
+        "[keybindings]",
+        "The effective key map, shown as `[keybindings.<context>]` → `action = \"key\"`. \
+Honored only from user-scope config (home or `--config`); a project-local config's \
+`[keybindings]` is ignored. Set an action to `false` to unbind it.",
+    ));
+    out.push_str(&render_config_section(
         "Limits",
         "[limits]",
         "Run guardrails such as the maximum number of parallel agent steps.",
@@ -272,6 +279,7 @@ mod tests {
             "[council]",
             "[limits]",
             "[ui]",
+            "[keybindings]",
             "[workspace]",
         ] {
             assert!(

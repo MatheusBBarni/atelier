@@ -18,8 +18,8 @@ use crate::skills::{
 };
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -1125,6 +1125,16 @@ fn key_event_to_tui_command_with_ui(
     ui_state: &TuiUiState,
     key: KeyEvent,
 ) -> Option<TuiCommand> {
+    // Ignore key-RELEASE events. crossterm reports them on Windows (always) and
+    // under the Kitty keyboard protocol; since `KeyChord` lookups and the modal
+    // arms match on code+modifiers regardless of `kind`, routing a release would
+    // fire every action twice (e.g. Ctrl-W deleting two words). Press and Repeat
+    // (held-key autorepeat) still route. On Unix without enhancement flags every
+    // event is already a Press, so this is a no-op there.
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+
     // Reserved-key chokepoint (ADR-004): Ctrl-C is the interrupt/quit kill-switch.
     // It is enforced here — before the modal cascade, normal routing, and (task_04)
     // any user-keymap lookup — so no context or future config can shadow it. This is
@@ -1192,26 +1202,37 @@ fn key_event_to_tui_command_with_ui(
         // Ctrl-C is handled by the reserved-key guard above.
         governance_decision_key_command(state, key)
     } else if state.pending_approval.is_some() {
-        key_event_to_tui_command(state, key)
+        // Modal contexts keep default chat-scroll (PageUp/PageDown/Home/End) as a
+        // fallback so keyboard users can still scroll while the modal is open, but the
+        // rebindable keymap is not consulted here (ADR-003). Same for the dropdowns.
+        key_event_to_tui_command(state, key).or_else(|| chat_scroll_command(&key))
     } else if agent_dropdown(state, ui_state).is_some() {
-        agent_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+        agent_dropdown_key_command(key)
+            .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else if skill_dropdown(&state.input, ui_state).is_some() {
-        skill_dropdown_key_command(key).or_else(|| key_event_to_tui_command(state, key))
+        skill_dropdown_key_command(key)
+            .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else if let Some(dropdown) = file_mention_dropdown(state, ui_state) {
         file_mention_dropdown_key_command(&dropdown, key)
             .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else if let Some(dropdown) = command_dropdown(state, ui_state) {
         command_dropdown_key_command(&dropdown, key)
             .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else if queue_control_active(state, ui_state) {
         queue_control_key_command(state, ui_state, key)
             .or_else(|| key_event_to_tui_command(state, key))
+            .or_else(|| chat_scroll_command(&key))
     } else {
         // Normal-input context only (ADR-003): consult the active keymap first. A hit
         // maps through the exhaustive `command_for_action` bridge; a miss falls through
-        // to the unchanged hardcoded handler, so no-config behavior is byte-identical
-        // for keys the keymap does not own. The keymap is never consulted in the modal
-        // branches above.
+        // to the hardcoded handler. For keys the keymap does not own, default routing is
+        // unchanged; the remappable actions (scroll/toggle/editing) are owned solely by
+        // the keymap here so rebinds and unbinds take effect. The keymap is never
+        // consulted in the modal branches above.
         if let Some(action) = ui_state.keymap.action_for(&key) {
             Some(command_for_action(action))
         } else {
@@ -1536,6 +1557,22 @@ fn is_reserved_interrupt(key: &KeyEvent) -> bool {
             ..
         }
     )
+}
+
+/// Chat-viewport scroll for the default navigation keys (`PageUp`/`PageDown`/
+/// `Home`/`End`), modifier-agnostic. Used as a fallback in the modal/dropdown
+/// contexts — where the rebindable keymap is deliberately not consulted (ADR-003)
+/// — so keyboard-only users keep chat scrollback while an approval or dropdown is
+/// open, matching the pre-keymap behavior. The normal-input branch does NOT use
+/// this (the keymap owns scroll there, honoring rebinds/unbinds).
+fn chat_scroll_command(key: &KeyEvent) -> Option<TuiCommand> {
+    match key.code {
+        KeyCode::PageUp => Some(TuiCommand::ScrollEvents(EventScrollCommand::PageUp)),
+        KeyCode::PageDown => Some(TuiCommand::ScrollEvents(EventScrollCommand::PageDown)),
+        KeyCode::Home => Some(TuiCommand::ScrollEvents(EventScrollCommand::Top)),
+        KeyCode::End => Some(TuiCommand::ScrollEvents(EventScrollCommand::Bottom)),
+        _ => None,
+    }
 }
 
 fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiCommand> {
@@ -8716,6 +8753,73 @@ mod tests {
         assert!(
             !text.contains("ctrl+l"),
             "old default key gone from keys tab"
+        );
+    }
+
+    // ── code-review fixes (config-driven-keybindings) ──
+
+    #[test]
+    fn release_key_events_are_ignored_to_avoid_double_fire() {
+        // crossterm emits Release events on Windows / under the Kitty protocol; routing
+        // one would fire the action a second time. Press still routes; Release does not.
+        let state = state_with_input("", false);
+        let ui = TuiUiState::default();
+        let press = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui, press),
+            Some(TuiCommand::InputKill(InputKillCommand::WordBack))
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui, release),
+            None,
+            "release events must not route"
+        );
+        // The reserved interrupt also must not double-fire on release.
+        let ctrl_c_release = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        );
+        assert_eq!(
+            key_event_to_tui_command_with_ui(&state, &ui, ctrl_c_release),
+            None
+        );
+    }
+
+    #[test]
+    fn chat_scroll_keys_still_work_in_modal_contexts() {
+        let ui = TuiUiState::default();
+        // The approval branch forces the modal path (the keymap is not consulted), so
+        // these assertions prove the dedicated chat-scroll fallback, not the keymap.
+        let approval = state_with_input("", true);
+
+        for (code, expected) in [
+            (KeyCode::PageUp, EventScrollCommand::PageUp),
+            (KeyCode::PageDown, EventScrollCommand::PageDown),
+            (KeyCode::Home, EventScrollCommand::Top),
+            (KeyCode::End, EventScrollCommand::Bottom),
+        ] {
+            assert_eq!(
+                key_event_to_tui_command_with_ui(&approval, &ui, key(code)),
+                Some(TuiCommand::ScrollEvents(expected)),
+                "{code:?} should scroll the chat in the approval modal"
+            );
+        }
+
+        // But a normal-mode editing key (Ctrl-A) stays inert in the approval modal —
+        // the rebindable keymap is still gated out of modal contexts.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &approval,
+                &ui,
+                key_with_modifiers(KeyCode::Char('a'), KeyModifiers::CONTROL)
+            ),
+            None
         );
     }
 

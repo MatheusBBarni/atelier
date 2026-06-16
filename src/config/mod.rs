@@ -1864,6 +1864,13 @@ pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConf
         .map(PathBuf::from);
     let config_path = options.config_path.or(env_config_path);
 
+    // Canonical path of the explicit --config/env file, so the local-override pass
+    // below can skip re-applying that very file as an (untrusted) Local layer — which
+    // would otherwise ignore + warn about its own honored [keybindings].
+    let explicit_canonical = config_path
+        .as_ref()
+        .and_then(|path| path.canonicalize().ok());
+
     if let Some(home_config) = config_path {
         // Explicit path (CLI flag or env var): user-scope, must exist.
         if home_config.exists() {
@@ -1889,7 +1896,16 @@ pub fn load_effective_config(options: ConfigLoadOptions) -> Result<EffectiveConf
         working_directory.join("atelier.toml"),
         working_directory.join("multiagent.toml"),
     ]) {
-        apply_config_file(&mut merged, &local_config, ConfigLayer::Local)?;
+        // Skip when the local file IS the explicit --config file already applied as
+        // a user-scope (Cli) layer; re-applying it as Local would double-apply every
+        // section and falsely report its honored [keybindings] as ignored.
+        let already_applied_as_user_scope = explicit_canonical
+            .as_ref()
+            .zip(local_config.canonicalize().ok().as_ref())
+            .is_some_and(|(explicit, local)| explicit == local);
+        if !already_applied_as_user_scope {
+            apply_config_file(&mut merged, &local_config, ConfigLayer::Local)?;
+        }
     }
 
     merged.into_effective()
@@ -2920,6 +2936,33 @@ mod tests {
         let toml = to_redacted_toml(&config).unwrap();
         assert!(toml.contains("[keybindings.normal]"));
         assert!(toml.contains("toggle-roster = \"ctrl+l\""), "{toml}");
+    }
+
+    #[test]
+    fn explicit_config_pointing_at_the_local_file_is_not_re_applied_as_local() {
+        // `--config ./atelier.toml` where that file is ALSO the working-dir local file:
+        // it must be honored as user-scope (Cli) exactly once, not re-applied as an
+        // (untrusted) Local layer that would falsely ignore + warn about its keybindings.
+        use crate::keybindings::KeyAction;
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("atelier.toml");
+        fs::write(
+            &config_path,
+            "[keybindings.normal]\ntoggle-roster = \"ctrl+g\"\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+
+        assert!(
+            config.keybinding_warnings.is_empty(),
+            "no spurious ignore warning expected, got: {:?}",
+            config.keybinding_warnings
+        );
+        assert!(config.keybindings.contains_key(&KeyAction::ToggleRoster));
     }
 
     #[test]
