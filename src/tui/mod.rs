@@ -4057,7 +4057,7 @@ fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState,
     let body = match active {
         HelpTab::GettingStarted => getting_started_lines(state, theme),
         HelpTab::Commands => commands_tab_lines(&ui_state.help_filter, theme),
-        HelpTab::Keys => keys_tab_lines(theme),
+        HelpTab::Keys => keys_tab_lines(&ui_state.keymap, theme),
         HelpTab::Skills => skills_tab_lines(ui_state, theme),
         HelpTab::Approvals => approvals_tab_lines(theme),
         HelpTab::Cli => cli_tab_lines(theme),
@@ -4083,27 +4083,87 @@ fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState,
     frame.render_widget(help, area);
 }
 
-/// Keybinding rows for the Keys help tab. Relocated verbatim from the pre-tab
-/// `render_help_modal` literals; pure builder consumed by the tabbed render
-/// (task 06). No `AppState`/`TuiUiState` reads.
-fn keys_tab_lines(_theme: &Theme) -> Vec<Line<'static>> {
-    vec![
-        Line::from("Enter                submit prompt or answer approval"),
-        Line::from("At an approval:"),
-        Line::from("  y / approve        approve once (High tier needs the word approve)"),
-        Line::from("  t / trust          approve & trust this session (when offered)"),
-        Line::from("  n / anything else  deny"),
-        Line::from("  (catastrophic)     retype the command exactly to confirm"),
-        Line::from("Ctrl-L               show or hide Agent Roster"),
-        Line::from("Arrow keys           move input cursor"),
-        Line::from("↑/↓ at input edges   recall recent prompts"),
-        Line::from("PageUp/PageDown     scroll Chat by page"),
-        Line::from("Mouse wheel         scroll Chat by line"),
-        Line::from("Home/End            jump Chat to top/latest"),
-        Line::from("Ctrl-C               interrupt active run and exit"),
-        Line::from("Backspace            delete input character"),
-        Line::from("Text                 edit the input composer"),
-    ]
+/// Human-readable label for a remappable action, shown beside its key in the
+/// Keys tab. (Distinct from `keybindings::action_name`, which is the kebab-case
+/// config identifier.)
+fn keys_action_label(action: KeyAction) -> &'static str {
+    match action {
+        KeyAction::ToggleRoster => "show or hide the Agent Roster",
+        KeyAction::ScrollPageUp => "scroll Chat up one page",
+        KeyAction::ScrollPageDown => "scroll Chat down one page",
+        KeyAction::ScrollTop => "jump Chat to the top",
+        KeyAction::ScrollBottom => "jump Chat to the latest",
+        KeyAction::InputLineStart => "move cursor to line start",
+        KeyAction::InputLineEnd => "move cursor to line end",
+        KeyAction::InputKillToEnd => "delete to end of line",
+        KeyAction::InputKillToStart => "delete to start of line",
+        KeyAction::InputKillWordBack => "delete the previous word",
+    }
+}
+
+/// Structurally fixed keys: reserved (`Ctrl-C`), composer-structural, and
+/// approval-context keys. None are rebindable, so they are rendered locked,
+/// separate from the data-driven remappable section.
+const FIXED_KEY_ROWS: &[(&str, &str)] = &[
+    ("ctrl+c", "interrupt active run and exit"),
+    ("enter", "submit prompt or answer an approval"),
+    ("backspace", "delete the character before the cursor"),
+    (
+        "arrows",
+        "move the input cursor; ↑/↓ at edges recall recent prompts",
+    ),
+    ("mouse wheel", "scroll Chat by line"),
+    (
+        "y / approve",
+        "approve a pending action (high tier: type approve)",
+    ),
+    (
+        "t / trust",
+        "approve & trust for this session, when offered",
+    ),
+    ("n", "deny a pending action"),
+];
+
+/// Keybinding rows for the Keys help tab, rendered from the active [`Keymap`]
+/// (ADR-003): one line per remappable binding via `keybindings::format_key` plus
+/// a short label, then the structurally fixed keys shown locked. Reflects user
+/// customizations automatically once the keymap is config-resolved (task_08).
+/// Theme tokens only (honors `colors_live_only_in_theme_module`).
+fn keys_tab_lines(keymap: &Keymap, theme: &Theme) -> Vec<Line<'static>> {
+    let header = |label: &'static str| {
+        Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let body = |text: String| Line::from(Span::styled(text, Style::default().fg(theme.text)));
+    let locked =
+        |text: String| Line::from(Span::styled(text, Style::default().fg(theme.text_muted)));
+
+    // Active remappable bindings, sorted by action for a stable display order.
+    let mut entries: Vec<_> = keymap.entries().collect();
+    entries.sort_by_key(|(action, _)| *action);
+
+    let mut lines = vec![header("Remappable keys")];
+    if entries.is_empty() {
+        lines.push(locked("  (every action unbound)".to_string()));
+    }
+    for (action, chord) in entries {
+        lines.push(body(format!(
+            "{:<14} {}",
+            keybindings::format_key(&chord),
+            keys_action_label(action)
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(header("Fixed keys (not rebindable)"));
+    for (keys, desc) in FIXED_KEY_ROWS {
+        lines.push(locked(format!("{keys:<14} {desc}  (locked)")));
+    }
+    lines
 }
 
 /// CLI flag rows for the CLI help tab. Relocated verbatim from the pre-tab
@@ -6381,7 +6441,9 @@ mod tests {
             no_color: false,
             truecolor: true,
         });
-        let text = help_tab_text(&keys_tab_lines(&theme));
+        // Approval-resolution keys are non-rebindable, so they live in the Keys tab's
+        // fixed-keys section.
+        let text = help_tab_text(&keys_tab_lines(&default_keymap(), &theme));
         assert!(text.contains("approve"));
         assert!(text.contains("trust"));
         assert!(text.contains("deny"));
@@ -6619,11 +6681,12 @@ mod tests {
             ..commands_ui.clone()
         };
         let keys_text = render_to_text_with_ui(&state, &keys_ui, 120, 32);
-        assert!(keys_text.contains("Mouse wheel"));
-        assert!(keys_text.contains("Ctrl-L"));
-        assert!(keys_text.contains("Arrow keys"));
-        assert!(keys_text.contains("PageUp/PageDown"));
-        assert!(keys_text.contains("Home/End"));
+        // Keys tab is data-driven from the keymap (canonical lowercase via format_key).
+        assert!(keys_text.contains("mouse wheel"));
+        assert!(keys_text.contains("ctrl+l"));
+        assert!(keys_text.contains("arrows"));
+        assert!(keys_text.contains("pageup"));
+        assert!(keys_text.contains("home"));
 
         // CLI flag rows live on the CLI tab.
         let cli_ui = TuiUiState {
@@ -6673,9 +6736,9 @@ mod tests {
             ..ui_state
         };
         let keys_text = render_to_text_with_ui(&state, &keys_ui, 120, 40);
-        assert!(keys_text.contains("Ctrl-L"));
-        assert!(keys_text.contains("Arrow keys"));
-        assert!(keys_text.contains("Mouse wheel"));
+        assert!(keys_text.contains("ctrl+l"));
+        assert!(keys_text.contains("arrows"));
+        assert!(keys_text.contains("mouse wheel"));
     }
 
     #[test]
@@ -12949,13 +13012,60 @@ runtime = "fake"
     #[test]
     fn keys_tab_lines_contains_expected_keybindings() {
         let theme = Theme::resolve(TerminalCaps::detect());
-        let text = help_tab_text(&keys_tab_lines(&theme));
-        assert!(text.contains("Ctrl-L"));
-        assert!(text.contains("PageUp/PageDown"));
-        assert!(text.contains("Home/End"));
-        // Verbatim relocation: the full keybinding set is present.
-        assert!(text.contains("Enter"));
-        assert!(text.contains("Backspace"));
+        // No config ⇒ the default keymap renders its bindings via `format_key`.
+        let text = help_tab_text(&keys_tab_lines(&default_keymap(), &theme));
+
+        // Remappable defaults, rendered by their canonical key strings + labels.
+        assert!(text.contains("ctrl+l"), "toggle-roster default key");
+        assert!(text.contains("show or hide the Agent Roster"));
+        assert!(text.contains("pageup"));
+        assert!(text.contains("pagedown"));
+        assert!(text.contains("home"));
+        assert!(text.contains("end"));
+        // Editing defaults from task_02/04 are present.
+        assert!(text.contains("ctrl+a"));
+        assert!(text.contains("ctrl+e"));
+        assert!(text.contains("ctrl+k"));
+        assert!(text.contains("ctrl+u"));
+        assert!(text.contains("ctrl+w"));
+
+        // Reserved / fixed keys are shown locked, distinct from remappable ones.
+        assert!(text.contains("ctrl+c"));
+        assert!(
+            text.contains("(locked)"),
+            "fixed keys carry a locked marker"
+        );
+        assert!(text.contains("Fixed keys (not rebindable)"));
+    }
+
+    #[test]
+    fn keys_tab_reflects_a_remapped_keymap() {
+        let theme = Theme::resolve(TerminalCaps::detect());
+        // Rebind toggle-roster to ctrl+g; the tab should show the new key, not ctrl+l.
+        let mut overrides = keybindings::KeybindingOverrides::new();
+        overrides.insert(
+            KeyAction::ToggleRoster,
+            Some(keybindings::parse_key("ctrl+g").unwrap()),
+        );
+        let keymap = Keymap::resolve(&keybindings::DEFAULTS, &overrides);
+        let text = help_tab_text(&keys_tab_lines(&keymap, &theme));
+        assert!(text.contains("ctrl+g"), "remapped key shown");
+        // The displaced default is gone from the remappable section. (`ctrl+l` does
+        // not appear anywhere else in the tab.)
+        assert!(!text.contains("ctrl+l"), "old default key removed");
+    }
+
+    #[test]
+    fn keys_tab_renders_via_test_backend_without_panic() {
+        let state = state_with_input("", false);
+        let ui_state = TuiUiState {
+            help_visible: true,
+            help_active_tab: HelpTab::Keys,
+            ..TuiUiState::default()
+        };
+        // Renders the full help modal (Keys tab) through the real render path.
+        let text = render_to_text_with_ui(&state, &ui_state, 100, 32);
+        assert!(text.contains("ctrl+l"));
     }
 
     #[test]
