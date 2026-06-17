@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "HistoryStore::open() + self-healing metadata cache fields"
 type: backend
 complexity: medium
@@ -27,10 +27,10 @@ Add `HistoryStore::open(root, session_id)` to load and schema-validate an existi
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add `open(root, session_id)` returning a store bound to the existing session, validating metadata schema.
-- [ ] 2.2 Extend `SessionMetadata` with the three optional cache fields (serde defaults).
-- [ ] 2.3 Add a read-modify-write that updates the cache fields while preserving permissions.
-- [ ] 2.4 Add round-trip + legacy-compatibility unit tests.
+- [x] 2.1 Add `open(root, session_id)` returning a store bound to the existing session, validating metadata schema.
+- [x] 2.2 Extend `SessionMetadata` with the three optional cache fields (serde defaults).
+- [x] 2.3 Add a read-modify-write that updates the cache fields while preserving permissions.
+- [x] 2.4 Add round-trip + legacy-compatibility unit tests.
 
 ## Implementation Details
 Work in `src/history/mod.rs`. Mirror `create()` (`:93`) for path setup; reuse the private-file write helper for permissions. `SessionMetadata` is at `:75`; `read_events`/`read_events_from_path` (`:180`/`:263`) already validate `schema_version == 1` on the event side — apply the same check to metadata on `open`. See TechSpec "Core Interfaces" and ADR-008. Do not add a new module.
@@ -55,12 +55,12 @@ Work in `src/history/mod.rs`. Mirror `create()` (`:93`) for path setup; reuse th
 
 ## Tests
 - Unit tests:
-  - [ ] `open()` on a `create()`d session returns a store whose `read_events()` matches the originally appended events.
-  - [ ] `open()` on a session whose `metadata.json` has `schema_version = 2` returns an error (fails loud).
-  - [ ] Legacy `metadata.json` lacking `goal`/`outcome`/`last_head_sha` deserializes with `None` defaults.
-  - [ ] `update_metadata_cache(Some("g"), Some("completed"))` then re-read returns the updated fields and preserves `0600` permissions (Unix).
+  - [x] `open()` on a `create()`d session returns a store whose `read_events()` matches the originally appended events. — `open_loads_existing_session_and_reads_same_events_in_order`
+  - [x] `open()` on a session whose `metadata.json` has `schema_version = 2` returns an error (fails loud). — `open_rejects_unsupported_metadata_schema_version`
+  - [x] Legacy `metadata.json` lacking `goal`/`outcome`/`last_head_sha` deserializes with `None` defaults. — `legacy_metadata_without_cache_fields_defaults_to_none`
+  - [x] `update_metadata_cache(...)` then re-read returns the updated fields and preserves `0600` permissions (Unix). — `update_metadata_cache_persists_fields_and_preserves_permissions` (+ `_round_trips_last_head_sha`)
 - Integration tests:
-  - [ ] `create()` → append events → `open()` same session id → `read_events()` returns the same events in order.
+  - [x] `create()` → append events → `open()` same session id → `read_events()` returns the same events in order. — `open_loads_existing_session_and_reads_same_events_in_order` (two events, order asserted)
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -69,3 +69,8 @@ Work in `src/history/mod.rs`. Mirror `create()` (`:93`) for path setup; reuse th
 - Test coverage >=80%
 - An existing session can be loaded and validated without going through `create()`.
 - Old metadata files load unchanged; new cache fields default to `None`.
+
+## As-built notes
+- `HistoryStore::open(root, session_id)` takes the `.atelier` data root (matching `HistoryStore.root` and `list_session_event_paths`) — not the workspace dir — and binds to `root/sessions/<id>`. It reads + schema-validates `metadata.json` via a shared private `read_metadata` helper, returning a loud error on `schema_version != 1` (mirrors the event reader, ADR-003).
+- `SessionMetadata` gains `goal`, `outcome`, `last_head_sha` — all `Option<String>` + `#[serde(default)]`, so pre-cache files still deserialize; `create()` initializes them to `None`. Schema stays `1` (additive).
+- **`update_metadata_cache(goal, outcome, last_head_sha)` is 3-arg** (the requirement says it updates "the cache fields" — all three; the task's 2-arg test bullet is illustrative shorthand). It read-modify-writes via `write_private_file`, preserving the authoritative fields and the `0600` permission. Added `read_metadata()` accessor for callers (task_03/06/13).

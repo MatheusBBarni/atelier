@@ -78,6 +78,20 @@ pub struct SessionMetadata {
     pub session_id: String,
     pub working_directory: PathBuf,
     pub started_at: String,
+    /// Derived, self-healing cache (ADR-008): the session goal label, or `None`.
+    /// The event log is authoritative; this is recomputed by folding the log when
+    /// stale, never the source of truth. `#[serde(default)]` so pre-cache
+    /// `metadata.json` files still deserialize.
+    #[serde(default)]
+    pub goal: Option<String>,
+    /// Derived cache: terminal run outcome (e.g. `completed` / `failed`), or
+    /// `None` while the session has no terminal run yet.
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// Derived cache: the `HEAD` sha recorded at the last write, the baseline for
+    /// resume drift detection (ADR-007).
+    #[serde(default)]
+    pub last_head_sha: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +119,9 @@ impl HistoryStore {
             session_id: session_id.clone(),
             working_directory: working_directory.to_path_buf(),
             started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            goal: None,
+            outcome: None,
+            last_head_sha: None,
         };
         let metadata_path = session_dir.join("metadata.json");
         write_private_file(
@@ -127,6 +144,57 @@ impl HistoryStore {
             events_path,
             artifacts_dir,
         })
+    }
+
+    /// Bind a store to an *existing* session under `root` (the `.atelier` data
+    /// root) by id, without creating anything — the sibling of [`create`]. Reads
+    /// and schema-validates `metadata.json`, failing loud on a missing file or
+    /// `schema_version != 1` (the same validation boundary as the event reader,
+    /// ADR-003). Used by the session browser (task_03/06) and resume
+    /// (task_10/11).
+    pub fn open(root: &Path, session_id: &str) -> Result<Self> {
+        let session_dir = root.join("sessions").join(session_id);
+        let metadata = read_metadata(&session_dir)?;
+        if metadata.schema_version != 1 {
+            return Err(anyhow!(
+                "unsupported session metadata schema_version {} in {}",
+                metadata.schema_version,
+                session_dir.join("metadata.json").display()
+            ));
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            session_id: session_id.to_string(),
+            events_path: session_dir.join("events.jsonl"),
+            artifacts_dir: session_dir.join("artifacts"),
+            session_dir,
+        })
+    }
+
+    /// Read this session's `metadata.json` (including the derived cache fields).
+    pub fn read_metadata(&self) -> Result<SessionMetadata> {
+        read_metadata(&self.session_dir)
+    }
+
+    /// Self-healing cache write (ADR-008): rewrite the derived metadata fields
+    /// (`goal`, `outcome`, `last_head_sha`) while preserving the authoritative
+    /// fields and the file's private `0600` permissions. The event log stays the
+    /// source of truth; callers recompute these by folding the log and persist
+    /// the result here.
+    pub fn update_metadata_cache(
+        &self,
+        goal: Option<String>,
+        outcome: Option<String>,
+        last_head_sha: Option<String>,
+    ) -> Result<()> {
+        let mut metadata = read_metadata(&self.session_dir)?;
+        metadata.goal = goal;
+        metadata.outcome = outcome;
+        metadata.last_head_sha = last_head_sha;
+        write_private_file(
+            &self.session_dir.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata)?.as_bytes(),
+        )
     }
 
     pub fn session_id(&self) -> &str {
@@ -393,6 +461,15 @@ pub fn clean_sessions(working_directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(deleted)
 }
 
+/// Read and parse a session's `metadata.json` from its session directory.
+fn read_metadata(session_dir: &Path) -> Result<SessionMetadata> {
+    let metadata_path = session_dir.join("metadata.json");
+    let raw = fs::read_to_string(&metadata_path)
+        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", metadata_path.display()))
+}
+
 fn create_private_dir(path: &Path) -> Result<()> {
     let existed = path.exists();
     fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
@@ -451,6 +528,115 @@ mod tests {
         store.append_event(&event).unwrap();
         let events = store.read_events().unwrap();
         assert_eq!(events, vec![event]);
+    }
+
+    // ── HistoryStore::open + self-healing metadata cache (task_02) ──
+
+    #[test]
+    fn open_loads_existing_session_and_reads_same_events_in_order() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let session_id = store.session_id().to_string();
+        let first = HistoryEvent::new(
+            session_id.clone(),
+            Some("run".to_string()),
+            None,
+            "run_started",
+            json!({ "prompt": "hi" }),
+        );
+        let second = HistoryEvent::new(
+            session_id.clone(),
+            Some("run".to_string()),
+            None,
+            "run_completed",
+            json!({ "summary": "done" }),
+        );
+        store.append_event(&first).unwrap();
+        store.append_event(&second).unwrap();
+
+        // Re-open the same session by id without going through create().
+        let opened = HistoryStore::open(&dir.path().join(".atelier"), &session_id).unwrap();
+        assert_eq!(opened.session_id(), session_id);
+        assert_eq!(opened.read_events().unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn open_rejects_unsupported_metadata_schema_version() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let session_id = store.session_id().to_string();
+        let root = dir.path().join(".atelier");
+        let metadata_path = root
+            .join("sessions")
+            .join(&session_id)
+            .join("metadata.json");
+        fs::write(
+            &metadata_path,
+            r#"{"schema_version":2,"session_id":"x","working_directory":".","started_at":"t"}"#,
+        )
+        .unwrap();
+        let err = HistoryStore::open(&root, &session_id).unwrap_err();
+        assert!(
+            err.to_string().contains("schema_version 2"),
+            "expected a loud schema error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_without_cache_fields_defaults_to_none() {
+        // A pre-cache metadata.json (no goal/outcome/last_head_sha) still loads.
+        let legacy = r#"{"schema_version":1,"session_id":"s","working_directory":"/tmp","started_at":"2026-06-17T00:00:00.000Z"}"#;
+        let metadata: SessionMetadata = serde_json::from_str(legacy).unwrap();
+        assert_eq!(metadata.goal, None);
+        assert_eq!(metadata.outcome, None);
+        assert_eq!(metadata.last_head_sha, None);
+    }
+
+    #[test]
+    fn update_metadata_cache_persists_fields_and_preserves_permissions() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        store
+            .update_metadata_cache(
+                Some("ship it".to_string()),
+                Some("completed".to_string()),
+                None,
+            )
+            .unwrap();
+
+        let metadata = store.read_metadata().unwrap();
+        assert_eq!(metadata.goal.as_deref(), Some("ship it"));
+        assert_eq!(metadata.outcome.as_deref(), Some("completed"));
+        assert_eq!(metadata.last_head_sha, None);
+        // Authoritative fields untouched; still schema v1 (additive, no bump).
+        assert_eq!(metadata.schema_version, 1);
+        assert_eq!(metadata.session_id, store.session_id());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir
+                .path()
+                .join(".atelier")
+                .join("sessions")
+                .join(store.session_id())
+                .join("metadata.json");
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "metadata.json should stay private 0600");
+        }
+    }
+
+    #[test]
+    fn update_metadata_cache_round_trips_last_head_sha() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        store
+            .update_metadata_cache(None, None, Some("abc123".to_string()))
+            .unwrap();
+        assert_eq!(
+            store.read_metadata().unwrap().last_head_sha.as_deref(),
+            Some("abc123")
+        );
     }
 
     #[test]
