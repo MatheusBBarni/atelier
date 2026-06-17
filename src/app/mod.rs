@@ -47,7 +47,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::env;
 use std::future::{pending, Future};
 use std::path::{Component, Path, PathBuf};
@@ -971,6 +971,19 @@ struct ApprovalSignal {
     resolution: ApprovalResolution,
 }
 
+/// Per-node lifecycle discriminator for the DAG scheduler (ADR-004). The flat
+/// parallel path spawns every child immediately, so its children are `Running`
+/// from the start and never read this field; the DAG path uses it to tell a
+/// *planned-but-not-yet-admitted* node (`Pending`) apart from a *spawned*
+/// node (`Running`) — a distinction `terminal_result == None` alone cannot make.
+/// Terminality remains authoritative via `terminal_result.is_some()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeRunState {
+    Pending,
+    Running,
+    Terminal,
+}
+
 #[derive(Clone, Debug)]
 struct ParallelChildRuntimeState {
     step_id: String,
@@ -984,6 +997,9 @@ struct ParallelChildRuntimeState {
     cancellation: CancellationToken,
     terminal_result: Option<AgentResult>,
     result_recorded: bool,
+    /// Admission state for the DAG scheduler; always `Running` on the flat
+    /// parallel path (which spawns all children up front).
+    node_run_state: NodeRunState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2786,12 +2802,12 @@ impl App {
                         self.handle_parallel_group_decision(run, &decision, group)
                             .await
                     }
-                    DecisionNextStep::Dag(_graph) => {
-                        // task_04 lowers the graph onto the ready-set scheduler
-                        // (run_execution_graph). Until then a dag decision —
-                        // only reachable when features.execution_graph is on —
-                        // is rejected rather than silently dropped (fail-closed).
-                        bail!("execution graph scheduling is not yet implemented")
+                    DecisionNextStep::Dag(graph) => {
+                        // Lower the validated graph onto the ready-set scheduler.
+                        match self.run_execution_graph(run, &decision, graph).await? {
+                            AgentStepOutcome::Completed => Ok(true),
+                            AgentStepOutcome::Paused | AgentStepOutcome::Stop => Ok(false),
+                        }
                     }
                 }
             }
@@ -3246,6 +3262,721 @@ impl App {
         Ok(AgentStepOutcome::Completed)
     }
 
+    /// Lower a validated [`ExecutionGraph`](crate::orchestrator::ExecutionGraph)
+    /// onto the reused parallel executor with **lazy ready-set admission**
+    /// (ADR-004). Instead of spawning every node up front, the join loop re-runs
+    /// [`admit_ready_nodes`](Self::admit_ready_nodes) at the top of every
+    /// iteration: it spawns newly-ready nodes, fail-closed-skips nodes downstream
+    /// of a failure, and — because skip-propagation cascades to a fixpoint and a
+    /// blocked node always has a running node ahead of it — always drains to
+    /// all-terminal without deadlocking.
+    async fn run_execution_graph(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+        graph: crate::orchestrator::ExecutionGraph,
+    ) -> Result<AgentStepOutcome> {
+        self.state.run_state = RunState::Running;
+        if self.wall_clock_limit_reached(run) {
+            self.stop_for_wall_clock_limit(run)?;
+            return Ok(AgentStepOutcome::Stop);
+        }
+        if self.execution_graph_exceeds_agent_step_limit(run, &graph) {
+            self.stop_for_execution_graph_agent_step_limit(run, &graph)?;
+            return Ok(AgentStepOutcome::Stop);
+        }
+
+        let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let cancellation = CancellationToken::new();
+        let interrupt_start = *self.interrupt_receiver.borrow();
+        let approval_start = self.approval_receiver.borrow().sequence;
+
+        // Static graph metadata: predecessors and command-ness per node.
+        let mut predecessors: BTreeMap<String, Vec<String>> = graph
+            .nodes
+            .iter()
+            .map(|node| (node.node_id.clone(), Vec::new()))
+            .collect();
+        for edge in &graph.edges {
+            if let Some(preds) = predecessors.get_mut(&edge.to) {
+                preds.push(edge.from.clone());
+            }
+        }
+        let command_nodes: BTreeSet<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node_runs_commands(node))
+            .map(|node| node.node_id.clone())
+            .collect();
+
+        let child_specs = self.prepare_execution_graph_nodes(run, &graph)?;
+        if let Some(workflow) = run.workflow.as_mut() {
+            for child in &child_specs {
+                workflow.record_planned_targets(
+                    &graph.graph_id,
+                    Some(&child.step_id),
+                    &child.step_label,
+                    &child.file_scope,
+                    &self.config.working_directory,
+                    &self.config.workspace.extra_write_roots,
+                )?;
+            }
+        }
+
+        let (sender, mut receiver) =
+            mpsc::channel(RUNTIME_EVENT_CHANNEL_CAPACITY * child_specs.len().max(1));
+        let resume_handle = ParallelRuntimeResumeHandle {
+            cancellation: cancellation.clone(),
+            sender: sender.clone(),
+        };
+        let mut children = BTreeMap::new();
+        let mut coalescers = BTreeMap::new();
+        for mut child in child_specs {
+            child.cancellation = cancellation.child_token();
+            coalescers.insert(
+                child.step_id.clone(),
+                RuntimeStreamCoalescer::new(child.agent_id.clone()),
+            );
+            children.insert(child.step_id.clone(), child);
+        }
+        let mut skipped_nodes: BTreeSet<String> = BTreeSet::new();
+
+        // Each node_pending event carries the full graph snapshot, so the Plan
+        // projection (task_06) can render the whole graph from the first event
+        // even before task_05's proposed/approved events exist.
+        for node in &graph.nodes {
+            let node_id = node.node_id.clone();
+            self.emit_node_lifecycle_event(
+                run,
+                &graph,
+                &children,
+                &skipped_nodes,
+                &node_id,
+                crate::history::NODE_PENDING_KIND,
+            )?;
+        }
+
+        let interrupt_requested =
+            wait_for_interrupt(self.interrupt_receiver.clone(), interrupt_start);
+        tokio::pin!(interrupt_requested);
+        let mut approval_answered = Box::pin(wait_for_approval(
+            self.approval_receiver.clone(),
+            approval_start,
+        ));
+        let mut approval_queue: VecDeque<PendingParallelApproval> = VecDeque::new();
+        let mut limit_tick = tokio::time::interval(Duration::from_millis(100));
+
+        let mut interrupted = false;
+        loop {
+            // Re-run admission at the top of every iteration: this is where the
+            // no-deadlock invariant is enforced (spawn ready nodes, fail-closed
+            // skip doomed ones, all cascaded to a fixpoint).
+            self.admit_ready_nodes(
+                &graph,
+                &mut children,
+                &predecessors,
+                &command_nodes,
+                run,
+                &sender,
+                &mut coalescers,
+                &mut skipped_nodes,
+            )?;
+            self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
+            self.publish_parallel_approval_head(&approval_queue)?;
+            if children
+                .values()
+                .all(|child| child.terminal_result.is_some())
+            {
+                break;
+            }
+
+            let message = tokio::select! {
+                message = receiver.recv() => message,
+                _ = &mut interrupt_requested => {
+                    cancellation.cancel();
+                    interrupted = true;
+                    self.state.run_state = RunState::Interrupted;
+                    self.state.pending_approval = None;
+                    self.state.show_first_approval_explainer = false;
+                    approval_queue.clear();
+                    self.record_step_cancelled_if_active()?;
+                    self.record_event(
+                        Some(run.run_id.clone()),
+                        None,
+                        "run_interrupted",
+                        json!({}),
+                        "Run interrupted.",
+                    )?;
+                    let to_cancel: Vec<(String, String)> = children
+                        .values()
+                        .filter(|child| child.terminal_result.is_none())
+                        .map(|child| (child.step_id.clone(), child.agent_id.clone()))
+                        .collect();
+                    for (node_id, agent_id) in to_cancel {
+                        let result = cancelled_agent_result(
+                            &agent_id,
+                            &node_id,
+                            "Execution graph cancelled by run interrupt.",
+                        );
+                        self.finalize_node(
+                            run,
+                            &graph,
+                            &mut children,
+                            &skipped_nodes,
+                            &node_id,
+                            result,
+                            crate::history::NODE_CANCELLED_KIND,
+                        )?;
+                    }
+                    None
+                }
+                approval = &mut approval_answered => {
+                    approval_answered = Box::pin(wait_for_approval(
+                        self.approval_receiver.clone(),
+                        approval.sequence,
+                    ));
+                    if let Some(pending) = approval_queue.pop_front() {
+                        self.publish_parallel_approval_head(&approval_queue)?;
+                        if let Some(child) = children.get_mut(&pending.step_id) {
+                            if child.terminal_result.is_none() {
+                                self.resolve_parallel_approval(
+                                    run,
+                                    child,
+                                    pending,
+                                    approval.resolution,
+                                    resume_handle.clone(),
+                                )
+                                .await?;
+                            }
+                        }
+                        self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
+                    }
+                    continue;
+                }
+                _ = limit_tick.tick() => {
+                    if self.apply_parallel_limit_checks(run, &mut children, &cancellation)? {
+                        self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
+                    }
+                    continue;
+                }
+            };
+            let Some(message) = message else {
+                break;
+            };
+            match message {
+                ParallelRuntimeMessage::RuntimeEvent { step_id, event } => {
+                    if let Some(child) = children.get(&step_id) {
+                        if child.terminal_result.is_some() {
+                            continue;
+                        }
+                        let coalescer = coalescers
+                            .get_mut(&step_id)
+                            .context("missing execution graph stream coalescer")?;
+                        self.record_parallel_runtime_event(
+                            run,
+                            &graph.graph_id,
+                            &step_id,
+                            coalescer,
+                            event,
+                        )?;
+                        self.set_agent_status(&child.agent_id, "running_parallel");
+                    }
+                }
+                ParallelRuntimeMessage::Output { step_id, output } => {
+                    if children
+                        .get(&step_id)
+                        .map(|child| child.terminal_result.is_some())
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    if let Some(coalescer) = coalescers.get_mut(&step_id) {
+                        self.flush_runtime_stream_coalescer_with_group(
+                            run,
+                            Some(&graph.graph_id),
+                            &step_id,
+                            coalescer,
+                            true,
+                        )?;
+                    }
+                    match *output {
+                        Ok(RuntimeOutput::AgentResult { result }) => {
+                            let kind = execution_graph_node_kind(&result.status);
+                            self.finalize_node(
+                                run,
+                                &graph,
+                                &mut children,
+                                &skipped_nodes,
+                                &step_id,
+                                result,
+                                kind,
+                            )?;
+                        }
+                        Ok(RuntimeOutput::ActionRequest { request }) => {
+                            let Some(child) = children.get_mut(&step_id) else {
+                                continue;
+                            };
+                            if self
+                                .handle_parallel_child_action(
+                                    run,
+                                    &graph.graph_id,
+                                    child,
+                                    request,
+                                    resume_handle.clone(),
+                                    &mut approval_queue,
+                                )
+                                .await?
+                            {
+                                continue;
+                            }
+                            self.publish_parallel_approval_head(&approval_queue)?;
+                        }
+                        Ok(RuntimeOutput::ParseError {
+                            agent,
+                            raw_output,
+                            diagnostic,
+                        }) => {
+                            let result = self.persist_parse_error_with_group(
+                                &run.run_id,
+                                &graph.graph_id,
+                                &step_id,
+                                &agent,
+                                raw_output,
+                                diagnostic,
+                            )?;
+                            self.finalize_node(
+                                run,
+                                &graph,
+                                &mut children,
+                                &skipped_nodes,
+                                &step_id,
+                                result,
+                                crate::history::NODE_FAILED_KIND,
+                            )?;
+                        }
+                        Ok(RuntimeOutput::OrchestratorDecision { .. }) => {
+                            let agent_id = children
+                                .get(&step_id)
+                                .map(|child| child.agent_id.clone())
+                                .unwrap_or_default();
+                            let result = failed_agent_result(
+                                &agent_id,
+                                &step_id,
+                                "Execution graph node returned an orchestrator decision.",
+                            );
+                            self.finalize_node(
+                                run,
+                                &graph,
+                                &mut children,
+                                &skipped_nodes,
+                                &step_id,
+                                result,
+                                crate::history::NODE_FAILED_KIND,
+                            )?;
+                        }
+                        Err(error) => {
+                            let agent_id = children
+                                .get(&step_id)
+                                .map(|child| child.agent_id.clone())
+                                .unwrap_or_default();
+                            let result = failed_agent_result(
+                                &agent_id,
+                                &step_id,
+                                &format!("Execution graph node runtime failed: {error:#}"),
+                            );
+                            self.finalize_node(
+                                run,
+                                &graph,
+                                &mut children,
+                                &skipped_nodes,
+                                &step_id,
+                                result,
+                                crate::history::NODE_FAILED_KIND,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let node_results = children
+            .values()
+            .filter_map(|child| child.terminal_result.clone().map(|result| (child, result)))
+            .collect::<Vec<_>>();
+        for (_child, result) in &node_results {
+            run.previous_results.push(RunStepResult::Agent {
+                result: result.clone(),
+            });
+        }
+        let graph_result = synthesize_execution_graph_result(
+            &run.run_id,
+            &graph.graph_id,
+            &started_at,
+            &node_results,
+            &skipped_nodes,
+        );
+        let mut completed_payload = serde_json::to_value(&graph_result)?;
+        if let serde_json::Value::Object(map) = &mut completed_payload {
+            map.insert(
+                "decision_id".to_string(),
+                serde_json::Value::String(decision.decision_id.clone()),
+            );
+            map.insert(
+                "graph".to_string(),
+                execution_graph_snapshot(&graph, &children, &skipped_nodes),
+            );
+        }
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            crate::history::EXECUTION_GRAPH_COMPLETED_KIND,
+            completed_payload,
+            "Execution graph completed.",
+        )?;
+        run.previous_results.push(RunStepResult::Dag {
+            result: graph_result,
+        });
+        for child in children.values() {
+            self.clear_active_step(&child.step_id);
+        }
+        self.state.pending_approval = None;
+        self.state.show_first_approval_explainer = false;
+        self.sync_chat_items();
+        self.publish_state();
+        if interrupted {
+            self.record_workflow_completed(run, true)?;
+            return Ok(AgentStepOutcome::Stop);
+        }
+        Ok(AgentStepOutcome::Completed)
+    }
+
+    /// Apply one ready-set admission pass (ADR-004): sync terminal nodes, compute
+    /// the pure [`compute_admission`] decision, fail-closed-skip the doomed
+    /// nodes, and spawn the admitted ones on the reused parallel runtime.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_ready_nodes(
+        &mut self,
+        graph: &crate::orchestrator::ExecutionGraph,
+        children: &mut BTreeMap<String, ParallelChildRuntimeState>,
+        predecessors: &BTreeMap<String, Vec<String>>,
+        command_nodes: &BTreeSet<String>,
+        run: &mut RunDriveContext,
+        sender: &mpsc::Sender<ParallelRuntimeMessage>,
+        coalescers: &mut BTreeMap<String, RuntimeStreamCoalescer>,
+        skipped_nodes: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        // Any node carrying a terminal_result is terminal regardless of how it
+        // got there (a reused limit/approval/interrupt path may set the result
+        // without the discriminator); reconcile before snapshotting.
+        for child in children.values_mut() {
+            if child.terminal_result.is_some() {
+                child.node_run_state = NodeRunState::Terminal;
+            }
+        }
+
+        let snapshots: Vec<DagNodeSnapshot> = graph
+            .nodes
+            .iter()
+            .map(|node| {
+                let child = children.get(&node.node_id);
+                let succeeded = child
+                    .and_then(|child| child.terminal_result.as_ref())
+                    .map(|result| {
+                        matches!(
+                            result.status,
+                            AgentResultStatus::Completed | AgentResultStatus::NoChanges
+                        )
+                    })
+                    .unwrap_or(false);
+                DagNodeSnapshot {
+                    node_id: node.node_id.clone(),
+                    run_state: child
+                        .map(|child| child.node_run_state)
+                        .unwrap_or(NodeRunState::Pending),
+                    succeeded,
+                    is_command: command_nodes.contains(&node.node_id),
+                    write_files: node.file_scope.write_files.iter().cloned().collect(),
+                    predecessors: predecessors.get(&node.node_id).cloned().unwrap_or_default(),
+                }
+            })
+            .collect();
+        let decision = compute_admission(&snapshots);
+
+        for node_id in decision.skip {
+            let agent_id = children
+                .get(&node_id)
+                .map(|child| child.agent_id.clone())
+                .unwrap_or_default();
+            if let Some(child) = children.get_mut(&node_id) {
+                child.cancellation.cancel();
+            }
+            skipped_nodes.insert(node_id.clone());
+            let result = skipped_agent_result(
+                &agent_id,
+                &node_id,
+                "Skipped: an upstream node did not succeed.",
+            );
+            self.finalize_node(
+                run,
+                graph,
+                children,
+                skipped_nodes,
+                &node_id,
+                result,
+                crate::history::NODE_SKIPPED_KIND,
+            )?;
+        }
+
+        for node_id in decision.admit {
+            let spawn = {
+                let child = children
+                    .get_mut(&node_id)
+                    .context("admitted execution graph node missing")?;
+                child.node_run_state = NodeRunState::Running;
+                child.step_started_at = Instant::now();
+                let sequence = child.next_runtime_sequence;
+                child.next_runtime_sequence = child.next_runtime_sequence.saturating_add(1);
+                (
+                    child.step_id.clone(),
+                    child.agent_id.clone(),
+                    child.step_label.clone(),
+                    child.file_scope.clone(),
+                    child.request.clone(),
+                    child.cancellation.clone(),
+                    sequence,
+                )
+            };
+            let (step_id, agent_id, step_label, file_scope, request, child_cancellation, sequence) =
+                spawn;
+            self.set_active_step_with_metadata(
+                &run.run_id,
+                Some(graph.graph_id.clone()),
+                &step_id,
+                Some(step_label.clone()),
+                Some(file_scope.clone()),
+                &agent_id,
+            );
+            self.set_agent_status(&agent_id, "running_parallel");
+            coalescers
+                .entry(step_id.clone())
+                .or_insert_with(|| RuntimeStreamCoalescer::new(agent_id.clone()));
+            spawn_parallel_runtime_task(
+                self.config.clone(),
+                step_id.clone(),
+                request,
+                sequence,
+                child_cancellation,
+                sender.clone(),
+            );
+            self.emit_node_lifecycle_event(
+                run,
+                graph,
+                children,
+                skipped_nodes,
+                &node_id,
+                crate::history::NODE_RUNNING_KIND,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Terminalize one node: persist its `agent_result`, record the terminal
+    /// result + run-state, fold it into the workflow ledger, and emit the
+    /// matching node lifecycle event (succeeded/failed/skipped/cancelled) with a
+    /// full graph snapshot.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_node(
+        &mut self,
+        run: &mut RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        children: &mut BTreeMap<String, ParallelChildRuntimeState>,
+        skipped_nodes: &BTreeSet<String>,
+        node_id: &str,
+        result: AgentResult,
+        lifecycle_kind: &str,
+    ) -> Result<()> {
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            Some(node_id.to_string()),
+            "agent_result",
+            serde_json::to_value(&result)?,
+            format!("{}: {}", result.agent, result.summary),
+        )?;
+        let file_scope = {
+            let child = children
+                .get_mut(node_id)
+                .context("finalized execution graph node missing")?;
+            child.terminal_result = Some(result.clone());
+            child.result_recorded = true;
+            child.node_run_state = NodeRunState::Terminal;
+            child.file_scope.clone()
+        };
+        self.set_live_step_status(
+            node_id,
+            if matches!(
+                result.status,
+                AgentResultStatus::Completed | AgentResultStatus::NoChanges
+            ) {
+                LiveStepStatus::Completed
+            } else {
+                LiveStepStatus::Failed
+            },
+        );
+        if let Some(workflow) = run.workflow.as_mut() {
+            workflow.record_child_result(
+                &graph.graph_id,
+                node_id,
+                &file_scope,
+                &result,
+                &self.config.working_directory,
+                &self.config.workspace.extra_write_roots,
+            )?;
+        }
+        self.emit_node_lifecycle_event(
+            run,
+            graph,
+            children,
+            skipped_nodes,
+            node_id,
+            lifecycle_kind,
+        )?;
+        self.clear_active_step(node_id);
+        Ok(())
+    }
+
+    /// Emit one node lifecycle event keyed by `graph_id` + `node_id`, carrying a
+    /// full graph snapshot so the Plan projection can re-render from it.
+    fn emit_node_lifecycle_event(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        children: &BTreeMap<String, ParallelChildRuntimeState>,
+        skipped_nodes: &BTreeSet<String>,
+        node_id: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let status = children
+            .get(node_id)
+            .map(|child| node_status_label(child, skipped_nodes))
+            .unwrap_or("pending");
+        let payload = json!({
+            "graph_id": graph.graph_id,
+            "node_id": node_id,
+            "status": status,
+            "graph": execution_graph_snapshot(graph, children, skipped_nodes),
+        });
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            Some(node_id.to_string()),
+            kind,
+            payload,
+            format!("Execution graph node {node_id}: {status}."),
+        )
+    }
+
+    fn prepare_execution_graph_nodes(
+        &mut self,
+        run: &mut RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+    ) -> Result<Vec<ParallelChildRuntimeState>> {
+        let sibling_contexts = graph
+            .nodes
+            .iter()
+            .map(|node| ParallelSiblingContext {
+                step_id: node.node_id.clone(),
+                step_label: node.step_label.clone(),
+                agent: node.agent.clone(),
+                file_scope: node.file_scope.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut children = Vec::with_capacity(graph.nodes.len());
+        // The whole-graph agent-step fit is pre-checked in
+        // execution_graph_exceeds_agent_step_limit, so every node is prepared.
+        for node in &graph.nodes {
+            let agent = self.agent(&node.agent)?.clone();
+            run.step_count += 1;
+            let step = crate::orchestrator::ParallelChildStepPlan {
+                step_label: node.step_label.clone(),
+                agent: node.agent.clone(),
+                instruction: node.instruction.clone(),
+                required_capabilities: node.required_capabilities.clone(),
+                file_scope: node.file_scope.clone(),
+            };
+            let prompt = parallel_child_prompt(&run.prompt, &step);
+            let mut request = self.runtime_request(
+                &run.run_id,
+                &node.node_id,
+                RuntimePrompt::new(&prompt, run.skill_context.as_ref()),
+                agent,
+                run.previous_results.clone(),
+                "agent_result",
+            )?;
+            request.parallel_context = Some(ParallelRuntimeContext {
+                group_id: graph.graph_id.clone(),
+                step_label: node.step_label.clone(),
+                file_scope: node.file_scope.clone(),
+                parallel_siblings: sibling_contexts
+                    .iter()
+                    .filter(|sibling| sibling.step_id != node.node_id)
+                    .cloned()
+                    .collect(),
+                scope_policy_summary: parallel_scope_policy_summary(&node.file_scope),
+            });
+            children.push(ParallelChildRuntimeState {
+                step_id: node.node_id.clone(),
+                step_label: node.step_label.clone(),
+                agent_id: node.agent.clone(),
+                file_scope: node.file_scope.clone(),
+                request,
+                step_started_at: Instant::now(),
+                next_runtime_sequence: 1,
+                action_count: 0,
+                cancellation: CancellationToken::new(),
+                terminal_result: None,
+                result_recorded: false,
+                node_run_state: NodeRunState::Pending,
+            });
+        }
+        Ok(children)
+    }
+
+    fn execution_graph_exceeds_agent_step_limit(
+        &self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+    ) -> bool {
+        match self.config.limits.max_agent_steps {
+            Limit::Value(limit) => run.step_count.saturating_add(graph.nodes.len() as u32) > limit,
+            Limit::Unlimited => false,
+        }
+    }
+
+    fn stop_for_execution_graph_agent_step_limit(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+    ) -> Result<()> {
+        self.state.run_state = RunState::LimitReached;
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            "run_limit_reached",
+            json!({
+                "limit": "max_agent_steps",
+                "value": run.step_count,
+                "requested_graph_nodes": graph.nodes.len(),
+                "graph_id": graph.graph_id
+            }),
+            "Run limit reached before the execution graph could start.",
+        )
+    }
+
     fn parallel_group_exceeds_agent_step_limit(
         &self,
         run: &RunDriveContext,
@@ -3344,6 +4075,8 @@ impl App {
                 cancellation: CancellationToken::new(),
                 terminal_result: None,
                 result_recorded: false,
+                // The flat parallel path spawns every child immediately.
+                node_run_state: NodeRunState::Running,
             });
         }
         Ok(children)
@@ -3714,7 +4447,12 @@ impl App {
         let timed_out = children
             .values()
             .filter(|child| {
+                // Only spawned (Running) nodes can hit the per-step time limit; a
+                // DAG node still Pending (planned, not admitted) has a stale
+                // step_started_at and must not be terminalized for "timing out"
+                // before it ever runs.
                 child.terminal_result.is_none()
+                    && child.node_run_state == NodeRunState::Running
                     && self.step_time_limit_reached(child.step_started_at)
             })
             .map(|child| {
@@ -5206,7 +5944,6 @@ impl App {
     /// sibling of [`record_event_with_group`]: the scheduler (task_04) emits the
     /// `execution_graph_*` / `node_*` lifecycle through here so graph events
     /// carry `graph_id` and are never mis-keyed through the flat-group path.
-    #[allow(dead_code)] // wired to the scheduler's emit sites in task_04
     fn record_event_with_graph(
         &mut self,
         run_id: Option<String>,
@@ -5223,7 +5960,6 @@ impl App {
 
     /// Durably append a graph-keyed event and fold it into the projection
     /// **without** broadcasting — the DAG sibling of [`append_event_with_group`].
-    #[allow(dead_code)] // wired to the scheduler's emit sites in task_04
     fn append_event_with_graph(
         &mut self,
         run_id: Option<String>,
@@ -7312,6 +8048,308 @@ fn synthesize_parallel_group_result(
         blocked_scopes,
         failed_scopes,
         approval_denials,
+        started_at: started_at.to_string(),
+        completed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    }
+}
+
+/// One node's view for the pure DAG admission decision (ADR-004): current
+/// lifecycle state, whether it succeeded (meaningful only when terminal),
+/// command-ness, its write set, and its predecessor node_ids.
+#[derive(Clone, Debug)]
+struct DagNodeSnapshot {
+    node_id: String,
+    run_state: NodeRunState,
+    succeeded: bool,
+    is_command: bool,
+    write_files: BTreeSet<String>,
+    predecessors: Vec<String>,
+}
+
+/// The admission decision over a graph snapshot: which currently-Pending nodes
+/// to spawn now (`admit`) and which to terminalize as Skipped now (`skip`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AdmissionDecision {
+    admit: Vec<String>,
+    skip: Vec<String>,
+}
+
+/// Pure ready-set admission over node states (ADR-004) — no I/O, no spawning;
+/// the scheduler applies the returned decision. This function carries the
+/// feature's hardest invariant (fail-closed forward progress):
+///   * **skip-propagation cascades to a fixpoint**, so every node downstream of
+///     a failed/blocked/cancelled/skipped predecessor is terminalized in a
+///     single call (the join loop can then drain to all-terminal — no deadlock);
+///   * a node is **admitted** only when every predecessor is terminal AND
+///     succeeded, its `write_files` are disjoint from the union of running
+///     nodes' writes, and — if it runs commands — nothing else is running
+///     (command nodes run in isolation).
+///
+/// `Pending` (planned-not-admitted) nodes are never counted as "running", so
+/// their write scopes do not pre-occupy the running set.
+fn compute_admission(nodes: &[DagNodeSnapshot]) -> AdmissionDecision {
+    let index: BTreeMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| (node.node_id.as_str(), i))
+        .collect();
+
+    // Fail-closed skip-propagation to a fixpoint: a Pending node is doomed when
+    // any predecessor is terminal-and-not-succeeded or itself already doomed.
+    let mut doomed: BTreeSet<usize> = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (i, node) in nodes.iter().enumerate() {
+            if node.run_state != NodeRunState::Pending || doomed.contains(&i) {
+                continue;
+            }
+            let blocked = node.predecessors.iter().any(|pred_id| {
+                index.get(pred_id.as_str()).is_some_and(|&pi| {
+                    doomed.contains(&pi)
+                        || (nodes[pi].run_state == NodeRunState::Terminal && !nodes[pi].succeeded)
+                })
+            });
+            if blocked {
+                doomed.insert(i);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Admission over the surviving Pending nodes (deterministic by slice order).
+    let initially_running = nodes.iter().any(|n| n.run_state == NodeRunState::Running);
+    let mut command_active = nodes
+        .iter()
+        .any(|n| n.run_state == NodeRunState::Running && n.is_command);
+    let mut admitted_any = false;
+    let mut running_writes: BTreeSet<String> = nodes
+        .iter()
+        .filter(|n| n.run_state == NodeRunState::Running)
+        .flat_map(|n| n.write_files.iter().cloned())
+        .collect();
+    let mut admit = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        if node.run_state != NodeRunState::Pending || doomed.contains(&i) {
+            continue;
+        }
+        // A command node, once running or admitted this pass, monopolizes the
+        // graph: nothing else may be admitted alongside it.
+        if command_active {
+            break;
+        }
+        let ready = node.predecessors.iter().all(|pred_id| {
+            index.get(pred_id.as_str()).is_none_or(|&pi| {
+                nodes[pi].run_state == NodeRunState::Terminal && nodes[pi].succeeded
+            })
+        });
+        if !ready {
+            continue;
+        }
+        if node.is_command {
+            // Command nodes run alone: nothing running, nothing admitted yet.
+            if !initially_running && !admitted_any {
+                admit.push(node.node_id.clone());
+                admitted_any = true;
+                command_active = true;
+            }
+        } else if node.write_files.is_disjoint(&running_writes) {
+            admit.push(node.node_id.clone());
+            running_writes.extend(node.write_files.iter().cloned());
+            admitted_any = true;
+        }
+    }
+
+    let skip = doomed.iter().map(|&i| nodes[i].node_id.clone()).collect();
+    AdmissionDecision { admit, skip }
+}
+
+/// Whether a graph node runs commands, derived from its declared capabilities
+/// (ADR-004) — command nodes are scheduled in isolation since their reads and
+/// side effects can't be fenced.
+fn node_runs_commands(node: &crate::orchestrator::ExecutionNode) -> bool {
+    node.required_capabilities.contains(&Capability::Command)
+}
+
+/// Map a completed node's result status to its lifecycle event kind.
+fn execution_graph_node_kind(status: &AgentResultStatus) -> &'static str {
+    match status {
+        AgentResultStatus::Completed | AgentResultStatus::NoChanges => {
+            crate::history::NODE_SUCCEEDED_KIND
+        }
+        _ => crate::history::NODE_FAILED_KIND,
+    }
+}
+
+/// The Plan-view status label for a node's current runtime state. A node in the
+/// `skipped_nodes` set renders `skipped`; otherwise terminality and the result
+/// status (or the admission state) decide the label.
+fn node_status_label(
+    child: &ParallelChildRuntimeState,
+    skipped_nodes: &BTreeSet<String>,
+) -> &'static str {
+    if skipped_nodes.contains(&child.step_id) {
+        return "skipped";
+    }
+    match &child.terminal_result {
+        Some(result) => match result.status {
+            AgentResultStatus::Completed | AgentResultStatus::NoChanges => "succeeded",
+            AgentResultStatus::Cancelled => "cancelled",
+            _ => "failed",
+        },
+        None => match child.node_run_state {
+            NodeRunState::Running => "running",
+            NodeRunState::Pending | NodeRunState::Terminal => "pending",
+        },
+    }
+}
+
+/// A full graph snapshot (every node's current status + the typed edges) carried
+/// in each graph/node event payload (ADR-005) so the single evolving Plan item
+/// can re-render the whole graph from any one event.
+fn execution_graph_snapshot(
+    graph: &crate::orchestrator::ExecutionGraph,
+    children: &BTreeMap<String, ParallelChildRuntimeState>,
+    skipped_nodes: &BTreeSet<String>,
+) -> serde_json::Value {
+    let nodes: Vec<serde_json::Value> = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            let status = children
+                .get(&node.node_id)
+                .map(|child| node_status_label(child, skipped_nodes))
+                .unwrap_or("pending");
+            json!({
+                "node_id": node.node_id,
+                "step_label": node.step_label,
+                "agent": node.agent,
+                "status": status,
+                "file_scope": node.file_scope,
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = graph
+        .edges
+        .iter()
+        .map(|edge| json!({ "from": edge.from, "to": edge.to, "kind": edge.kind }))
+        .collect();
+    json!({
+        "graph_id": graph.graph_id,
+        "reason": graph.reason,
+        "nodes": nodes,
+        "edges": edges,
+    })
+}
+
+/// The terminal AgentResult for a node skipped by fail-closed propagation. Uses
+/// `Cancelled` status (it never ran); the scheduler tracks skipped node_ids
+/// separately so the result and events can distinguish skip from interrupt.
+fn skipped_agent_result(agent: &str, node_id: &str, diagnostic: &str) -> AgentResult {
+    AgentResult {
+        status: AgentResultStatus::Cancelled,
+        ..failed_agent_result(agent, node_id, diagnostic)
+    }
+}
+
+/// Build the terminal [`ExecutionGraphResult`] from each node's recorded result
+/// plus the set of node_ids that were skipped (ADR-004/005). Status mirrors
+/// [`synthesize_parallel_group_result`].
+fn synthesize_execution_graph_result(
+    run_id: &str,
+    graph_id: &str,
+    started_at: &str,
+    node_results: &[(&ParallelChildRuntimeState, AgentResult)],
+    skipped_nodes: &BTreeSet<String>,
+) -> crate::orchestrator::ExecutionGraphResult {
+    use crate::orchestrator::{ExecutionGraphStatus, NodeResultRef};
+    let mut counts = BTreeMap::new();
+    let mut changed_files = Vec::new();
+    let mut results = Vec::new();
+    let mut failed = Vec::new();
+    let mut successful = 0usize;
+
+    for (index, (child, result)) in node_results.iter().enumerate() {
+        let is_skipped = skipped_nodes.contains(&child.step_id);
+        let label = if is_skipped {
+            "skipped".to_string()
+        } else {
+            agent_status_key(&result.status).to_string()
+        };
+        *counts.entry(label).or_insert(0) += 1;
+        if !is_skipped
+            && matches!(
+                result.status,
+                AgentResultStatus::Completed | AgentResultStatus::NoChanges
+            )
+        {
+            successful += 1;
+        }
+        if !is_skipped
+            && matches!(
+                result.status,
+                AgentResultStatus::Failed
+                    | AgentResultStatus::ParseError
+                    | AgentResultStatus::Blocked
+                    | AgentResultStatus::ApprovalDenied
+            )
+        {
+            failed.push(child.step_id.clone());
+        }
+        changed_files.extend(result.changed_files.iter().cloned());
+        results.push(NodeResultRef {
+            node_id: child.step_id.clone(),
+            step_label: child.step_label.clone(),
+            agent: child.agent_id.clone(),
+            file_scope: child.file_scope.clone(),
+            status: result.status.clone(),
+            result_index: index,
+        });
+    }
+    changed_files.sort();
+    changed_files.dedup();
+
+    let total = node_results.len();
+    let status = if total > 0
+        && node_results.iter().all(|(_, result)| {
+            matches!(
+                result.status,
+                AgentResultStatus::Cancelled | AgentResultStatus::LimitReached
+            )
+        }) {
+        if node_results
+            .iter()
+            .any(|(_, result)| matches!(result.status, AgentResultStatus::LimitReached))
+        {
+            ExecutionGraphStatus::LimitReached
+        } else {
+            ExecutionGraphStatus::Cancelled
+        }
+    } else if total > 0 && successful == total {
+        ExecutionGraphStatus::Completed
+    } else if successful > 0 {
+        ExecutionGraphStatus::CompletedWithIssues
+    } else {
+        ExecutionGraphStatus::Failed
+    };
+    let summary = format!(
+        "Execution graph {graph_id} joined with {successful}/{total} successful node(s), {} skipped.",
+        skipped_nodes.len()
+    );
+
+    crate::orchestrator::ExecutionGraphResult {
+        schema_version: 1,
+        graph_id: graph_id.to_string(),
+        run_id: run_id.to_string(),
+        status,
+        summary,
+        node_results: results,
+        counts,
+        changed_files,
+        skipped: skipped_nodes.iter().cloned().collect(),
+        failed,
         started_at: started_at.to_string(),
         completed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     }
@@ -10086,6 +11124,260 @@ runtime = "fake"
             config_path: Some(config_path),
         })
         .unwrap()
+    }
+
+    fn fake_dag_config(dir: &std::path::Path) -> EffectiveConfig {
+        let config_path = dir.join("atelier.toml");
+        fs::write(
+            &config_path,
+            r#"
+[features]
+execution_graph = true
+
+[limits]
+max_parallel_agent_steps = 2
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    // ── DAG ready-set admission (task_04) ──
+
+    fn dag_snapshot(
+        node_id: &str,
+        run_state: NodeRunState,
+        succeeded: bool,
+        is_command: bool,
+        writes: &[&str],
+        preds: &[&str],
+    ) -> DagNodeSnapshot {
+        DagNodeSnapshot {
+            node_id: node_id.to_string(),
+            run_state,
+            succeeded,
+            is_command,
+            write_files: writes.iter().map(|w| w.to_string()).collect(),
+            predecessors: preds.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn admission_promotes_disjoint_dependents_in_one_pass() {
+        // A done-succeeded; B and C depend on A with disjoint writes → both ready.
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Terminal, true, false, &["a.rs"], &[]),
+            dag_snapshot("b", NodeRunState::Pending, false, false, &["b.rs"], &["a"]),
+            dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &["a"]),
+        ];
+        let decision = compute_admission(&nodes);
+        assert_eq!(decision.admit, vec!["b".to_string(), "c".to_string()]);
+        assert!(decision.skip.is_empty());
+    }
+
+    #[test]
+    fn admission_write_overlap_holds_second_node() {
+        // B and C share a write file; only one is admitted, the other waits.
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Terminal, true, false, &["a.rs"], &[]),
+            dag_snapshot(
+                "b",
+                NodeRunState::Pending,
+                false,
+                false,
+                &["shared.rs"],
+                &["a"],
+            ),
+            dag_snapshot(
+                "c",
+                NodeRunState::Pending,
+                false,
+                false,
+                &["shared.rs"],
+                &["a"],
+            ),
+        ];
+        let decision = compute_admission(&nodes);
+        assert_eq!(decision.admit, vec!["b".to_string()]);
+        assert!(decision.skip.is_empty());
+    }
+
+    #[test]
+    fn admission_command_node_waits_while_others_run() {
+        // A command-capable ready node cannot be admitted while anything runs.
+        let nodes = vec![
+            dag_snapshot("x", NodeRunState::Running, false, false, &["x.rs"], &[]),
+            dag_snapshot("y", NodeRunState::Pending, false, true, &[], &[]),
+        ];
+        let decision = compute_admission(&nodes);
+        assert!(decision.admit.is_empty());
+    }
+
+    #[test]
+    fn admission_command_node_runs_in_isolation() {
+        // Nothing running; a command node and a non-command node are both ready.
+        // The command node monopolizes: exactly one node is admitted.
+        let nodes = vec![
+            dag_snapshot("y", NodeRunState::Pending, false, true, &[], &[]),
+            dag_snapshot("z", NodeRunState::Pending, false, false, &["z.rs"], &[]),
+        ];
+        let decision = compute_admission(&nodes);
+        assert_eq!(decision.admit, vec!["y".to_string()]);
+    }
+
+    #[test]
+    fn admission_fail_closed_skips_dependent_of_failed_node() {
+        // A failed → its dependent D is skipped, never admitted.
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Terminal, false, false, &["a.rs"], &[]),
+            dag_snapshot("d", NodeRunState::Pending, false, false, &["d.rs"], &["a"]),
+        ];
+        let decision = compute_admission(&nodes);
+        assert!(decision.admit.is_empty());
+        assert_eq!(decision.skip, vec!["d".to_string()]);
+    }
+
+    #[test]
+    fn admission_forward_progress_cascades_skip_through_tail() {
+        // A failed; B→C→D are all downstream. One admission call skips the whole
+        // tail so the join loop drains to all-terminal (no deadlock).
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Terminal, false, false, &["a.rs"], &[]),
+            dag_snapshot("b", NodeRunState::Pending, false, false, &["b.rs"], &["a"]),
+            dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &["b"]),
+            dag_snapshot("d", NodeRunState::Pending, false, false, &["d.rs"], &["c"]),
+        ];
+        let decision = compute_admission(&nodes);
+        assert!(decision.admit.is_empty());
+        assert_eq!(
+            decision.skip,
+            vec!["b".to_string(), "c".to_string(), "d".to_string()]
+        );
+    }
+
+    #[test]
+    fn admission_pending_writes_do_not_pre_occupy_running_set() {
+        // Two ready nodes share a write file, nothing running. If a Pending node's
+        // writes were wrongly counted as "running", neither would admit
+        // (deadlock); the correct behavior admits the first and holds the second.
+        let nodes = vec![
+            dag_snapshot(
+                "a",
+                NodeRunState::Pending,
+                false,
+                false,
+                &["shared.rs"],
+                &[],
+            ),
+            dag_snapshot(
+                "b",
+                NodeRunState::Pending,
+                false,
+                false,
+                &["shared.rs"],
+                &[],
+            ),
+        ];
+        let decision = compute_admission(&nodes);
+        assert_eq!(decision.admit, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dag_decision_routes_through_scheduler_and_completes() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "graph work",
+            "graph work",
+            None,
+            None,
+            None,
+        );
+        let node = |id: &str, label: &str| crate::orchestrator::ExecutionNode {
+            node_id: id.to_string(),
+            step_label: label.to_string(),
+            agent: "explorer".to_string(),
+            instruction: format!("inspect {label}"),
+            required_capabilities: vec![Capability::Read],
+            file_scope: ParallelFileScope {
+                write_files: Vec::new(),
+                read_roots: vec!["src".to_string()],
+            },
+        };
+        let graph = crate::orchestrator::ExecutionGraph {
+            graph_id: "graph-1".to_string(),
+            reason: "two read-only nodes in sequence".to_string(),
+            nodes: vec![node("a", "alpha"), node("b", "beta")],
+            edges: vec![crate::orchestrator::ExecutionEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                kind: crate::orchestrator::ExecutionEdgeKind::DataDependency,
+            }],
+        };
+        let decision = crate::orchestrator::OrchestratorDecision {
+            schema_version: 3,
+            decision_id: "decision-dag".to_string(),
+            run_id: "run-dag".to_string(),
+            status: DecisionStatus::Continue,
+            plan: vec!["Run the graph.".to_string()],
+            next_agent: None,
+            next_step: Some(DecisionNextStep::Dag(graph)),
+            reason: "The work forms a dependency graph.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Graph completes.".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            multi_select: false,
+            final_summary: None,
+        };
+
+        let routed = app
+            .handle_orchestrator_decision(&mut run, decision)
+            .await
+            .unwrap();
+
+        assert!(routed, "a completed graph routes as a successful step");
+        // Routed to the scheduler (not the single-agent or parallel-group path).
+        assert!(run
+            .previous_results
+            .iter()
+            .any(|result| matches!(result, RunStepResult::Dag { .. })));
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "node_succeeded"
+                    && event.graph_id.as_deref() == Some("graph-1"))
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == "execution_graph_completed"
+                && event.graph_id.as_deref() == Some("graph-1")
+        }));
+        // The DAG path must not leak flat parallel-group vocabulary.
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started"));
     }
 
     fn assert_no_workflow_run_start_events(events: &[HistoryEvent]) {
