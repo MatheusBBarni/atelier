@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Hooks core types & normalize() + public-event vocabulary | pending | medium | — |
+| 01 | Hooks core types & normalize() + public-event vocabulary | completed | medium | — |
 | 02 | Hooks config through the ladder + drop local-layer hooks | pending | medium | task_01 |
 | 03 | Notifier backends (OSC-native + fallback command) | pending | medium | task_01 |
 | 04 | Off-thread hook dispatcher (channel + subprocess + hook events) | pending | high | task_01, task_03 |

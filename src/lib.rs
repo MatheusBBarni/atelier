@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod file_index;
 pub mod governance;
 pub mod history;
+pub mod hooks;
 pub mod ids;
 pub mod keybindings;
 pub mod orchestrator;

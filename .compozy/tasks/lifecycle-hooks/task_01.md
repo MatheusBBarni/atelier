@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Hooks core types & normalize() + public-event vocabulary
 type: backend
 complexity: medium
@@ -30,12 +30,12 @@ Establish the new `src/hooks/` module with the normalized payload contract, the 
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Create the `src/hooks/` module and register `mod hooks;` in `src/lib.rs`.
-- [ ] 1.2 Define `HookPayload` + `Actor` and the config/action types (`HooksConfig`, `HookHandler`, `HookAction`, `PayloadDetail`, `NotifyConfig`).
-- [ ] 1.3 Define the public-event vocabulary and the public-name↔internal-kind mapping.
-- [ ] 1.4 Implement `normalize()` with metadata/full handling and `None` for non-public kinds.
-- [ ] 1.5 Define the hook-lifecycle event payload type for `hook_started`/`hook_completed`.
-- [ ] 1.6 Add unit tests for the mapping and `normalize()`.
+- [x] 1.1 Create the `src/hooks/` module and register `mod hooks;` in `src/lib.rs`.
+- [x] 1.2 Define `HookPayload` + `Actor` and the config/action types (`HooksConfig`, `HookHandler`, `HookAction`, `PayloadDetail`, `NotifyConfig`).
+- [x] 1.3 Define the public-event vocabulary and the public-name↔internal-kind mapping.
+- [x] 1.4 Implement `normalize()` with metadata/full handling and `None` for non-public kinds.
+- [x] 1.5 Define the hook-lifecycle event payload type for `hook_started`/`hook_completed`.
+- [x] 1.6 Add unit tests for the mapping and `normalize()`.
 
 ## Implementation Details
 Create `src/hooks/mod.rs` (optionally split payload types into `src/hooks/payload.rs`). Consume `history::HistoryEvent` (`src/history/mod.rs:12`). `ActorCtx` carries `{ agent: Option<String>, runtime: Option<String> }`; the live tap (task_05) populates it from `active_step.agent` + `AgentProfile.runtime`, and the follow reader (task_07) reconstructs it. Mirror existing serde derive conventions. Do NOT implement config-merge (task_02), dispatch (task_04), or notifier (task_03) here. See TechSpec "Core Interfaces" and "Data Models".
@@ -65,13 +65,13 @@ Create `src/hooks/mod.rs` (optionally split payload types into `src/hooks/payloa
 
 ## Tests
 - Unit tests:
-  - [ ] `normalize()` maps internal `agent_step_started` → public `step_started` with a populated `actor { agent, runtime }`.
-  - [ ] `normalize()` returns `None` for `runtime_stream_delta` and for `hook_completed` (non-public kinds never re-trigger hooks).
-  - [ ] `PayloadDetail::Metadata` (default) omits body fields; `PayloadDetail::Full` includes them.
-  - [ ] Every ADR-004 public name resolves to an internal kind; an unknown public name is absent from the map.
-  - [ ] `actor` is `None`/orchestrator for a pre-agent event (e.g. `run_started`).
+  - [x] `normalize()` maps internal `agent_step_started` → public `step_started` with a populated `actor { agent, runtime }`. — `maps_agent_step_started_to_public_step_started_with_actor`
+  - [x] `normalize()` returns `None` for `runtime_stream_delta` and for `hook_completed` (non-public kinds never re-trigger hooks). — `returns_none_for_non_public_kinds`
+  - [x] `PayloadDetail::Metadata` (default) omits body fields; `PayloadDetail::Full` includes them. — `metadata_omits_body_and_full_includes_it`
+  - [x] Every ADR-004 public name resolves to an internal kind; an unknown public name is absent from the map. — `every_public_name_round_trips_and_unknowns_are_absent`
+  - [x] `actor` is `None`/orchestrator for a pre-agent event (e.g. `run_started`). — `actor_is_orchestrator_for_a_pre_agent_event`
 - Integration tests:
-  - [ ] `normalize()` output shape asserted through task_05's end-to-end fake-runtime run (cross-referenced).
+  - [ ] `normalize()` output shape asserted through task_05's end-to-end fake-runtime run (cross-referenced; deferred to task_05).
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -81,3 +81,9 @@ Create `src/hooks/mod.rs` (optionally split payload types into `src/hooks/payloa
 - `src/hooks/` compiles and is registered in `src/lib.rs`
 - `normalize()` is pure (no `App`/IO dependencies) and returns `None` outside the public vocabulary
 - The public vocabulary matches the ADR-004 mapping table
+
+## As-built notes
+- **`normalize()` takes a third `detail: PayloadDetail` argument** — `normalize(event, actor, detail) -> Option<HookPayload>`, refining the two-argument sketch in the techspec "Core Interfaces". The detail must be an input so the *single* shared projection serves both the per-handler live tap (task_05, which knows its handler's `PayloadDetail`) and the `--events follow` reader (task_07), and so the metadata-vs-full contract is realized inside one pure function. Downstream callers pass `handler.payload` (tap) or a chosen detail (follow).
+- **`HookPayload` carries an optional `body: Option<serde_json::Value>`** (`skip_serializing_if = "Option::is_none"`): `None`/omitted under `PayloadDetail::Metadata` (the default), the raw event payload under `Full`. Redaction is applied downstream by the dispatcher (task_04) / follow reader (task_07) — `normalize()` stays pure.
+- **Extras for downstream tasks:** `ActorCtx` (input type), `HookLifecyclePayload` (Serialize+Deserialize, for task_04 emit / task_06 projection), the `public_name_for_kind` / `internal_kind_for_public` vocabulary accessors, and `HookHandler::matches` / `HookAction::kind_str` helpers.
+- **`target`/`outcome` extraction** in `normalize()` is best-effort and tolerant of absent fields: `target` from `action_requested` (`params.command|path`) and `file_edit_applied` (`path` or first `changed_files`); `outcome` for the terminal kinds + `file_edit_applied`. No task_01 acceptance test pins specific target/outcome values, but coverage tests assert the common cases.
