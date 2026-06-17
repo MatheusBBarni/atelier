@@ -10,6 +10,7 @@ use crate::app::{
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
 use crate::governance::{GovernanceAnswer, GovernanceDecisionView};
+use crate::history::SessionSummary;
 use crate::hooks::{self, HookLifecycleRecord};
 use crate::keybindings::{self, KeyAction, Keymap};
 use crate::orchestrator::RunState;
@@ -191,6 +192,7 @@ enum TuiCommand {
     ClarificationInputCharacter(char),
     ClarificationInputBackspace,
     QueueSelection(QueueSelectionCommand),
+    SessionBrowser(SessionBrowserCommand),
     ReloadSkills,
     InputCharacter(char),
     InputBackspace,
@@ -297,6 +299,64 @@ enum AppWorkerCommand {
     Shutdown,
 }
 
+/// Which view the session browser is showing. `Preview` arrives in task_08.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BrowserMode {
+    #[default]
+    List,
+}
+
+/// One browser action, routed while the modal is visible (task_07). Preview /
+/// resume actions arrive in task_08/task_11.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionBrowserCommand {
+    Open,
+    Close,
+    Up,
+    Down,
+    FilterChar(char),
+    FilterBackspace,
+}
+
+/// Ephemeral session-browser modal state, held in `TuiUiState` like `help_*`
+/// (ADR-001). Summaries arrive off-thread over a watch channel; the filter is a
+/// case-insensitive substring narrow (fuzzy deferred, ADR-001).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SessionBrowserState {
+    visible: bool,
+    mode: BrowserMode,
+    summaries: Vec<SessionSummary>,
+    selection_index: usize,
+    filter: String,
+}
+
+impl SessionBrowserState {
+    /// Indices of `summaries` matching the case-insensitive substring filter, in
+    /// list (newest-first) order. An empty filter matches everything.
+    fn filtered_indices(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.summaries.len()).collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.summaries
+            .iter()
+            .enumerate()
+            .filter(|(_, summary)| summary.label.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Keep `selection_index` within the current filtered range.
+    fn clamp_selection(&mut self) {
+        let len = self.filtered_indices().len();
+        if len == 0 {
+            self.selection_index = 0;
+        } else if self.selection_index >= len {
+            self.selection_index = len - 1;
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TuiUiState {
     roster_visible: bool,
@@ -371,6 +431,9 @@ struct TuiUiState {
     /// task_08 swaps in the config-resolved map. No overrides ⇒ byte-identical
     /// default routing.
     keymap: Keymap,
+    /// Session-browser modal state (task_07): visibility, off-thread-loaded
+    /// summaries, selection, and filter. Default = closed/empty.
+    browser: SessionBrowserState,
 }
 
 impl Default for TuiUiState {
@@ -419,6 +482,7 @@ impl Default for TuiUiState {
             }),
             hide_banner: false,
             keymap: default_keymap(),
+            browser: SessionBrowserState::default(),
         }
     }
 }
@@ -673,6 +737,11 @@ async fn run_loop(
     mut ui_state: TuiUiState,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
+    // Session-browser list channel (task_07): the loader runs off-thread on
+    // browser-open and publishes summaries here; the render loop syncs them in,
+    // so opening the browser never blocks the render loop.
+    let (session_summaries_sender, mut session_summaries_receiver) =
+        watch::channel(Vec::<SessionSummary>::new());
     // Render the first frame (welcome visible) before the blocking skill scan,
     // then load suggestions behind it so the /skill dropdown is ready by the
     // next interaction.
@@ -684,6 +753,7 @@ async fn run_loop(
         sync_worker_state(&mut state, &mut state_receiver);
         sync_file_index(&mut ui_state, &mut file_index_receiver);
         sync_prompt_history(&mut ui_state, &mut prompt_history_receiver);
+        sync_session_summaries(&mut ui_state, &mut session_summaries_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
         terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
 
@@ -694,6 +764,7 @@ async fn run_loop(
                 _ => None,
             };
             if let Some(command) = command {
+                let browser_was_visible = ui_state.browser.visible;
                 // Skill reload reports via the status line (set in `reload_skills`)
                 // rather than a full-screen takeover.
                 if !execute_tui_command_with_interrupt(
@@ -707,6 +778,13 @@ async fn run_loop(
                 .await?
                 {
                     break;
+                }
+                // The browser just opened → load its session list off-thread.
+                if ui_state.browser.visible && !browser_was_visible {
+                    spawn_session_summaries_load(
+                        ui_state.working_directory.clone(),
+                        session_summaries_sender.clone(),
+                    );
                 }
             }
         }
@@ -814,6 +892,10 @@ async fn execute_tui_command_with_interrupt(
         }
         TuiCommand::QueueSelection(command) => {
             apply_queue_selection_command(state, ui_state, command);
+            Ok(true)
+        }
+        TuiCommand::SessionBrowser(command) => {
+            apply_session_browser_command(ui_state, command);
             Ok(true)
         }
         TuiCommand::ReloadSkills => {
@@ -928,6 +1010,41 @@ fn sync_file_index(
     if file_index_receiver.has_changed().unwrap_or(false) {
         ui_state.file_mention_entries = file_index_receiver.borrow_and_update().clone();
     }
+}
+
+/// Adopt the latest off-thread session-list snapshot into the browser state
+/// (task_07), keeping the selection within range after the list lands.
+fn sync_session_summaries(
+    ui_state: &mut TuiUiState,
+    receiver: &mut watch::Receiver<Vec<SessionSummary>>,
+) {
+    if receiver.has_changed().unwrap_or(false) {
+        ui_state.browser.summaries = receiver.borrow_and_update().clone();
+        ui_state.browser.clamp_selection();
+    }
+}
+
+/// Load the session summaries off the render thread and publish them to the
+/// browser (task_07), mirroring `spawn_file_index_refresh`.
+/// `list_session_summaries` is synchronous file I/O, so it runs inside
+/// `spawn_blocking`; a join error (panic) or a closed receiver leaves the list
+/// unchanged. No-op without a working directory.
+fn spawn_session_summaries_load(
+    working_directory: Option<PathBuf>,
+    sender: watch::Sender<Vec<SessionSummary>>,
+) {
+    tokio::spawn(async move {
+        let Some(working_directory) = working_directory else {
+            return;
+        };
+        let data_root = working_directory.join(".atelier");
+        if let Ok(summaries) =
+            tokio::task::spawn_blocking(move || crate::history::list_session_summaries(&data_root))
+                .await
+        {
+            let _ = sender.send(summaries);
+        }
+    });
 }
 
 /// Project this project's recall list off the render thread and publish it to
@@ -1245,6 +1362,11 @@ fn key_event_to_tui_command_with_ui(
             }
             _ => None,
         }
+    } else if ui_state.browser.visible {
+        // Full modal (task_07): below help, above every other context. While
+        // visible it consumes keys (nav / filter / close); unmatched keys are
+        // swallowed so nothing leaks to the composer. Help still wins above.
+        session_browser_key_command(key)
     } else if state.pending_clarification.is_some() {
         // Ctrl-C is handled by the reserved-key guard above.
         clarification_key_command(state, ui_state, key)
@@ -1289,6 +1411,38 @@ fn key_event_to_tui_command_with_ui(
             key_event_to_tui_command(state, key)
         }
     }
+}
+
+/// Map a key to a [`SessionBrowserCommand`] while the browser modal is visible
+/// (task_07). `Esc` closes; `↑/↓` navigate; `Backspace` and printable characters
+/// narrow the filter. Every other key returns `None` and is swallowed by the
+/// modal (Ctrl-C is intercepted earlier by the reserved-key guard).
+fn session_browser_key_command(key: KeyEvent) -> Option<TuiCommand> {
+    let command = match key {
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        } => SessionBrowserCommand::Close,
+        KeyEvent {
+            code: KeyCode::Up, ..
+        } => SessionBrowserCommand::Up,
+        KeyEvent {
+            code: KeyCode::Down,
+            ..
+        } => SessionBrowserCommand::Down,
+        KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        } => SessionBrowserCommand::FilterBackspace,
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            ..
+        } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            SessionBrowserCommand::FilterChar(ch)
+        }
+        _ => return None,
+    };
+    Some(TuiCommand::SessionBrowser(command))
 }
 
 /// Queue focus is active when the input composer is empty and there are queued
@@ -1388,6 +1542,42 @@ fn apply_queue_selection_command(
         }
         QueueSelectionCommand::Next => (current + 1) % count,
     };
+}
+
+/// Apply a [`SessionBrowserCommand`] to the modal state (task_07). The summaries
+/// refresh on `Open` is triggered by `run_loop` (it owns the watch channel), so
+/// this only mutates visibility / selection / filter.
+fn apply_session_browser_command(ui_state: &mut TuiUiState, command: SessionBrowserCommand) {
+    let browser = &mut ui_state.browser;
+    match command {
+        SessionBrowserCommand::Open => {
+            browser.visible = true;
+            browser.mode = BrowserMode::List;
+            browser.filter.clear();
+            browser.selection_index = 0;
+        }
+        SessionBrowserCommand::Close => {
+            // Full reset so the next open starts clean (no stale summaries/filter).
+            *browser = SessionBrowserState::default();
+        }
+        SessionBrowserCommand::Up => {
+            browser.selection_index = browser.selection_index.saturating_sub(1);
+        }
+        SessionBrowserCommand::Down => {
+            let len = browser.filtered_indices().len();
+            if len > 0 && browser.selection_index + 1 < len {
+                browser.selection_index += 1;
+            }
+        }
+        SessionBrowserCommand::FilterChar(ch) => {
+            browser.filter.push(ch);
+            browser.selection_index = 0;
+        }
+        SessionBrowserCommand::FilterBackspace => {
+            browser.filter.pop();
+            browser.selection_index = 0;
+        }
+    }
 }
 
 fn agent_dropdown_key_command(key: KeyEvent) -> Option<TuiCommand> {
@@ -1635,6 +1825,20 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
         // `Keymap`, consulted in the normal-input branch of the wrapper (task_04/08).
         // Keeping them here would shadow a user rebind/unbind of their default key,
         // and would also leak them into modal fallbacks (the keymap is normal-only).
+        //
+        // Ctrl-R opens the session browser (task_07; hardcoded — no keybinding
+        // config yet). Guarded off while a blocking modal (approval / clarification
+        // / governance) is pending so it can't shadow those answer paths.
+        KeyEvent {
+            code: KeyCode::Char('r'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } if state.pending_approval.is_none()
+            && state.pending_clarification.is_none()
+            && state.pending_governance_decision.is_none() =>
+        {
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
+        }
         KeyEvent {
             code: KeyCode::Up, ..
         } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up)),
@@ -2958,6 +3162,13 @@ fn agent_suggestion_detail(agent: &crate::app::AgentView) -> String {
 
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     let theme = ui_state.theme;
+    // The session browser is a full-screen modal (task_07): when visible it takes
+    // over the frame, so it renders correctly regardless of any composer /
+    // clarification / approval context that may exist underneath.
+    if ui_state.browser.visible {
+        render_session_browser(frame, &ui_state.browser, &theme);
+        return;
+    }
     // Reset / default the clarification selection before sizing the composer so
     // the measured height matches what we render this frame.
     sync_clarification_state(state, ui_state);
@@ -4114,6 +4325,89 @@ fn wrapped_event_line_count(lines: &[Line<'_>], width: u16) -> usize {
 /// dispatches on `ui_state.help_active_tab` to the matching per-tab builder. The
 /// default tab (`GettingStarted`) renders on open. Tab navigation is handled in the
 /// key-routing layer (task 07); this render just reflects `help_active_tab`.
+/// Render the session-browser modal (task_07): a centered, newest-first list of
+/// `label · timestamp · outcome` rows with the selection highlighted and a filter
+/// line. All color flows through theme tokens; transcript-derived text is
+/// sanitized (ADR-004) before display.
+fn render_session_browser(frame: &mut Frame, browser: &SessionBrowserState, theme: &Theme) {
+    let area = centered_rect(78, 80, frame.area());
+    let filtered = browser.filtered_indices();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(if browser.filter.is_empty() {
+        Span::styled(
+            "type to filter".to_string(),
+            Style::default().fg(theme.text_dim),
+        )
+    } else {
+        Span::styled(
+            format!(
+                "filter: {}",
+                crate::app::chat::sanitize_transcript_text(&browser.filter)
+            ),
+            Style::default().fg(theme.text_muted),
+        )
+    }));
+    lines.push(Line::from(""));
+
+    if filtered.is_empty() {
+        let message = if browser.summaries.is_empty() {
+            "No sessions yet."
+        } else {
+            "No sessions match the filter."
+        };
+        lines.push(Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(theme.text_dim),
+        )));
+    }
+
+    for (row, &index) in filtered.iter().enumerate() {
+        let summary = &browser.summaries[index];
+        let selected = row == browser.selection_index;
+        let label_style = if selected {
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_muted)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if selected { "▶ " } else { "  " }.to_string(), label_style),
+            Span::styled(
+                crate::app::chat::sanitize_transcript_text(&summary.label),
+                label_style,
+            ),
+            Span::raw("  "),
+            Span::styled(
+                crate::app::chat::sanitize_transcript_text(&summary.started_at),
+                Style::default().fg(theme.text_dim),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                run_state_label(&summary.outcome).to_string(),
+                run_state_style(theme, &summary.outcome),
+            ),
+        ]));
+    }
+
+    let widget = Paragraph::new(lines)
+        .style(Style::default().fg(theme.text).bg(theme.ink))
+        .block(
+            Block::default()
+                .title(" Sessions ")
+                .title(Line::from(" ↑↓ select · type to filter · Esc close ").right_aligned())
+                .title_style(
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .border_style(Style::default().fg(theme.accent))
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
 fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState, theme: &Theme) {
     let area = centered_rect(78, 100, frame.area());
     let active = ui_state.help_active_tab;
@@ -10632,14 +10926,17 @@ runtime = "fake"
         )]);
         let ui_state = TuiUiState::default();
 
-        // Ctrl-R only resumes paused items; on a pending item it falls through.
+        // Ctrl-R resumes only PAUSED items; on a pending item it does NOT resume —
+        // it falls through to opening the session browser (task_07). The key point
+        // is that no FollowUpResumeRequested is produced for a pending item.
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            key_with_modifiers(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
         assert_eq!(
-            key_event_to_tui_command_with_ui(
-                &state,
-                &ui_state,
-                key_with_modifiers(KeyCode::Char('r'), KeyModifiers::CONTROL)
-            ),
-            None
+            command,
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
         );
     }
 
@@ -12436,6 +12733,133 @@ runtime = "fake"
             agent_view("c", "C", "idle", &[]),
         ];
         assert_eq!(agent_summary(&idle), "3 agents");
+    }
+
+    // ── session browser modal (task_07) ──
+
+    fn browser_summary(label: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: format!("id-{label}"),
+            label: label.to_string(),
+            started_at: "2026-06-17T00:00:00.000Z".to_string(),
+            outcome: RunState::Completed,
+            working_directory: std::path::PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn session_browser_keys_route_to_filter_nav_and_close() {
+        use SessionBrowserCommand as Cmd;
+        let cmd = |code| session_browser_key_command(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(
+            cmd(KeyCode::Char('a')),
+            Some(TuiCommand::SessionBrowser(Cmd::FilterChar('a')))
+        );
+        assert_eq!(cmd(KeyCode::Up), Some(TuiCommand::SessionBrowser(Cmd::Up)));
+        assert_eq!(
+            cmd(KeyCode::Down),
+            Some(TuiCommand::SessionBrowser(Cmd::Down))
+        );
+        assert_eq!(
+            cmd(KeyCode::Backspace),
+            Some(TuiCommand::SessionBrowser(Cmd::FilterBackspace))
+        );
+        assert_eq!(
+            cmd(KeyCode::Esc),
+            Some(TuiCommand::SessionBrowser(Cmd::Close))
+        );
+    }
+
+    #[test]
+    fn browser_takes_precedence_over_normal_but_help_wins() {
+        let state = state_with_input("hello", false);
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        // A printable key narrows the browser filter, not the composer.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(
+                SessionBrowserCommand::FilterChar('x')
+            ))
+        );
+        // Help still wins if both are somehow set.
+        ui.help_visible = true;
+        assert!(!matches!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(_))
+        ));
+    }
+
+    #[test]
+    fn ctrl_r_opens_browser_from_normal_context() {
+        let state = state_with_input("", false);
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
+        );
+    }
+
+    #[test]
+    fn browser_filter_narrows_rows_case_insensitively() {
+        let mut ui = TuiUiState::default();
+        ui.browser.summaries = vec![
+            browser_summary("Fix the parser"),
+            browser_summary("Add hooks"),
+            browser_summary("PARSER cleanup"),
+        ];
+        ui.browser.filter = "parser".to_string();
+        assert_eq!(ui.browser.filtered_indices(), vec![0, 2]);
+
+        // Down moves within the filtered set and clamps at its end; Up returns.
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::Down);
+        assert_eq!(ui.browser.selection_index, 1);
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::Down);
+        assert_eq!(
+            ui.browser.selection_index, 1,
+            "clamped at the last filtered row"
+        );
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::Up);
+        assert_eq!(ui.browser.selection_index, 0);
+    }
+
+    #[test]
+    fn sync_session_summaries_adopts_published_snapshot() {
+        let (sender, mut receiver) = watch::channel(Vec::<SessionSummary>::new());
+        let mut ui = TuiUiState::default();
+        sender
+            .send(vec![browser_summary("loaded off-thread")])
+            .unwrap();
+        sync_session_summaries(&mut ui, &mut receiver);
+        assert_eq!(ui.browser.summaries.len(), 1);
+        assert_eq!(ui.browser.summaries[0].label, "loaded off-thread");
+    }
+
+    #[test]
+    fn browser_renders_summaries_newest_first() {
+        let state = state_with_input("", false);
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        ui.browser.summaries = vec![
+            browser_summary("newest session"),
+            browser_summary("older session"),
+        ];
+        let text = render_to_text_with_ui_mut(&state, &mut ui, 100, 30);
+        let newest = text.find("newest session").expect("newest rendered");
+        let older = text.find("older session").expect("older rendered");
+        assert!(newest < older, "newest-first order in the rendered list");
     }
 
     #[test]
