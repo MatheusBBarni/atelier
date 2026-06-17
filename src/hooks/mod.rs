@@ -13,6 +13,13 @@ use crate::history::HistoryEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod notify;
+
+pub use notify::{
+    build_notifier_argv, notification_text, osc777_sequence, osc9_sequence, CommandNotifier,
+    Notifier, NotifyRunner, OscNotifier,
+};
+
 /// Version of the [`HookPayload`] contract. Bumped only on a
 /// backward-incompatible change to the normalized shape (ADR-004); additive,
 /// optional fields do not require a bump.

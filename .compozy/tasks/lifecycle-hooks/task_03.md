@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Notifier backends (OSC-native + fallback command)
 type: backend
 complexity: medium
@@ -30,11 +30,11 @@ Implement the built-in notifier behind an injectable `Notifier` trait: a default
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Define the `Notifier` trait in `src/hooks/notify.rs`.
-- [ ] 3.2 Implement `OscNotifier` emitting OSC 9/777 to the controlling TTY.
-- [ ] 3.3 Implement `CommandNotifier` spawning `notify_fallback_command`.
-- [ ] 3.4 Map `HookPayload` → notification title/body with sane defaults.
-- [ ] 3.5 Add unit tests asserting emitted bytes and command construction via the trait.
+- [x] 3.1 Define the `Notifier` trait in `src/hooks/notify.rs`.
+- [x] 3.2 Implement `OscNotifier` emitting OSC 9/777 to the controlling TTY.
+- [x] 3.3 Implement `CommandNotifier` spawning `notify_fallback_command`.
+- [x] 3.4 Map `HookPayload` → notification title/body with sane defaults.
+- [x] 3.5 Add unit tests asserting emitted bytes and command construction via the trait.
 
 ## Implementation Details
 Create `src/hooks/notify.rs` under the task_01 module. `OscNotifier` writes the escape sequence to the controlling terminal (stderr/TTY); the exact OSC-9-vs-777 selection is internal. `CommandNotifier` reuses the `run_git`-style subprocess pattern (`src/app/git.rs:72`, `kill_on_drop` + timeout). The notifier is invoked by the dispatcher (task_04) when a handler's action is `Notify`. See TechSpec "Core Interfaces" (Notifier) and ADR-005.
@@ -60,12 +60,12 @@ Create `src/hooks/notify.rs` under the task_01 module. `OscNotifier` writes the 
 
 ## Tests
 - Unit tests:
-  - [ ] `OscNotifier::notify("Run done","ok")` writes the exact OSC 9 byte sequence (`\x1b]9;…\x07`) to its sink.
-  - [ ] `CommandNotifier` builds the expected argv from `notify_fallback_command` + title/body without executing real delivery (injected runner).
-  - [ ] Title/body are derived from a `run_completed` `HookPayload` with sensible defaults.
-  - [ ] A `CommandNotifier` whose command exits non-zero surfaces an error rather than panicking.
+  - [x] `OscNotifier::notify("Run done","ok")` writes the exact OSC 9 byte sequence (`\x1b]9;…\x07`) to its sink. — `osc_notifier_writes_exact_osc9_sequence`
+  - [x] `CommandNotifier` builds the expected argv from `notify_fallback_command` + title/body without executing real delivery (injected runner). — `command_notifier_builds_expected_argv` + `command_notifier_invokes_runner_with_constructed_argv`
+  - [x] Title/body are derived from a `run_completed` `HookPayload` with sensible defaults. — `notification_text_from_run_completed_has_sensible_defaults` (+ `notification_body_folds_actor_target_and_outcome`)
+  - [x] A `CommandNotifier` whose command exits non-zero surfaces an error rather than panicking. — `command_notifier_non_zero_exit_surfaces_error` (+ `_spawn_failure_`)
 - Integration tests:
-  - [ ] The dispatcher (task_04) invokes the injected `Notifier` for a `notify = true` handler (cross-referenced).
+  - [ ] The dispatcher (task_04) invokes the injected `Notifier` for a `notify = true` handler (cross-referenced; deferred to task_04).
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -75,3 +75,9 @@ Create `src/hooks/notify.rs` under the task_01 module. `OscNotifier` writes the 
 - `OscNotifier` emits a valid OSC sequence with no external dependency
 - `CommandNotifier` runs the fallback command via the bounded subprocess idiom
 - The backend is injectable and unit-testable without real OS delivery
+
+## As-built notes
+- **`Notifier` is synchronous** (`fn notify(&self, title, body) -> Result<()>`, per the task's MUST), so `OscNotifier` writes bytes synchronously and `CommandNotifier` uses a **`std::process::Command`** spawn — not the async tokio `kill_on_drop`+timeout `run_git` idiom. Rationale: a notifier binary is expected to return promptly, and the sync trait can't host an `.await`. The heavyweight bounded async idiom is reserved for arbitrary `command` *hooks* in the task_04 dispatcher (documented in `spawn_notifier_command`).
+- **OSC 9 only by default.** `OscNotifier` emits OSC 9 (`\x1b]9;{title}: {body}\x07`); `osc777_sequence()` is provided as a pure helper for terminals where it applies, but is not emitted by default — auto-detecting terminal support is unreliable (ADR-005 rejects it) and emitting both would double-notify. tmux passthrough documented in the module header.
+- **Injection seams:** `OscNotifier<W: Write + Send>` holds the sink behind a `Mutex` (the trait method is `&self`); tests inject a `SharedSink`. `CommandNotifier` takes a `NotifyRunner` (`Arc<dyn Fn(&[String]) -> Result<()>>`); the default runner spawns, tests inject a recorder. `build_notifier_argv` whitespace-splits the command and appends title+body — never shell-interpolated (ADR-001 no-argv-templating posture).
+- Re-exported from `src/hooks/mod.rs`. Dispatcher wiring + the notify integration test land in task_04.
