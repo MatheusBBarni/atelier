@@ -586,7 +586,7 @@ pub(crate) fn derive_goal(events: &[HistoryEvent]) -> Option<String> {
 /// The session outcome folded from the log: the last *terminal* run state
 /// (`is_terminal()`, task_01), or the terminal `run_state` in a `session_ended`
 /// payload. `Idle` when no run reached a terminal state.
-fn derive_outcome(events: &[HistoryEvent]) -> RunState {
+pub(crate) fn derive_outcome(events: &[HistoryEvent]) -> RunState {
     let mut outcome = RunState::Idle;
     for event in events {
         let candidate = match event.kind.as_str() {
@@ -607,6 +607,20 @@ fn derive_outcome(events: &[HistoryEvent]) -> RunState {
         }
     }
     outcome
+}
+
+/// A SHA-256 digest of the pre-resume event log, recorded in the `session_resumed`
+/// boundary as tamper-evidence for the prior tail (ADR-002/007). Hashing the
+/// serialized parsed events (which atelier solely reads and writes) detects added,
+/// removed, reordered, or payload-edited prior events. `None` for an empty log.
+pub(crate) fn hash_events_digest(events: &[HistoryEvent]) -> Option<String> {
+    if events.is_empty() {
+        return None;
+    }
+    let bytes = serde_json::to_vec(events).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// The most-recently-started run together with the state it was last seen in,

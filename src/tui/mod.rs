@@ -319,12 +319,16 @@ enum SessionBrowserCommand {
     Down,
     FilterChar(char),
     FilterBackspace,
-    /// `Enter` on a list row → load that session's preview and switch to it.
+    /// `→` on a list row → load that session's preview and switch to it.
     OpenPreview,
     /// `Esc` in preview → return to the list.
     Back,
     /// Scroll the preview transcript (reuses the chat scroll vocabulary).
     ScrollPreview(EventScrollCommand),
+    /// `Enter` (list or preview) → resume this session: dispatch
+    /// `AppEvent::ResumeSession` to the worker and close the modal (task_11). The
+    /// id is resolved at keypress so the worker need not see browser state.
+    Resume(String),
 }
 
 /// Ephemeral session-browser modal state, held in `TuiUiState` like `help_*`
@@ -370,6 +374,19 @@ impl SessionBrowserState {
             self.selection_index = 0;
         } else if self.selection_index >= len {
             self.selection_index = len - 1;
+        }
+    }
+
+    /// The session id the Resume action targets: the previewed session in preview
+    /// mode, else the highlighted list row. `None` when the (filtered) list is
+    /// empty, so Resume is a no-op rather than resuming nothing.
+    fn selected_session_id(&self) -> Option<String> {
+        match self.mode {
+            BrowserMode::Preview => self.preview_session_id.clone(),
+            BrowserMode::List => self
+                .filtered_indices()
+                .get(self.selection_index)
+                .map(|&index| self.summaries[index].session_id.clone()),
         }
     }
 }
@@ -928,12 +945,22 @@ async fn execute_tui_command_with_interrupt(
             Ok(true)
         }
         TuiCommand::SessionBrowser(command) => {
-            // Opening clears the composer so a `/sessions` trigger doesn't linger
-            // (a Ctrl-R open has an empty composer, so this is a no-op there).
-            let opening = matches!(command, SessionBrowserCommand::Open);
-            apply_session_browser_command(ui_state, command);
-            if opening {
-                clear_input(state, ui_state);
+            match command {
+                // Resume dispatches to the worker (off-thread read → adopt_session
+                // → lifecycle events), then closes the modal + clears the composer
+                // so the re-rendered transcript shows unobstructed (task_11).
+                SessionBrowserCommand::Resume(session_id) => {
+                    queue_app_event(command_sender, AppEvent::ResumeSession(session_id)).await?;
+                    apply_session_browser_command(ui_state, SessionBrowserCommand::Close);
+                    clear_input(state, ui_state);
+                }
+                // Opening clears the composer so a `/sessions` trigger doesn't
+                // linger (a Ctrl-R open has an empty composer, so it's a no-op there).
+                SessionBrowserCommand::Open => {
+                    apply_session_browser_command(ui_state, SessionBrowserCommand::Open);
+                    clear_input(state, ui_state);
+                }
+                other => apply_session_browser_command(ui_state, other),
             }
             Ok(true)
         }
@@ -1492,16 +1519,30 @@ fn key_event_to_tui_command_with_ui(
 /// (task_07). `Esc` closes; `↑/↓` navigate; `Backspace` and printable characters
 /// narrow the filter. Every other key returns `None` and is swallowed by the
 /// modal (Ctrl-C is intercepted earlier by the reserved-key guard).
+/// Build the Resume command for the browser's current selection, or `None` when
+/// the (filtered) list is empty so `Enter` is a no-op rather than resuming
+/// nothing. The session id is resolved here so the worker never reads UI state.
+fn resume_command(browser: &SessionBrowserState) -> Option<TuiCommand> {
+    browser
+        .selected_session_id()
+        .map(|id| TuiCommand::SessionBrowser(SessionBrowserCommand::Resume(id)))
+}
+
 fn session_browser_key_command(browser: &SessionBrowserState, key: KeyEvent) -> Option<TuiCommand> {
     use SessionBrowserCommand as Cmd;
     let command = match browser.mode {
-        // List: Enter previews the selection, ↑/↓ navigate, typing filters, Esc closes.
+        // List: Enter resumes the selection, → previews it, ↑/↓ navigate, typing
+        // filters, Esc closes.
         BrowserMode::List => match key {
             KeyEvent {
                 code: KeyCode::Esc, ..
             } => Cmd::Close,
             KeyEvent {
                 code: KeyCode::Enter,
+                ..
+            } => return resume_command(browser),
+            KeyEvent {
+                code: KeyCode::Right,
                 ..
             } => Cmd::OpenPreview,
             KeyEvent {
@@ -1522,8 +1563,13 @@ fn session_browser_key_command(browser: &SessionBrowserState, key: KeyEvent) -> 
             } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => Cmd::FilterChar(ch),
             _ => return None,
         },
-        // Preview: Esc returns to the list; chat-scroll keys move the transcript.
+        // Preview: Enter resumes, Esc returns to the list, chat-scroll keys move
+        // the transcript.
         BrowserMode::Preview => match key {
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => return resume_command(browser),
             KeyEvent {
                 code: KeyCode::Esc, ..
             } => Cmd::Back,
@@ -1711,6 +1757,11 @@ fn apply_session_browser_command(ui_state: &mut TuiUiState, command: SessionBrow
         }
         SessionBrowserCommand::ScrollPreview(scroll) => {
             apply_preview_scroll(browser, scroll);
+        }
+        SessionBrowserCommand::Resume(_) => {
+            // Resume is intercepted in `execute_tui_command_with_interrupt` (it
+            // dispatches `AppEvent::ResumeSession` to the worker and then closes
+            // the modal); it never reaches this UI-only mutator.
         }
     }
 }
@@ -4569,7 +4620,10 @@ fn render_session_browser(frame: &mut Frame, browser: &SessionBrowserState, them
         .block(
             Block::default()
                 .title(" Sessions ")
-                .title(Line::from(" ↑↓ select · type to filter · Esc close ").right_aligned())
+                .title(
+                    Line::from(" ↑↓ select · Enter resume · → preview · Esc close ")
+                        .right_aligned(),
+                )
                 .title_style(
                     Style::default()
                         .fg(theme.accent)
@@ -4617,7 +4671,7 @@ fn render_session_preview(
         .block(
             Block::default()
                 .title(" Session preview ")
-                .title(Line::from(" Esc back · PgUp/PgDn scroll ").right_aligned())
+                .title(Line::from(" Enter resume · Esc back · PgUp/PgDn scroll ").right_aligned())
                 .title_style(
                     Style::default()
                         .fg(theme.accent)
@@ -13124,16 +13178,16 @@ runtime = "fake"
     }
 
     #[test]
-    fn enter_opens_preview_and_esc_returns_to_list() {
+    fn right_opens_preview_and_esc_returns_to_list() {
         let mut ui = TuiUiState::default();
         ui.browser.visible = true;
         ui.browser.summaries = vec![browser_summary("a session")];
 
-        // List-mode Enter routes to OpenPreview.
+        // List-mode → (Right) routes to OpenPreview (Enter is reserved for Resume).
         assert_eq!(
             session_browser_key_command(
                 &ui.browser,
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
             ),
             Some(TuiCommand::SessionBrowser(
                 SessionBrowserCommand::OpenPreview
@@ -13157,6 +13211,50 @@ runtime = "fake"
         apply_session_browser_command(&mut ui, SessionBrowserCommand::Back);
         assert_eq!(ui.browser.mode, BrowserMode::List);
         assert_eq!(ui.browser.preview_session_id, None);
+    }
+
+    #[test]
+    fn enter_resumes_selected_session_from_list_and_preview() {
+        let mut browser = SessionBrowserState {
+            visible: true,
+            summaries: vec![browser_summary("first"), browser_summary("second")],
+            selection_index: 1,
+            ..SessionBrowserState::default()
+        };
+
+        // List mode: Enter resumes the highlighted row.
+        assert_eq!(
+            session_browser_key_command(
+                &browser,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Resume(
+                "id-second".to_string()
+            )))
+        );
+
+        // Preview mode: Enter resumes the previewed session.
+        browser.mode = BrowserMode::Preview;
+        browser.preview_session_id = Some("id-first".to_string());
+        assert_eq!(
+            session_browser_key_command(
+                &browser,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Resume(
+                "id-first".to_string()
+            )))
+        );
+
+        // Empty (filtered-out) list: Enter is a no-op, not a resume of nothing.
+        let empty = SessionBrowserState {
+            visible: true,
+            ..SessionBrowserState::default()
+        };
+        assert_eq!(
+            session_browser_key_command(&empty, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]

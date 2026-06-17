@@ -17,8 +17,9 @@ use crate::governance::{
     GOVERNANCE_DECISION_RESOLVED,
 };
 use crate::history::{
-    dangling_run_from_events, derive_goal, HistoryEvent, HistoryStore, RunInterruptedPayload,
-    RUN_INTERRUPTED_KIND,
+    dangling_run_from_events, derive_goal, derive_outcome, hash_events_digest, HistoryEvent,
+    HistoryStore, RunInterruptedPayload, SessionResumedPayload, RUN_INTERRUPTED_KIND,
+    SESSION_RESUMED_KIND,
 };
 use crate::hooks::{
     normalize, public_name_for_kind, try_dispatch, ActorCtx, DroppedHookCounter, HookDispatch,
@@ -367,6 +368,10 @@ pub enum AppEvent {
     GovernanceDecisionResolved(String, GovernanceAnswer),
     FollowUpCancelled(String),
     FollowUpResumeRequested(String),
+    /// Resume the session with this id (session browser, ADR-002): the worker
+    /// reads it off-thread, `adopt_session`s it, and appends the resume
+    /// lifecycle events. Rejected while a run is active (one-active-run guard).
+    ResumeSession(String),
     InputCharacter(char),
     InputBackspace,
     RunInterruptRequested,
@@ -1004,6 +1009,13 @@ pub struct LoadedSession {
     /// `run_interrupted` event (ADR-002). Already filtered to non-terminal by
     /// [`dangling_run_from_events`], so a `Some` here always needs reconciling.
     dangling_run: Option<(String, RunState)>,
+    /// The session's end-state before resume, recorded into `session_resumed`
+    /// (ADR-002): the dangling run's in-flight state, else the folded terminal
+    /// outcome. Captured by the resume flow before `adopt_session` consumes this.
+    prior_end_state: RunState,
+    /// A digest of the pre-resume log tail for tamper-evidence (ADR-007), recorded
+    /// into `session_resumed`. `None` for an empty log.
+    prior_tail_hash: Option<String>,
 }
 
 impl LoadedSession {
@@ -1025,10 +1037,19 @@ impl LoadedSession {
     /// while this cheap fold runs on the worker (ADR-003/006).
     pub fn from_history_and_events(history: HistoryStore, events: &[HistoryEvent]) -> Self {
         let session_id = history.session_id().to_string();
+        let dangling_run = dangling_run_from_events(events);
+        // Prior end-state: the dangling run's in-flight state if any, else the
+        // folded terminal outcome (ADR-002).
+        let prior_end_state = dangling_run
+            .as_ref()
+            .map(|(_, state)| state.clone())
+            .unwrap_or_else(|| derive_outcome(events));
         Self {
             projection: ChatProjection::rebuild(events),
             session_goal: derive_goal(events),
-            dangling_run: dangling_run_from_events(events),
+            prior_tail_hash: hash_events_digest(events),
+            prior_end_state,
+            dangling_run,
             session_id,
             history,
         }
@@ -1200,6 +1221,11 @@ impl App {
                 }
                 Ok(())
             }
+            AppEvent::ResumeSession(session_id) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resume_session(session_id).await
+            }
             AppEvent::InputCharacter(ch) => {
                 self.state.input.push(ch);
                 self.publish_state();
@@ -1251,11 +1277,12 @@ impl App {
     /// The worker thread owns `App`, so this swap is atomic from the UI's
     /// perspective regardless of the single broadcast (ADR-006).
     ///
-    /// Kept private per ADR-006 (the single, audited swap point). The production
-    /// caller — `AppEvent::ResumeSession` → off-thread load → `adopt_session` —
-    /// lands in task_11; until then it is exercised only by the adoption tests,
-    /// so the lib-target dead-code lint is suppressed (allow removed in task_11).
-    #[allow(dead_code)]
+    /// Kept private per ADR-006 (the single, audited swap point); the production
+    /// caller is [`resume_session`]. `prior_end_state` / `prior_tail_hash` are
+    /// the resume flow's to read off `loaded` *before* this consumes it, so they
+    /// are ignored here.
+    ///
+    /// [`resume_session`]: App::resume_session
     fn adopt_session(&mut self, loaded: LoadedSession) -> Result<()> {
         let LoadedSession {
             history,
@@ -1263,6 +1290,8 @@ impl App {
             session_id,
             session_goal,
             dangling_run,
+            prior_end_state: _,
+            prior_tail_hash: _,
         } = loaded;
 
         // Swap the durable store + folded transcript first, so the reconciling
@@ -1336,6 +1365,93 @@ impl App {
         self.sync_chat_items();
         self.publish_state();
         Ok(())
+    }
+
+    /// Resume the session `session_id` from the browser (ADR-002): read it
+    /// off-thread, adopt it on the worker, and append the resume lifecycle
+    /// events, landing `Idle` with the full prior transcript re-rendered so the
+    /// user can continue in the SAME durable log. No automatic re-execution of
+    /// the interrupted step (V1). A failed read degrades to a diagnostic rather
+    /// than crashing the worker.
+    async fn resume_session(&mut self, session_id: String) -> Result<()> {
+        // One-active-run guard (req): never swap the session out from under a
+        // live run. The browser is openable mid-run, so this can happen.
+        if self.state.active_run_id.is_some() {
+            self.record_diagnostic("Cannot resume a session while a run is active.")?;
+            return Ok(());
+        }
+
+        // Refresh git first so the resume boundary records the live HEAD/dirty
+        // and the drift baseline reflects where resume actually runs (ADR-007).
+        self.refresh_git_context().await;
+
+        // The heavy disk read (enumerate + read `events.jsonl`) runs off-thread;
+        // the cheap fold + swap run here on the worker (ADR-006). `LoadedSession`
+        // is `Send`, so it crosses the `spawn_blocking` boundary.
+        let root = self.config.working_directory.join(".atelier");
+        let load_id = session_id.clone();
+        let loaded = match tokio::task::spawn_blocking(move || LoadedSession::load(&root, &load_id))
+            .await
+        {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(err)) => {
+                self.record_diagnostic(format!("Failed to load session {session_id}: {err}"))?;
+                return Ok(());
+            }
+            Err(join_err) => {
+                self.record_diagnostic(format!("Failed to load session {session_id}: {join_err}"))?;
+                return Ok(());
+            }
+        };
+
+        // Capture the pre-resume context BEFORE `adopt_session` consumes `loaded`.
+        let prior_end_state = loaded.prior_end_state.clone();
+        let prior_tail_hash = loaded.prior_tail_hash.clone();
+
+        // Atomic swap: reconciles a dangling run (`run_interrupted`) and lands
+        // Idle, re-rendering the full prior transcript (ADR-002/006).
+        self.adopt_session(loaded)?;
+
+        // Append the tamper-evident resume boundary AFTER the swap, so it lands
+        // in the adopted log as the most recent event (ADR-002/007/008).
+        self.record_session_resumed(prior_end_state, prior_tail_hash)?;
+        Ok(())
+    }
+
+    /// Append the `session_resumed` boundary event capturing the resume context
+    /// (ADR-002/007/008). The approval mode recorded here is the current
+    /// effective mode; task_12 defaults resume to the cautious (`Normal`) mode.
+    fn record_session_resumed(
+        &mut self,
+        prior_end_state: RunState,
+        prior_tail_hash: Option<String>,
+    ) -> Result<()> {
+        let (head_sha, dirty) = self
+            .state
+            .git_context
+            .as_ref()
+            .map(|context| (context.head_sha.clone(), context.dirty))
+            .unwrap_or((None, false));
+        let approval_mode = serde_json::to_value(&self.config.approval_mode)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "normal".to_string());
+        let payload = SessionResumedPayload {
+            resumed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            cwd: self.config.working_directory.clone(),
+            head_sha,
+            dirty,
+            prior_end_state,
+            approval_mode,
+            prior_tail_hash,
+        };
+        self.record_event(
+            None,
+            None,
+            SESSION_RESUMED_KIND,
+            serde_json::to_value(payload)?,
+            "Session resumed.",
+        )
     }
 
     pub async fn submit_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
@@ -7965,6 +8081,315 @@ runtime = "fake"
                 .iter()
                 .any(|event| event == "stale event"),
             "stale events leaked across the swap"
+        );
+    }
+
+    // ── Resume flow (task_11) ──
+
+    fn session_resumed_payload(app: &App) -> SessionResumedPayload {
+        let events = app.history.read_events().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == SESSION_RESUMED_KIND)
+            .expect("a session_resumed event was appended");
+        serde_json::from_value(event.payload.clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn resume_appends_session_resumed_with_context() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b.clone()))
+            .await
+            .unwrap();
+
+        let resumed = session_resumed_payload(&app);
+        assert!(!resumed.resumed_at.is_empty(), "resumed_at recorded");
+        // The live working directory (canonicalized by config load on macOS, where
+        // tempdirs live under a `/private` symlink).
+        assert_eq!(
+            resumed.cwd, app.config.working_directory,
+            "cwd is the live working directory"
+        );
+        assert!(
+            resumed.head_sha.is_some(),
+            "a git workspace records a HEAD baseline"
+        );
+        assert!(
+            resumed.prior_tail_hash.is_some(),
+            "a non-empty prior log records a tamper-evidence digest (ADR-007)"
+        );
+        // Terminal prior run ⇒ prior_end_state is the folded outcome.
+        assert_eq!(resumed.prior_end_state, RunState::Completed);
+        assert_eq!(app.state().run_state, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn resume_dangling_appends_run_interrupted_then_session_resumed() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "work", "submitted_prompt": "work", "source": "fresh" }),
+                "work",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+            // dangling: no terminal event
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        // Both lifecycle events present, run_interrupted BEFORE session_resumed.
+        let interrupted_at = events
+            .iter()
+            .position(|event| event.kind == RUN_INTERRUPTED_KIND)
+            .expect("run_interrupted appended for the dangling run");
+        let resumed_at = events
+            .iter()
+            .position(|event| event.kind == SESSION_RESUMED_KIND)
+            .expect("session_resumed appended");
+        assert!(
+            interrupted_at < resumed_at,
+            "the dangling run is closed before the resume boundary"
+        );
+        assert_eq!(app.state().run_state, RunState::Idle);
+        // prior_end_state reflects the in-flight (non-terminal) run.
+        assert_eq!(
+            session_resumed_payload(&app).prior_end_state,
+            RunState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_terminal_session_appends_only_session_resumed() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "ok" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RUN_INTERRUPTED_KIND)
+                .count(),
+            0,
+            "a cleanly-terminal session is not reconciled"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == SESSION_RESUMED_KIND)
+                .count(),
+            1,
+            "exactly one resume boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_renders_full_prior_transcript() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "remembered prompt", "submitted_prompt": "remembered prompt", "source": "fresh" }),
+                "remembered prompt",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "finished the work" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        // The live transcript re-renders the prior thread plus a resume divider.
+        let transcript: String = app
+            .state()
+            .chat_items
+            .iter()
+            .map(chat_item_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("remembered prompt"),
+            "prior prompt re-rendered: {transcript}"
+        );
+        assert!(
+            transcript.to_lowercase().contains("resum"),
+            "a resume divider is rendered: {transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_is_rejected_while_a_run_is_active() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        let own_session = app.state().session_id.clone();
+        // Simulate an in-flight run (the one-active-run guard).
+        app.state.active_run_id = Some("live-run".into());
+
+        app.handle_event(AppEvent::ResumeSession(session_b.clone()))
+            .await
+            .unwrap();
+
+        // The guard refused: the session was NOT swapped and no resume boundary
+        // was written.
+        assert_eq!(app.state().session_id, own_session, "session not swapped");
+        assert_ne!(app.history.session_id(), session_b);
+        assert_eq!(
+            app.history
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == SESSION_RESUMED_KIND)
+                .count(),
+            0,
+            "no resume boundary written while a run is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_then_new_prompt_appends_to_the_same_log_and_drives_a_run() {
+        let dir = tempdir().unwrap();
+        // A session left dangling by a crash mid-run.
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "original work", "submitted_prompt": "original work", "source": "fresh" }),
+                "original work",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+
+        // Resume → both lifecycle events land in the SAME events.jsonl.
+        app.handle_event(AppEvent::ResumeSession(session_b.clone()))
+            .await
+            .unwrap();
+        assert_eq!(app.history.session_id(), session_b, "adopted B's store");
+        let after_resume = app.history.read_events().unwrap();
+        assert!(after_resume.iter().any(|e| e.kind == RUN_INTERRUPTED_KIND));
+        assert!(after_resume.iter().any(|e| e.kind == SESSION_RESUMED_KIND));
+        let resume_event_count = after_resume.len();
+
+        // A new prompt drives a fresh fake run that appends to the SAME log.
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(app.state().run_state, RunState::Completed);
+
+        let final_events = app.history.read_events().unwrap();
+        assert!(
+            final_events.len() > resume_event_count,
+            "the new run appended to the same log"
+        );
+        // The new run is distinct from the reconciled dangling one, completed in
+        // B's log.
+        let new_run = final_events
+            .iter()
+            .find(|event| {
+                event.kind == "prompt_submitted" && event.payload["prompt"] == "create a feature"
+            })
+            .and_then(|event| event.run_id.clone())
+            .expect("the new prompt started a run");
+        assert_ne!(new_run, "run-b", "a fresh run id, not the reconciled one");
+        assert!(
+            final_events.iter().any(|event| {
+                event.kind == "run_completed" && event.run_id.as_deref() == Some(new_run.as_str())
+            }),
+            "the new run completed in the adopted log"
         );
     }
 
