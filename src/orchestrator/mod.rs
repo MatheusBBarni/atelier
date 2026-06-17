@@ -226,11 +226,7 @@ pub struct AgentResult {
 pub enum RunStepResult {
     Agent { result: AgentResult },
     ParallelGroup { result: ParallelGroupResult },
-    // NOTE (task_03): a `Dag { result: ExecutionGraphResult }` arm is added here
-    // — the terminal aggregate for an `ExecutionGraph`, modeled on
-    // `ParallelGroupResult` and serialized into `execution_graph_completed`.
-    // task_02 deliberately adds only the decision-side `Dag` variant; the
-    // result-side variant lands with the event plumbing in task_03.
+    Dag { result: ExecutionGraphResult },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,6 +282,50 @@ pub struct ParallelFailedScope {
     pub agent: String,
     pub file_scope: ParallelFileScope,
     pub diagnostic: String,
+}
+
+/// The terminal aggregate of an execution-graph (DAG) run (ADR-004/005),
+/// modeled on [`ParallelGroupResult`] and serialized into the
+/// `execution_graph_completed` event. The scheduler (task_04) populates it; the
+/// projection (task_06) renders it. `skipped`/`failed` carry the `node_id`s the
+/// fail-closed admission terminalized without (or after a failed) run.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionGraphResult {
+    pub schema_version: u32,
+    pub graph_id: String,
+    pub run_id: String,
+    pub status: ExecutionGraphStatus,
+    pub summary: String,
+    pub node_results: Vec<NodeResultRef>,
+    pub counts: BTreeMap<String, u32>,
+    pub changed_files: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<String>,
+    pub started_at: String,
+    pub completed_at: String,
+}
+
+/// Terminal status of an execution graph, mirroring [`ParallelGroupStatus`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionGraphStatus {
+    Completed,
+    CompletedWithIssues,
+    Failed,
+    Cancelled,
+    LimitReached,
+}
+
+/// One graph node's result reference, mirroring [`ParallelChildResultRef`] with
+/// a durable `node_id` instead of a `step_id`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeResultRef {
+    pub node_id: String,
+    pub step_label: String,
+    pub agent: String,
+    pub file_scope: ParallelFileScope,
+    pub status: AgentResultStatus,
+    pub result_index: usize,
 }
 
 impl AgentResult {
@@ -361,7 +401,9 @@ impl OrchestratorDecision {
 pub fn agent_results(results: &[RunStepResult]) -> impl Iterator<Item = &AgentResult> {
     results.iter().flat_map(|result| match result {
         RunStepResult::Agent { result } => std::slice::from_ref(result),
-        RunStepResult::ParallelGroup { .. } => &[],
+        // Parallel groups and DAGs aggregate their own per-child/per-node
+        // results; neither contributes a top-level AgentResult here.
+        RunStepResult::ParallelGroup { .. } | RunStepResult::Dag { .. } => &[],
     })
 }
 
@@ -1993,6 +2035,44 @@ mod tests {
         let parsed = parse_orchestrator_decision(&wrapped).unwrap();
         assert_eq!(parsed, decision);
         validate_orchestrator_decision(&parsed, &config).unwrap();
+    }
+
+    #[test]
+    fn execution_graph_result_round_trips_via_run_step_result() {
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("completed".to_string(), 1u32);
+        counts.insert("skipped".to_string(), 1u32);
+        counts.insert("failed".to_string(), 1u32);
+        let result = RunStepResult::Dag {
+            result: ExecutionGraphResult {
+                schema_version: 1,
+                graph_id: "graph".to_string(),
+                run_id: "run".to_string(),
+                status: ExecutionGraphStatus::CompletedWithIssues,
+                summary: "one succeeded, one failed, one skipped".to_string(),
+                node_results: vec![NodeResultRef {
+                    node_id: "a".to_string(),
+                    step_label: "step a".to_string(),
+                    agent: "fixer".to_string(),
+                    file_scope: ParallelFileScope {
+                        write_files: vec!["src/a.rs".to_string()],
+                        read_roots: vec!["src".to_string()],
+                    },
+                    status: AgentResultStatus::Completed,
+                    result_index: 0,
+                }],
+                counts,
+                changed_files: vec!["src/a.rs".to_string()],
+                skipped: vec!["c".to_string()],
+                failed: vec!["b".to_string()],
+                started_at: "2026-06-17T00:00:00.000Z".to_string(),
+                completed_at: "2026-06-17T00:01:00.000Z".to_string(),
+            },
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["kind"], "dag");
+        let parsed: RunStepResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, result);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "DAG events, graph_id, and ExecutionGraphResult"
 type: backend
 complexity: medium
@@ -29,11 +29,18 @@ Add the durable event vocabulary for DAG runs — a serde-default `graph_id` on 
 </requirements>
 
 ## Subtasks
-- [ ] 3.1 Add the `graph_id` field and thread it through both serializers (`append_event` via the struct, `append_debug_event` hand-built JSON).
-- [ ] 3.2 Add `ExecutionGraphResult` and `RunStepResult::Dag`.
-- [ ] 3.3 Add the new event-kind constants/strings: `execution_graph_proposed`, `execution_graph_approved`, `execution_graph_rejected`, `node_pending|ready|running|succeeded|failed|skipped|cancelled`, `execution_graph_completed`.
-- [ ] 3.4 Add the recorder path that emits these with `graph_id` (+ `node_id` in payload for node events).
-- [ ] 3.5 Add unit tests for legacy deserialize, round-trip, and debug-event lockstep.
+- [x] 3.1 Add the `graph_id` field and thread it through both serializers (`append_event` via the struct + `new_with_graph` sibling constructor, `append_debug_event` hand-built JSON).
+- [x] 3.2 Add `ExecutionGraphResult` (+ `ExecutionGraphStatus`, `NodeResultRef`) and `RunStepResult::Dag`.
+- [x] 3.3 Add the new event-kind constants/strings in `history/mod.rs`: `execution_graph_proposed`, `execution_graph_approved`, `execution_graph_rejected`, `node_pending|ready|running|succeeded|failed|skipped|cancelled`, `execution_graph_completed`.
+- [x] 3.4 Add the `graph_id`-carrying recorder path (`record_event_with_graph` + `append_event_with_graph`, `#[allow(dead_code)]` until task_04 wires the emit sites).
+- [x] 3.5 Add unit tests for legacy deserialize, round-trip, debug-event lockstep, mixed-log parse, non-v1 reject, and full-sequence replay.
+
+> Compilation note: adding `graph_id` to `HistoryEvent` and `RunStepResult::Dag`
+> compiler-forced minimal additions in shared test helpers — `graph_id: None` in
+> the `HistoryEvent` struct literals (`app/chat/projection.rs`, `tui/mod.rs`,
+> history `event_at`) and a `Dag` arm in `fake.rs`' result-label match and the
+> orchestrator `agent_results` flat-map (both mirror the `ParallelGroup` arm).
+> `record_event_with_graph` is `#[allow(dead_code)]` until task_04 emits events.
 
 ## Implementation Details
 Changes span `src/history/mod.rs` (the `HistoryEvent` struct + constructors + `append_debug_event`) and `src/app/mod.rs` (the recorder funnel `record_event_with_group` and the new emit sites). `ExecutionGraphResult`/`RunStepResult::Dag` live in `src/orchestrator/mod.rs` alongside `ParallelGroupResult`. Most parallel events today use loose `json!{}` payload maps; the proposal/completed events SHOULD use the typed structs for serde-checked fields. See TechSpec "Data Models" and "Orchestrator Decision & Event Contract".
@@ -59,13 +66,13 @@ Changes span `src/history/mod.rs` (the `HistoryEvent` struct + constructors + `a
 
 ## Tests
 - Unit tests:
-  - [ ] A legacy JSONL event with no `graph_id` deserializes with `graph_id == None` (extends the existing `reads_legacy_jsonl_events_without_group_id` pattern).
-  - [ ] An event written with a `graph_id` round-trips through `append_event` and read-back.
-  - [ ] `append_debug_event` includes `graph_id` in its hand-built JSON (lockstep check).
-  - [ ] An `ExecutionGraphResult` serializes/deserializes via `RunStepResult::Dag`.
-  - [ ] `read_events_from_path` still rejects `schema_version != 1` (unchanged), and a mixed log of old `parallel_*` and new `node_*`/`execution_graph_*` events all parse.
+  - [x] A legacy JSONL event with no `graph_id` deserializes with `graph_id == None`. (`reads_legacy_jsonl_events_without_graph_id`)
+  - [x] An event written with a `graph_id` round-trips through `append_event` and read-back. (`graph_id_round_trips_through_append_and_read`)
+  - [x] `append_debug_event` includes `graph_id` in its hand-built JSON (lockstep check). (`append_debug_event_includes_graph_id_in_lockstep`)
+  - [x] An `ExecutionGraphResult` serializes/deserializes via `RunStepResult::Dag`. (`execution_graph_result_round_trips_via_run_step_result`)
+  - [x] `read_events_from_path` still rejects `schema_version != 1` (unchanged), and a mixed log of old `parallel_*` and new `node_*`/`execution_graph_*` events all parse. (`read_events_still_rejects_non_v1_schema`, `mixed_legacy_parallel_and_dag_events_all_parse`)
 - Integration tests:
-  - [ ] A recorded `execution_graph_proposed` + `node_*` + `execution_graph_completed` sequence replays cleanly through history read-back.
+  - [x] A recorded `execution_graph_proposed` + `node_*` + `execution_graph_completed` sequence replays cleanly through history read-back. (`dag_event_sequence_replays_through_read_back`)
 - Test coverage target: >=80%
 - All tests must pass
 

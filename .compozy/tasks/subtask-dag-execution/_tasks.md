@@ -6,7 +6,7 @@
 |---|-------|--------|------------|--------------|
 | 01 | Config execution_graph feature flag | completed | low | — |
 | 02 | DAG decision schema, types, validation, and prompt guidance | completed | high | task_01 |
-| 03 | DAG events, graph_id, and ExecutionGraphResult | pending | medium | task_02 |
+| 03 | DAG events, graph_id, and ExecutionGraphResult | completed | medium | task_02 |
 | 04 | Ready-set scheduler with fail-closed admission | pending | critical | task_02, task_03 |
 | 05 | Whole-plan approval gate (normal mode) | pending | high | task_03, task_04 |
 | 06 | Single evolving Plan chat projection | pending | high | task_03 |

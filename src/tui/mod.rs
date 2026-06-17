@@ -6843,6 +6843,7 @@ mod tests {
             session_id: "session".to_string(),
             run_id: Some("run".to_string()),
             group_id: None,
+            graph_id: None,
             step_id: None,
             timestamp: "2026-06-05T00:00:00.000Z".to_string(),
             kind: "prompt_submitted".to_string(),

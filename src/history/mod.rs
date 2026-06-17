@@ -17,6 +17,11 @@ pub struct HistoryEvent {
     pub run_id: Option<String>,
     #[serde(default)]
     pub group_id: Option<String>,
+    /// Groups every event of one execution-graph (DAG) run, mirroring `group_id`
+    /// for flat parallel groups (ADR-005). `#[serde(default)]` so legacy logs
+    /// without it still deserialize at `schema_version 1` (the DAG is additive).
+    #[serde(default)]
+    pub graph_id: Option<String>,
     pub step_id: Option<String>,
     pub timestamp: String,
     pub kind: String,
@@ -50,6 +55,34 @@ impl HistoryEvent {
             session_id: session_id.into(),
             run_id,
             group_id,
+            graph_id: None,
+            step_id,
+            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            kind: kind.into(),
+            payload,
+            payload_truncated: false,
+        }
+    }
+
+    /// Construct a graph-keyed event (ADR-005). The DAG sibling of
+    /// [`new_with_group`]: it sets `graph_id` and leaves `group_id` `None` so
+    /// orchestrator-altitude graph/node events are never mis-keyed through the
+    /// flat-group path. Node events carry their `node_id` inside `payload`.
+    pub fn new_with_graph(
+        session_id: impl Into<String>,
+        run_id: Option<String>,
+        graph_id: Option<String>,
+        step_id: Option<String>,
+        kind: impl Into<String>,
+        payload: Value,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            event_id: new_id(),
+            session_id: session_id.into(),
+            run_id,
+            group_id: None,
+            graph_id,
             step_id,
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             kind: kind.into(),
@@ -104,6 +137,22 @@ pub const SESSION_RESUMED_KIND: &str = "session_resumed";
 /// at the first state-mutating action after a drifted resume (ADR-004/007).
 /// Additive — no schema bump.
 pub const RESUME_DRIFT_ACK_KIND: &str = "resume_drift_acknowledged";
+
+/// Execution-graph (DAG) lifecycle event kinds (ADR-005). All additive at
+/// history `schema_version 1`: the scheduler (task_04) emits them through the
+/// `graph_id`-keyed recorder path and the projection (task_06) registers each
+/// one explicitly. The `node_*` kinds carry their `node_id` inside `payload`.
+pub const EXECUTION_GRAPH_PROPOSED_KIND: &str = "execution_graph_proposed";
+pub const EXECUTION_GRAPH_APPROVED_KIND: &str = "execution_graph_approved";
+pub const EXECUTION_GRAPH_REJECTED_KIND: &str = "execution_graph_rejected";
+pub const EXECUTION_GRAPH_COMPLETED_KIND: &str = "execution_graph_completed";
+pub const NODE_PENDING_KIND: &str = "node_pending";
+pub const NODE_READY_KIND: &str = "node_ready";
+pub const NODE_RUNNING_KIND: &str = "node_running";
+pub const NODE_SUCCEEDED_KIND: &str = "node_succeeded";
+pub const NODE_FAILED_KIND: &str = "node_failed";
+pub const NODE_SKIPPED_KIND: &str = "node_skipped";
+pub const NODE_CANCELLED_KIND: &str = "node_cancelled";
 
 /// Payload for a `run_interrupted` event — closes a dangling run found on resume
 /// (ADR-008). Emitted by task_11; folded by the existing run-summary projection
@@ -274,6 +323,7 @@ impl HistoryStore {
             "session_id": event.session_id,
             "run_id": event.run_id,
             "group_id": event.group_id,
+            "graph_id": event.graph_id,
             "step_id": event.step_id,
             "kind": event.kind,
             "payload": event.payload,
@@ -1372,6 +1422,7 @@ mod tests {
             session_id: "s".to_string(),
             run_id: None,
             group_id: None,
+            graph_id: None,
             step_id: None,
             timestamp: timestamp.to_string(),
             kind: kind.to_string(),
@@ -1472,6 +1523,159 @@ mod tests {
 
         assert_eq!(events[0].group_id, None);
         assert!(!events[0].payload_truncated);
+    }
+
+    // ── execution-graph (DAG) events + graph_id (task_03) ──
+
+    #[test]
+    fn reads_legacy_jsonl_events_without_graph_id() {
+        // A pre-DAG line (no graph_id column) deserializes with graph_id == None
+        // at schema_version 1 — the DAG is additive, no schema bump.
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let path = store.session_dir().join("events.jsonl");
+        fs::write(
+            &path,
+            r#"{"schema_version":1,"event_id":"event","session_id":"session","run_id":"run","group_id":null,"step_id":"step","timestamp":"2026-06-06T00:00:00.000Z","kind":"agent_result","payload":{}}"#,
+        )
+        .unwrap();
+
+        let events = read_events_from_path(&path).unwrap();
+        assert_eq!(events[0].graph_id, None);
+    }
+
+    #[test]
+    fn graph_id_round_trips_through_append_and_read() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let event = HistoryEvent::new_with_graph(
+            store.session_id().to_string(),
+            Some("run".to_string()),
+            Some("graph-1".to_string()),
+            None,
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            json!({ "graph_id": "graph-1", "nodes": [] }),
+        );
+        store.append_event(&event).unwrap();
+        let events = store.read_events().unwrap();
+        assert_eq!(events, vec![event]);
+        assert_eq!(events[0].graph_id.as_deref(), Some("graph-1"));
+        // new_with_graph keeps the group path clear (graph events aren't mis-keyed).
+        assert_eq!(events[0].group_id, None);
+    }
+
+    #[test]
+    fn append_debug_event_includes_graph_id_in_lockstep() {
+        // append_debug_event hand-builds its JSON; it must carry graph_id or the
+        // debug log silently drops it (the lockstep risk called out in the spec).
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let event = HistoryEvent::new_with_graph(
+            store.session_id().to_string(),
+            Some("run".to_string()),
+            Some("graph-7".to_string()),
+            None,
+            NODE_RUNNING_KIND,
+            json!({ "graph_id": "graph-7", "node_id": "a" }),
+        );
+        store.append_debug_event(&event).unwrap();
+
+        let debug = fs::read_to_string(store.root.join("debug.log")).unwrap();
+        let record: Value = serde_json::from_str(debug.trim()).unwrap();
+        assert_eq!(record["graph_id"], json!("graph-7"));
+        assert_eq!(record["kind"], json!(NODE_RUNNING_KIND));
+    }
+
+    #[test]
+    fn mixed_legacy_parallel_and_dag_events_all_parse() {
+        // Old parallel_* events and new node_*/execution_graph_* events coexist in
+        // one events.jsonl at schema_version 1.
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let session = store.session_id().to_string();
+        let legacy = HistoryEvent::new_with_group(
+            session.clone(),
+            Some("run".to_string()),
+            Some("group-1".to_string()),
+            None,
+            "parallel_group_started",
+            json!({ "group_id": "group-1" }),
+        );
+        let proposed = HistoryEvent::new_with_graph(
+            session.clone(),
+            Some("run".to_string()),
+            Some("graph-1".to_string()),
+            None,
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            json!({ "graph_id": "graph-1" }),
+        );
+        let node = HistoryEvent::new_with_graph(
+            session.clone(),
+            Some("run".to_string()),
+            Some("graph-1".to_string()),
+            None,
+            NODE_SUCCEEDED_KIND,
+            json!({ "graph_id": "graph-1", "node_id": "a" }),
+        );
+        store.append_event(&legacy).unwrap();
+        store.append_event(&proposed).unwrap();
+        store.append_event(&node).unwrap();
+
+        let events = store.read_events().unwrap();
+        assert_eq!(events, vec![legacy, proposed, node]);
+    }
+
+    #[test]
+    fn read_events_still_rejects_non_v1_schema() {
+        // The schema gate is unchanged by the DAG additions.
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let path = store.session_dir().join("events.jsonl");
+        fs::write(
+            &path,
+            r#"{"schema_version":2,"event_id":"e","session_id":"s","run_id":null,"step_id":null,"timestamp":"2026-06-06T00:00:00.000Z","kind":"node_running","payload":{}}"#,
+        )
+        .unwrap();
+        let err = read_events_from_path(&path).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported history schema_version 2"));
+    }
+
+    #[test]
+    fn dag_event_sequence_replays_through_read_back() {
+        // A full proposed → node_* → completed sequence replays cleanly, all
+        // grouped under one graph_id.
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let session = store.session_id().to_string();
+        let kinds = [
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            EXECUTION_GRAPH_APPROVED_KIND,
+            NODE_PENDING_KIND,
+            NODE_READY_KIND,
+            NODE_RUNNING_KIND,
+            NODE_SUCCEEDED_KIND,
+            EXECUTION_GRAPH_COMPLETED_KIND,
+        ];
+        for kind in kinds {
+            let event = HistoryEvent::new_with_graph(
+                session.clone(),
+                Some("run".to_string()),
+                Some("graph-9".to_string()),
+                None,
+                kind,
+                json!({ "graph_id": "graph-9" }),
+            );
+            store.append_event(&event).unwrap();
+        }
+
+        let events = store.read_events().unwrap();
+        let replayed: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(replayed, kinds);
+        assert!(events
+            .iter()
+            .all(|e| e.graph_id.as_deref() == Some("graph-9")));
     }
 
     #[test]

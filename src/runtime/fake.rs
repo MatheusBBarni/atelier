@@ -214,6 +214,7 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
         .map(|result| match result {
             crate::orchestrator::RunStepResult::Agent { result } => result.agent.as_str(),
             crate::orchestrator::RunStepResult::ParallelGroup { .. } => "parallel_group",
+            crate::orchestrator::RunStepResult::Dag { .. } => "dag",
         });
     let prompt = fake_control_text(request);
     if last_agent.is_none() && prompt.contains("parallel") {

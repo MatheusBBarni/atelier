@@ -3038,6 +3038,7 @@ mod tests {
             session_id: "session".to_string(),
             run_id: run_id.map(str::to_string),
             group_id: None,
+            graph_id: None,
             step_id: step_id.map(str::to_string),
             timestamp: "2026-06-05T00:00:00.000Z".to_string(),
             kind: kind.to_string(),

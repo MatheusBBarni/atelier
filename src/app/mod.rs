@@ -5202,6 +5202,56 @@ impl App {
         Ok(())
     }
 
+    /// Durably record a graph-keyed event and broadcast (ADR-005). The DAG
+    /// sibling of [`record_event_with_group`]: the scheduler (task_04) emits the
+    /// `execution_graph_*` / `node_*` lifecycle through here so graph events
+    /// carry `graph_id` and are never mis-keyed through the flat-group path.
+    #[allow(dead_code)] // wired to the scheduler's emit sites in task_04
+    fn record_event_with_graph(
+        &mut self,
+        run_id: Option<String>,
+        graph_id: Option<String>,
+        step_id: Option<String>,
+        kind: &str,
+        payload: serde_json::Value,
+        display: impl Into<String>,
+    ) -> Result<()> {
+        self.append_event_with_graph(run_id, graph_id, step_id, kind, payload, display)?;
+        self.publish_state();
+        Ok(())
+    }
+
+    /// Durably append a graph-keyed event and fold it into the projection
+    /// **without** broadcasting — the DAG sibling of [`append_event_with_group`].
+    #[allow(dead_code)] // wired to the scheduler's emit sites in task_04
+    fn append_event_with_graph(
+        &mut self,
+        run_id: Option<String>,
+        graph_id: Option<String>,
+        step_id: Option<String>,
+        kind: &str,
+        payload: serde_json::Value,
+        display: impl Into<String>,
+    ) -> Result<()> {
+        let event = HistoryEvent::new_with_graph(
+            self.history.session_id().to_string(),
+            run_id,
+            graph_id,
+            step_id,
+            kind,
+            payload,
+        );
+        self.history.append_event(&event)?;
+        self.dispatch_hooks_for_event(&event);
+        if self.debug_enabled {
+            self.history.append_debug_event(&event)?;
+        }
+        self.chat_projection.apply_history_event(&event);
+        self.sync_chat_items();
+        self.state.events.push(display.into());
+        Ok(())
+    }
+
     /// The event tap (ADR-003): resolve actor + normalize + match handlers +
     /// `try_send` to the off-thread dispatcher. Non-blocking and pure-read of
     /// `&self`; returns immediately when no sender is wired or the event is
