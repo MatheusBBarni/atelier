@@ -647,6 +647,21 @@ fn run_state_label(state: &RunState) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// The most recent short HEAD recorded in the log — the resume drift baseline
+/// (ADR-007). Folds for the last event carrying a non-empty `head_sha` payload
+/// field (recorded on `run_started` at run boundaries). `None` when no run
+/// recorded a HEAD (e.g. a non-git workspace).
+pub fn last_recorded_head_sha(events: &[HistoryEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        event
+            .payload
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string)
+    })
+}
+
 pub fn clean_sessions(working_directory: &Path) -> Result<Vec<PathBuf>> {
     let root = working_directory.join(".atelier");
     let targets = [root.join("sessions"), root.join("runs")];
@@ -1011,6 +1026,52 @@ mod tests {
         assert_eq!(by_id(a.session_id()).outcome, RunState::Completed);
         assert_eq!(by_id(b.session_id()).label, "second session goal");
         assert_eq!(by_id(b.session_id()).outcome, RunState::Failed);
+    }
+
+    // ── HEAD baseline fold (task_05) ──
+
+    #[test]
+    fn last_recorded_head_sha_returns_the_most_recent_non_empty() {
+        let head_a = HistoryEvent::new(
+            "s",
+            Some("r1".to_string()),
+            None,
+            "run_started",
+            json!({ "run_id": "r1", "head_sha": "aaa1111" }),
+        );
+        let head_b = HistoryEvent::new(
+            "s",
+            Some("r2".to_string()),
+            None,
+            "run_started",
+            json!({ "run_id": "r2", "head_sha": "bbb2222" }),
+        );
+        let no_head = HistoryEvent::new(
+            "s",
+            Some("r2".to_string()),
+            None,
+            "run_completed",
+            json!({ "summary": "done" }),
+        );
+        // Empty log → no baseline.
+        assert_eq!(last_recorded_head_sha(&[]), None);
+        // Most recent recorded HEAD wins; events without a head_sha are ignored.
+        assert_eq!(
+            last_recorded_head_sha(&[head_a.clone(), head_b, no_head]),
+            Some("bbb2222".to_string())
+        );
+        // A null head_sha (non-git run) is skipped, falling back to an earlier one.
+        let null_head = HistoryEvent::new(
+            "s",
+            Some("r3".to_string()),
+            None,
+            "run_started",
+            json!({ "run_id": "r3", "head_sha": null }),
+        );
+        assert_eq!(
+            last_recorded_head_sha(&[head_a, null_head]),
+            Some("aaa1111".to_string())
+        );
     }
 
     #[test]

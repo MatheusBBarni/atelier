@@ -1279,7 +1279,16 @@ impl App {
             Some(run_id.clone()),
             None,
             "run_started",
-            json!({ "run_id": run_id }),
+            json!({
+                "run_id": run_id,
+                // Resume drift baseline (ADR-007): the short HEAD as of the last
+                // git poll, recoverable later by folding the log.
+                "head_sha": self
+                    .state
+                    .git_context
+                    .as_ref()
+                    .and_then(|context| context.head_sha.clone()),
+            }),
             "Run started.",
         )?;
         if let Some(start) = workflow_start.as_ref() {
@@ -1723,7 +1732,16 @@ impl App {
             Some(run_id.clone()),
             None,
             "run_started",
-            json!({ "run_id": run_id }),
+            json!({
+                "run_id": run_id,
+                // Resume drift baseline (ADR-007): the short HEAD as of the last
+                // git poll, recoverable later by folding the log.
+                "head_sha": self
+                    .state
+                    .git_context
+                    .as_ref()
+                    .and_then(|context| context.head_sha.clone()),
+            }),
             "Run started.",
         )?;
         self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
@@ -10195,6 +10213,48 @@ prompt = "{reviewer_prompt}"
     }
 
     #[tokio::test]
+    async fn run_records_head_baseline_and_detects_external_commit_drift() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.refresh_git_context().await;
+        let stored_head = app
+            .state
+            .git_context
+            .as_ref()
+            .and_then(|context| context.head_sha.clone());
+        assert!(stored_head.is_some(), "a git repo yields a head_sha");
+
+        // Recording a run captures the HEAD baseline into the log (ADR-007).
+        app.submit_prompt("create a feature").await.unwrap();
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            crate::history::last_recorded_head_sha(&events),
+            stored_head,
+            "run_started records the head baseline, recoverable by folding"
+        );
+
+        // An external commit moves HEAD.
+        std::fs::write(dir.path().join("new.txt"), "x").unwrap();
+        run_git(dir.path(), &["add", "new.txt"]);
+        run_git(dir.path(), &["commit", "-m", "external"]);
+        let live_head = fetch_git_context(dir.path())
+            .await
+            .and_then(|context| context.head_sha);
+        assert_ne!(stored_head, live_head, "external commit moved HEAD");
+
+        // Drift: HEAD changed, same cwd.
+        let drift = git::detect_drift(
+            dir.path(),
+            stored_head.as_deref(),
+            dir.path(),
+            live_head.as_deref(),
+        );
+        assert!(drift.head_changed);
+        assert!(!drift.cwd_moved);
+    }
+
+    #[tokio::test]
     async fn set_git_context_publishes_only_on_change() {
         let dir = tempdir().unwrap();
         let mut app = App::new(fake_config(dir.path())).await.unwrap();
@@ -10205,6 +10265,8 @@ prompt = "{reviewer_prompt}"
         let context = GitContext {
             repo_name: "atelier".to_string(),
             branch: "main".to_string(),
+            head_sha: None,
+            dirty: false,
         };
         assert!(app.set_git_context(Some(context.clone())));
         assert!(receiver.has_changed().unwrap(), "change published");

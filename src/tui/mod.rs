@@ -12406,6 +12406,8 @@ runtime = "fake"
         let theme = TuiUiState::default().theme;
         let git = GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "main".to_string(),
         };
         let with = footer_text(&footer_line(&theme, Some(&git), &RunState::Idle, &[], 80));
@@ -12461,6 +12463,8 @@ runtime = "fake"
         let theme = TuiUiState::default().theme;
         let git = GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "feature/a-very-long-branch-name-that-will-not-fit".to_string(),
         };
         // At 40 cols the branch is shortened first while the run state stays.
@@ -12481,6 +12485,8 @@ runtime = "fake"
         let mut state = state_with_agent_roster("");
         state.git_context = Some(GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "main".to_string(),
         });
 
@@ -12506,6 +12512,8 @@ runtime = "fake"
         let mut state = state_with_input("", false);
         state.git_context = Some(GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "feat/one".to_string(),
         });
         let before = render_to_text(&state, 80, 24);
@@ -12513,6 +12521,8 @@ runtime = "fake"
 
         state.git_context = Some(GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "feat/two".to_string(),
         });
         let after = render_to_text(&state, 80, 24);
