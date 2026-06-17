@@ -120,7 +120,7 @@ pub struct HookPayload {
 }
 
 /// Effective hooks configuration after the config ladder (filled by task_02).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HooksConfig {
     pub handlers: Vec<HookHandler>,
     /// Optional notifier command for terminals/tmux that strip OSC (ADR-005).
@@ -129,7 +129,7 @@ pub struct HooksConfig {
 
 /// One configured handler: the public events it fires on (exact match), the
 /// single action to run, and how much payload it receives.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HookHandler {
     pub on: Vec<String>,
     pub action: HookAction,
@@ -146,7 +146,7 @@ impl HookHandler {
 
 /// Exactly one action per handler (ADR-004): the built-in notifier or a shell
 /// command.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HookAction {
     Notify(NotifyConfig),
     Command(String),

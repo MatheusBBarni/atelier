@@ -1,3 +1,7 @@
+use crate::hooks::{
+    internal_kind_for_public, HookAction, HookHandler, HooksConfig, NotifyConfig, PayloadDetail,
+    PUBLIC_EVENT_VOCABULARY,
+};
 use crate::keybindings::{
     self, key_action_from_name, parse_key, validate_overrides, KeybindingOverrides,
 };
@@ -436,6 +440,10 @@ pub struct EffectiveConfig {
     pub features: Features,
     pub ui: UiConfig,
     pub limits: Limits,
+    /// Validated lifecycle hooks (ADR-001, ADR-004), drawn only from user-scope
+    /// layers — a project-local `./atelier.toml`'s `[hooks]` is dropped so a
+    /// cloned repo cannot register shell commands. Empty when none configured.
+    pub hooks: HooksConfig,
     pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
     pub agents: BTreeMap<String, AgentProfile>,
@@ -447,6 +455,9 @@ pub struct EffectiveConfig {
     /// [keybindings]" notes plus soft-fail (unknown-action) warnings (ADR-004).
     /// Surfaced by `--doctor`/startup; never blocks a run.
     pub keybinding_warnings: Vec<String>,
+    /// Non-fatal hooks diagnostics: the trust-boundary "ignored local [hooks]"
+    /// note (ADR-001). Surfaced by `--doctor` (task_08); never blocks a run.
+    pub hooks_warnings: Vec<String>,
 }
 
 impl EffectiveConfig {
@@ -488,6 +499,9 @@ struct RawConfig {
     /// project-local config's `[keybindings]` is ignored with a warning
     /// (ADR-004). Parsed + validated in task_07.
     keybindings: Option<BTreeMap<String, BTreeMap<String, RawKeyBinding>>>,
+    /// `[hooks]` lifecycle handlers. Honored only from user-scope layers; a
+    /// project-local config's `[hooks]` is dropped (ADR-001 security posture).
+    hooks: Option<RawHooksConfig>,
 }
 
 /// A single `[keybindings]` entry: either a key string (`"ctrl+g"`) to rebind an
@@ -556,6 +570,62 @@ struct RawLimits {
     max_command_minutes: Option<Limit>,
     max_review_fix_cycles: Option<Limit>,
     max_parallel_agent_steps: Option<u32>,
+}
+
+/// Raw `[hooks]` section (ADR-004). `deny_unknown_fields` so a typo'd key under
+/// `[hooks]` or `[[hooks.handler]]` is a precise error rather than silent.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHooksConfig {
+    /// `[[hooks.handler]]` array — each is one `on` plus exactly one action.
+    handler: Option<Vec<RawHookHandler>>,
+    /// Notifier command used when the terminal/tmux strips OSC (ADR-005).
+    notify_fallback_command: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHookHandler {
+    /// One public event name, or a list of them (exact match).
+    on: RawHookEvents,
+    /// Built-in notifier: `notify = true`, or a `{ title, body }` table.
+    notify: Option<RawNotify>,
+    /// Shell command receiving the normalized payload JSON on stdin.
+    command: Option<String>,
+    /// `"metadata"` (default) or `"full"`.
+    payload: Option<PayloadDetail>,
+}
+
+/// `on` accepts a single public event name or a list of them.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum RawHookEvents {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl RawHookEvents {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            RawHookEvents::One(name) => vec![name],
+            RawHookEvents::Many(names) => names,
+        }
+    }
+}
+
+/// `notify = true` or a `[hooks.handler.notify]` table with title/body templates.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum RawNotify {
+    Enabled(bool),
+    Config(RawNotifyConfig),
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNotifyConfig {
+    title: Option<String>,
+    body: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -701,6 +771,10 @@ struct MergedConfig {
     features: Features,
     ui: UiConfig,
     limits: Limits,
+    /// Lifecycle hooks accumulated from user-scope layers only; a project-local
+    /// `[hooks]` is dropped before reaching here (ADR-001). Last user-scope
+    /// layer wins (whole-array replacement, not field merge).
+    hooks: HooksConfig,
     council: MergedCouncilConfig,
     runtimes: BTreeMap<String, MergedRuntimeConfig>,
     presets: BTreeMap<String, RawPresetDefinition>,
@@ -715,6 +789,9 @@ struct MergedConfig {
     /// [keybindings]" notes plus soft-fail (unknown-action) notes (ADR-004).
     /// Surfaced on `EffectiveConfig.keybinding_warnings`.
     keybinding_warnings: Vec<String>,
+    /// "ignored local [hooks]" diagnostics (ADR-001). Surfaced on
+    /// `EffectiveConfig.hooks_warnings`.
+    hooks_warnings: Vec<String>,
 }
 
 /// Canonical default system prompts for the six core structured-runtime agents.
@@ -997,6 +1074,7 @@ impl MergedConfig {
             features: Features::default(),
             ui: UiConfig::default(),
             limits: Limits::default(),
+            hooks: HooksConfig::default(),
             council: builtin_council_config(),
             runtimes,
             presets: BTreeMap::new(),
@@ -1004,6 +1082,7 @@ impl MergedConfig {
             agent_layers: Vec::new(),
             keybindings: KeybindingOverrides::new(),
             keybinding_warnings: Vec::new(),
+            hooks_warnings: Vec::new(),
         }
     }
 
@@ -1142,6 +1221,21 @@ impl MergedConfig {
                 ));
             } else {
                 self.apply_keybindings(keybindings, source_name)?;
+            }
+        }
+
+        // Trust boundary (ADR-001): hooks run shell commands, so they are
+        // honored only from user-scope layers. A project-local `./atelier.toml`'s
+        // `[hooks]` is dropped with a diagnostic — a cloned repo must not be able
+        // to register commands that run on the user's machine (RCE-on-clone).
+        if let Some(hooks) = raw.hooks {
+            if layer == ConfigLayer::Local {
+                self.hooks_warnings.push(format!(
+                    "ignored [hooks] in {source_name}: hooks are honored only from your home \
+                     config or an explicit --config, not a project-local config"
+                ));
+            } else {
+                self.hooks = build_hooks_config(hooks, source_name)?;
             }
         }
 
@@ -1680,11 +1774,13 @@ impl MergedConfig {
             features: self.features,
             ui: self.ui,
             limits: self.limits,
+            hooks: self.hooks,
             council,
             runtimes,
             agents,
             keybindings: self.keybindings,
             keybinding_warnings: self.keybinding_warnings,
+            hooks_warnings: self.hooks_warnings,
         })
     }
 
@@ -1967,6 +2063,74 @@ fn resolve_config_path(source_dir: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
+/// Validate and lower a raw `[hooks]` section into the effective [`HooksConfig`]
+/// (ADR-004). Rejects unknown public event names and any handler that does not
+/// declare exactly one action (`notify` XOR `command`). `source_name` names the
+/// originating file for precise diagnostics.
+fn build_hooks_config(raw: RawHooksConfig, source_name: &str) -> Result<HooksConfig> {
+    let mut handlers = Vec::new();
+    for raw_handler in raw.handler.unwrap_or_default() {
+        let on = raw_handler.on.into_vec();
+        if on.is_empty() {
+            bail!(
+                "invalid [[hooks.handler]] in {source_name}: `on` must name at least one public event"
+            );
+        }
+        for name in &on {
+            if internal_kind_for_public(name).is_none() {
+                bail!(
+                    "invalid [[hooks.handler]] in {source_name}: unknown public event `{name}`{}. \
+                     Known events: {}",
+                    did_you_mean(
+                        name,
+                        PUBLIC_EVENT_VOCABULARY.iter().map(|(public, _)| *public)
+                    ),
+                    known_public_events(),
+                );
+            }
+        }
+        // Exactly one action per handler: notify XOR command.
+        let notify = match raw_handler.notify {
+            Some(RawNotify::Enabled(true)) => Some(NotifyConfig::default()),
+            Some(RawNotify::Config(cfg)) => Some(NotifyConfig {
+                title: cfg.title,
+                body: cfg.body,
+            }),
+            Some(RawNotify::Enabled(false)) | None => None,
+        };
+        let action = match (notify, raw_handler.command) {
+            (Some(notify), None) => HookAction::Notify(notify),
+            (None, Some(command)) => HookAction::Command(command),
+            (Some(_), Some(_)) => bail!(
+                "invalid [[hooks.handler]] in {source_name}: a handler must declare exactly one \
+                 action, not both `notify` and `command`"
+            ),
+            (None, None) => bail!(
+                "invalid [[hooks.handler]] in {source_name}: a handler must declare exactly one \
+                 action (`notify` or `command`)"
+            ),
+        };
+        handlers.push(HookHandler {
+            on,
+            action,
+            payload: raw_handler.payload.unwrap_or_default(),
+        });
+    }
+    Ok(HooksConfig {
+        handlers,
+        notify_fallback_command: raw.notify_fallback_command,
+    })
+}
+
+/// Comma-joined list of public event names, for the "unknown event" diagnostic.
+fn known_public_events() -> String {
+    PUBLIC_EVENT_VOCABULARY
+        .iter()
+        .map(|(public, _)| *public)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn read_prompt_source(source: &InstructionSource, file_label: &str) -> Result<String> {
     match source {
         InstructionSource::Inline(value) => Ok(value.clone()),
@@ -2199,6 +2363,10 @@ pub(crate) struct PrintableConfig {
     pub(crate) approval: ApprovalConfig,
     pub(crate) ui: UiConfig,
     pub(crate) limits: Limits,
+    /// Configured lifecycle hooks; omitted entirely when none are set so the
+    /// `[hooks]` block only appears for users who configured it (task_02).
+    #[serde(skip_serializing_if = "PrintableHooks::is_empty")]
+    pub(crate) hooks: PrintableHooks,
     pub(crate) council: PrintableCouncilConfig,
     pub(crate) runtimes: BTreeMap<String, PrintableRuntime>,
     pub(crate) agents: BTreeMap<String, PrintableAgent>,
@@ -2206,6 +2374,34 @@ pub(crate) struct PrintableConfig {
     /// key`. Emitted in `--print-config` so the resolved bindings are visible.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) keybindings: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Printable projection of the effective `[hooks]` section. Field order matters
+/// for TOML: the scalar `notify_fallback_command` is emitted before the
+/// `[[hooks.handler]]` array-of-tables.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct PrintableHooks {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) notify_fallback_command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) handler: Vec<PrintableHookHandler>,
+}
+
+impl PrintableHooks {
+    fn is_empty(&self) -> bool {
+        self.notify_fallback_command.is_none() && self.handler.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PrintableHookHandler {
+    pub(crate) on: Vec<String>,
+    /// Action kind label: `notify` | `command`.
+    pub(crate) action: String,
+    /// The shell command, present only for a `command` action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) command: Option<String>,
+    pub(crate) payload: PayloadDetail,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2283,6 +2479,23 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
         approval: config.approval.clone(),
         ui: config.ui.clone(),
         limits: config.limits.clone(),
+        hooks: PrintableHooks {
+            notify_fallback_command: config.hooks.notify_fallback_command.clone(),
+            handler: config
+                .hooks
+                .handlers
+                .iter()
+                .map(|handler| PrintableHookHandler {
+                    on: handler.on.clone(),
+                    action: handler.action.kind_str().to_string(),
+                    command: match &handler.action {
+                        HookAction::Command(command) => Some(command.clone()),
+                        HookAction::Notify(_) => None,
+                    },
+                    payload: handler.payload,
+                })
+                .collect(),
+        },
         council: PrintableCouncilConfig {
             default_preset: config.council.default_preset.clone(),
             timeout_seconds: config.council.timeout_seconds,
@@ -2489,6 +2702,25 @@ parallel_step_groups = false
 # input-kill-to-end    = "ctrl+k"   # default: ctrl+k
 # scroll-top           = "home"     # default: home
 # input-kill-word-back = false       # unbind (example)
+
+# Optional lifecycle hooks (ADR-001/004). USER SCOPE ONLY: handlers are honored
+# from this home config or an explicit --config; a project-local ./atelier.toml
+# [hooks] is dropped (so a cloned repo can't run shell commands on your machine).
+# Each [[hooks.handler]] fires on one or more public events and runs exactly one
+# action: `notify = true` (terminal notification; works over SSH) XOR `command`
+# (a shell command that receives the normalized event JSON on stdin — never on
+# argv). `payload` is "metadata" (default) or "full". Public events: run_started,
+# step_started, action_requested, approval_required, clarification_required,
+# file_edited, run_completed, run_failed, run_limit_reached, run_interrupted.
+# Set notify_fallback_command (under [hooks]) for terminals/tmux that strip OSC.
+# [[hooks.handler]]
+# on = "approval_required"
+# notify = true
+#
+# [[hooks.handler]]
+# on = ["run_completed", "run_failed"]
+# command = "cat >> ~/atelier-audit.jsonl"
+# payload = "full"
 
 [runtimes.codex]
 type = "codex"
@@ -2784,6 +3016,171 @@ mod tests {
         );
         // A non-keybinding section in that same local file still merges unchanged.
         assert!(config.ui.hide_banner);
+    }
+
+    // ── hooks config through the ladder (task_02) ──
+
+    #[test]
+    fn hooks_handler_with_notify_parses() {
+        let config =
+            load_user_scope_config("[[hooks.handler]]\non = \"run_completed\"\nnotify = true\n")
+                .unwrap();
+        assert_eq!(config.hooks.handlers.len(), 1);
+        let handler = &config.hooks.handlers[0];
+        assert_eq!(handler.on, vec!["run_completed".to_string()]);
+        assert!(matches!(handler.action, HookAction::Notify(_)));
+        // Metadata is the per-handler default when `payload` is omitted.
+        assert_eq!(handler.payload, PayloadDetail::Metadata);
+        assert!(config.hooks_warnings.is_empty());
+    }
+
+    #[test]
+    fn hooks_on_list_parses_to_multi_event_handler() {
+        let config = load_user_scope_config(
+            "[[hooks.handler]]\non = [\"run_completed\", \"run_failed\"]\ncommand = \"audit\"\n",
+        )
+        .unwrap();
+        let handler = &config.hooks.handlers[0];
+        assert_eq!(
+            handler.on,
+            vec!["run_completed".to_string(), "run_failed".to_string()]
+        );
+        assert!(matches!(&handler.action, HookAction::Command(c) if c == "audit"));
+    }
+
+    #[test]
+    fn hooks_handler_with_both_actions_is_rejected() {
+        let err = load_user_scope_config(
+            "[[hooks.handler]]\non = \"run_completed\"\nnotify = true\ncommand = \"x\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("exactly one action"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn hooks_handler_without_an_action_is_rejected() {
+        let err =
+            load_user_scope_config("[[hooks.handler]]\non = \"run_completed\"\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("exactly one action"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn hooks_unknown_public_event_is_rejected() {
+        let err =
+            load_user_scope_config("[[hooks.handler]]\non = \"not_an_event\"\nnotify = true\n")
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown public event"), "got: {msg}");
+        assert!(msg.contains("not_an_event"), "got: {msg}");
+    }
+
+    #[test]
+    fn local_layer_hooks_are_dropped_while_other_local_overrides_apply() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("atelier.toml"),
+            "[[hooks.handler]]\non = \"run_completed\"\nnotify = true\n\n[ui]\nhide_banner = true\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+
+        // The project-local [hooks] is dropped (RCE-on-clone guard, ADR-001)...
+        assert!(config.hooks.handlers.is_empty());
+        assert!(
+            config
+                .hooks_warnings
+                .iter()
+                .any(|w| w.contains("ignored [hooks]") && w.contains("atelier.toml")),
+            "expected an ignored-local hooks warning, got: {:?}",
+            config.hooks_warnings
+        );
+        // ...but a non-hooks override in that same local file still applies.
+        assert!(config.ui.hide_banner);
+    }
+
+    #[test]
+    fn hooks_unknown_key_is_rejected_by_deny_unknown_fields() {
+        // An unknown key under [hooks] is rejected.
+        assert!(toml::from_str::<RawConfig>("[hooks]\nbogus = 1\n").is_err());
+        // As is an unknown key on a handler.
+        assert!(toml::from_str::<RawConfig>(
+            "[[hooks.handler]]\non = \"run_completed\"\nnotify = true\nbogus = 1\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hooks_notify_table_and_fallback_command_parse() {
+        let config = load_user_scope_config(
+            "[hooks]\nnotify_fallback_command = \"terminal-notifier -message\"\n\n\
+             [[hooks.handler]]\non = \"approval_required\"\n\
+             notify = { title = \"atelier\", body = \"needs you\" }\npayload = \"full\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.hooks.notify_fallback_command.as_deref(),
+            Some("terminal-notifier -message")
+        );
+        let handler = &config.hooks.handlers[0];
+        assert_eq!(handler.payload, PayloadDetail::Full);
+        match &handler.action {
+            HookAction::Notify(cfg) => {
+                assert_eq!(cfg.title.as_deref(), Some("atelier"));
+                assert_eq!(cfg.body.as_deref(), Some("needs you"));
+            }
+            other => panic!("expected a notify action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn print_config_renders_configured_hooks_section() {
+        let config = load_user_scope_config(
+            "[[hooks.handler]]\non = [\"run_completed\", \"run_failed\"]\n\
+             command = \"cat >> audit.jsonl\"\npayload = \"full\"\n",
+        )
+        .unwrap();
+        let rendered = to_redacted_toml(&config).unwrap();
+        assert!(
+            rendered.contains("[[hooks.handler]]"),
+            "missing hooks section:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("run_completed"),
+            "missing event name:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("cat >> audit.jsonl"),
+            "missing command:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn print_config_omits_hooks_when_none_configured() {
+        let config = load_user_scope_config("schema_version = 1\n").unwrap();
+        let rendered = to_redacted_toml(&config).unwrap();
+        assert!(
+            !rendered.contains("hooks"),
+            "did not expect a hooks section:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn starter_config_text_documents_hooks() {
+        let text = starter_config_text();
+        assert!(text.contains("[[hooks.handler]]"));
+        // The scaffold is commented so a fresh config registers no hooks, and it
+        // still parses cleanly through the ladder.
+        assert!(toml::from_str::<RawConfig>(&text).is_ok());
     }
 
     // ── keybinding validation + EffectiveConfig wiring (task_07) ──
