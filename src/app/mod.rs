@@ -138,6 +138,11 @@ pub struct AppState {
     pub show_first_approval_explainer: bool,
     pub pending_clarification: Option<PendingClarificationView>,
     pub pending_governance_decision: Option<PendingGovernanceDecisionView>,
+    /// A proposed execution graph awaiting whole-plan approval (normal mode,
+    /// ADR-005). Distinct from `pending_approval` (per-action) so the two never
+    /// collide; `None` outside the DAG plan-approval gate.
+    #[serde(default)]
+    pub pending_plan_approval: Option<PendingPlanApprovalView>,
     pub agents: Vec<AgentView>,
     /// Live-activity-first roster view-model, rebuilt on every publish (ADR-003).
     /// Empty until the roster builder (task 03) populates it.
@@ -271,6 +276,27 @@ pub struct PendingClarificationView {
     pub multi_select: bool,
 }
 
+/// The user-facing snapshot of a proposed execution graph awaiting whole-plan
+/// approval in `normal` mode (ADR-005). A **distinct** slot from
+/// `pending_approval` (per-action) so the two never collide; resolved through
+/// the shared accept/reject approval channel (accept is the recommended
+/// default). The full graph rendering lives in the Plan chat item (task_06);
+/// this view carries just the identity + a one-line summary.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingPlanApprovalView {
+    pub run_id: String,
+    pub graph_id: String,
+    /// Stable id derived from `graph_id` so an accept/reject re-keys identically.
+    pub question_id: String,
+    pub summary: String,
+}
+
+/// Deterministic clarification/approval question id for an execution graph's
+/// whole-plan approval gate, derived from its `graph_id` (ADR-005).
+pub(crate) fn plan_question_id(graph_id: &str) -> String {
+    format!("plan-approval:{graph_id}")
+}
+
 /// The user-facing snapshot of a pending governance decision, mirroring
 /// `PendingClarificationView`. The full decision payload lives in `view`; the
 /// `decision_id` is what the resolver matches an answer against (ADR-003).
@@ -300,6 +326,15 @@ pub enum ApprovalResolution {
     Deny,
     ApproveOnce,
     ApproveAndTrust,
+}
+
+/// The user's answer at the whole-plan approval gate (ADR-005): accept runs the
+/// proposed graph; reject carries an optional free-text reason that returns the
+/// plan to the orchestrator to re-propose.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanApprovalAnswer {
+    Accept,
+    Reject { reason: Option<String> },
 }
 
 impl ApprovalResolution {
@@ -379,6 +414,10 @@ pub enum AppEvent {
     /// (governance spine, ADR-003). The `decision_id` lets the resolver reject a
     /// stale answer that does not match the pending decision.
     GovernanceDecisionResolved(String, GovernanceAnswer),
+    /// Resolve the pending whole-plan approval `question_id` with `answer`
+    /// (DAG, ADR-005). The `question_id` (derived from the graph_id) lets the
+    /// resolver reject a stale answer that does not match the pending plan.
+    PlanApprovalResolved(String, PlanApprovalAnswer),
     FollowUpCancelled(String),
     FollowUpResumeRequested(String),
     /// Resume the session with this id (session browser, ADR-002): the worker
@@ -420,6 +459,7 @@ pub struct App {
     pending_approval: Option<PendingApproval>,
     pending_clarification: Option<PendingClarification>,
     pending_governance_decision: Option<PendingGovernanceDecision>,
+    pending_plan_approval: Option<PendingPlanApproval>,
     active_step: Option<ActiveStep>,
     active_steps: Vec<ActiveStep>,
     follow_up_queue: VecDeque<QueuedFollowUp>,
@@ -545,6 +585,17 @@ struct PendingClarification {
 #[derive(Clone, Debug)]
 struct PendingGovernanceDecision {
     run: RunDriveContext,
+}
+
+/// Captured state for a DAG whole-plan approval paused in `normal` mode
+/// (ADR-005): the run, the proposing decision, and the validated graph, all
+/// owned so accept can run the graph and reject can re-drive the orchestrator —
+/// the same pause/resume transport as [`PendingGovernanceDecision`].
+#[derive(Clone, Debug)]
+struct PendingPlanApproval {
+    run: RunDriveContext,
+    decision: crate::orchestrator::OrchestratorDecision,
+    graph: crate::orchestrator::ExecutionGraph,
 }
 
 #[derive(Clone, Debug)]
@@ -1132,6 +1183,7 @@ impl App {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: build_agent_views(&config, &availability),
             roster_rows: Vec::new(),
             // Branded welcome item present from the first frame (ADR-005);
@@ -1153,6 +1205,7 @@ impl App {
             pending_approval: None,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             active_step: None,
             active_steps: Vec::new(),
             follow_up_queue: VecDeque::new(),
@@ -1277,6 +1330,12 @@ impl App {
                 self.resolve_pending_governance_decision(&decision_id, answer)
                     .await
             }
+            AppEvent::PlanApprovalResolved(question_id, answer) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resolve_pending_plan_approval(&question_id, answer)
+                    .await
+            }
             AppEvent::FollowUpCancelled(id) => {
                 self.state.input.clear();
                 self.publish_state();
@@ -1379,6 +1438,7 @@ impl App {
         self.pending_approval = None;
         self.pending_clarification = None;
         self.pending_governance_decision = None;
+        self.pending_plan_approval = None;
         self.active_step = None;
         self.active_steps.clear();
         self.follow_up_queue.clear();
@@ -1411,6 +1471,7 @@ impl App {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
             queued_follow_ups: Vec::new(),
@@ -1989,6 +2050,7 @@ impl App {
             && self.pending_approval.is_none()
             && self.pending_clarification.is_none()
             && self.pending_governance_decision.is_none()
+            && self.pending_plan_approval.is_none()
     }
 
     /// React to the Run that just ended: drain queued follow-ups FIFO after a
@@ -2094,6 +2156,8 @@ impl App {
                     "run is waiting for clarification"
                 } else if self.pending_governance_decision.is_some() {
                     "run is waiting for a governance decision"
+                } else if self.pending_plan_approval.is_some() {
+                    "run is waiting for plan approval"
                 } else {
                     "run is waiting for user"
                 }
@@ -2609,9 +2673,11 @@ impl App {
             self.state.show_first_approval_explainer = false;
             self.state.pending_clarification = None;
             self.state.pending_governance_decision = None;
+            self.state.pending_plan_approval = None;
             self.pending_approval = None;
             self.pending_clarification = None;
             self.pending_governance_decision = None;
+            self.pending_plan_approval = None;
             self.active_step = None;
             self.active_steps.clear();
             self.sync_chat_items();
@@ -2803,11 +2869,10 @@ impl App {
                             .await
                     }
                     DecisionNextStep::Dag(graph) => {
-                        // Lower the validated graph onto the ready-set scheduler.
-                        match self.run_execution_graph(run, &decision, graph).await? {
-                            AgentStepOutcome::Completed => Ok(true),
-                            AgentStepOutcome::Paused | AgentStepOutcome::Stop => Ok(false),
-                        }
+                        // Propose the plan, then gate (normal) or auto-accept
+                        // (yolo) before the scheduler admits any node.
+                        self.handle_execution_graph_decision(run, &decision, graph)
+                            .await
                     }
                 }
             }
@@ -3260,6 +3325,181 @@ impl App {
             return Ok(AgentStepOutcome::Stop);
         }
         Ok(AgentStepOutcome::Completed)
+    }
+
+    /// Propose an execution graph and gate it before scheduling (ADR-005). In
+    /// `normal` mode the whole plan pauses on a binary accept/reject resolved
+    /// through the clarification answer channel (a distinct `pending_plan_approval`
+    /// slot, never the per-action approval slot); `yolo` auto-accepts and runs
+    /// immediately. A node is admitted only after acceptance, so fail-closed
+    /// behavior (task_04) holds in both modes.
+    async fn handle_execution_graph_decision(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+        graph: crate::orchestrator::ExecutionGraph,
+    ) -> Result<bool> {
+        self.emit_execution_graph_proposed(run, &graph, &decision.decision_id)?;
+        if self.config.approval_mode == ApprovalMode::Normal {
+            // Pause: capture the run + graph + decision so accept can run the
+            // graph and reject can re-drive the orchestrator (same transport as
+            // the governance gate). No node is admitted until the user accepts.
+            let question_id = plan_question_id(&graph.graph_id);
+            self.state.run_state = RunState::WaitingForUser;
+            self.pending_plan_approval = Some(PendingPlanApproval {
+                run: run.clone(),
+                decision: decision.clone(),
+                graph: graph.clone(),
+            });
+            self.state.pending_plan_approval = Some(PendingPlanApprovalView {
+                run_id: run.run_id.clone(),
+                graph_id: graph.graph_id.clone(),
+                question_id,
+                summary: format!(
+                    "Review the proposed plan: {} node(s), {} edge(s).",
+                    graph.nodes.len(),
+                    graph.edges.len()
+                ),
+            });
+            self.set_agent_status("orchestrator", "waiting_for_user");
+            self.publish_state();
+            Ok(false)
+        } else {
+            self.emit_execution_graph_approved(run, &graph, &decision.decision_id, true)?;
+            match self.run_execution_graph(run, decision, graph).await? {
+                AgentStepOutcome::Completed => Ok(true),
+                AgentStepOutcome::Paused | AgentStepOutcome::Stop => Ok(false),
+            }
+        }
+    }
+
+    /// Resolve a pending whole-plan approval (ADR-005). `Accept` records the
+    /// approval, runs the graph, and continues the orchestrator loop;
+    /// `Reject { reason }` records the rejection with its optional free-text
+    /// reason and returns the plan to the orchestrator to re-propose (not a hard
+    /// failure). Mirrors `resolve_pending_governance_decision`'s transport.
+    pub async fn resolve_pending_plan_approval(
+        &mut self,
+        question_id: &str,
+        answer: PlanApprovalAnswer,
+    ) -> Result<()> {
+        let expected = match self.state.pending_plan_approval.as_ref() {
+            Some(view) => view.question_id.clone(),
+            None => bail!("no plan approval is pending"),
+        };
+        if expected != question_id {
+            return Err(anyhow!(
+                "answer question id does not match pending plan approval (expected: {expected}, got: {question_id})"
+            ));
+        }
+        let Some(pending) = self.pending_plan_approval.take() else {
+            bail!("no plan approval is pending");
+        };
+        self.state.pending_plan_approval = None;
+        let mut run = pending.run;
+        let decision = pending.decision;
+        let graph = pending.graph;
+
+        match answer {
+            PlanApprovalAnswer::Accept => {
+                self.emit_execution_graph_approved(&run, &graph, &decision.decision_id, false)?;
+                self.state.run_state = RunState::Running;
+                self.publish_state();
+                match self.run_execution_graph(&mut run, &decision, graph).await? {
+                    AgentStepOutcome::Completed => self.drive_and_replay(run, None).await?,
+                    AgentStepOutcome::Paused | AgentStepOutcome::Stop => {
+                        self.react_to_run_end_for_queue().await?
+                    }
+                }
+            }
+            PlanApprovalAnswer::Reject { reason } => {
+                let reason_text = reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+                self.emit_execution_graph_rejected(
+                    &run,
+                    &graph,
+                    &decision.decision_id,
+                    reason_text,
+                )?;
+                if let Some(reason_text) = reason_text {
+                    run.prompt = format!(
+                        "{}\n\nThe user rejected the proposed plan: {reason_text}",
+                        run.prompt
+                    );
+                }
+                self.state.run_state = RunState::Planning;
+                self.publish_state();
+                self.drive_and_replay(run, None).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_execution_graph_proposed(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        decision_id: &str,
+    ) -> Result<()> {
+        let snapshot = execution_graph_snapshot(graph, &BTreeMap::new(), &BTreeSet::new());
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            crate::history::EXECUTION_GRAPH_PROPOSED_KIND,
+            json!({
+                "graph_id": graph.graph_id,
+                "decision_id": decision_id,
+                "reason": graph.reason,
+                "graph": snapshot,
+            }),
+            "Execution graph proposed.",
+        )
+    }
+
+    fn emit_execution_graph_approved(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        decision_id: &str,
+        auto_accepted: bool,
+    ) -> Result<()> {
+        let snapshot = execution_graph_snapshot(graph, &BTreeMap::new(), &BTreeSet::new());
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            crate::history::EXECUTION_GRAPH_APPROVED_KIND,
+            json!({
+                "graph_id": graph.graph_id,
+                "decision_id": decision_id,
+                "auto_accepted": auto_accepted,
+                "graph": snapshot,
+            }),
+            "Execution graph approved.",
+        )
+    }
+
+    fn emit_execution_graph_rejected(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        decision_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let snapshot = execution_graph_snapshot(graph, &BTreeMap::new(), &BTreeSet::new());
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            crate::history::EXECUTION_GRAPH_REJECTED_KIND,
+            json!({
+                "graph_id": graph.graph_id,
+                "decision_id": decision_id,
+                "reason": reason,
+                "graph": snapshot,
+            }),
+            "Execution graph rejected.",
+        )
     }
 
     /// Lower a validated [`ExecutionGraph`](crate::orchestrator::ExecutionGraph)
@@ -11378,6 +11618,271 @@ runtime = "fake"
         assert!(!events
             .iter()
             .any(|event| event.kind == "parallel_group_started"));
+    }
+
+    // ── whole-plan approval gate (task_05) ──
+
+    fn fake_dag_normal_config(dir: &std::path::Path) -> EffectiveConfig {
+        let config_path = dir.join("atelier.toml");
+        fs::write(
+            &config_path,
+            r#"
+approval_mode = "normal"
+
+[features]
+execution_graph = true
+
+[limits]
+max_parallel_agent_steps = 2
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn simple_dag_graph(graph_id: &str) -> crate::orchestrator::ExecutionGraph {
+        let node = |id: &str, label: &str| crate::orchestrator::ExecutionNode {
+            node_id: id.to_string(),
+            step_label: label.to_string(),
+            agent: "explorer".to_string(),
+            instruction: format!("inspect {label}"),
+            required_capabilities: vec![Capability::Read],
+            file_scope: ParallelFileScope {
+                write_files: Vec::new(),
+                read_roots: vec!["src".to_string()],
+            },
+        };
+        crate::orchestrator::ExecutionGraph {
+            graph_id: graph_id.to_string(),
+            reason: "two read-only nodes in sequence".to_string(),
+            nodes: vec![node("a", "alpha"), node("b", "beta")],
+            edges: vec![crate::orchestrator::ExecutionEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                kind: crate::orchestrator::ExecutionEdgeKind::DataDependency,
+            }],
+        }
+    }
+
+    fn dag_continue_decision_for(
+        graph: crate::orchestrator::ExecutionGraph,
+    ) -> crate::orchestrator::OrchestratorDecision {
+        crate::orchestrator::OrchestratorDecision {
+            schema_version: 3,
+            decision_id: "decision-dag".to_string(),
+            run_id: "run-dag".to_string(),
+            status: DecisionStatus::Continue,
+            plan: vec!["Run the graph.".to_string()],
+            next_agent: None,
+            next_step: Some(DecisionNextStep::Dag(graph)),
+            reason: "The work forms a dependency graph.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Graph completes.".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            multi_select: false,
+            final_summary: None,
+        }
+    }
+
+    #[test]
+    fn plan_question_id_is_deterministic_from_graph_id() {
+        assert_eq!(plan_question_id("graph-1"), plan_question_id("graph-1"));
+        assert_ne!(plan_question_id("graph-1"), plan_question_id("graph-2"));
+        assert!(plan_question_id("graph-1").contains("graph-1"));
+    }
+
+    #[tokio::test]
+    async fn dag_normal_mode_pauses_for_plan_approval_without_spawning() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_normal_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "graph work",
+            "graph work",
+            None,
+            None,
+            None,
+        );
+
+        let cont = app
+            .handle_orchestrator_decision(
+                &mut run,
+                dag_continue_decision_for(simple_dag_graph("graph-1")),
+            )
+            .await
+            .unwrap();
+
+        assert!(!cont, "normal mode pauses until the plan is accepted");
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        let plan = app
+            .state
+            .pending_plan_approval
+            .as_ref()
+            .expect("plan gate pending");
+        assert_eq!(plan.graph_id, "graph-1");
+        assert_eq!(plan.question_id, plan_question_id("graph-1"));
+        // The plan gate uses a distinct slot; the per-action slot is untouched.
+        assert!(app.state.pending_approval.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "execution_graph_proposed" && event.graph_id.as_deref() == Some("graph-1")
+        }));
+        // No node spawned, no approval yet.
+        assert!(!events.iter().any(|event| event.kind == "node_running"));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "execution_graph_approved"));
+    }
+
+    #[tokio::test]
+    async fn dag_yolo_mode_auto_accepts_and_runs() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "graph work",
+            "graph work",
+            None,
+            None,
+            None,
+        );
+
+        let cont = app
+            .handle_orchestrator_decision(
+                &mut run,
+                dag_continue_decision_for(simple_dag_graph("graph-1")),
+            )
+            .await
+            .unwrap();
+
+        assert!(cont);
+        assert!(
+            app.state.pending_plan_approval.is_none(),
+            "yolo never gates"
+        );
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "execution_graph_approved"
+                && event.payload["auto_accepted"] == json!(true)
+        }));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "execution_graph_completed"));
+        assert!(run
+            .previous_results
+            .iter()
+            .any(|result| matches!(result, RunStepResult::Dag { .. })));
+    }
+
+    #[tokio::test]
+    async fn dag_plan_reject_emits_rejected_with_reason_and_spawns_nothing() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_normal_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "what is the status?",
+            "what is the status?",
+            None,
+            None,
+            None,
+        );
+        app.handle_orchestrator_decision(
+            &mut run,
+            dag_continue_decision_for(simple_dag_graph("graph-1")),
+        )
+        .await
+        .unwrap();
+        assert!(app.state.pending_plan_approval.is_some());
+
+        app.resolve_pending_plan_approval(
+            &plan_question_id("graph-1"),
+            PlanApprovalAnswer::Reject {
+                reason: Some("too risky".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let rejected = events
+            .iter()
+            .find(|event| event.kind == "execution_graph_rejected")
+            .expect("rejected event recorded");
+        assert_eq!(rejected.payload["reason"], json!("too risky"));
+        // Rejection returns the plan to the orchestrator; no graph node ran.
+        assert!(!events.iter().any(|event| event.kind == "node_running"));
+        assert!(app.state.pending_plan_approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn dag_plan_accept_runs_the_graph() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_normal_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "graph work",
+            "graph work",
+            None,
+            None,
+            None,
+        );
+        app.handle_orchestrator_decision(
+            &mut run,
+            dag_continue_decision_for(simple_dag_graph("graph-1")),
+        )
+        .await
+        .unwrap();
+        assert!(app.state.pending_plan_approval.is_some());
+
+        app.resolve_pending_plan_approval(&plan_question_id("graph-1"), PlanApprovalAnswer::Accept)
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "execution_graph_approved"
+                && event.payload["auto_accepted"] == json!(false)
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "node_succeeded"
+                    && event.graph_id.as_deref() == Some("graph-1"))
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "execution_graph_completed"));
+        assert!(app.state.pending_plan_approval.is_none());
     }
 
     fn assert_no_workflow_run_start_events(events: &[HistoryEvent]) {

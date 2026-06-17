@@ -6513,6 +6513,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: vec![
                 AgentView {
                     runtime: "codex".to_string(),
@@ -6559,6 +6560,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -6590,6 +6592,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
                 name: "Fixer".to_string(),
@@ -6817,6 +6820,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -6924,6 +6928,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -6962,6 +6967,7 @@ mod tests {
             show_first_approval_explainer,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             // Empty so the pending-approval fallback render path is exercised.
@@ -9744,6 +9750,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
                 name: "Fixer".to_string(),
@@ -9867,6 +9874,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
