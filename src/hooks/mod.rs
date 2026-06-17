@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod dispatch;
+pub mod follow;
 pub mod notify;
 
 pub use dispatch::{
@@ -21,6 +22,7 @@ pub use dispatch::{
     HookLifecycleKind, HookLifecycleRecord, MatchedHandler, DEFAULT_HOOK_TIMEOUT,
     HOOK_CHANNEL_CAPACITY,
 };
+pub use follow::{follow_events, project_session_payloads, EventsCommand};
 pub use notify::{
     build_notifier_argv, notification_text, osc777_sequence, osc9_sequence, CommandNotifier,
     Notifier, NotifyRunner, OscNotifier,
