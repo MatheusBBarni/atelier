@@ -6,6 +6,7 @@ use super::{
 };
 use crate::app::{LiveStepStatus, LiveStepView, PendingApprovalView};
 use crate::history::HistoryEvent;
+use crate::hooks::HookLifecyclePayload;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -98,6 +99,8 @@ impl ChatProjection {
             | "follow_up_replay_resumed"
             | "follow_up_cancelled" => self.apply_follow_up_lifecycle(event),
             "blocker_reported" => self.apply_blocker(event),
+            "hook_started" => self.apply_hook_started(event),
+            "hook_completed" => self.apply_hook_completed(event),
             "config_viewed"
             | "session_goal_viewed"
             | "session_goal_set"
@@ -401,6 +404,86 @@ impl ChatProjection {
             summary: None,
             body: vec![ChatLineView::muted("waiting for runtime output")],
             details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    fn apply_hook_started(&mut self, event: &HistoryEvent) {
+        self.apply_hook_lifecycle(event, false);
+    }
+
+    fn apply_hook_completed(&mut self, event: &HistoryEvent) {
+        self.apply_hook_lifecycle(event, true);
+    }
+
+    /// Project a hook-lifecycle event (ADR-003) into one `HookInvocation` item
+    /// that evolves `hook_started` → `hook_completed`. Keyed by run + handler
+    /// index + public event so the started/completed pair collapses into a
+    /// single transcript item carrying action, status, duration, and exit code.
+    fn apply_hook_lifecycle(&mut self, event: &HistoryEvent, completed: bool) {
+        let Ok(payload) = serde_json::from_value::<HookLifecyclePayload>(event.payload.clone())
+        else {
+            return;
+        };
+        let Some(run_id) = event.run_id.clone() else {
+            return; // Hooks fire only on run-scoped events.
+        };
+        let key = ChatLifecycleKey::Hook {
+            run_id,
+            handler_index: payload.handler_index,
+            event: payload.event.clone(),
+        };
+        let mut body = vec![ChatLineView::muted(format!(
+            "handler #{}",
+            payload.handler_index
+        ))];
+        let (status, severity, title) = if completed {
+            let status_label = payload.status.as_deref().unwrap_or("done");
+            let failed = status_label != "ok";
+            if let Some(duration) = payload.duration_ms {
+                body.push(ChatLineView::muted(format!("duration: {duration} ms")));
+            }
+            if let Some(code) = payload.exit_code {
+                body.push(ChatLineView::muted(format!("exit code: {code}")));
+            }
+            if let Some(excerpt) = payload.stderr_excerpt.as_deref().filter(|e| !e.is_empty()) {
+                body.push(ChatLineView::error(excerpt.to_string()));
+            }
+            (
+                if failed {
+                    ChatItemStatus::Failed
+                } else {
+                    ChatItemStatus::Completed
+                },
+                if failed {
+                    ChatSeverity::Error
+                } else {
+                    ChatSeverity::Success
+                },
+                format!(
+                    "Hook {status_label}: {} on {}",
+                    payload.action, payload.event
+                ),
+            )
+        } else {
+            body.push(ChatLineView::muted("dispatching…"));
+            (
+                ChatItemStatus::Running,
+                ChatSeverity::Info,
+                format!("Hook running: {} on {}", payload.action, payload.event),
+            )
+        };
+        self.upsert(ItemInput {
+            lifecycle_key: Some(key),
+            kind: ChatItemKind::HookInvocation,
+            status,
+            severity,
+            title,
+            summary: Some(format!("{} · {}", payload.action, payload.event)),
+            body,
+            details: history_detail(event, "hook"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
             fallback_event_id: event.event_id.clone(),
@@ -2956,6 +3039,115 @@ mod tests {
             text.push_str(&line.text);
         }
         text
+    }
+
+    // ── hook transcript projection (task_06) ──
+
+    fn hook_lifecycle_payload(
+        handler_index: usize,
+        action: &str,
+        public_event: &str,
+        status: Option<&str>,
+        duration_ms: Option<u64>,
+        exit_code: Option<i32>,
+    ) -> Value {
+        serde_json::to_value(crate::hooks::HookLifecyclePayload {
+            handler_index,
+            action: action.to_string(),
+            event: public_event.to_string(),
+            status: status.map(str::to_string),
+            duration_ms,
+            exit_code,
+            stderr_excerpt: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn hook_started_creates_running_hook_invocation_item() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(0, "command", "run_completed", None, None, None),
+        ));
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::HookInvocation);
+        assert_eq!(item.status, ChatItemStatus::Running);
+        // Handler/action/event labels surface in the item.
+        let text = item_text(item);
+        assert!(text.contains("command"), "text: {text}");
+        assert!(text.contains("run_completed"), "text: {text}");
+        assert!(text.contains("handler #0"), "text: {text}");
+    }
+
+    #[test]
+    fn hook_completed_collapses_into_one_item_with_duration_and_exit_code() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(0, "command", "run_completed", None, None, None),
+        ));
+        projection.apply_history_event(&event(
+            "hook_completed",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(0, "command", "run_completed", Some("ok"), Some(12), Some(0)),
+        ));
+        // The two events collapse into a single, now-completed item.
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::HookInvocation);
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.severity, ChatSeverity::Success);
+        let text = item_text(item);
+        assert!(text.contains("12 ms"), "text: {text}");
+        assert!(text.contains("exit code: 0"), "text: {text}");
+    }
+
+    #[test]
+    fn hook_completed_with_nonzero_exit_renders_failed() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(1, "command", "run_failed", None, None, None),
+        ));
+        projection.apply_history_event(&event(
+            "hook_completed",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(1, "command", "run_failed", Some("error"), Some(5), Some(2)),
+        ));
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Failed);
+        assert_eq!(item.severity, ChatSeverity::Error);
+        assert!(item_text(item).contains("exit code: 2"));
+    }
+
+    #[test]
+    fn distinct_hook_handlers_do_not_collapse() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(0, "notify", "run_completed", None, None, None),
+        ));
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(1, "command", "run_completed", None, None, None),
+        ));
+        // Different handler indices ⇒ different lifecycle keys ⇒ two items.
+        assert_eq!(projection.items().len(), 2);
     }
 
     #[test]

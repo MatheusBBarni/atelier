@@ -4078,6 +4078,7 @@ fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
         ChatItemKind::SkillContext => "skills",
         ChatItemKind::AgentResult => "agent",
         ChatItemKind::RunSummary => "run",
+        ChatItemKind::HookInvocation => "hook",
         ChatItemKind::Welcome => "welcome",
     }
 }
@@ -12628,6 +12629,25 @@ runtime = "fake"
         assert_eq!(explorer_fg, theme.accent_for(0));
         assert_eq!(fixer_fg, theme.accent_for(1));
         assert_ne!(explorer_fg, fixer_fg);
+    }
+
+    #[test]
+    fn hook_invocation_item_renders_without_panicking() {
+        // The new exhaustive arm resolves...
+        assert_eq!(chat_kind_label(&ChatItemKind::HookInvocation), "hook");
+        // ...and a HookInvocation item renders through the transcript path without
+        // panicking (the render path is a pure function of chat items).
+        let mut state = state_with_input("", false);
+        state.chat_items = vec![chat_item(
+            "Hook running: command on run_completed",
+            ChatItemKind::HookInvocation,
+        )];
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut ui_state = TuiUiState::default();
+        terminal
+            .draw(|frame| render(frame, &state, &mut ui_state))
+            .unwrap();
     }
 
     #[test]

@@ -40,6 +40,10 @@ pub enum ChatItemKind {
     SkillContext,
     AgentResult,
     RunSummary,
+    /// A lifecycle-hook execution (ADR-003), evolving from `hook_started` →
+    /// `hook_completed` as a single transcript item: action, status, duration,
+    /// and exit code. Recorded for transparency; never re-enters dispatch.
+    HookInvocation,
     /// Synthetic branded welcome item, injected at startup (ADR-005). Not an
     /// orchestration event; carries no lifecycle key and never updates.
     Welcome,
@@ -150,6 +154,13 @@ pub enum ChatLifecycleKey {
     FollowUp {
         follow_up_id: String,
     },
+    /// One hook execution within a run (ADR-003): `hook_started` and
+    /// `hook_completed` for the same matched handler collapse into one item.
+    Hook {
+        run_id: String,
+        handler_index: usize,
+        event: String,
+    },
 }
 
 impl ChatLineView {
@@ -238,6 +249,11 @@ impl ChatLifecycleKey {
             ChatLifecycleKey::FollowUp { follow_up_id } => {
                 format!("chat:follow_up:{follow_up_id}")
             }
+            ChatLifecycleKey::Hook {
+                run_id,
+                handler_index,
+                event,
+            } => format!("chat:hook:{run_id}:{handler_index}:{event}"),
         }
     }
 }
@@ -258,6 +274,7 @@ impl ChatItemKind {
             ChatItemKind::SkillContext => "skill_context",
             ChatItemKind::AgentResult => "agent_result",
             ChatItemKind::RunSummary => "run_summary",
+            ChatItemKind::HookInvocation => "hook_invocation",
             ChatItemKind::Welcome => "welcome",
         }
     }
