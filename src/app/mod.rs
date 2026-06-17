@@ -2786,6 +2786,13 @@ impl App {
                         self.handle_parallel_group_decision(run, &decision, group)
                             .await
                     }
+                    DecisionNextStep::Dag(_graph) => {
+                        // task_04 lowers the graph onto the ready-set scheduler
+                        // (run_execution_graph). Until then a dag decision —
+                        // only reachable when features.execution_graph is on —
+                        // is rejected rather than silently dropped (fail-closed).
+                        bail!("execution graph scheduling is not yet implemented")
+                    }
                 }
             }
             DecisionStatus::WaitingForUser => {
