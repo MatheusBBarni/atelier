@@ -11,5 +11,5 @@
 | 05 | Event tap + App wiring + dispatcher spawn | completed | high | task_01, task_02, task_04 |
 | 06 | Hook transcript projection | completed | low | task_01 |
 | 07 | `atelier --events follow` CLI | completed | medium | task_01 |
-| 08 | Doctor hooks check | pending | low | task_02, task_04 |
+| 08 | Doctor hooks check | completed | low | task_02, task_04 |
 | 09 | Docs & recipes | pending | low | task_02, task_03, task_07, task_08 |

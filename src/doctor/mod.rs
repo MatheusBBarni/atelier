@@ -74,6 +74,7 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
     checks.push(tool_access_check(config));
     checks.push(approval_check(config));
     checks.push(governance_metrics_check(config));
+    checks.push(hooks_check(config));
 
     // Runtimes guaranteed to run on every prompt (V1: the orchestrator's). An
     // unavailable one is a hard error; everything else stays a warning (ADR-003).
@@ -754,6 +755,80 @@ fn governance_metrics_check(config: &EffectiveConfig) -> DoctorCheck {
     }
 }
 
+/// The PRD's local adoption signal (ADR-002): how many lifecycle-hook handlers
+/// are configured, when one last fired (from the local event log), and the
+/// dropped-event count. Neutral (`Skipped`) when no hooks are configured.
+///
+/// The dropped counter is process-local (task_04); a standalone `--doctor`
+/// invocation has no running dispatcher, so it reports `0` and the configured
+/// count is the primary signal.
+fn hooks_check(config: &EffectiveConfig) -> DoctorCheck {
+    let configured = config.hooks.handlers.len();
+    let root = config.working_directory.join(".atelier");
+    let last_fired = last_hook_fired(&read_all_session_events(&root));
+    let dropped_events = 0u64;
+
+    let context = serde_json::json!({
+        "configured_handlers": configured,
+        "dropped_events": dropped_events,
+        "dropped_events_note": "process-local; zero in a standalone --doctor invocation",
+        "last_fired": last_fired,
+    });
+
+    if configured == 0 {
+        return DoctorCheck {
+            id: "hooks".to_string(),
+            title: "Lifecycle Hooks".to_string(),
+            status: DoctorStatus::Skipped,
+            severity: DoctorSeverity::Info,
+            message: "no lifecycle hooks configured".to_string(),
+            remediation: Some(
+                "Add a [[hooks.handler]] to your home config (atelier --init-config scaffolds an \
+                 example), then preview what a hook receives with atelier --events follow."
+                    .to_string(),
+            ),
+            context: Some(context),
+        };
+    }
+
+    let last = last_fired
+        .as_ref()
+        .and_then(|fired| fired.get("time").and_then(Value::as_str))
+        .map(|time| format!("last fired {time}"))
+        .unwrap_or_else(|| "none fired yet".to_string());
+
+    DoctorCheck {
+        id: "hooks".to_string(),
+        title: "Lifecycle Hooks".to_string(),
+        status: DoctorStatus::Ok,
+        severity: DoctorSeverity::Info,
+        message: format!(
+            "{configured} hook handler(s) configured; {last}; {dropped_events} dropped event(s)"
+        ),
+        remediation: Some(
+            "Preview exactly what a hook receives on stdin with atelier --events follow."
+                .to_string(),
+        ),
+        context: Some(context),
+    }
+}
+
+/// The most recent `hook_completed` across the local event log, as
+/// `{ time, event, status }`, or `None` if no hook has fired.
+fn last_hook_fired(events: &[HistoryEvent]) -> Option<Value> {
+    events
+        .iter()
+        .filter(|event| event.kind == "hook_completed")
+        .max_by(|a, b| a.timestamp.cmp(&b.timestamp))
+        .map(|event| {
+            serde_json::json!({
+                "time": event.timestamp,
+                "event": event.payload.get("event").and_then(Value::as_str),
+                "status": event.payload.get("status").and_then(Value::as_str),
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,6 +1048,99 @@ mod tests {
         // The proxy label survives JSON rendering.
         let rendered = render_json(&report).unwrap();
         assert!(rendered.contains("trusted_outcome_rate_is_proxy"));
+    }
+
+    // ── lifecycle hooks check (task_08) ──
+
+    fn config_with_hooks(dir: &Path, hooks_toml: &str) -> EffectiveConfig {
+        let config_path = dir.join("home.toml");
+        fs::write(&config_path, hooks_toml).unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn hooks_check_reports_configured_count_and_dropped_field() {
+        let dir = tempdir().unwrap();
+        let config = config_with_hooks(
+            dir.path(),
+            "[[hooks.handler]]\non = \"run_completed\"\nnotify = true\n\n\
+             [[hooks.handler]]\non = \"run_failed\"\ncommand = \"audit\"\n",
+        );
+        let check = hooks_check(&config);
+        assert_eq!(check.id, "hooks");
+        assert_eq!(check.status, DoctorStatus::Ok);
+        let context = check.context.as_ref().unwrap();
+        assert_eq!(context["configured_handlers"], json!(2));
+        // The dropped-event count field is present.
+        assert_eq!(context["dropped_events"], json!(0));
+    }
+
+    #[test]
+    fn hooks_check_is_skipped_when_none_configured() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+        let check = hooks_check(&config);
+        // Neutral, not a failure, when no hooks are configured.
+        assert_eq!(check.status, DoctorStatus::Skipped);
+        assert_eq!(check.severity, DoctorSeverity::Info);
+        assert_eq!(
+            check.context.as_ref().unwrap()["configured_handlers"],
+            json!(0)
+        );
+    }
+
+    #[test]
+    fn last_hook_fired_picks_most_recent_completed() {
+        assert!(last_hook_fired(&[]).is_none());
+        let mut earlier = HistoryEvent::new(
+            "s",
+            Some("r".to_string()),
+            None,
+            "hook_completed",
+            json!({ "event": "run_completed", "status": "ok" }),
+        );
+        earlier.timestamp = "2026-06-17T00:00:01.000Z".to_string();
+        let mut later = HistoryEvent::new(
+            "s",
+            Some("r".to_string()),
+            None,
+            "hook_completed",
+            json!({ "event": "run_failed", "status": "error" }),
+        );
+        later.timestamp = "2026-06-17T00:00:02.000Z".to_string();
+        let fired = last_hook_fired(&[earlier, later]).unwrap();
+        assert_eq!(fired["event"], json!("run_failed"));
+        assert_eq!(fired["status"], json!("error"));
+    }
+
+    #[tokio::test]
+    async fn doctor_json_includes_hooks_check_with_configured_count() {
+        let dir = tempdir().unwrap();
+        let config = config_with_hooks(
+            dir.path(),
+            "[[hooks.handler]]\non = \"run_completed\"\nnotify = true\n",
+        );
+        let report = run_doctor(&config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "hooks")
+            .expect("hooks check present");
+        assert_eq!(
+            check.context.as_ref().unwrap()["configured_handlers"],
+            json!(1)
+        );
+        let rendered = render_json(&report).unwrap();
+        assert!(rendered.contains("\"id\": \"hooks\""));
+        assert!(rendered.contains("configured_handlers"));
     }
 
     #[tokio::test]
