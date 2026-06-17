@@ -9,17 +9,17 @@ use crate::actions::{
     RiskNote, RiskTier, TrustTarget,
 };
 use crate::config::{
-    AgentProfile, AgentPromptMetadata, Capability, CouncilExecutionMode, CouncilMemberProfile,
-    EffectiveConfig, Limit,
+    AgentProfile, AgentPromptMetadata, ApprovalMode, Capability, CouncilExecutionMode,
+    CouncilMemberProfile, EffectiveConfig, Limit,
 };
 use crate::governance::{
     GovernanceAnswer, GovernanceDecisionView, GovernanceKind, GOVERNANCE_DECISION_REQUESTED,
     GOVERNANCE_DECISION_RESOLVED,
 };
 use crate::history::{
-    dangling_run_from_events, derive_goal, derive_outcome, hash_events_digest, HistoryEvent,
-    HistoryStore, RunInterruptedPayload, SessionResumedPayload, RUN_INTERRUPTED_KIND,
-    SESSION_RESUMED_KIND,
+    dangling_run_from_events, derive_goal, derive_outcome, hash_events_digest,
+    last_recorded_head_sha, HistoryEvent, HistoryStore, RunInterruptedPayload,
+    SessionResumedPayload, RESUME_DRIFT_ACK_KIND, RUN_INTERRUPTED_KIND, SESSION_RESUMED_KIND,
 };
 use crate::hooks::{
     normalize, public_name_for_kind, try_dispatch, ActorCtx, DroppedHookCounter, HookDispatch,
@@ -243,6 +243,12 @@ pub struct PendingApprovalView {
     /// that option (e.g. for catastrophic actions).
     #[serde(default)]
     pub trust_target: Option<TrustTarget>,
+    /// Drift context for the first state-mutating action after a drifted resume
+    /// (ADR-004/007): the workspace moved or HEAD changed since this session
+    /// paused, so the user must acknowledge before this change. `None` on the
+    /// clean common path. Surfaced in the approval modal.
+    #[serde(default)]
+    pub drift_notice: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -429,6 +435,17 @@ pub struct App {
     /// Shared best-effort drop counter, incremented by the tap when the dispatch
     /// channel is full. Surfaced by `--doctor` (task_08).
     dropped_hooks: DroppedHookCounter,
+    /// Per-session approval-mode override for a resumed session (ADR-004):
+    /// `Some(Normal)` after resume forces an approval before any write/command,
+    /// independent of the global `config.approval_mode` (which may be `Yolo`).
+    /// `None` for a fresh session. Re-elevation to `Yolo` is a fresh explicit act;
+    /// prior approvals are never replayed (the trust store is cleared on adopt).
+    resume_approval_mode: Option<ApprovalMode>,
+    /// Armed when a resumed session detected workspace drift (cwd moved or HEAD
+    /// changed, ADR-004/007). Forces a positive acknowledgment on the FIRST
+    /// state-mutating action and is cleared once acknowledged. `None` on the clean
+    /// path. Reset by `adopt_session`, set by `resume_session`.
+    pending_drift_ack: Option<git::WorkspaceDrift>,
 }
 
 /// In-memory, session-scoped allow-list of exact trust targets (ADR-004). Granted
@@ -1016,6 +1033,10 @@ pub struct LoadedSession {
     /// A digest of the pre-resume log tail for tamper-evidence (ADR-007), recorded
     /// into `session_resumed`. `None` for an empty log.
     prior_tail_hash: Option<String>,
+    /// The session's last-recorded short HEAD (`last_recorded_head_sha`) — the
+    /// drift baseline (ADR-007). The resume flow compares it against the live HEAD
+    /// to detect a branch/rebase change. `None` for a non-git session.
+    stored_head_sha: Option<String>,
 }
 
 impl LoadedSession {
@@ -1048,6 +1069,7 @@ impl LoadedSession {
             projection: ChatProjection::rebuild(events),
             session_goal: derive_goal(events),
             prior_tail_hash: hash_events_digest(events),
+            stored_head_sha: last_recorded_head_sha(events),
             prior_end_state,
             dangling_run,
             session_id,
@@ -1114,6 +1136,8 @@ impl App {
             trust_store: TrustStore::default(),
             hook_sender: None,
             dropped_hooks: DroppedHookCounter::new(),
+            resume_approval_mode: None,
+            pending_drift_ack: None,
         };
         app.record_event(
             None,
@@ -1176,6 +1200,24 @@ impl App {
             json!({ "message": message.clone() }),
             format!("Error: {}", concise_diagnostic(&message)),
         )
+    }
+
+    /// The approval mode action decisions run under: a resumed session's cautious
+    /// override (ADR-004) when present, else the global config mode. Consulted
+    /// everywhere an `ActionExecutionContext` is built so a resumed `Yolo` session
+    /// still prompts before any write/command.
+    fn effective_approval_mode(&self) -> ApprovalMode {
+        self.resume_approval_mode
+            .clone()
+            .unwrap_or_else(|| self.config.approval_mode.clone())
+    }
+
+    /// The drift context to fold into the first mutating action's approval prompt
+    /// (ADR-004/007), or `None` when no drift gate is armed. Carried into the
+    /// `ActionExecutionContext` so the enforcement matrix forces the prompt and
+    /// the modal shows what moved.
+    fn drift_ack_context(&self) -> Option<String> {
+        self.pending_drift_ack.as_ref().map(drift_ack_message)
     }
 
     pub async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
@@ -1292,6 +1334,7 @@ impl App {
             dangling_run,
             prior_end_state: _,
             prior_tail_hash: _,
+            stored_head_sha: _,
         } = loaded;
 
         // Swap the durable store + folded transcript first, so the reconciling
@@ -1311,6 +1354,11 @@ impl App {
         self.follow_up_queue.clear();
         self.trust_store.clear();
         self.session_ended = false;
+        // Resume safety state (ADR-004) is reset here and (re)armed by
+        // `resume_session` after this swap, so an adoption that is not a resume
+        // (or a re-resume) never inherits a stale cautious-mode/drift gate.
+        self.resume_approval_mode = None;
+        self.pending_drift_ack = None;
 
         // Rebuild the session subset of `AppState` via a FULL struct literal (no
         // `..` spread): a future `AppState` field then forces a compile error
@@ -1408,9 +1456,36 @@ impl App {
         let prior_end_state = loaded.prior_end_state.clone();
         let prior_tail_hash = loaded.prior_tail_hash.clone();
 
+        // Drift baseline (ADR-007): the session's stored working dir + last HEAD
+        // vs the live workspace (git just refreshed above). A moved cwd or a
+        // changed HEAD is drift; a merely dirty tree is not (handled by
+        // `detect_drift`).
+        let stored_cwd = loaded.history.read_metadata()?.working_directory;
+        let stored_head = loaded.stored_head_sha.clone();
+        let live_head = self
+            .state
+            .git_context
+            .as_ref()
+            .and_then(|context| context.head_sha.clone());
+        let drift = git::detect_drift(
+            &stored_cwd,
+            stored_head.as_deref(),
+            &self.config.working_directory,
+            live_head.as_deref(),
+        );
+
         // Atomic swap: reconciles a dangling run (`run_interrupted`) and lands
         // Idle, re-rendering the full prior transcript (ADR-002/006).
         self.adopt_session(loaded)?;
+
+        // Re-consent to the cautious default and arm the first-mutation drift
+        // interlock (ADR-004). Set AFTER adopt (which resets both) and BEFORE the
+        // resume boundary, so `session_resumed.approval_mode` records the cautious
+        // override rather than the global config mode.
+        self.resume_approval_mode = Some(ApprovalMode::Normal);
+        if drift.any() {
+            self.pending_drift_ack = Some(drift);
+        }
 
         // Append the tamper-evident resume boundary AFTER the swap, so it lands
         // in the adopted log as the most recent event (ADR-002/007/008).
@@ -1432,7 +1507,7 @@ impl App {
             .as_ref()
             .map(|context| (context.head_sha.clone(), context.dirty))
             .unwrap_or((None, false));
-        let approval_mode = serde_json::to_value(&self.config.approval_mode)
+        let approval_mode = serde_json::to_value(self.effective_approval_mode())
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
             .unwrap_or_else(|| "normal".to_string());
@@ -1451,6 +1526,31 @@ impl App {
             SESSION_RESUMED_KIND,
             serde_json::to_value(payload)?,
             "Session resumed.",
+        )
+    }
+
+    /// On approving the first state-mutating action after a drifted resume,
+    /// record the acknowledgment and disarm the gate so later mutations run under
+    /// the normal cautious approval without re-prompting for drift (ADR-004). A
+    /// no-op when no gate is armed or the action is read-only (which never holds
+    /// the gate). Called from both the serial and parallel approve paths.
+    fn acknowledge_resume_drift(&mut self, action_request: &ActionRequest) -> Result<()> {
+        if !crate::actions::is_mutating_kind(&action_request.kind) {
+            return Ok(());
+        }
+        let Some(drift) = self.pending_drift_ack.take() else {
+            return Ok(());
+        };
+        self.record_event(
+            self.state.active_run_id.clone(),
+            Some(action_request.step_id.clone()),
+            RESUME_DRIFT_ACK_KIND,
+            json!({
+                "cwd_moved": drift.cwd_moved,
+                "head_changed": drift.head_changed,
+                "action_id": action_request.action_id.clone(),
+            }),
+            "Resume drift acknowledged before the first change.",
         )
     }
 
@@ -2218,6 +2318,9 @@ impl App {
             // the re-run runs it even when catastrophic or floor=Enforce (which
             // would otherwise re-prompt).
             pending.context.pre_approved = true;
+            // Approving the first mutating action after a drifted resume is the
+            // drift acknowledgment (ADR-004): record it and disarm the gate.
+            self.acknowledge_resume_drift(&pending.action_request)?;
             self.record_command_started_if_executable(
                 &pending.run.run_id,
                 &pending.step_id,
@@ -3253,13 +3356,14 @@ impl App {
         let context = ActionExecutionContext {
             working_directory: self.config.working_directory.clone(),
             workspace: self.config.workspace.clone(),
-            approval_mode: self.config.approval_mode.clone(),
+            approval_mode: self.effective_approval_mode(),
             command_timeout: command_timeout(&self.config.limits.max_command_minutes),
             user_prompt: Some(run.prompt.clone()),
             action_scope: crate::actions::ActionScope::ParallelFileScope(child.file_scope.clone()),
             floor: self.config.approval.floor,
             trusted_targets: self.trust_store.snapshot(),
             pre_approved: false,
+            drift_ack: self.drift_ack_context(),
         };
         self.record_command_started_if_executable_with_group(
             &run.run_id,
@@ -3419,6 +3523,8 @@ impl App {
             // Pre-approve the re-run so catastrophic / floor=Enforce actions execute
             // instead of re-prompting (mirrors the serial path).
             pending.context.pre_approved = true;
+            // First-mutation drift acknowledgment, mirroring the serial path (ADR-004).
+            self.acknowledge_resume_drift(&pending.action_request)?;
             self.record_command_started_if_executable_with_group(
                 &pending.run_id,
                 Some(&pending.group_id),
@@ -4792,13 +4898,14 @@ impl App {
                     let context = ActionExecutionContext {
                         working_directory: self.config.working_directory.clone(),
                         workspace: self.config.workspace.clone(),
-                        approval_mode: self.config.approval_mode.clone(),
+                        approval_mode: self.effective_approval_mode(),
                         command_timeout: command_timeout(&self.config.limits.max_command_minutes),
                         user_prompt: Some(run.prompt.clone()),
                         action_scope: crate::actions::ActionScope::Unrestricted,
                         floor: self.config.approval.floor,
                         trusted_targets: self.trust_store.snapshot(),
                         pre_approved: false,
+                        drift_ack: self.drift_ack_context(),
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -6863,6 +6970,28 @@ fn capped_preview(text: &str) -> String {
     format!("{truncated}\n… (truncated)")
 }
 
+/// Human-readable drift context for the first-mutation approval prompt and the
+/// `ActionExecutionContext` gate (ADR-004/007). Names the concrete drift modes
+/// (moved cwd, changed HEAD) without surfacing the dirty flag (never a trigger).
+fn drift_ack_message(drift: &git::WorkspaceDrift) -> String {
+    let mut reasons = Vec::new();
+    if drift.cwd_moved {
+        reasons.push("the working directory moved");
+    }
+    if drift.head_changed {
+        reasons.push("the git HEAD changed");
+    }
+    let what = if reasons.is_empty() {
+        "the workspace changed".to_string()
+    } else {
+        reasons.join(" and ")
+    };
+    format!(
+        "Workspace drift since this session paused: {what}. Verify you are on the \
+         intended tree before this first change."
+    )
+}
+
 /// Build the rich `PendingApprovalView` for the modal (ADR-003). Risk fields are
 /// derived from `assess_risk` (the same pure assessment the gate used), with the
 /// command/diff previews capped before they enter `AppState`.
@@ -6892,6 +7021,13 @@ fn build_pending_approval_view(
         Some(TrustTarget::WritePath(path)) => vec![path.display().to_string()],
         _ => Vec::new(),
     };
+    // Fold the drift context into the prompt only for the mutating action the
+    // interlock actually gates (ADR-004); a read-only action under the same armed
+    // gate shows no drift notice.
+    let drift_notice = context
+        .drift_ack
+        .clone()
+        .filter(|_| crate::actions::is_mutating_kind(&request.kind));
     PendingApprovalView {
         run_id,
         group_id,
@@ -6909,6 +7045,7 @@ fn build_pending_approval_view(
         boundary_crossed: None,
         reversible: None,
         trust_target: risk.target,
+        drift_notice,
     }
 }
 
@@ -8013,6 +8150,11 @@ runtime = "fake"
         app.trust_store
             .grant(TrustTarget::Command("rm -rf /".into()));
         app.session_ended = true;
+        app.resume_approval_mode = Some(ApprovalMode::Normal);
+        app.pending_drift_ack = Some(git::WorkspaceDrift {
+            cwd_moved: true,
+            head_changed: true,
+        });
         // `pending_approval` (App) is omitted: a PendingApproval needs a full
         // PausedStep + RuntimeRequest + ActionExecutionContext. Its reset is the
         // explicit `self.pending_approval = None` in adopt_session, asserted below.
@@ -8061,6 +8203,14 @@ runtime = "fake"
         );
         assert!(app.trust_store.is_empty(), "trust_store not cleared");
         assert!(!app.session_ended, "session_ended not reset");
+        assert!(
+            app.resume_approval_mode.is_none(),
+            "resume_approval_mode not reset"
+        );
+        assert!(
+            app.pending_drift_ack.is_none(),
+            "pending_drift_ack not reset"
+        );
 
         // ── AppState session subset reset / replaced ───────────────────────
         assert_eq!(app.state().session_id, session_b);
@@ -8393,6 +8543,319 @@ runtime = "fake"
         );
     }
 
+    // ── Resume safety: cautious approval + drift interlock (task_12) ──
+
+    fn short_head(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("git available");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn write_action(action_id: &str) -> ActionRequest {
+        ActionRequest {
+            schema_version: 1,
+            action_id: action_id.to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::WriteFile,
+            params: json!({ "path": "out.txt", "content": "x" }),
+        }
+    }
+
+    fn read_action(action_id: &str) -> ActionRequest {
+        ActionRequest {
+            schema_version: 1,
+            action_id: action_id.to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::ReadFile,
+            params: json!({ "path": "in.txt" }),
+        }
+    }
+
+    /// A `yolo` config so the resumed-session cautious override is observable
+    /// (the global default would not require approval on its own).
+    fn yolo_fake_config(dir: &Path) -> EffectiveConfig {
+        let config = fake_config(dir);
+        assert_eq!(
+            config.approval_mode,
+            ApprovalMode::Yolo,
+            "fake_config must default to Yolo for these tests"
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn resumed_session_forces_normal_approval_mode_over_yolo_config() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        // Before resume: the global Yolo config governs.
+        assert_eq!(app.effective_approval_mode(), ApprovalMode::Yolo);
+
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        // After resume: cautious Normal, regardless of the Yolo config, and the
+        // resume boundary records it.
+        assert_eq!(app.effective_approval_mode(), ApprovalMode::Normal);
+        assert_eq!(session_resumed_payload(&app).approval_mode, "normal");
+    }
+
+    #[tokio::test]
+    async fn resume_with_head_drift_arms_the_interlock() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        // The session last ran at a HEAD that differs from the live one (branch
+        // switch / rebase since it paused).
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b", "head_sha": "0000000" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        let drift = app
+            .pending_drift_ack
+            .as_ref()
+            .expect("HEAD drift arms the gate");
+        assert!(drift.head_changed);
+        assert!(!drift.cwd_moved, "same directory");
+    }
+
+    #[tokio::test]
+    async fn resume_without_drift_has_no_interlock() {
+        let dir = tempdir().unwrap();
+        // Non-git workspace: no HEAD on either side, same cwd ⇒ no drift.
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        assert!(
+            app.pending_drift_ack.is_none(),
+            "no drift ⇒ only the cautious approval applies, no extra gate"
+        );
+        // Still cautious, though.
+        assert_eq!(app.effective_approval_mode(), ApprovalMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn resume_dirty_tree_but_same_head_is_not_drift() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        let head = short_head(dir.path());
+        // The session last ran at the CURRENT HEAD; the tree is dirty (the
+        // untracked `.atelier/` dir at least), which must NOT count as drift.
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b", "head_sha": head }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        assert!(
+            app.pending_drift_ack.is_none(),
+            "a dirty tree at the same HEAD is not drift (ADR-004)"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledging_first_mutation_records_audit_and_clears_gate() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.pending_drift_ack = Some(git::WorkspaceDrift {
+            cwd_moved: false,
+            head_changed: true,
+        });
+
+        // A read-only action never satisfies the gate (the gate stays armed).
+        app.acknowledge_resume_drift(&read_action("r1")).unwrap();
+        assert!(
+            app.pending_drift_ack.is_some(),
+            "read-only action must not consume the drift gate"
+        );
+
+        // The first mutating action acknowledges: records the audit event + clears.
+        app.acknowledge_resume_drift(&write_action("w1")).unwrap();
+        assert!(app.pending_drift_ack.is_none(), "gate cleared after ack");
+        let events = app.history.read_events().unwrap();
+        let ack = events
+            .iter()
+            .find(|event| event.kind == RESUME_DRIFT_ACK_KIND)
+            .expect("drift acknowledgment recorded in the audit log");
+        assert_eq!(ack.payload["head_changed"], json!(true));
+        assert_eq!(ack.payload["action_id"], json!("w1"));
+
+        // A SECOND mutating action is not re-gated (gate already cleared) and adds
+        // no further ack event.
+        app.acknowledge_resume_drift(&write_action("w2")).unwrap();
+        assert_eq!(
+            app.history
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == RESUME_DRIFT_ACK_KIND)
+                .count(),
+            1,
+            "the interlock fires once, not on every later mutation"
+        );
+    }
+
+    #[test]
+    fn drift_notice_is_folded_into_mutating_approval_prompts_only() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut context = ActionExecutionContext::new(
+            config.working_directory.clone(),
+            config.workspace.clone(),
+            ApprovalMode::Normal,
+        );
+        context.drift_ack = Some("HEAD changed since this session paused".to_string());
+
+        // A mutating action's prompt carries the drift context.
+        let write_view = build_pending_approval_view(
+            "run".to_string(),
+            None,
+            "step".to_string(),
+            "fixer".to_string(),
+            "writes a file".to_string(),
+            None,
+            &write_action("w1"),
+            &context,
+        );
+        assert!(write_view.drift_notice.is_some());
+
+        // A read-only action under the same armed gate shows no drift notice.
+        let read_view = build_pending_approval_view(
+            "run".to_string(),
+            None,
+            "step".to_string(),
+            "explorer".to_string(),
+            "reads a file".to_string(),
+            None,
+            &read_action("r1"),
+            &context,
+        );
+        assert!(read_view.drift_notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_with_drift_requires_acknowledgment_before_first_write() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        // Session last ran at a different HEAD ⇒ drift on resume.
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b", "head_sha": "0000000" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+        assert!(app.pending_drift_ack.is_some(), "resume armed the gate");
+
+        // A new prompt that drives the fixer to a write pauses for approval, and the
+        // prompt carries the drift context — even though the global config is Yolo.
+        app.submit_prompt("approval action create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        let pending = app
+            .state
+            .pending_approval
+            .as_ref()
+            .expect("the first mutation paused for approval");
+        assert!(
+            pending.drift_notice.is_some(),
+            "the first write surfaces the drift context"
+        );
+
+        // Acknowledging (approving) records the audit event, clears the gate, and
+        // lets the run proceed.
+        app.handle_event(AppEvent::ApprovalAnswered(ApprovalResolution::ApproveOnce))
+            .await
+            .unwrap();
+        assert!(app.pending_drift_ack.is_none(), "ack cleared the gate");
+        assert!(
+            app.history
+                .read_events()
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == RESUME_DRIFT_ACK_KIND),
+            "the acknowledgment is auditable in the log"
+        );
+    }
+
     fn runtime_skill_context(display_name: &str, content: &str) -> SkillPromptContext {
         SkillPromptContext {
             loaded: vec![test_loaded_skill(display_name, content)],
@@ -8701,6 +9164,7 @@ runtime = "fake"
             floor: app.config.approval.floor,
             trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
             pre_approved: false,
+            drift_ack: None,
         };
         let rendered_context = ActionExecutionContext {
             user_prompt: Some(request.prompt.clone()),

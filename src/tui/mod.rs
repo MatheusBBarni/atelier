@@ -2273,6 +2273,17 @@ fn approval_modal_lines(
             Style::default().fg(theme.text_muted),
         ));
     }
+    // Drift interlock context for the first mutation after a drifted resume
+    // (ADR-004): surface it prominently so a reflexive approve cannot silently
+    // write to a moved tree.
+    if let Some(drift) = pending.drift_notice.as_deref() {
+        lines.push(Line::styled(
+            format!("⚠ {drift}"),
+            Style::default()
+                .fg(theme.status_warn)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // Key hint, adapted to the tier and trust availability.
     let trust_hint = if pending.trust_target.is_some() {

@@ -100,6 +100,10 @@ pub const RUN_INTERRUPTED_KIND: &str = "run_interrupted";
 /// Kind string for the tamper-evident resume-boundary lifecycle event
 /// (ADR-002/007/008). Additive — no schema bump.
 pub const SESSION_RESUMED_KIND: &str = "session_resumed";
+/// Kind string for the audit event recording acknowledgment of workspace drift
+/// at the first state-mutating action after a drifted resume (ADR-004/007).
+/// Additive — no schema bump.
+pub const RESUME_DRIFT_ACK_KIND: &str = "resume_drift_acknowledged";
 
 /// Payload for a `run_interrupted` event — closes a dangling run found on resume
 /// (ADR-008). Emitted by task_11; folded by the existing run-summary projection
