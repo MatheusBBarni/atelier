@@ -13,8 +13,14 @@ use crate::history::HistoryEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod dispatch;
 pub mod notify;
 
+pub use dispatch::{
+    hook_channel, run_hook_dispatcher, try_dispatch, DroppedHookCounter, HookDispatch,
+    HookLifecycleKind, HookLifecycleRecord, MatchedHandler, DEFAULT_HOOK_TIMEOUT,
+    HOOK_CHANNEL_CAPACITY,
+};
 pub use notify::{
     build_notifier_argv, notification_text, osc777_sequence, osc9_sequence, CommandNotifier,
     Notifier, NotifyRunner, OscNotifier,
