@@ -3183,6 +3183,85 @@ mod tests {
         assert!(toml::from_str::<RawConfig>(&text).is_ok());
     }
 
+    // ── documented hooks examples parse (task_09: docs must not drift) ──
+
+    /// Extract the bodies of all ```` ```toml ```` fenced blocks from `markdown`.
+    fn extract_toml_blocks(markdown: &str) -> Vec<String> {
+        let mut blocks = Vec::new();
+        let mut current: Option<String> = None;
+        for line in markdown.lines() {
+            match &mut current {
+                None if line.trim_start().starts_with("```toml") => current = Some(String::new()),
+                None => {}
+                Some(_) if line.trim_start().starts_with("```") => {
+                    blocks.push(current.take().unwrap());
+                }
+                Some(body) => {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
+        }
+        blocks
+    }
+
+    #[test]
+    fn documented_hooks_examples_parse_through_the_loader() {
+        // Every `[hooks]`/`[[hooks.handler]]` example in the README must load
+        // through the real config loader, so the docs can never drift from the
+        // schema (task_09).
+        let readme = include_str!("../../README.md");
+        let blocks: Vec<String> = extract_toml_blocks(readme)
+            .into_iter()
+            .filter(|block| block.contains("hooks"))
+            .collect();
+        assert!(
+            blocks.len() >= 4,
+            "expected >=4 documented hooks TOML examples, found {}",
+            blocks.len()
+        );
+        for block in &blocks {
+            let dir = tempdir().unwrap();
+            let config_path = dir.path().join("home.toml");
+            fs::write(&config_path, block).unwrap();
+            load_effective_config(ConfigLoadOptions {
+                working_directory: dir.path().to_path_buf(),
+                config_path: Some(config_path),
+            })
+            .unwrap_or_else(|err| {
+                panic!("README hooks example failed to load:\n{block}\nerror: {err:#}")
+            });
+        }
+    }
+
+    #[test]
+    fn documented_hooks_block_round_trips_through_home_config() {
+        // The three recipes + fallback combined into one home config load and
+        // produce the expected effective hooks.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("home.toml");
+        fs::write(
+            &config_path,
+            "[hooks]\nnotify_fallback_command = \"terminal-notifier -message\"\n\n\
+             [[hooks.handler]]\non = [\"approval_required\", \"run_completed\"]\nnotify = true\n\n\
+             [[hooks.handler]]\non = [\"run_completed\", \"run_failed\", \"file_edited\"]\n\
+             command = \"cat >> ~/atelier-audit.jsonl\"\npayload = \"full\"\n\n\
+             [[hooks.handler]]\non = \"run_failed\"\n\
+             command = \"curl -sS -X POST -d @- https://example.com/hook\"\n",
+        )
+        .unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap();
+        assert_eq!(config.hooks.handlers.len(), 3);
+        assert_eq!(
+            config.hooks.notify_fallback_command.as_deref(),
+            Some("terminal-notifier -message")
+        );
+    }
+
     // ── keybinding validation + EffectiveConfig wiring (task_07) ──
 
     #[test]
