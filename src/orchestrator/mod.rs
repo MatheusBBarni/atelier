@@ -22,6 +22,22 @@ pub enum RunState {
     LimitReached,
 }
 
+impl RunState {
+    /// Whether the run has reached a terminal state — finished, not in flight.
+    /// True for exactly `Completed`, `Failed`, `Interrupted`, and `LimitReached`;
+    /// false for `Idle`, `Planning`, `Running`, and `WaitingForUser`.
+    ///
+    /// The single expression of "is this run finished", consumed by session
+    /// outcome derivation (task_03) and dangling-run detection on resume
+    /// (task_10) (ADR-008). It does not change which states are terminal.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            RunState::Completed | RunState::Failed | RunState::Interrupted | RunState::LimitReached
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StepState {
@@ -785,6 +801,28 @@ mod tests {
     use super::*;
     use crate::config::{load_effective_config, ConfigLoadOptions};
     use tempfile::tempdir;
+
+    #[test]
+    fn run_state_is_terminal_truth_table() {
+        // Terminal: the run has finished.
+        for state in [
+            RunState::Completed,
+            RunState::Failed,
+            RunState::Interrupted,
+            RunState::LimitReached,
+        ] {
+            assert!(state.is_terminal(), "{state:?} should be terminal");
+        }
+        // In-flight: the run is not finished.
+        for state in [
+            RunState::Idle,
+            RunState::Planning,
+            RunState::Running,
+            RunState::WaitingForUser,
+        ] {
+            assert!(!state.is_terminal(), "{state:?} should not be terminal");
+        }
+    }
 
     fn parallel_enabled_config(max_parallel_agent_steps: u32) -> crate::config::EffectiveConfig {
         let dir = tempdir().unwrap();

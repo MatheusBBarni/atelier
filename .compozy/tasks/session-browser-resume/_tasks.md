@@ -6,7 +6,7 @@ Derived from `_techspec.md` (Build Order). Phase 1 (read-only browse + preview M
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Add `RunState::is_terminal()` helper | pending | low | — |
+| 01 | Add `RunState::is_terminal()` helper | completed | low | — |
 | 02 | `HistoryStore::open()` + self-healing metadata cache fields | pending | medium | — |
 | 03 | Session summaries (`SessionSummary` + `list_session_summaries`) | pending | medium | task_01, task_02 |
 | 04 | New lifecycle event kinds + projection fold handlers | pending | medium | — |
