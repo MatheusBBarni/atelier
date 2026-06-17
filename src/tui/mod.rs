@@ -6796,6 +6796,9 @@ mod tests {
             ],
             preset: Some("research".to_string()),
             warnings: vec!["enabled agents without model_fallbacks: explorer".to_string()],
+            approval_mode: crate::config::ApprovalMode::Yolo,
+            execution_graph_enabled: false,
+            max_parallel_agent_steps: 2,
         };
 
         let small = render_to_text(&state, 80, 24);
@@ -10220,6 +10223,9 @@ mod tests {
             sources: vec!["built-in defaults".to_string()],
             preset: None,
             warnings: Vec::new(),
+            approval_mode: crate::config::ApprovalMode::Yolo,
+            execution_graph_enabled: false,
+            max_parallel_agent_steps: 2,
         }
     }
 

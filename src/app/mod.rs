@@ -221,6 +221,18 @@ pub struct ConfigStatusView {
     pub sources: Vec<String>,
     pub preset: Option<String>,
     pub warnings: Vec<String>,
+    /// The resolved approval posture (ADR-005), surfaced in `/config` so the
+    /// gating mode is discoverable in-app. `#[serde(default)]` keeps older
+    /// `config_viewed` payloads deserializing.
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
+    /// Whether the sub-task DAG capability is enabled (`features.execution_graph`).
+    #[serde(default)]
+    pub execution_graph_enabled: bool,
+    /// The reused concurrency ceiling (`limits.max_parallel_agent_steps`); `0`
+    /// disables both flat groups and the DAG.
+    #[serde(default)]
+    pub max_parallel_agent_steps: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -7572,6 +7584,9 @@ fn build_config_status(
         sources,
         preset,
         warnings,
+        approval_mode: config.approval_mode.clone(),
+        execution_graph_enabled: config.features.execution_graph,
+        max_parallel_agent_steps: config.limits.max_parallel_agent_steps,
     }
 }
 
@@ -7592,6 +7607,14 @@ fn config_warning_messages(config: &EffectiveConfig) -> Vec<String> {
     // Keybinding trust-boundary + soft-fail notes (ADR-004): surfaced at startup
     // and via /config alongside the model-fallback warning.
     warnings.extend(config.keybinding_warnings.iter().cloned());
+    // Enabled-but-disabled-by-ceiling: the DAG flag is on but the reused
+    // concurrency ceiling is 0, so no graph can ever run (ADR-005).
+    if config.features.execution_graph && config.limits.max_parallel_agent_steps == 0 {
+        warnings.push(
+            "execution_graph is enabled but limits.max_parallel_agent_steps = 0 disables it"
+                .to_string(),
+        );
+    }
     warnings
 }
 
@@ -8706,13 +8729,30 @@ fn hook_lifecycle_display(record: &HookLifecycleRecord) -> String {
 fn config_status_display(status: &ConfigStatusView) -> String {
     let sources = status.sources.join(", ");
     let preset = status.preset.as_deref().unwrap_or("none");
-    if status.warnings.is_empty() {
-        format!("Config: sources: {sources}; preset: {preset}; warnings: none.")
-    } else {
+    let approval = approval_mode_label(&status.approval_mode);
+    let dag = if status.execution_graph_enabled {
         format!(
-            "Config: sources: {sources}; preset: {preset}; warnings: {}.",
-            status.warnings.join("; ")
+            "enabled (max_parallel_agent_steps={})",
+            status.max_parallel_agent_steps
         )
+    } else {
+        "disabled".to_string()
+    };
+    let warnings = if status.warnings.is_empty() {
+        "none".to_string()
+    } else {
+        status.warnings.join("; ")
+    };
+    format!(
+        "Config: sources: {sources}; preset: {preset}; approval: {approval}; dag: {dag}; warnings: {warnings}."
+    )
+}
+
+/// Wire label for an [`ApprovalMode`] in the `/config` display.
+fn approval_mode_label(mode: &ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Yolo => "yolo",
+        ApprovalMode::Normal => "normal",
     }
 }
 
@@ -9200,6 +9240,100 @@ runtime = "fake"
             warnings.iter().any(|w| w.contains("ignored [keybindings]")),
             "expected keybinding warning, got: {warnings:?}"
         );
+    }
+
+    // ── /config DAG visibility (task_07) ──
+
+    #[test]
+    fn config_display_shows_dag_enabled_with_ceiling() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = 3;
+        let status = build_config_status(&config, &BTreeMap::new());
+        assert!(status.execution_graph_enabled);
+        assert_eq!(status.max_parallel_agent_steps, 3);
+        let display = config_status_display(&status);
+        assert!(
+            display.contains("dag: enabled (max_parallel_agent_steps=3)"),
+            "{display}"
+        );
+    }
+
+    #[test]
+    fn config_display_shows_dag_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let status = build_config_status(&config, &BTreeMap::new());
+        assert!(!status.execution_graph_enabled);
+        assert!(config_status_display(&status).contains("dag: disabled"));
+    }
+
+    #[test]
+    fn config_warns_when_dag_enabled_but_ceiling_zero() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = 0;
+        let status = build_config_status(&config, &BTreeMap::new());
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|w| w.contains("max_parallel_agent_steps = 0 disables it")),
+            "{:?}",
+            status.warnings
+        );
+        assert!(config_status_display(&status).contains("max_parallel_agent_steps = 0 disables it"));
+    }
+
+    #[test]
+    fn config_display_shows_approval_mode() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.approval_mode = ApprovalMode::Normal;
+        let normal = config_status_display(&build_config_status(&config, &BTreeMap::new()));
+        assert!(normal.contains("approval: normal"), "{normal}");
+        config.approval_mode = ApprovalMode::Yolo;
+        let yolo = config_status_display(&build_config_status(&config, &BTreeMap::new()));
+        assert!(yolo.contains("approval: yolo"), "{yolo}");
+    }
+
+    #[test]
+    fn config_status_view_serializes_with_dag_fields() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = 2;
+        let value = serde_json::to_value(build_config_status(&config, &BTreeMap::new())).unwrap();
+        assert_eq!(value["execution_graph_enabled"], json!(true));
+        assert_eq!(value["max_parallel_agent_steps"], json!(2));
+        assert_eq!(value["approval_mode"], json!("yolo"));
+    }
+
+    #[tokio::test]
+    async fn config_command_records_dag_fields() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = 2;
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/config").await.unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let viewed = events
+            .iter()
+            .find(|event| event.kind == "config_viewed")
+            .expect("config_viewed recorded");
+        assert_eq!(viewed.payload["execution_graph_enabled"], json!(true));
+        assert_eq!(viewed.payload["max_parallel_agent_steps"], json!(2));
+        let display = app.state.events.join("\n");
+        assert!(
+            display.contains("dag: enabled (max_parallel_agent_steps=2)"),
+            "{display}"
+        );
+        assert!(display.contains("approval: yolo"), "{display}");
     }
 
     fn write_project_skill(
