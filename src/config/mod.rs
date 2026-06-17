@@ -226,6 +226,14 @@ pub struct Features {
     /// can confirm the interpreted intent before any edit (governance spine,
     /// ADR-004). Off by default.
     pub governance_early_abort: bool,
+    /// Gate the sub-task DAG capability (ADR-005). When off (the default), the
+    /// orchestrator never proposes a `Dag` decision and the scheduler is never
+    /// reached; flat `parallel_step_groups` behavior is unaffected — the two
+    /// flags coexist. The DAG reuses `limits.max_parallel_agent_steps` as its
+    /// concurrency ceiling unchanged, so `max_parallel_agent_steps == 0`
+    /// disables the DAG even when this flag is on (mirroring the flat-group
+    /// preflight contract).
+    pub execution_graph: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -550,6 +558,7 @@ struct RawApprovalConfig {
 struct RawFeatures {
     parallel_step_groups: Option<bool>,
     governance_early_abort: Option<bool>,
+    execution_graph: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1133,6 +1142,9 @@ impl MergedConfig {
             }
             if let Some(value) = features.governance_early_abort {
                 self.features.governance_early_abort = value;
+            }
+            if let Some(value) = features.execution_graph {
+                self.features.execution_graph = value;
             }
         }
 
@@ -3546,6 +3558,94 @@ governance_early_abort = true
         )
         .unwrap();
         assert!(enabled.features.governance_early_abort);
+    }
+
+    #[test]
+    fn execution_graph_defaults_off() {
+        // The DAG capability is gated behind a default-off flag (ADR-005): an
+        // absent [features] section leaves it disabled.
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+        assert!(!config.features.execution_graph);
+    }
+
+    #[test]
+    fn execution_graph_parses_true() {
+        let config = load_from_temp(
+            r#"
+[features]
+execution_graph = true
+"#,
+        )
+        .unwrap();
+        assert!(config.features.execution_graph);
+        // The two parallel gates coexist; enabling the DAG does not flip flat groups.
+        assert!(!config.features.parallel_step_groups);
+    }
+
+    #[test]
+    fn execution_graph_unknown_features_key_still_hard_fails() {
+        // Adding `execution_graph` must not relax `deny_unknown_fields`: an
+        // unrelated key under [features] still fails config load.
+        let err = load_from_temp(
+            r#"
+[features]
+execution_graph = true
+not_a_real_flag = true
+"#,
+        )
+        .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("not_a_real_flag") || rendered.contains("unknown field"),
+            "expected unknown-field rejection, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn execution_graph_ceiling_zero_disables_concurrency() {
+        // The DAG reuses `max_parallel_agent_steps` as its concurrency ceiling;
+        // 0 is the disable sentinel (mirrors the flat-group preflight contract),
+        // and must remain accepted alongside an enabled DAG flag.
+        let config = load_from_temp(
+            r#"
+[features]
+execution_graph = true
+
+[limits]
+max_parallel_agent_steps = 0
+"#,
+        )
+        .unwrap();
+        assert!(config.features.execution_graph);
+        assert_eq!(config.limits.max_parallel_agent_steps, 0);
+    }
+
+    #[test]
+    fn execution_graph_local_overrides_home() {
+        // Layer precedence (built-in → home → local): home enables the DAG, the
+        // project file disables it; local wins (last-writer-wins via apply_raw).
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(
+            &home_path,
+            "schema_version = 1\n[features]\nexecution_graph = true\n",
+        )
+        .unwrap();
+
+        let local_dir = tempdir().unwrap();
+        fs::write(
+            local_dir.path().join("atelier.toml"),
+            "[features]\nexecution_graph = false\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: local_dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        assert!(!config.features.execution_graph);
     }
 
     #[test]

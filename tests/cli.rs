@@ -153,6 +153,34 @@ fn print_config_includes_approval_floor() {
 }
 
 #[test]
+fn print_config_includes_execution_graph_flag() {
+    // The DAG enable flag must be visible in --print-config so users can see
+    // and tune its posture (ADR-005). It surfaces automatically via the
+    // [features] clone, defaulting to false and reflecting an explicit opt-in.
+    let home_dir = tempdir().unwrap();
+    let config_path = home_dir.path().join("home.toml");
+    std::fs::write(
+        &config_path,
+        "schema_version = 1\n[features]\nexecution_graph = true\n",
+    )
+    .unwrap();
+    let work_dir = tempdir().unwrap();
+
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .current_dir(work_dir.path())
+        .arg("--print-config")
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("[features]")
+                .and(predicate::str::contains("execution_graph = true")),
+        );
+}
+
+#[test]
 fn help_lists_update_flag() {
     Command::cargo_bin("atelier")
         .unwrap()

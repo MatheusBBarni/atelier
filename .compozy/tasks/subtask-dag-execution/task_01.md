@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Config execution_graph feature flag"
 type: backend
 complexity: low
@@ -28,11 +28,11 @@ Add a default-off `features.execution_graph` flag that gates the entire DAG capa
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Add the `execution_graph` field to `Features` with a `false` default.
-- [ ] 1.2 Add `execution_graph: Option<bool>` to `RawFeatures` and the merge arm in `apply_raw`.
-- [ ] 1.3 Confirm `PrintableConfig` surfaces the new flag automatically via the existing `features` clone.
-- [ ] 1.4 Document (in code/tests) that `max_parallel_agent_steps == 0` disables the DAG, mirroring the flat-group preflight contract.
-- [ ] 1.5 Add unit tests covering default-off, TOML round-trip, and the 0-ceiling-disables contract.
+- [x] 1.1 Add the `execution_graph` field to `Features` with a `false` default.
+- [x] 1.2 Add `execution_graph: Option<bool>` to `RawFeatures` and the merge arm in `apply_raw`.
+- [x] 1.3 Confirm `PrintableConfig` surfaces the new flag automatically via the existing `features` clone.
+- [x] 1.4 Document (in code/tests) that `max_parallel_agent_steps == 0` disables the DAG, mirroring the flat-group preflight contract.
+- [x] 1.5 Add unit tests covering default-off, TOML round-trip, and the 0-ceiling-disables contract.
 
 ## Implementation Details
 All changes are confined to `src/config/mod.rs`. Follow the existing `parallel_step_groups` wiring exactly (effective field → raw field → `apply_raw` arm). See TechSpec "Implementation Design → Data Models" and ADR-005 for the flag rationale. Do not add a new TOML section; extend `Features`/`RawFeatures`.
@@ -55,13 +55,13 @@ All changes are confined to `src/config/mod.rs`. Follow the existing `parallel_s
 
 ## Tests
 - Unit tests:
-  - [ ] Default config has `execution_graph == false`.
-  - [ ] An `atelier.toml` with `[features] execution_graph = true` loads and yields `execution_graph == true`.
-  - [ ] An `atelier.toml` with an unrelated unknown `[features]` key still hard-fails (confirms `deny_unknown_fields` is intact and the new key is the only addition).
-  - [ ] `max_parallel_agent_steps = 0` is accepted as the disable sentinel (existing contract preserved).
-  - [ ] Local config `execution_graph` overrides home config (last-writer-wins via `apply_raw`).
+  - [x] Default config has `execution_graph == false`. (`execution_graph_defaults_off`)
+  - [x] An `atelier.toml` with `[features] execution_graph = true` loads and yields `execution_graph == true`. (`execution_graph_parses_true`)
+  - [x] An `atelier.toml` with an unrelated unknown `[features]` key still hard-fails (confirms `deny_unknown_fields` is intact and the new key is the only addition). (`execution_graph_unknown_features_key_still_hard_fails`)
+  - [x] `max_parallel_agent_steps = 0` is accepted as the disable sentinel (existing contract preserved). (`execution_graph_ceiling_zero_disables_concurrency`)
+  - [x] Local config `execution_graph` overrides home config (last-writer-wins via `apply_raw`). (`execution_graph_local_overrides_home`)
 - Integration tests:
-  - [ ] `atelier --print-config` output includes `execution_graph` under features.
+  - [x] `atelier --print-config` output includes `execution_graph` under features. (`print_config_includes_execution_graph_flag`)
 - Test coverage target: >=80%
 - All tests must pass
 
