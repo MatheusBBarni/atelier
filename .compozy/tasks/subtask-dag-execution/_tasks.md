@@ -11,4 +11,4 @@
 | 05 | Whole-plan approval gate (normal mode) | completed | high | task_03, task_04 |
 | 06 | Single evolving Plan chat projection | completed | high | task_03 |
 | 07 | Surface DAG state in /config | completed | low | task_01 |
-| 08 | Fake-runtime DAG harness and integration suite | pending | high | task_04, task_05, task_06 |
+| 08 | Fake-runtime DAG harness and integration suite | completed | high | task_04, task_05, task_06 |

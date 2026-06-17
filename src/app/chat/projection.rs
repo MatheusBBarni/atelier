@@ -422,7 +422,20 @@ impl ChatProjection {
         });
     }
 
+    /// Whether an event belongs to a known execution graph (its `group_id` is a
+    /// tracked `graph_id`). Per-node live items for graph nodes are suppressed in
+    /// favor of the single Plan item (ADR-005); detail stays in the Agent Roster.
+    fn belongs_to_graph(&self, event: &HistoryEvent) -> bool {
+        event
+            .group_id
+            .as_ref()
+            .is_some_and(|group_id| self.graph_ids.contains(group_id))
+    }
+
     fn apply_agent_step_started(&mut self, event: &HistoryEvent) {
+        if self.belongs_to_graph(event) {
+            return;
+        }
         let Some(agent) = string_field(&event.payload, "agent") else {
             return;
         };
@@ -525,6 +538,9 @@ impl ChatProjection {
     }
 
     fn apply_runtime_stream_delta(&mut self, event: &HistoryEvent) {
+        if self.belongs_to_graph(event) {
+            return;
+        }
         let Some(agent) = string_field(&event.payload, "agent") else {
             return;
         };

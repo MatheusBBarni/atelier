@@ -7,8 +7,8 @@ use crate::config::{Capability, RuntimeConfig};
 use crate::ids::new_id;
 use crate::orchestrator::{
     agent_results, AgentResult, AgentResultStatus, ClarificationOption, DecisionNextStep,
-    DecisionStatus, OrchestratorDecision, ParallelChildStepPlan, ParallelFileScope,
-    ParallelGroupPlan,
+    DecisionStatus, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNode,
+    OrchestratorDecision, ParallelChildStepPlan, ParallelFileScope, ParallelGroupPlan,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -217,6 +217,9 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
             crate::orchestrator::RunStepResult::Dag { .. } => "dag",
         });
     let prompt = fake_control_text(request);
+    if last_agent.is_none() && prompt.contains("execution graph") {
+        return fake_execution_graph_decision(request, &prompt);
+    }
     if last_agent.is_none() && prompt.contains("parallel") {
         let steps = if prompt.contains("same agent") || prompt.contains("scoped write action") {
             vec![
@@ -473,6 +476,73 @@ fn fake_decision(request: &RuntimeRequest) -> OrchestratorDecision {
     }
 }
 
+/// Build a deterministic diamond DAG decision `A → {B, C} → D` for the `fake`
+/// runtime (task_08). Per-node outcomes are scripted by markers in a node's
+/// instruction (so only that node's request carries them): `fail node <id>`
+/// forces that node to fail; `fence node <id>` makes it attempt an out-of-scope
+/// write the runtime fence denies. Each node writes a disjoint
+/// `dag-output/<id>.txt`, so the concurrent siblings B and C are scope-disjoint
+/// and the graph passes `validate_execution_graph`.
+fn fake_execution_graph_decision(request: &RuntimeRequest, prompt: &str) -> OrchestratorDecision {
+    let node = |id: &str| {
+        let mut instruction = format!("Handle DAG node {id}.");
+        if prompt.contains(&format!("fail node {id}")) {
+            instruction.push_str(" force-node-failure");
+        }
+        if prompt.contains(&format!("fence node {id}")) {
+            // An out-of-scope write (no "scoped" qualifier) the fence rejects.
+            instruction.push_str(" write action");
+        }
+        ExecutionNode {
+            node_id: id.to_string(),
+            step_label: format!("node {id}"),
+            agent: "fixer".to_string(),
+            instruction,
+            required_capabilities: vec![Capability::Read, Capability::Edit, Capability::Verify],
+            file_scope: ParallelFileScope {
+                write_files: vec![format!("dag-output/{id}.txt")],
+                read_roots: vec!["src".to_string()],
+            },
+        }
+    };
+    let edge = |from: &str, to: &str| ExecutionEdge {
+        from: from.to_string(),
+        to: to.to_string(),
+        kind: ExecutionEdgeKind::DataDependency,
+    };
+    let graph = ExecutionGraph {
+        graph_id: new_id(),
+        reason: "Fake runtime planned a diamond DAG (A, then B and C, joined at D).".to_string(),
+        nodes: vec![node("a"), node("b"), node("c"), node("d")],
+        edges: vec![
+            edge("a", "b"),
+            edge("a", "c"),
+            edge("b", "d"),
+            edge("c", "d"),
+        ],
+    };
+    OrchestratorDecision {
+        schema_version: 3,
+        decision_id: new_id(),
+        run_id: request.run_id.clone(),
+        status: DecisionStatus::Continue,
+        plan: vec![
+            "Plan the work as a dependency graph.".to_string(),
+            "Run independent nodes concurrently; join dependents.".to_string(),
+        ],
+        next_agent: None,
+        next_step: Some(DecisionNextStep::Dag(graph)),
+        reason: "Independent fake nodes form a diamond dependency graph.".to_string(),
+        required_capabilities: Vec::new(),
+        stop_condition: "All graph nodes reach a terminal state.".to_string(),
+        clarifying_question: None,
+        clarifying_options: Vec::new(),
+        recommended_option_id: None,
+        multi_select: false,
+        final_summary: None,
+    }
+}
+
 fn fake_agent_result(request: &RuntimeRequest) -> AgentResult {
     let agent = request.agent_profile.id.clone();
     let mut result = AgentResult::completed(
@@ -480,6 +550,14 @@ fn fake_agent_result(request: &RuntimeRequest) -> AgentResult {
         request.step_id.clone(),
         format!("Fake {agent} step completed."),
     );
+    // A graph node scripted to fail (the marker lives only in this node's
+    // instruction, so siblings are unaffected) drives the fail-closed path.
+    if fake_control_text(request).contains("force-node-failure") {
+        result.status = AgentResultStatus::Failed;
+        result.summary = "Fake runtime forced a node failure.".to_string();
+        result.blocker = Some("forced node failure".to_string());
+        return result;
+    }
     if let Some(denied) = request.action_results.iter().find(|result| {
         matches!(result.status, ActionStatus::Denied)
             && result.diagnostic.as_deref().is_some_and(|diagnostic| {
@@ -749,6 +827,45 @@ mod tests {
             capability_constraints: Vec::new(),
             limits: Limits::default(),
         }
+    }
+
+    // ── DAG decision harness (task_08) ──
+
+    #[test]
+    fn emits_a_validatable_diamond_dag_decision() {
+        let request = orchestrator_request("execution graph create a feature");
+        let decision = fake_decision(&request);
+        assert_eq!(decision.schema_version, 3);
+        let Some(DecisionNextStep::Dag(graph)) = decision.next_step else {
+            panic!("expected the fake runtime to select a dag");
+        };
+        assert_eq!(graph.nodes.len(), 4);
+        assert_eq!(graph.edges.len(), 4);
+        // The emitted graph passes task_02's validator (sibling B/C writes are
+        // disjoint; edit-capable nodes carry write_files).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::load_effective_config(crate::config::ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = 2;
+        crate::orchestrator::validate_execution_graph(&graph, &config).unwrap();
+    }
+
+    #[test]
+    fn fail_node_marker_scripts_only_the_named_node() {
+        let request = orchestrator_request("execution graph fail node b create a feature");
+        let decision = fake_decision(&request);
+        let Some(DecisionNextStep::Dag(graph)) = decision.next_step else {
+            panic!("expected a dag");
+        };
+        let node = |id: &str| graph.nodes.iter().find(|n| n.node_id == id).unwrap();
+        assert!(node("b").instruction.contains("force-node-failure"));
+        assert!(!node("a").instruction.contains("force-node-failure"));
+        assert!(!node("c").instruction.contains("force-node-failure"));
+        assert!(!node("d").instruction.contains("force-node-failure"));
     }
 
     fn assert_scoped_parallel_write_plan(prompt: &str) {

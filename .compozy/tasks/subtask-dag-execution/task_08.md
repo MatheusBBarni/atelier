@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Fake-runtime DAG harness and integration suite"
 type: test
 complexity: high
@@ -31,12 +31,14 @@ Extend the deterministic `fake` runtime so tests can drive a full DAG end-to-end
 </requirements>
 
 ## Subtasks
-- [ ] 8.1 Add DAG-decision emission + per-node outcome scripting to the `fake` runtime.
-- [ ] 8.2 Handle the `Dag` case in the `fake.rs` `let-else` cast.
-- [ ] 8.3 Add the diamond-concurrency + dependency-ordering integration test.
-- [ ] 8.4 Add the fail-closed skip integration test.
-- [ ] 8.5 Add the normal-mode approval (accept / reject-re-propose) and yolo auto-accept integration tests.
-- [ ] 8.6 Add the write-fence + scheduler-disjointness integration test.
+- [x] 8.1 `fake_execution_graph_decision` emits a schema_version 3 diamond Dag on the `execution graph` control phrase; per-node outcomes scripted by markers in the targeted node's instruction (`fail node <id>` → `force-node-failure`; `fence node <id>` → out-of-scope `write action`). `fake_agent_result` honors `force-node-failure`.
+- [x] 8.2 Audited the `fake.rs` `let-else` (it is a **test-only** helper that expects a parallel group for parallel prompts; a `Dag` never reaches it, and the production result-label match already has a `Dag` arm from task_03 — no change needed).
+- [x] 8.3 Diamond concurrency + ordering integration test (`diamond_runs_b_and_c_concurrently_then_d`).
+- [x] 8.4 Fail-closed skip integration test (`fail_closed_skips_dependent_when_a_node_fails`).
+- [x] 8.5 Normal accept / reject-re-propose + yolo integration tests.
+- [x] 8.6 Write-fence integration test (`out_of_scope_write_is_denied_by_the_fence`); scheduler write-disjointness is unit-tested in task_04's `compute_admission`.
+
+> While integration-testing the projection, the per-node live-item suppression was completed: `belongs_to_graph` also suppresses the durable `runtime_stream_delta`/`agent_step_started` AgentProgress items for graph nodes (task_06 covered the transient `apply_live_steps` path; flat groups are unaffected since their `group_id` is not a tracked `graph_id`).
 
 ## Implementation Details
 The harness lives in `src/runtime/fake.rs`; integration tests live under `tests/` (follow the `runtime_integration.rs` / app-test conventions and the control-phrase pattern). Reuse the existing fake-runtime trigger style (control phrases embedded in the prompt) to script the graph and node outcomes. See TechSpec "Testing Approach → Integration Tests" and CLAUDE.md (the `fake` runtime drives deterministic end-to-end tests). Do not duplicate scheduler logic — exercise it.
@@ -62,14 +64,14 @@ The harness lives in `src/runtime/fake.rs`; integration tests live under `tests/
 
 ## Tests
 - Unit tests:
-  - [ ] The fake runtime emits a valid `Dag` decision for a configured graph shape and validates via task_02's validator.
-  - [ ] A control phrase scripts a specific node to fail (drives the fail-closed path).
-- Integration tests:
-  - [ ] Diamond A→{B,C}→D: B and C run concurrently (overlapping start/finish in the event log) and D starts only after both succeed.
-  - [ ] Fail-closed: when B fails, D is `Skipped` and the run ends with a report distinguishing completed vs skipped nodes.
-  - [ ] Normal-mode accept: the run blocks until accepted, then completes; reject-with-reason triggers an orchestrator re-proposal; yolo runs with no gate.
-  - [ ] Write-fence: a node scripted to write outside its scope is denied by the runtime fence, and the scheduler never co-runs two intersecting-write nodes.
-  - [ ] Projection: the run surfaces exactly one evolving Plan item (WaitingApproval → Running → Completed) with no per-node chat flooding.
+  - [x] The fake runtime emits a valid `Dag` decision validated by task_02's validator. (`emits_a_validatable_diamond_dag_decision`)
+  - [x] A control phrase scripts a specific node to fail. (`fail_node_marker_scripts_only_the_named_node`)
+- Integration tests (`tests/dag_execution.rs`):
+  - [x] Diamond A→{B,C}→D: B and C overlap (event ordering), D waits for both. (`diamond_runs_b_and_c_concurrently_then_d`)
+  - [x] Fail-closed: B fails → D Skipped; completed report distinguishes failed vs skipped. (`fail_closed_skips_dependent_when_a_node_fails`)
+  - [x] Normal accept runs the graph; reject-with-reason re-proposes; yolo runs with no gate. (`normal_mode_blocks_until_accepted_then_completes`, `normal_mode_reject_with_reason_re_proposes`, `yolo_runs_without_a_gate`)
+  - [x] Write-fence: an out-of-scope write is denied; the failed node's dependent is skipped. (`out_of_scope_write_is_denied_by_the_fence`)
+  - [x] Projection: exactly one evolving Plan item, no per-node AgentProgress flooding. (`run_surfaces_one_evolving_plan_item`)
 - Test coverage target: >=80%
 - All tests must pass
 
