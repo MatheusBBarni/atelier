@@ -353,6 +353,12 @@ fn facts_lines(theme: &Theme, facts: &WelcomeFacts) -> Vec<Line<'static>> {
         "type /help for commands",
         Style::default().fg(theme.text_muted),
     )));
+    // Browser discoverability cue (task_09): point users at the session browser
+    // beyond the keybinding. The dynamic post-crash variant is task_13.
+    lines.push(Line::from(Span::styled(
+        "Ctrl-R or /sessions to browse and resume past sessions",
+        Style::default().fg(theme.text_muted),
+    )));
     lines
 }
 
@@ -560,6 +566,29 @@ mod tests {
                 .iter()
                 .all(|span| span.style.fg == Some(truecolor().text_muted)),
             "hint styled with theme.text_muted token"
+        );
+    }
+
+    #[test]
+    fn facts_box_includes_session_browser_cue() {
+        // task_09: a static cue points users at the session browser, styled with
+        // the shared muted token (no inline color).
+        let agents = [agent("explorer")];
+        let lines = facts_lines(&truecolor(), &facts_with(&agents, None));
+        let text: String = lines
+            .iter()
+            .map(|line| format!("{}\n", line_text(line)))
+            .collect();
+        assert!(text.contains("/sessions"), "session browser cue present");
+        let cue = lines
+            .iter()
+            .find(|line| line_text(line).contains("/sessions"))
+            .expect("cue line present");
+        assert!(
+            cue.spans
+                .iter()
+                .all(|span| span.style.fg == Some(truecolor().text_muted)),
+            "cue styled with theme.text_muted token"
         );
     }
 

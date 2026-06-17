@@ -928,7 +928,13 @@ async fn execute_tui_command_with_interrupt(
             Ok(true)
         }
         TuiCommand::SessionBrowser(command) => {
+            // Opening clears the composer so a `/sessions` trigger doesn't linger
+            // (a Ctrl-R open has an empty composer, so this is a no-op there).
+            let opening = matches!(command, SessionBrowserCommand::Open);
             apply_session_browser_command(ui_state, command);
+            if opening {
+                clear_input(state, ui_state);
+            }
             Ok(true)
         }
         TuiCommand::ReloadSkills => {
@@ -2016,6 +2022,13 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
             code: KeyCode::Enter,
             ..
         } if state.input.trim() == "/help" => Some(TuiCommand::ToggleHelp),
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        } if state.input.trim() == "/sessions" => {
+            // /sessions opens the same browser as Ctrl-R (task_09 discoverability).
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
+        }
         KeyEvent {
             code: KeyCode::Enter,
             ..
@@ -13249,6 +13262,43 @@ runtime = "fake"
                 .unwrap()
                 .items
         );
+    }
+
+    // ── /sessions discoverability (task_09) ──
+
+    #[test]
+    fn slash_sessions_routes_to_browser_open() {
+        // The base routing layer owns the /sessions → browser-open binding (just
+        // like /help → ToggleHelp); the command dropdown handles completion first,
+        // then this fires on submit.
+        let state = state_with_input("/sessions", false);
+        assert_eq!(
+            key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
+        );
+    }
+
+    #[tokio::test]
+    async fn submitting_slash_sessions_opens_browser_and_clears_input() {
+        let mut state = state_with_input("/sessions", false);
+        // Once the command dropdown has been dismissed (after completion), the
+        // submit routes to the browser-open binding — the same end state as Ctrl-R.
+        let mut ui = TuiUiState {
+            command_dropdown_dismissed: Some("/sessions".to_string()),
+            ..TuiUiState::default()
+        };
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .expect("a command for /sessions + Enter");
+        let (sender, _receiver) = mpsc::channel(1);
+        execute_tui_command(&mut state, &mut ui, &sender, command)
+            .await
+            .unwrap();
+        assert!(ui.browser.visible, "/sessions opens the browser");
+        assert!(state.input.is_empty(), "the /sessions trigger is cleared");
     }
 
     #[test]

@@ -43,8 +43,9 @@ pub struct SlashCommandSpec {
 /// commands from the surfaces this catalog is meant to align. Amended
 /// 2026-06-13 (Provider Usage Status PRD scope change) to add
 /// `/provider:status`, a runway-first provider readiness command routed as an
-/// app command. Entries must still not be added or removed without a
-/// deliberate PRD scope change.
+/// app command. Amended 2026-06-17 (Session Browser & Resume PRD scope change)
+/// to add `/sessions`, a TUI-local command opening the session browser. Entries
+/// must still not be added or removed without a deliberate PRD scope change.
 const CATALOG: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         label: "/help",
@@ -94,6 +95,13 @@ const CATALOG: &[SlashCommandSpec] = &[
         usage: "/queue <message>",
         description: "queue a follow-up prompt (alias /q)",
         kind: SlashCommandKind::AppCommand,
+    },
+    SlashCommandSpec {
+        label: "/sessions",
+        insert_text: "/sessions",
+        usage: "/sessions",
+        description: "browse and preview past sessions",
+        kind: SlashCommandKind::TuiLocal,
     },
     SlashCommandSpec {
         label: "/provider:status",
@@ -161,7 +169,7 @@ pub fn help_command_lines() -> Vec<String> {
 mod tests {
     use super::*;
 
-    const FIXED_V1_LABELS: [&str; 12] = [
+    const FIXED_V1_LABELS: [&str; 13] = [
         "/help",
         "/goal",
         "/goal clear",
@@ -169,6 +177,7 @@ mod tests {
         "/subtask",
         "/workflow",
         "/queue",
+        "/sessions",
         "/provider:status",
         "/trust",
         "/agent:",
@@ -249,7 +258,7 @@ mod tests {
         };
         assert_eq!(
             labels_of(SlashCommandKind::TuiLocal),
-            ["/help", "/reload:skills"]
+            ["/help", "/sessions", "/reload:skills"]
         );
         assert_eq!(
             labels_of(SlashCommandKind::AppCommand),
