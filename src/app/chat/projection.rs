@@ -92,6 +92,7 @@ impl ChatProjection {
             "workflow_completed" => self.apply_workflow_completed(event),
             "run_completed" | "run_failed" | "run_limit_reached" | "run_interrupted"
             | "subtask_completed" => self.apply_run_summary(event),
+            "session_resumed" => self.apply_session_resumed(event),
             "diagnostic" => self.apply_diagnostic(event),
             "follow_up_queued"
             | "follow_up_replay_started"
@@ -1298,6 +1299,39 @@ impl ChatProjection {
             severity,
             title: title.to_string(),
             summary: summary.map(|summary| message_summary(&summary)),
+            body,
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    /// Fold a `session_resumed` event (ADR-002/008) into a visible "Resumed"
+    /// divider marking the resume boundary. Each resume is its own standalone
+    /// item (no lifecycle key → keyed by the event id), so multiple resumes each
+    /// render a divider and none collapse. Reuses the `RunSummary` item kind +
+    /// neutral `Info` styling rather than introducing a new chat kind.
+    fn apply_session_resumed(&mut self, event: &HistoryEvent) {
+        let mut body = Vec::new();
+        if let Some(prior) = string_field(&event.payload, "prior_end_state") {
+            body.push(ChatLineView::muted(format!("previous run: {prior}")));
+        }
+        if let Some(cwd) = string_field(&event.payload, "cwd") {
+            body.push(ChatLineView::muted(format!("cwd: {cwd}")));
+        }
+        if event.payload.get("dirty").and_then(Value::as_bool) == Some(true) {
+            body.push(ChatLineView::warning(
+                "workspace had uncommitted changes at resume",
+            ));
+        }
+        self.upsert(ItemInput {
+            lifecycle_key: None,
+            kind: ChatItemKind::RunSummary,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "Session resumed".to_string(),
+            summary: Some("resumed from a previous session".to_string()),
             body,
             details: history_detail(event, "history"),
             source: source_from_event(event, None),
@@ -3148,6 +3182,130 @@ mod tests {
         ));
         // Different handler indices ⇒ different lifecycle keys ⇒ two items.
         assert_eq!(projection.items().len(), 2);
+    }
+
+    // ── resume lifecycle fold: run_interrupted + session_resumed (task_04) ──
+
+    #[test]
+    fn dangling_run_then_run_interrupted_renders_interrupted() {
+        // A run with no terminal event, then a run_interrupted closing it.
+        let events = vec![
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "run_interrupted",
+                Some("run-1"),
+                None,
+                json!({ "run_id": "run-1", "prior_state": "running" }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        // run_started + run_interrupted collapse into one Run item, now interrupted.
+        assert_eq!(projection.items().len(), 1);
+        assert_eq!(projection.items()[0].status, ChatItemStatus::Interrupted);
+        assert_eq!(projection.items()[0].title, "Run interrupted");
+    }
+
+    #[test]
+    fn session_resumed_inserts_exactly_one_resume_divider() {
+        let events = vec![event(
+            "session_resumed",
+            Some("run-1"),
+            None,
+            json!({
+                "resumed_at": "2026-06-17T00:00:00.000Z",
+                "cwd": "/tmp/project",
+                "dirty": false,
+                "prior_end_state": "interrupted",
+                "approval_mode": "normal"
+            }),
+        )];
+        let projection = ChatProjection::rebuild(&events);
+        assert_eq!(projection.items().len(), 1);
+        assert_eq!(projection.items()[0].title, "Session resumed");
+    }
+
+    #[test]
+    fn log_without_new_kinds_folds_unchanged() {
+        // Backward compatibility: a log of pre-existing kinds folds with no
+        // resume divider and the expected run summary.
+        let events = vec![
+            event(
+                "prompt_submitted",
+                Some("run-1"),
+                None,
+                json!({ "prompt": "go" }),
+            ),
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "run_completed",
+                Some("run-1"),
+                None,
+                json!({ "summary": "done" }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        assert!(projection
+            .items()
+            .iter()
+            .all(|item| item.title != "Session resumed"));
+        assert!(projection
+            .items()
+            .iter()
+            .any(|item| item.title == "Run completed"));
+    }
+
+    #[test]
+    fn unrecognized_future_kind_folds_to_no_item() {
+        let projection = ChatProjection::rebuild(&[event(
+            "some_future_kind_v9",
+            Some("run-1"),
+            None,
+            json!({ "whatever": true }),
+        )]);
+        assert!(projection.items().is_empty());
+    }
+
+    #[test]
+    fn rebuild_over_mixed_log_with_resume_kinds_is_ordered() {
+        let events = vec![
+            event(
+                "prompt_submitted",
+                Some("run-1"),
+                None,
+                json!({ "prompt": "do it" }),
+            ),
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "run_interrupted",
+                Some("run-1"),
+                None,
+                json!({ "run_id": "run-1", "prior_state": "running" }),
+            ),
+            event(
+                "session_resumed",
+                Some("run-1"),
+                None,
+                json!({
+                    "resumed_at": "2026-06-17T00:00:00.000Z",
+                    "cwd": "/tmp/project",
+                    "dirty": true,
+                    "prior_end_state": "interrupted",
+                    "approval_mode": "normal"
+                }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+        // UserPrompt, the (interrupted) Run, then the resume divider — in order.
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].kind, ChatItemKind::UserPrompt);
+        assert_eq!(items[1].status, ChatItemStatus::Interrupted);
+        assert_eq!(items[2].title, "Session resumed");
+        // The dirty-workspace note is surfaced in the divider body.
+        assert!(items[2]
+            .body
+            .iter()
+            .any(|line| line.text.contains("uncommitted changes")));
     }
 
     #[test]

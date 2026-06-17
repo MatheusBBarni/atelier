@@ -94,6 +94,41 @@ pub struct SessionMetadata {
     pub last_head_sha: Option<String>,
 }
 
+/// Kind string for the lifecycle event that closes a dangling run on resume
+/// (ADR-002/008). Additive — no schema bump.
+pub const RUN_INTERRUPTED_KIND: &str = "run_interrupted";
+/// Kind string for the tamper-evident resume-boundary lifecycle event
+/// (ADR-002/007/008). Additive — no schema bump.
+pub const SESSION_RESUMED_KIND: &str = "session_resumed";
+
+/// Payload for a `run_interrupted` event — closes a dangling run found on resume
+/// (ADR-008). Emitted by task_11; folded by the existing run-summary projection
+/// arm, which marks the run Interrupted.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunInterruptedPayload {
+    pub run_id: String,
+    pub prior_state: RunState,
+}
+
+/// Payload for a `session_resumed` event — the tamper-evident resume boundary
+/// (ADR-002/007/008). Emitted by task_11; folded into a visible "Resumed"
+/// divider in the transcript.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionResumedPayload {
+    pub resumed_at: String,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    pub dirty: bool,
+    pub prior_end_state: RunState,
+    /// The approval mode the resumed session runs under (serialized form, e.g.
+    /// `normal` — task_12 defaults resume to cautious).
+    pub approval_mode: String,
+    /// Hash of the prior log tail at resume time, for tamper-evidence (ADR-007).
+    #[serde(default)]
+    pub prior_tail_hash: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct HistoryStore {
     root: PathBuf,
