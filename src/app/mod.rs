@@ -16,7 +16,10 @@ use crate::governance::{
     GovernanceAnswer, GovernanceDecisionView, GovernanceKind, GOVERNANCE_DECISION_REQUESTED,
     GOVERNANCE_DECISION_RESOLVED,
 };
-use crate::history::{HistoryEvent, HistoryStore};
+use crate::history::{
+    dangling_run_from_events, derive_goal, HistoryEvent, HistoryStore, RunInterruptedPayload,
+    RUN_INTERRUPTED_KIND,
+};
 use crate::hooks::{
     normalize, public_name_for_kind, try_dispatch, ActorCtx, DroppedHookCounter, HookDispatch,
     HookLifecycleRecord, MatchedHandler, PayloadDetail,
@@ -978,6 +981,60 @@ struct SubtaskRecord {
     request: String,
 }
 
+/// A fully replayed session ready to replace the running one in a single atomic
+/// swap (ADR-003/006). The heavy disk read (enumerating + reading `events.jsonl`)
+/// can run off-thread — see [`LoadedSession::from_history_and_events`], which
+/// folds an already-read `Vec<HistoryEvent>` on the worker; [`adopt_session`]
+/// then performs the cheap swap. Every session-scoped value the swap needs is
+/// captured here so adoption never re-reads disk or derives state piecemeal.
+///
+/// [`adopt_session`]: App::adopt_session
+pub struct LoadedSession {
+    /// The adopted durable store, bound via [`HistoryStore::open`] (schema
+    /// validated, so an incompatible log is unconstructible — ADR-003).
+    history: HistoryStore,
+    /// The chat transcript folded from the adopted log (`ChatProjection::rebuild`).
+    projection: ChatProjection,
+    /// The adopted session id (mirrors `history.session_id()`).
+    session_id: String,
+    /// The session goal folded from the log, or `None`.
+    session_goal: Option<String>,
+    /// `Some((run_id, prior_state))` when the last run never reached a terminal
+    /// state — a dangling run that adoption reconciles with a terminal
+    /// `run_interrupted` event (ADR-002). Already filtered to non-terminal by
+    /// [`dangling_run_from_events`], so a `Some` here always needs reconciling.
+    dangling_run: Option<(String, RunState)>,
+}
+
+impl LoadedSession {
+    /// Open, read, and fold a stored session into an adoptable value. The schema
+    /// validation in [`HistoryStore::open`] makes an incompatible log
+    /// unconstructible (ADR-003), so adoption downstream never sees a stale or
+    /// raw event. The read happens on the calling thread here; the resume flow
+    /// (task_11) reads off-thread and calls [`from_history_and_events`] directly.
+    ///
+    /// [`from_history_and_events`]: LoadedSession::from_history_and_events
+    pub fn load(root: &Path, session_id: &str) -> Result<Self> {
+        let history = HistoryStore::open(root, session_id)?;
+        let events = history.read_events()?;
+        Ok(Self::from_history_and_events(history, &events))
+    }
+
+    /// Fold an already-read event log (from an opened store) into an adoptable
+    /// value. Pure + `Send`-friendly so the heavy read can be lifted off-thread
+    /// while this cheap fold runs on the worker (ADR-003/006).
+    pub fn from_history_and_events(history: HistoryStore, events: &[HistoryEvent]) -> Self {
+        let session_id = history.session_id().to_string();
+        Self {
+            projection: ChatProjection::rebuild(events),
+            session_goal: derive_goal(events),
+            dangling_run: dangling_run_from_events(events),
+            session_id,
+            history,
+        }
+    }
+}
+
 impl App {
     pub async fn new(config: EffectiveConfig) -> Result<Self> {
         Self::new_with_debug(config, false).await
@@ -1179,6 +1236,105 @@ impl App {
             "Harness session ended.",
         )?;
         self.session_ended = true;
+        Ok(())
+    }
+
+    /// The single atomic point that swaps the running session for `loaded`
+    /// (ADR-003/006): reassign **every** session-scoped field, reconcile a
+    /// dangling run, and emit exactly one state broadcast. No other path may
+    /// rebind these fields piecemeal — the exhaustiveness test
+    /// `adopt_session_resets_every_session_scoped_field` guards that, and the
+    /// `AppState` subset is rebuilt via a full struct literal below so a new
+    /// `AppState` field forces a compile error here rather than silently
+    /// stranding prior-session state.
+    ///
+    /// The worker thread owns `App`, so this swap is atomic from the UI's
+    /// perspective regardless of the single broadcast (ADR-006).
+    ///
+    /// Kept private per ADR-006 (the single, audited swap point). The production
+    /// caller — `AppEvent::ResumeSession` → off-thread load → `adopt_session` —
+    /// lands in task_11; until then it is exercised only by the adoption tests,
+    /// so the lib-target dead-code lint is suppressed (allow removed in task_11).
+    #[allow(dead_code)]
+    fn adopt_session(&mut self, loaded: LoadedSession) -> Result<()> {
+        let LoadedSession {
+            history,
+            projection,
+            session_id,
+            session_goal,
+            dangling_run,
+        } = loaded;
+
+        // Swap the durable store + folded transcript first, so the reconciling
+        // `run_interrupted` event below appends into the ADOPTED log/projection.
+        self.history = history;
+        self.chat_projection = projection;
+
+        // Reset every transient session-scoped field on `App` to its fresh value
+        // so no prior-session modal / queue / live step / trust grant leaks
+        // across the swap (mirrors the `interrupt()` teardown).
+        self.step_timings.clear();
+        self.pending_approval = None;
+        self.pending_clarification = None;
+        self.pending_governance_decision = None;
+        self.active_step = None;
+        self.active_steps.clear();
+        self.follow_up_queue.clear();
+        self.trust_store.clear();
+        self.session_ended = false;
+
+        // Rebuild the session subset of `AppState` via a FULL struct literal (no
+        // `..` spread): a future `AppState` field then forces a compile error
+        // here, making the session-scoped set exhaustive at compile time
+        // (ADR-006). Process-scoped fields (config/availability-derived status,
+        // live git context) carry across unchanged; live agent activity resets
+        // to a fresh idle roster. `chat_items` is filled by `sync_chat_items`
+        // below. Resume always opens `Idle` with no active run (ADR-002).
+        self.state = AppState {
+            session_id,
+            run_state: RunState::Idle,
+            active_run_id: None,
+            session_goal,
+            config_status: self.state.config_status.clone(),
+            git_context: self.state.git_context.clone(),
+            agents: build_agent_views(&self.config, &self.availability),
+            live_step: None,
+            live_steps: Vec::new(),
+            pending_approval: None,
+            show_first_approval_explainer: false,
+            pending_clarification: None,
+            pending_governance_decision: None,
+            roster_rows: Vec::new(),
+            chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
+            events: Vec::new(),
+            input: String::new(),
+        };
+
+        // Reconcile a dangling (non-terminal) run: append a terminal
+        // `run_interrupted` event so a future replay knows the run ended
+        // (ADR-002). `dangling_run` is pre-filtered to non-terminal, so its
+        // presence is the "detect dangling" signal. The no-publish append keeps
+        // the swap a single broadcast; `run_state` stays `Idle` either way.
+        if let Some((run_id, prior_state)) = dangling_run {
+            let payload = serde_json::to_value(RunInterruptedPayload {
+                run_id: run_id.clone(),
+                prior_state,
+            })?;
+            self.append_event_with_group(
+                Some(run_id),
+                None,
+                None,
+                RUN_INTERRUPTED_KIND,
+                payload,
+                "Prior run interrupted on resume.",
+            )?;
+        }
+
+        // Make `chat_items` reflect the adopted projection (+ the reconciliation
+        // event, if any), then broadcast exactly once.
+        self.sync_chat_items();
+        self.publish_state();
         Ok(())
     }
 
@@ -4757,6 +4913,25 @@ impl App {
         payload: serde_json::Value,
         display: impl Into<String>,
     ) -> Result<()> {
+        self.append_event_with_group(run_id, group_id, step_id, kind, payload, display)?;
+        self.publish_state();
+        Ok(())
+    }
+
+    /// Durably append an event and fold it into the projection/chat **without**
+    /// broadcasting. [`record_event_with_group`] is this plus a `publish_state`;
+    /// `adopt_session` (ADR-006) appends its reconciling `run_interrupted` event
+    /// through this path so the swap emits exactly one `watch` broadcast rather
+    /// than one mid-swap and one at the end.
+    fn append_event_with_group(
+        &mut self,
+        run_id: Option<String>,
+        group_id: Option<String>,
+        step_id: Option<String>,
+        kind: &str,
+        payload: serde_json::Value,
+        display: impl Into<String>,
+    ) -> Result<()> {
         let event = HistoryEvent::new_with_group(
             self.history.session_id().to_string(),
             run_id,
@@ -4777,7 +4952,6 @@ impl App {
         self.chat_projection.apply_history_event(&event);
         self.sync_chat_items();
         self.state.events.push(display.into());
-        self.publish_state();
         Ok(())
     }
 
@@ -7455,6 +7629,343 @@ runtime = "fake"
             text.push_str(&line.text);
         }
         text
+    }
+
+    // ── Session adoption (task_10) ──
+
+    /// The `.atelier` data root for a workspace temp dir (where sessions live).
+    fn atelier_root(dir: &Path) -> std::path::PathBuf {
+        dir.join(".atelier")
+    }
+
+    /// Build a separate, fully-recorded session under the same `.atelier` root as
+    /// `dir` and return its id. The `App` is dropped before returning (there is no
+    /// `Drop` that writes events), leaving only the durable log for
+    /// `LoadedSession::load` to replay — the realistic "adopt a session this
+    /// process did not just write" path.
+    async fn seed_session(dir: &Path, record: impl FnOnce(&mut App) -> Result<()>) -> String {
+        let mut app = App::new_with_debug(fake_config(dir), false).await.unwrap();
+        let id = app.history.session_id().to_string();
+        record(&mut app).unwrap();
+        id
+    }
+
+    fn sentinel_active_step(step_id: &str) -> ActiveStep {
+        ActiveStep {
+            run_id: "stale-run".into(),
+            group_id: None,
+            step_id: step_id.into(),
+            step_label: None,
+            file_scope: None,
+            agent: "explorer".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn adopt_session_swaps_identity_goal_and_transcript() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                None,
+                None,
+                "session_goal_set",
+                json!({ "goal": "Ship the browser" }),
+                "Goal set.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "browse sessions", "submitted_prompt": "browse sessions", "source": "fresh" }),
+                "browse sessions",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "all done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new_with_debug(fake_config(dir.path()), false)
+            .await
+            .unwrap();
+        let original = app.state().session_id.clone();
+        assert_ne!(original, session_b, "the two sessions must be distinct");
+
+        let (sender, receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let loaded = LoadedSession::load(&atelier_root(dir.path()), &session_b).unwrap();
+        app.adopt_session(loaded).unwrap();
+
+        // Identity + goal + run state reflect the ADOPTED session, not app's own.
+        assert_eq!(app.state().session_id, session_b);
+        assert_eq!(app.history.session_id(), session_b);
+        assert_eq!(
+            app.state().session_goal.as_deref(),
+            Some("Ship the browser")
+        );
+        assert_eq!(app.state().run_state, RunState::Idle);
+        assert_eq!(app.state().active_run_id, None);
+
+        // The transcript is the adopted log's fold; the welcome item stays first.
+        assert!(
+            app.state().chat_items.len() >= 2,
+            "expected welcome + adopted items"
+        );
+        let transcript: String = app
+            .state()
+            .chat_items
+            .iter()
+            .map(chat_item_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("browse sessions"),
+            "adopted transcript missing the prompt: {transcript}"
+        );
+
+        // The swap broadcast carried the adopted state over the watch channel.
+        assert_eq!(receiver.borrow().session_id, session_b);
+
+        // A terminal last run needs no reconciliation event.
+        let interrupted = app
+            .history
+            .read_events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == RUN_INTERRUPTED_KIND)
+            .count();
+        assert_eq!(interrupted, 0);
+    }
+
+    #[tokio::test]
+    async fn adopt_session_reconciles_a_dangling_run_to_idle() {
+        let dir = tempdir().unwrap();
+        // A run that started but never reached a terminal event (crash mid-run).
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "do work", "submitted_prompt": "do work", "source": "fresh" }),
+                "do work",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        let mut app = App::new_with_debug(fake_config(dir.path()), false)
+            .await
+            .unwrap();
+        let loaded = LoadedSession::load(&atelier_root(dir.path()), &session_b).unwrap();
+        app.adopt_session(loaded).unwrap();
+
+        // Resume always opens Idle (ADR-002), even reconciling a dangling run.
+        assert_eq!(app.state().run_state, RunState::Idle);
+        assert_eq!(app.state().active_run_id, None);
+
+        // Exactly one terminal run_interrupted was appended to the ADOPTED log so
+        // a future replay knows the run ended.
+        let events = app.history.read_events().unwrap();
+        let reconciliations: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == RUN_INTERRUPTED_KIND)
+            .collect();
+        assert_eq!(
+            reconciliations.len(),
+            1,
+            "expected exactly one reconciliation event"
+        );
+        let payload: RunInterruptedPayload =
+            serde_json::from_value(reconciliations[0].payload.clone()).unwrap();
+        assert_eq!(payload.run_id, "run-b");
+        assert_eq!(payload.prior_state, RunState::Running);
+    }
+
+    #[tokio::test]
+    async fn adopt_session_does_not_reconcile_a_terminal_run() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "ok" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new_with_debug(fake_config(dir.path()), false)
+            .await
+            .unwrap();
+        let loaded = LoadedSession::load(&atelier_root(dir.path()), &session_b).unwrap();
+        app.adopt_session(loaded).unwrap();
+
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RUN_INTERRUPTED_KIND)
+                .count(),
+            0,
+            "a cleanly-completed run must not be reconciled"
+        );
+        assert_eq!(app.state().run_state, RunState::Idle);
+    }
+
+    /// The exhaustiveness guard (ADR-006): mutate every session-scoped field to a
+    /// sentinel, adopt a different session, and assert each was reset/replaced so
+    /// no prior-session state leaks across the swap. The `AppState` subset is
+    /// ALSO guaranteed at compile time by the full struct literal in
+    /// `adopt_session` (a new field there is a compile error); these runtime
+    /// assertions additionally cover the `App`-level fields the literal can't.
+    #[tokio::test]
+    async fn adopt_session_resets_every_session_scoped_field() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "adopted", "submitted_prompt": "adopted", "source": "fresh" }),
+                "adopted",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "ok" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new_with_debug(fake_config(dir.path()), false)
+            .await
+            .unwrap();
+
+        // ── Sentinel every App-level session-scoped field ──────────────────
+        app.step_timings.insert(
+            "step-x".into(),
+            StepTiming {
+                started_at: Instant::now(),
+                last_activity: Instant::now(),
+            },
+        );
+        app.pending_clarification = Some(PendingClarification {
+            run: RunDriveContext::new("stale", None, "q", "q", None, None, None),
+        });
+        app.pending_governance_decision = Some(PendingGovernanceDecision {
+            run: RunDriveContext::new("stale", None, "g", "g", None, None, None),
+        });
+        app.active_step = Some(sentinel_active_step("s1"));
+        app.active_steps.push(sentinel_active_step("s2"));
+        app.follow_up_queue
+            .push_back(QueuedFollowUp::new("queued work"));
+        app.trust_store
+            .grant(TrustTarget::Command("rm -rf /".into()));
+        app.session_ended = true;
+        // `pending_approval` (App) is omitted: a PendingApproval needs a full
+        // PausedStep + RuntimeRequest + ActionExecutionContext. Its reset is the
+        // explicit `self.pending_approval = None` in adopt_session, asserted below.
+
+        // ── Sentinel the cheap AppState fields (the literal guards them all at
+        //    compile time; these prove the runtime reset for the obvious ones) ──
+        app.state.run_state = RunState::Running;
+        app.state.active_run_id = Some("stale-run".into());
+        app.state.session_goal = Some("stale goal".into());
+        app.state.input = "half-typed".into();
+        app.state.show_first_approval_explainer = true;
+        app.state.pending_approval = Some(PendingApprovalView::default());
+        app.state.pending_clarification = Some(PendingClarificationView {
+            run_id: "stale".into(),
+            question_id: "q".into(),
+            question: "?".into(),
+            options: Vec::new(),
+            recommended_option_id: None,
+            multi_select: false,
+        });
+        app.state.events.push("stale event".into());
+
+        // ── Adopt a different session ──────────────────────────────────────
+        let loaded = LoadedSession::load(&atelier_root(dir.path()), &session_b).unwrap();
+        app.adopt_session(loaded).unwrap();
+
+        // ── App-level fields reset ─────────────────────────────────────────
+        assert!(app.step_timings.is_empty(), "step_timings not cleared");
+        assert!(
+            app.pending_approval.is_none(),
+            "pending_approval (App) not cleared"
+        );
+        assert!(
+            app.pending_clarification.is_none(),
+            "pending_clarification (App) not cleared"
+        );
+        assert!(
+            app.pending_governance_decision.is_none(),
+            "pending_governance_decision (App) not cleared"
+        );
+        assert!(app.active_step.is_none(), "active_step not cleared");
+        assert!(app.active_steps.is_empty(), "active_steps not cleared");
+        assert!(
+            app.follow_up_queue.is_empty(),
+            "follow_up_queue not cleared"
+        );
+        assert!(app.trust_store.is_empty(), "trust_store not cleared");
+        assert!(!app.session_ended, "session_ended not reset");
+
+        // ── AppState session subset reset / replaced ───────────────────────
+        assert_eq!(app.state().session_id, session_b);
+        assert_eq!(app.state().run_state, RunState::Idle);
+        assert_eq!(app.state().active_run_id, None);
+        assert_eq!(app.state().session_goal, None, "stale goal leaked");
+        assert!(app.state().input.is_empty(), "input not cleared");
+        assert!(!app.state().show_first_approval_explainer);
+        assert!(app.state().pending_approval.is_none());
+        assert!(app.state().pending_clarification.is_none());
+        assert!(app.state().pending_governance_decision.is_none());
+        assert!(app.state().live_step.is_none());
+        assert!(app.state().live_steps.is_empty());
+        assert!(app.state().queued_follow_ups.is_empty());
+        assert!(
+            !app.state()
+                .events
+                .iter()
+                .any(|event| event == "stale event"),
+            "stale events leaked across the swap"
+        );
     }
 
     fn runtime_skill_context(display_name: &str, content: &str) -> SkillPromptContext {

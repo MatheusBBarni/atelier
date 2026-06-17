@@ -565,7 +565,7 @@ fn summarize_session(root: &Path, session_id: &str) -> Option<SessionSummary> {
 
 /// The active session goal folded from the log: the last `session_goal_set`
 /// value, cleared by a later `session_goal_cleared`.
-fn derive_goal(events: &[HistoryEvent]) -> Option<String> {
+pub(crate) fn derive_goal(events: &[HistoryEvent]) -> Option<String> {
     let mut goal = None;
     for event in events {
         match event.kind.as_str() {
@@ -607,6 +607,68 @@ fn derive_outcome(events: &[HistoryEvent]) -> RunState {
         }
     }
     outcome
+}
+
+/// The most-recently-started run together with the state it was last seen in,
+/// **only when that run never reached a terminal state** — i.e. a run left
+/// dangling by a crash or a quit mid-run (ADR-002/008). `None` when the last run
+/// closed terminally or no run ever started.
+///
+/// Resume folds this to decide whether to append a reconciling `run_interrupted`
+/// event; the `!is_terminal()` filter (task_01) is the "detect dangling" gate.
+/// A `run_started` marks a run at least `Running`; a later terminal run event
+/// (or a `session_ended` whose own `run_state` is terminal) closes it. A
+/// graceful quit *mid-run* records the in-flight `active_run_id` + `run_state`
+/// in `session_ended`, which is trusted; a clean between-runs quit carries
+/// `active_run_id: null` and must not resurrect the just-closed run.
+pub(crate) fn dangling_run_from_events(events: &[HistoryEvent]) -> Option<(String, RunState)> {
+    let mut current: Option<(String, RunState)> = None;
+    for event in events {
+        match event.kind.as_str() {
+            "run_started" => {
+                if let Some(run_id) = event.run_id.clone() {
+                    current = Some((run_id, RunState::Running));
+                }
+            }
+            "run_completed" => close_current_run(&mut current, event, RunState::Completed),
+            "run_failed" => close_current_run(&mut current, event, RunState::Failed),
+            "run_limit_reached" => close_current_run(&mut current, event, RunState::LimitReached),
+            "run_interrupted" => close_current_run(&mut current, event, RunState::Interrupted),
+            "session_ended" => {
+                if let Some(run_id) = event.payload.get("active_run_id").and_then(Value::as_str) {
+                    let state = event
+                        .payload
+                        .get("run_state")
+                        .and_then(|value| serde_json::from_value::<RunState>(value.clone()).ok())
+                        .unwrap_or(RunState::Running);
+                    current = Some((run_id.to_string(), state));
+                }
+            }
+            _ => {}
+        }
+    }
+    current.filter(|(_, state)| !state.is_terminal())
+}
+
+/// Mark the run currently being folded by [`dangling_run_from_events`] as closed
+/// in `state`. Runs are sequential (the one-active-run guard), so a terminal
+/// event closes the open run; the `run_id` is matched when the event carries one
+/// to stay robust against any out-of-order tail.
+fn close_current_run(
+    current: &mut Option<(String, RunState)>,
+    event: &HistoryEvent,
+    state: RunState,
+) {
+    if let Some((run_id, slot)) = current.as_mut() {
+        if event
+            .run_id
+            .as_deref()
+            .map(|id| id == run_id)
+            .unwrap_or(true)
+        {
+            *slot = state;
+        }
+    }
 }
 
 /// The first non-secret user prompt as a truncated label, or `None`. Mirrors
@@ -1072,6 +1134,113 @@ mod tests {
             last_recorded_head_sha(&[head_a, null_head]),
             Some("aaa1111".to_string())
         );
+    }
+
+    // ── Dangling-run detection (task_10) ──
+
+    fn run_event(run_id: &str, kind: &str, payload: Value) -> HistoryEvent {
+        HistoryEvent::new("s", Some(run_id.to_string()), None, kind, payload)
+    }
+
+    #[test]
+    fn dangling_run_is_none_for_an_empty_or_runless_log() {
+        assert_eq!(dangling_run_from_events(&[]), None);
+        let goal_only = HistoryEvent::new(
+            "s",
+            None,
+            None,
+            "session_goal_set",
+            json!({ "goal": "ship it" }),
+        );
+        assert_eq!(dangling_run_from_events(&[goal_only]), None);
+    }
+
+    #[test]
+    fn dangling_run_is_none_when_the_last_run_closed_terminally() {
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            run_event("r1", "run_completed", json!({ "summary": "done" })),
+        ];
+        assert_eq!(dangling_run_from_events(&events), None);
+    }
+
+    #[test]
+    fn dangling_run_reports_a_crash_mid_run_as_running() {
+        // A started run with no terminal event after it (the process died).
+        let events = [run_event("r1", "run_started", json!({ "run_id": "r1" }))];
+        assert_eq!(
+            dangling_run_from_events(&events),
+            Some(("r1".to_string(), RunState::Running))
+        );
+    }
+
+    #[test]
+    fn dangling_run_trusts_a_graceful_quit_mid_run() {
+        // end_session records the in-flight run via active_run_id + run_state.
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            HistoryEvent::new(
+                "s",
+                None,
+                None,
+                "session_ended",
+                json!({ "run_state": RunState::Running, "active_run_id": "r1" }),
+            ),
+        ];
+        assert_eq!(
+            dangling_run_from_events(&events),
+            Some(("r1".to_string(), RunState::Running))
+        );
+    }
+
+    #[test]
+    fn dangling_run_is_none_for_a_clean_between_runs_quit() {
+        // A run completed, then the user quit while Idle: session_ended carries a
+        // null active_run_id and must not resurrect the just-closed run.
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            run_event("r1", "run_completed", json!({ "summary": "done" })),
+            HistoryEvent::new(
+                "s",
+                None,
+                None,
+                "session_ended",
+                json!({ "run_state": RunState::Idle, "active_run_id": null }),
+            ),
+        ];
+        assert_eq!(dangling_run_from_events(&events), None);
+    }
+
+    #[test]
+    fn dangling_run_tracks_only_the_most_recent_run() {
+        // First run completed; a second started and never closed → the second is
+        // the dangling one.
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            run_event("r1", "run_completed", json!({ "summary": "done" })),
+            run_event("r2", "run_started", json!({ "run_id": "r2" })),
+        ];
+        assert_eq!(
+            dangling_run_from_events(&events),
+            Some(("r2".to_string(), RunState::Running))
+        );
+    }
+
+    #[test]
+    fn dangling_run_is_none_when_session_ended_recorded_a_terminal_state() {
+        // Quit captured a terminal run_state (e.g. right after failure): the
+        // is_terminal() filter rejects it, so there is nothing to reconcile.
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            HistoryEvent::new(
+                "s",
+                None,
+                None,
+                "session_ended",
+                json!({ "run_state": RunState::Failed, "active_run_id": "r1" }),
+            ),
+        ];
+        assert_eq!(dangling_run_from_events(&events), None);
     }
 
     #[test]
