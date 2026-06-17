@@ -567,6 +567,94 @@ fn summarize_session(root: &Path, session_id: &str) -> Option<SessionSummary> {
     })
 }
 
+/// The PRD resume success metrics, derived **entirely by folding the durable log**
+/// — no external telemetry (ADR-002/005). Counts across every session under a
+/// data root; the rates are the headline KPIs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResumeMetrics {
+    /// Sessions that ended non-terminally (a run was interrupted or left dangling).
+    pub crashed: usize,
+    /// Crashed sessions later recovered (their log carries a `session_resumed`).
+    pub recovered: usize,
+    /// Sessions that were resumed at least once.
+    pub resumed: usize,
+    /// Resumed sessions that reached a terminal `Completed` outcome.
+    pub resumed_completed: usize,
+}
+
+impl ResumeMetrics {
+    /// Crash-recovery adoption: `recovered / crashed`. `None` when nothing crashed
+    /// (the ratio is undefined, not zero).
+    pub fn crash_recovery_rate(&self) -> Option<f64> {
+        (self.crashed > 0).then(|| self.recovered as f64 / self.crashed as f64)
+    }
+
+    /// Resumed-session completion: `resumed_completed / resumed`. `None` when
+    /// nothing was resumed.
+    pub fn resumed_completion_rate(&self) -> Option<f64> {
+        (self.resumed > 0).then(|| self.resumed_completed as f64 / self.resumed as f64)
+    }
+}
+
+/// Fold every session under `root` into [`ResumeMetrics`]. Tolerant: a session
+/// whose log can't be read is skipped (mirrors [`list_session_summaries`]).
+pub fn resume_metrics(root: &Path) -> ResumeMetrics {
+    let mut metrics = ResumeMetrics::default();
+    let Ok(entries) = fs::read_dir(root.join("sessions")) else {
+        return metrics;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(events) = read_events_from_path(&entry.path().join("events.jsonl")) else {
+            continue;
+        };
+        if events.is_empty() {
+            continue;
+        }
+        let resumed = events
+            .iter()
+            .any(|event| event.kind == SESSION_RESUMED_KIND);
+        if session_ended_non_terminal(&events) {
+            metrics.crashed += 1;
+            if resumed {
+                metrics.recovered += 1;
+            }
+        }
+        if resumed {
+            metrics.resumed += 1;
+            if derive_outcome(&events) == RunState::Completed {
+                metrics.resumed_completed += 1;
+            }
+        }
+    }
+    metrics
+}
+
+/// Whether a session ended non-terminally — a run was interrupted
+/// (`run_interrupted`, including the resume reconciliation) or left dangling. The
+/// durable "crashed" signal behind the crash-recovery metric.
+fn session_ended_non_terminal(events: &[HistoryEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| event.kind == RUN_INTERRUPTED_KIND)
+        || dangling_run_from_events(events).is_some()
+}
+
+/// Time-to-continue: the delay from a session's `session_resumed` boundary to the
+/// next `prompt_submitted` (the user actually continuing in the resumed session).
+/// `None` when the session was never resumed, no prompt followed the resume, or a
+/// timestamp won't parse. Derived from the RFC3339 event timestamps.
+pub fn time_to_continue(events: &[HistoryEvent]) -> Option<chrono::Duration> {
+    let resumed_index = events
+        .iter()
+        .position(|event| event.kind == SESSION_RESUMED_KIND)?;
+    let resumed_at = chrono::DateTime::parse_from_rfc3339(&events[resumed_index].timestamp).ok()?;
+    let prompt = events[resumed_index + 1..]
+        .iter()
+        .find(|event| event.kind == "prompt_submitted")?;
+    let prompt_at = chrono::DateTime::parse_from_rfc3339(&prompt.timestamp).ok()?;
+    Some(prompt_at - resumed_at)
+}
+
 /// The active session goal folded from the log: the last `session_goal_set`
 /// value, cleared by a later `session_goal_cleared`.
 pub(crate) fn derive_goal(events: &[HistoryEvent]) -> Option<String> {
@@ -1259,6 +1347,114 @@ mod tests {
             ),
         ];
         assert_eq!(dangling_run_from_events(&events), None);
+    }
+
+    // ── Resume metrics (task_13) ──
+
+    fn seed_metrics_session(working_dir: &Path, kinds: &[(&str, Value)]) {
+        let store = HistoryStore::create(working_dir).unwrap();
+        for (kind, payload) in kinds {
+            let event = HistoryEvent::new(
+                store.session_id(),
+                Some("r".to_string()),
+                None,
+                *kind,
+                payload.clone(),
+            );
+            store.append_event(&event).unwrap();
+        }
+    }
+
+    fn event_at(kind: &str, timestamp: &str) -> HistoryEvent {
+        HistoryEvent {
+            schema_version: 1,
+            event_id: "e".to_string(),
+            session_id: "s".to_string(),
+            run_id: None,
+            group_id: None,
+            step_id: None,
+            timestamp: timestamp.to_string(),
+            kind: kind.to_string(),
+            payload: json!({}),
+            payload_truncated: false,
+        }
+    }
+
+    #[test]
+    fn resume_metrics_fold_crash_recovery_and_completion() {
+        let dir = tempdir().unwrap();
+        // 1: crashed (interrupted), never resumed.
+        seed_metrics_session(
+            dir.path(),
+            &[
+                ("run_started", json!({ "run_id": "r" })),
+                ("run_interrupted", json!({ "run_id": "r" })),
+            ],
+        );
+        // 2: crashed + resumed, not completed.
+        seed_metrics_session(
+            dir.path(),
+            &[
+                ("run_interrupted", json!({})),
+                ("session_resumed", json!({})),
+            ],
+        );
+        // 3: crashed + resumed + completed.
+        seed_metrics_session(
+            dir.path(),
+            &[
+                ("run_interrupted", json!({})),
+                ("session_resumed", json!({})),
+                ("run_completed", json!({})),
+            ],
+        );
+        // 4: clean run, never crashed/resumed → counts in nothing.
+        seed_metrics_session(
+            dir.path(),
+            &[
+                ("run_started", json!({ "run_id": "r" })),
+                ("run_completed", json!({})),
+            ],
+        );
+
+        let metrics = resume_metrics(&dir.path().join(".atelier"));
+        assert_eq!(metrics.crashed, 3, "sessions 1–3 ended non-terminally");
+        assert_eq!(metrics.recovered, 2, "sessions 2 and 3 were resumed");
+        assert_eq!(metrics.resumed, 2);
+        assert_eq!(metrics.resumed_completed, 1, "only session 3 completed");
+        assert_eq!(metrics.crash_recovery_rate(), Some(2.0 / 3.0));
+        assert_eq!(metrics.resumed_completion_rate(), Some(0.5));
+    }
+
+    #[test]
+    fn resume_metrics_on_empty_root_are_zero_with_undefined_rates() {
+        let dir = tempdir().unwrap();
+        let metrics = resume_metrics(&dir.path().join(".atelier"));
+        assert_eq!(metrics, ResumeMetrics::default());
+        assert_eq!(metrics.crash_recovery_rate(), None);
+        assert_eq!(metrics.resumed_completion_rate(), None);
+    }
+
+    #[test]
+    fn time_to_continue_is_resume_to_next_prompt_delta() {
+        let events = [
+            event_at("run_interrupted", "2026-06-17T10:00:00.000Z"),
+            event_at("session_resumed", "2026-06-17T10:00:02.000Z"),
+            event_at("prompt_submitted", "2026-06-17T10:00:07.000Z"),
+        ];
+        // 10:00:02 → 10:00:07 = 5s.
+        assert_eq!(
+            time_to_continue(&events).map(|delta| delta.num_seconds()),
+            Some(5)
+        );
+
+        // A session never resumed has no time-to-continue.
+        let unresumed = [event_at("prompt_submitted", "2026-06-17T10:00:00.000Z")];
+        assert_eq!(time_to_continue(&unresumed), None);
+
+        // Resumed but no following prompt yet (still idle after reopening).
+        let no_prompt = [event_at("session_resumed", "2026-06-17T10:00:00.000Z")];
+        assert_eq!(time_to_continue(&no_prompt), None);
     }
 
     #[test]

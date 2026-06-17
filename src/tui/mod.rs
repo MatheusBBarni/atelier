@@ -3649,6 +3649,7 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
             .git_context
             .as_ref()
             .map(|git| (git.repo_name.as_str(), git.branch.as_str())),
+        recoverable_session: state.recoverable_session,
     };
     let event_lines = if !state.chat_items.is_empty() {
         chat_item_lines(
@@ -6528,6 +6529,7 @@ mod tests {
             events: Vec::new(),
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
         populate_roster_rows(&mut state);
         let ui_state = TuiUiState {
@@ -6564,6 +6566,7 @@ mod tests {
             events: Vec::new(),
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Agent Roster"));
@@ -6612,6 +6615,7 @@ mod tests {
             ],
             input: "follow up".to_string(),
             git_context: None,
+            recoverable_session: false,
         };
         populate_roster_rows(&mut state);
         let text = render_to_text(&state, 100, 24);
@@ -6820,6 +6824,7 @@ mod tests {
             events: vec!["You: build a feature".to_string()],
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
 
         let text = render_to_text(&state, 100, 24);
@@ -6925,6 +6930,7 @@ mod tests {
             events: vec!["Action approval required.".to_string()],
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Approval required for fixer"));
@@ -6963,6 +6969,7 @@ mod tests {
             events: vec!["Action approval required.".to_string()],
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         }
     }
 
@@ -9753,6 +9760,7 @@ mod tests {
             events: vec!["Run started.".to_string()],
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
         let ui_state = TuiUiState {
             roster_visible: false,
@@ -9865,6 +9873,7 @@ mod tests {
             events: Vec::new(),
             input: input.to_string(),
             git_context: None,
+            recoverable_session: false,
         }
     }
 
@@ -13905,6 +13914,7 @@ runtime = "fake"
             preset: None,
             warnings: 0,
             git: None,
+            recoverable_session: false,
         };
         let line_text = |line: &Line<'static>| -> String {
             line.spans.iter().map(|s| s.content.as_ref()).collect()

@@ -96,6 +96,9 @@ pub struct WelcomeFacts<'a> {
     pub preset: Option<&'a str>,
     pub warnings: usize,
     pub git: Option<(&'a str, &'a str)>,
+    /// The newest prior session ended non-terminally (task_13): swaps the static
+    /// browser cue for a dynamic post-crash recovery nudge.
+    pub recoverable_session: bool,
 }
 
 /// Render the welcome item: an adaptive wordmark (skipped under `NO_COLOR` or
@@ -353,12 +356,20 @@ fn facts_lines(theme: &Theme, facts: &WelcomeFacts) -> Vec<Line<'static>> {
         "type /help for commands",
         Style::default().fg(theme.text_muted),
     )));
-    // Browser discoverability cue (task_09): point users at the session browser
-    // beyond the keybinding. The dynamic post-crash variant is task_13.
-    lines.push(Line::from(Span::styled(
-        "Ctrl-R or /sessions to browse and resume past sessions",
-        Style::default().fg(theme.text_muted),
-    )));
+    // Browser discoverability cue (task_09) → dynamic post-crash hint (task_13):
+    // when the newest prior session ended non-terminally, replace the neutral
+    // cue with a recovery nudge in a warning tone; otherwise keep the muted cue.
+    if facts.recoverable_session {
+        lines.push(Line::from(Span::styled(
+            "⚠ your last session was interrupted — Ctrl-R or /sessions to resume it",
+            Style::default().fg(theme.status_warn),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Ctrl-R or /sessions to browse and resume past sessions",
+            Style::default().fg(theme.text_muted),
+        )));
+    }
     lines
 }
 
@@ -423,6 +434,7 @@ mod tests {
             preset: Some("default"),
             warnings: 0,
             git,
+            recoverable_session: false,
         }
     }
 
@@ -589,6 +601,49 @@ mod tests {
                 .iter()
                 .all(|span| span.style.fg == Some(truecolor().text_muted)),
             "cue styled with theme.text_muted token"
+        );
+    }
+
+    #[test]
+    fn facts_box_shows_dynamic_post_crash_hint_when_recoverable() {
+        // task_13: when the newest prior session ended non-terminally, the static
+        // cue is replaced by a recovery nudge in the warning tone.
+        let agents = [agent("explorer")];
+        let facts = WelcomeFacts {
+            version: "1.0.0",
+            working_directory: None,
+            agents: &agents,
+            preset: Some("default"),
+            warnings: 0,
+            git: None,
+            recoverable_session: true,
+        };
+        let lines = facts_lines(&truecolor(), &facts);
+        let text: String = lines
+            .iter()
+            .map(|line| format!("{}\n", line_text(line)))
+            .collect();
+        assert!(
+            text.to_lowercase().contains("interrupted"),
+            "post-crash hint shown: {text}"
+        );
+        assert!(
+            text.contains("Ctrl-R") || text.contains("/sessions"),
+            "the hint points at recovery: {text}"
+        );
+        assert!(
+            !text.contains("browse and resume past sessions"),
+            "the static cue is replaced, not shown alongside the dynamic hint"
+        );
+        let hint = lines
+            .iter()
+            .find(|line| line_text(line).to_lowercase().contains("interrupted"))
+            .expect("hint line present");
+        assert!(
+            hint.spans
+                .iter()
+                .all(|span| span.style.fg == Some(truecolor().status_warn)),
+            "post-crash hint uses the warning theme token"
         );
     }
 

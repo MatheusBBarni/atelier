@@ -18,8 +18,9 @@ use crate::governance::{
 };
 use crate::history::{
     dangling_run_from_events, derive_goal, derive_outcome, hash_events_digest,
-    last_recorded_head_sha, HistoryEvent, HistoryStore, RunInterruptedPayload,
-    SessionResumedPayload, RESUME_DRIFT_ACK_KIND, RUN_INTERRUPTED_KIND, SESSION_RESUMED_KIND,
+    last_recorded_head_sha, list_session_summaries, HistoryEvent, HistoryStore,
+    RunInterruptedPayload, SessionResumedPayload, RESUME_DRIFT_ACK_KIND, RUN_INTERRUPTED_KIND,
+    SESSION_RESUMED_KIND,
 };
 use crate::hooks::{
     normalize, public_name_for_kind, try_dispatch, ActorCtx, DroppedHookCounter, HookDispatch,
@@ -149,6 +150,12 @@ pub struct AppState {
     /// Repo + branch of the working directory, refreshed by the git poller
     /// (ADR-006). `None` outside a git repo or while git is unavailable.
     pub git_context: Option<GitContext>,
+    /// True when the newest *prior* session (not this one) ended non-terminally,
+    /// computed once at startup from `list_session_summaries` (task_13). Drives the
+    /// dynamic post-crash hint in the welcome facts; the welcome only renders on an
+    /// empty chat, so it self-clears once the user resumes or starts working.
+    #[serde(default)]
+    pub recoverable_session: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1085,6 +1092,12 @@ impl App {
 
     pub async fn new_with_debug(config: EffectiveConfig, debug_enabled: bool) -> Result<Self> {
         let history = HistoryStore::create(&config.working_directory)?;
+        // Post-crash hint (task_13): does the newest *prior* session (not this
+        // just-created one) show as non-terminal? Computed once at startup.
+        let recoverable_session = newest_prior_session_recoverable(
+            &config.working_directory.join(".atelier"),
+            history.session_id(),
+        );
         let availability = check_all_runtime_availability(&config).await;
         let (interrupt_sender, interrupt_receiver) = watch::channel(0);
         let (approval_sender, approval_receiver) = watch::channel(ApprovalSignal {
@@ -1112,6 +1125,7 @@ impl App {
             events: Vec::new(),
             input: String::new(),
             git_context: None,
+            recoverable_session,
         };
         let mut app = Self {
             config,
@@ -1386,6 +1400,9 @@ impl App {
             queued_follow_ups: Vec::new(),
             events: Vec::new(),
             input: String::new(),
+            // The post-crash hint is a startup-only welcome cue; a session adopted
+            // mid-run never shows the welcome, so this is always false here.
+            recoverable_session: false,
         };
 
         // Reconcile a dangling (non-terminal) run: append a terminal
@@ -6970,6 +6987,19 @@ fn capped_preview(text: &str) -> String {
     format!("{truncated}\n… (truncated)")
 }
 
+/// Whether the newest session OTHER than `current_id` ended non-terminally — the
+/// signal for the dynamic post-crash welcome hint (task_13). Read from
+/// `list_session_summaries` (newest-first), skipping the just-created current
+/// session so a fresh launch never flags itself. `false` when there is no prior
+/// session or it ended cleanly (no false "crash" on a normal quit).
+fn newest_prior_session_recoverable(root: &Path, current_id: &str) -> bool {
+    list_session_summaries(root)
+        .into_iter()
+        .find(|summary| summary.session_id != current_id)
+        .map(|summary| !summary.outcome.is_terminal())
+        .unwrap_or(false)
+}
+
 /// Human-readable drift context for the first-mutation approval prompt and the
 /// `ActionExecutionContext` gate (ADR-004/007). Names the concrete drift modes
 /// (moved cwd, changed HEAD) without surfacing the dirty flag (never a trigger).
@@ -8854,6 +8884,122 @@ runtime = "fake"
                 .any(|event| event.kind == RESUME_DRIFT_ACK_KIND),
             "the acknowledgment is auditable in the log"
         );
+    }
+
+    // ── Resume-rate instrumentation + post-crash hint (task_13) ──
+
+    #[tokio::test]
+    async fn post_crash_hint_shown_when_newest_prior_session_is_non_terminal() {
+        let dir = tempdir().unwrap();
+        // A prior session left mid-flight (dangling ⇒ non-terminal outcome).
+        let prior = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        let app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(
+            app.state().recoverable_session,
+            "a fresh launch nudges recovery of the interrupted prior session"
+        );
+        // The outcome comes from list_session_summaries, not an ad-hoc scan.
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        let prior_outcome = summaries
+            .iter()
+            .find(|summary| summary.session_id == prior)
+            .map(|summary| summary.outcome.clone())
+            .unwrap();
+        assert!(!prior_outcome.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn post_crash_hint_suppressed_when_newest_prior_session_completed() {
+        let dir = tempdir().unwrap();
+        // A prior session that ended cleanly: a normal quit must not look like a crash.
+        seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(
+            !app.state().recoverable_session,
+            "a cleanly-completed prior session shows no post-crash hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_ever_session_shows_no_post_crash_hint() {
+        let dir = tempdir().unwrap();
+        // No prior session at all ⇒ nothing to recover.
+        let app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(!app.state().recoverable_session);
+    }
+
+    #[tokio::test]
+    async fn resume_metrics_and_hint_reflect_a_crash_then_recovery() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        // A session left mid-flight (dangling crash).
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "work", "submitted_prompt": "work", "source": "fresh" }),
+                "work",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        // A fresh launch shows the post-crash hint…
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(app.state().recoverable_session, "hint shown until resumed");
+
+        // …then the user resumes and completes it.
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(app.state().run_state, RunState::Completed);
+
+        // The derived metrics reflect exactly one recovered + completed resume.
+        let metrics = crate::history::resume_metrics(&root);
+        assert_eq!(metrics.recovered, 1);
+        assert_eq!(metrics.resumed_completed, 1);
+        assert_eq!(metrics.crash_recovery_rate(), Some(1.0));
+        assert_eq!(metrics.resumed_completion_rate(), Some(1.0));
     }
 
     fn runtime_skill_context(display_name: &str, content: &str) -> SkillPromptContext {
