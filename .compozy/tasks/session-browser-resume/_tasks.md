@@ -8,7 +8,7 @@ Derived from `_techspec.md` (Build Order). Phase 1 (read-only browse + preview M
 |---|-------|--------|------------|--------------|
 | 01 | Add `RunState::is_terminal()` helper | completed | low | — |
 | 02 | `HistoryStore::open()` + self-healing metadata cache fields | completed | medium | — |
-| 03 | Session summaries (`SessionSummary` + `list_session_summaries`) | pending | medium | task_01, task_02 |
+| 03 | Session summaries (`SessionSummary` + `list_session_summaries`) | completed | medium | task_01, task_02 |
 | 04 | New lifecycle event kinds + projection fold handlers | pending | medium | — |
 | 05 | `GitContext` HEAD+dirty, HEAD baseline, `detect_drift` | pending | medium | — |
 | 06 | Read-only preview fold + transcript sanitization | pending | medium | task_02, task_04 |

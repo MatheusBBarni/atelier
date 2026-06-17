@@ -1,5 +1,5 @@
 use crate::ids::new_id;
-use crate::orchestrator::ArtifactReference;
+use crate::orchestrator::{ArtifactReference, RunState};
 use anyhow::{anyhow, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -447,6 +447,171 @@ pub fn project_prompt_history(root: &Path, max: usize) -> Vec<String> {
     history
 }
 
+/// A newest-first browse row for the session picker (task_07). All fields are
+/// derived from the session's event log (the source of truth, ADR-008); the
+/// `metadata.json` cache is a self-healing accelerator, never authoritative.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub session_id: String,
+    /// Human-scannable label: the goal if set, else the first user prompt
+    /// (truncated), else `started_at · outcome`.
+    pub label: String,
+    pub started_at: String,
+    /// Terminal run outcome folded from the log (`Idle` when no run finished).
+    pub outcome: RunState,
+    pub working_directory: PathBuf,
+}
+
+/// Longest label rendered in the picker before truncation.
+const SESSION_LABEL_MAX_CHARS: usize = 72;
+
+/// Build newest-first [`SessionSummary`] rows for every session under `root`
+/// (the `.atelier` data root). Tolerant: a session that fails to open, parse, or
+/// read is skipped rather than failing the whole list. Self-healing: each
+/// session's `goal`/`outcome` cache is recomputed from its log and rewritten when
+/// missing or disagreeing (the log wins, ADR-008).
+///
+/// Newest-first ordering leverages the ULID-like session ids (lexicographically
+/// sortable = chronological): the directory names are sorted and reversed.
+pub fn list_session_summaries(root: &Path) -> Vec<SessionSummary> {
+    let sessions_dir = root.join("sessions");
+    let Ok(entries) = fs::read_dir(&sessions_dir) else {
+        return Vec::new(); // No sessions/ yet → empty, not an error.
+    };
+    let mut session_ids: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    // ULID-like ids: lexicographic order is chronological; reverse → newest first.
+    session_ids.sort();
+    session_ids.reverse();
+
+    session_ids
+        .iter()
+        .filter_map(|session_id| summarize_session(root, session_id))
+        .collect()
+}
+
+/// Summarize one session, self-healing its metadata cache from the log. Returns
+/// `None` (skip) when the session can't be opened/read.
+fn summarize_session(root: &Path, session_id: &str) -> Option<SessionSummary> {
+    let store = HistoryStore::open(root, session_id).ok()?;
+    let metadata = store.read_metadata().ok()?;
+    // The log is authoritative; an unreadable log degrades to "no events".
+    let events = store.read_events().unwrap_or_default();
+
+    let goal = derive_goal(&events);
+    let outcome = derive_outcome(&events);
+    let outcome_label = run_state_label(&outcome);
+
+    // Self-heal the derived cache when missing or disagreeing with the log.
+    if metadata.goal != goal || metadata.outcome.as_deref() != Some(outcome_label.as_str()) {
+        let _ = store.update_metadata_cache(
+            goal.clone(),
+            Some(outcome_label.clone()),
+            metadata.last_head_sha.clone(),
+        );
+    }
+
+    let label = goal
+        .clone()
+        .or_else(|| first_prompt_label(&events))
+        .unwrap_or_else(|| format!("{} · {}", metadata.started_at, outcome_label));
+
+    Some(SessionSummary {
+        session_id: session_id.to_string(),
+        label,
+        started_at: metadata.started_at,
+        outcome,
+        working_directory: metadata.working_directory,
+    })
+}
+
+/// The active session goal folded from the log: the last `session_goal_set`
+/// value, cleared by a later `session_goal_cleared`.
+fn derive_goal(events: &[HistoryEvent]) -> Option<String> {
+    let mut goal = None;
+    for event in events {
+        match event.kind.as_str() {
+            "session_goal_set" => {
+                goal = event
+                    .payload
+                    .get("goal")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            "session_goal_cleared" => goal = None,
+            _ => {}
+        }
+    }
+    goal
+}
+
+/// The session outcome folded from the log: the last *terminal* run state
+/// (`is_terminal()`, task_01), or the terminal `run_state` in a `session_ended`
+/// payload. `Idle` when no run reached a terminal state.
+fn derive_outcome(events: &[HistoryEvent]) -> RunState {
+    let mut outcome = RunState::Idle;
+    for event in events {
+        let candidate = match event.kind.as_str() {
+            "run_completed" => Some(RunState::Completed),
+            "run_failed" => Some(RunState::Failed),
+            "run_limit_reached" => Some(RunState::LimitReached),
+            "run_interrupted" => Some(RunState::Interrupted),
+            "session_ended" => event
+                .payload
+                .get("run_state")
+                .and_then(|value| serde_json::from_value::<RunState>(value.clone()).ok()),
+            _ => None,
+        };
+        if let Some(candidate) = candidate {
+            if candidate.is_terminal() {
+                outcome = candidate;
+            }
+        }
+    }
+    outcome
+}
+
+/// The first non-secret user prompt as a truncated label, or `None`. Mirrors
+/// [`project_prompt_history`]'s extraction, including the leading-space secrets
+/// escape hatch (such prompts never surface).
+fn first_prompt_label(events: &[HistoryEvent]) -> Option<String> {
+    events
+        .iter()
+        .filter(|event| event.kind == "prompt_submitted")
+        .find_map(|event| {
+            let prompt = event.payload.get("prompt").and_then(Value::as_str)?;
+            if prompt.starts_with(' ') {
+                return None; // Secrets escape hatch — skip, try the next prompt.
+            }
+            Some(truncate_label(prompt))
+        })
+}
+
+fn truncate_label(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() <= SESSION_LABEL_MAX_CHARS {
+        return text.to_string();
+    }
+    format!(
+        "{}…",
+        text.chars()
+            .take(SESSION_LABEL_MAX_CHARS.saturating_sub(1))
+            .collect::<String>()
+    )
+}
+
+/// The snake_case label for a [`RunState`] (e.g. `completed`, `limit_reached`),
+/// matching its serde representation and the cached `outcome` string.
+fn run_state_label(state: &RunState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 pub fn clean_sessions(working_directory: &Path) -> Result<Vec<PathBuf>> {
     let root = working_directory.join(".atelier");
     let targets = [root.join("sessions"), root.join("runs")];
@@ -637,6 +802,180 @@ mod tests {
             store.read_metadata().unwrap().last_head_sha.as_deref(),
             Some("abc123")
         );
+    }
+
+    // ── session summaries (task_03) ──
+
+    fn append(store: &HistoryStore, kind: &str, payload: Value) {
+        let event = HistoryEvent::new(
+            store.session_id().to_string(),
+            Some("run".to_string()),
+            None,
+            kind,
+            payload,
+        );
+        store.append_event(&event).unwrap();
+    }
+
+    #[test]
+    fn list_session_summaries_orders_newest_first_by_id() {
+        let dir = tempdir().unwrap();
+        let ids: Vec<String> = (0..3)
+            .map(|_| {
+                HistoryStore::create(dir.path())
+                    .unwrap()
+                    .session_id()
+                    .to_string()
+            })
+            .collect();
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        let got: Vec<String> = summaries.iter().map(|s| s.session_id.clone()).collect();
+        // The contract is reverse-lexicographic by id; for ULID ids that is
+        // newest-created first.
+        let mut expected = ids.clone();
+        expected.sort();
+        expected.reverse();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn summary_label_uses_goal_when_set() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        append(
+            &store,
+            "prompt_submitted",
+            json!({ "prompt": "do something" }),
+        );
+        append(
+            &store,
+            "session_goal_set",
+            json!({ "goal": "ship the feature" }),
+        );
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        assert_eq!(summaries[0].label, "ship the feature");
+    }
+
+    #[test]
+    fn summary_label_falls_back_to_first_prompt() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        // A leading-space (secret) prompt is skipped; the first real prompt wins.
+        append(
+            &store,
+            "prompt_submitted",
+            json!({ "prompt": " secret token" }),
+        );
+        append(
+            &store,
+            "prompt_submitted",
+            json!({ "prompt": "fix the parser" }),
+        );
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        assert_eq!(summaries[0].label, "fix the parser");
+    }
+
+    #[test]
+    fn summary_label_falls_back_to_timestamp_and_outcome() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        // No goal, no prompt — only a terminal run.
+        append(&store, "run_completed", json!({ "summary": "done" }));
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        let summary = &summaries[0];
+        assert_eq!(summary.outcome, RunState::Completed);
+        assert!(
+            summary.label.contains("completed"),
+            "label: {}",
+            summary.label
+        );
+        assert!(
+            summary.label.contains(&summary.started_at),
+            "label: {}",
+            summary.label
+        );
+    }
+
+    #[test]
+    fn summary_self_heals_missing_outcome_cache_from_log() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        append(&store, "run_failed", json!({ "reason": "boom" }));
+        // Fresh metadata has no cached outcome.
+        assert_eq!(store.read_metadata().unwrap().outcome, None);
+
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        assert_eq!(summaries[0].outcome, RunState::Failed);
+        // The browse pass rewrote the cache from the log (log wins, ADR-008).
+        assert_eq!(
+            store.read_metadata().unwrap().outcome.as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn corrupt_session_is_skipped_without_failing_the_list() {
+        let dir = tempdir().unwrap();
+        let good = HistoryStore::create(dir.path()).unwrap();
+        append(
+            &good,
+            "prompt_submitted",
+            json!({ "prompt": "valid session" }),
+        );
+        let good_id = good.session_id().to_string();
+
+        // A corrupt session: unparseable metadata.json.
+        let root = dir.path().join(".atelier");
+        let corrupt_dir = root.join("sessions").join("corrupt");
+        fs::create_dir_all(&corrupt_dir).unwrap();
+        fs::write(corrupt_dir.join("metadata.json"), "not json").unwrap();
+
+        let summaries = list_session_summaries(&root);
+        let ids: Vec<&str> = summaries.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(ids.contains(&good_id.as_str()));
+        assert!(
+            !ids.contains(&"corrupt"),
+            "corrupt session should be skipped"
+        );
+    }
+
+    #[test]
+    fn list_session_summaries_over_multi_session_fixture() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+
+        let a = HistoryStore::create(dir.path()).unwrap();
+        append(&a, "prompt_submitted", json!({ "prompt": "first session" }));
+        append(&a, "run_completed", json!({ "summary": "ok" }));
+
+        let b = HistoryStore::create(dir.path()).unwrap();
+        append(
+            &b,
+            "session_goal_set",
+            json!({ "goal": "second session goal" }),
+        );
+        append(&b, "run_failed", json!({ "reason": "nope" }));
+
+        let summaries = list_session_summaries(&root);
+        assert_eq!(summaries.len(), 2);
+        // Order is reverse-lexicographic by id (deterministic; back-to-back ULIDs
+        // can share a millisecond, so don't assume creation order == id order).
+        let mut expected_order = vec![a.session_id().to_string(), b.session_id().to_string()];
+        expected_order.sort();
+        expected_order.reverse();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|s| s.session_id.clone())
+                .collect::<Vec<_>>(),
+            expected_order
+        );
+        // Content by id.
+        let by_id = |id: &str| summaries.iter().find(|s| s.session_id == id).unwrap();
+        assert_eq!(by_id(a.session_id()).label, "first session");
+        assert_eq!(by_id(a.session_id()).outcome, RunState::Completed);
+        assert_eq!(by_id(b.session_id()).label, "second session goal");
+        assert_eq!(by_id(b.session_id()).outcome, RunState::Failed);
     }
 
     #[test]
