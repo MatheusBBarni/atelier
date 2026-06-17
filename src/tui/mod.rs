@@ -1,5 +1,6 @@
 use crate::app::chat::{
     ChatDetailRef, ChatItemKind, ChatItemView, ChatLineStyle, ChatLineView, ChatSeverity,
+    SessionPreview,
 };
 use crate::app::git::GitContext;
 use crate::app::{
@@ -299,15 +300,17 @@ enum AppWorkerCommand {
     Shutdown,
 }
 
-/// Which view the session browser is showing. `Preview` arrives in task_08.
+/// Which view the session browser is showing: the list, or a selected session's
+/// read-only transcript preview (task_08).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BrowserMode {
     #[default]
     List,
+    Preview,
 }
 
-/// One browser action, routed while the modal is visible (task_07). Preview /
-/// resume actions arrive in task_08/task_11.
+/// One browser action, routed while the modal is visible (task_07/08). The
+/// resume action arrives in task_11.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SessionBrowserCommand {
     Open,
@@ -316,6 +319,12 @@ enum SessionBrowserCommand {
     Down,
     FilterChar(char),
     FilterBackspace,
+    /// `Enter` on a list row → load that session's preview and switch to it.
+    OpenPreview,
+    /// `Esc` in preview → return to the list.
+    Back,
+    /// Scroll the preview transcript (reuses the chat scroll vocabulary).
+    ScrollPreview(EventScrollCommand),
 }
 
 /// Ephemeral session-browser modal state, held in `TuiUiState` like `help_*`
@@ -328,6 +337,14 @@ struct SessionBrowserState {
     summaries: Vec<SessionSummary>,
     selection_index: usize,
     filter: String,
+    /// The selected session's loaded preview (task_08); `None` while loading or
+    /// in list mode. Arrives off-thread over a watch channel.
+    preview: Option<SessionPreview>,
+    /// Which session the current preview is for, so `run_loop` knows when to
+    /// spawn a fresh off-thread load.
+    preview_session_id: Option<String>,
+    /// Scroll offset (in transcript lines) for the preview pane.
+    preview_scroll: usize,
 }
 
 impl SessionBrowserState {
@@ -742,6 +759,10 @@ async fn run_loop(
     // so opening the browser never blocks the render loop.
     let (session_summaries_sender, mut session_summaries_receiver) =
         watch::channel(Vec::<SessionSummary>::new());
+    // Session-preview channel (task_08): on selecting a row, the sanitized
+    // history-only fold is built off-thread and published here.
+    let (session_preview_sender, mut session_preview_receiver) =
+        watch::channel(None::<SessionPreview>);
     // Render the first frame (welcome visible) before the blocking skill scan,
     // then load suggestions behind it so the /skill dropdown is ready by the
     // next interaction.
@@ -754,6 +775,7 @@ async fn run_loop(
         sync_file_index(&mut ui_state, &mut file_index_receiver);
         sync_prompt_history(&mut ui_state, &mut prompt_history_receiver);
         sync_session_summaries(&mut ui_state, &mut session_summaries_receiver);
+        sync_session_preview(&mut ui_state, &mut session_preview_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
         terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
 
@@ -765,6 +787,7 @@ async fn run_loop(
             };
             if let Some(command) = command {
                 let browser_was_visible = ui_state.browser.visible;
+                let preview_target_before = ui_state.browser.preview_session_id.clone();
                 // Skill reload reports via the status line (set in `reload_skills`)
                 // rather than a full-screen takeover.
                 if !execute_tui_command_with_interrupt(
@@ -785,6 +808,16 @@ async fn run_loop(
                         ui_state.working_directory.clone(),
                         session_summaries_sender.clone(),
                     );
+                }
+                // A new session was selected for preview → fold it off-thread.
+                if let Some(session_id) = ui_state.browser.preview_session_id.clone() {
+                    if Some(&session_id) != preview_target_before.as_ref() {
+                        spawn_session_preview_load(
+                            ui_state.working_directory.clone(),
+                            session_id,
+                            session_preview_sender.clone(),
+                        );
+                    }
                 }
             }
         }
@@ -1043,6 +1076,41 @@ fn spawn_session_summaries_load(
                 .await
         {
             let _ = sender.send(summaries);
+        }
+    });
+}
+
+/// Adopt the latest off-thread preview into the browser (task_08). The build is
+/// pure and read-only; this only updates `ui_state`.
+fn sync_session_preview(
+    ui_state: &mut TuiUiState,
+    receiver: &mut watch::Receiver<Option<SessionPreview>>,
+) {
+    if receiver.has_changed().unwrap_or(false) {
+        ui_state.browser.preview = receiver.borrow_and_update().clone();
+    }
+}
+
+/// Build the read-only session preview off the render thread and publish it
+/// (task_08), reusing the task_06 builder. `build_session_preview` is synchronous
+/// file I/O, so it runs inside `spawn_blocking`; a build error or join failure
+/// leaves the loading placeholder in place. Strictly read-only — no `App` touch.
+fn spawn_session_preview_load(
+    working_directory: Option<PathBuf>,
+    session_id: String,
+    sender: watch::Sender<Option<SessionPreview>>,
+) {
+    tokio::spawn(async move {
+        let Some(working_directory) = working_directory else {
+            return;
+        };
+        let data_root = working_directory.join(".atelier");
+        let built = tokio::task::spawn_blocking(move || {
+            crate::app::chat::build_session_preview(&data_root, &session_id)
+        })
+        .await;
+        if let Ok(Ok(preview)) = built {
+            let _ = sender.send(Some(preview));
         }
     });
 }
@@ -1363,10 +1431,11 @@ fn key_event_to_tui_command_with_ui(
             _ => None,
         }
     } else if ui_state.browser.visible {
-        // Full modal (task_07): below help, above every other context. While
-        // visible it consumes keys (nav / filter / close); unmatched keys are
-        // swallowed so nothing leaks to the composer. Help still wins above.
-        session_browser_key_command(key)
+        // Full modal (task_07/08): below help, above every other context. While
+        // visible it consumes keys (nav / filter / preview-scroll / close);
+        // unmatched keys are swallowed so nothing leaks to the composer. Help
+        // still wins above. Routing is mode-aware (list vs preview).
+        session_browser_key_command(&ui_state.browser, key)
     } else if state.pending_clarification.is_some() {
         // Ctrl-C is handled by the reserved-key guard above.
         clarification_key_command(state, ui_state, key)
@@ -1417,30 +1486,65 @@ fn key_event_to_tui_command_with_ui(
 /// (task_07). `Esc` closes; `↑/↓` navigate; `Backspace` and printable characters
 /// narrow the filter. Every other key returns `None` and is swallowed by the
 /// modal (Ctrl-C is intercepted earlier by the reserved-key guard).
-fn session_browser_key_command(key: KeyEvent) -> Option<TuiCommand> {
-    let command = match key {
-        KeyEvent {
-            code: KeyCode::Esc, ..
-        } => SessionBrowserCommand::Close,
-        KeyEvent {
-            code: KeyCode::Up, ..
-        } => SessionBrowserCommand::Up,
-        KeyEvent {
-            code: KeyCode::Down,
-            ..
-        } => SessionBrowserCommand::Down,
-        KeyEvent {
-            code: KeyCode::Backspace,
-            ..
-        } => SessionBrowserCommand::FilterBackspace,
-        KeyEvent {
-            code: KeyCode::Char(ch),
-            modifiers,
-            ..
-        } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
-            SessionBrowserCommand::FilterChar(ch)
-        }
-        _ => return None,
+fn session_browser_key_command(browser: &SessionBrowserState, key: KeyEvent) -> Option<TuiCommand> {
+    use SessionBrowserCommand as Cmd;
+    let command = match browser.mode {
+        // List: Enter previews the selection, ↑/↓ navigate, typing filters, Esc closes.
+        BrowserMode::List => match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => Cmd::Close,
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => Cmd::OpenPreview,
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => Cmd::Up,
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => Cmd::Down,
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => Cmd::FilterBackspace,
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => Cmd::FilterChar(ch),
+            _ => return None,
+        },
+        // Preview: Esc returns to the list; chat-scroll keys move the transcript.
+        BrowserMode::Preview => match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => Cmd::Back,
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            } => Cmd::ScrollPreview(EventScrollCommand::PageUp),
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            } => Cmd::ScrollPreview(EventScrollCommand::PageDown),
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => Cmd::ScrollPreview(EventScrollCommand::LinesUp(1)),
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => Cmd::ScrollPreview(EventScrollCommand::LinesDown(1)),
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } => Cmd::ScrollPreview(EventScrollCommand::Top),
+            KeyEvent {
+                code: KeyCode::End, ..
+            } => Cmd::ScrollPreview(EventScrollCommand::Bottom),
+            _ => return None,
+        },
     };
     Some(TuiCommand::SessionBrowser(command))
 }
@@ -1555,6 +1659,9 @@ fn apply_session_browser_command(ui_state: &mut TuiUiState, command: SessionBrow
             browser.mode = BrowserMode::List;
             browser.filter.clear();
             browser.selection_index = 0;
+            browser.preview = None;
+            browser.preview_session_id = None;
+            browser.preview_scroll = 0;
         }
         SessionBrowserCommand::Close => {
             // Full reset so the next open starts clean (no stale summaries/filter).
@@ -1577,7 +1684,58 @@ fn apply_session_browser_command(ui_state: &mut TuiUiState, command: SessionBrow
             browser.filter.pop();
             browser.selection_index = 0;
         }
+        SessionBrowserCommand::OpenPreview => {
+            // Enter on the selected list row: switch to preview mode and mark which
+            // session to load. `run_loop` spawns the off-thread fold; the preview
+            // stays `None` (loading placeholder) until it lands.
+            if let Some(&index) = browser.filtered_indices().get(browser.selection_index) {
+                let session_id = browser.summaries[index].session_id.clone();
+                browser.mode = BrowserMode::Preview;
+                browser.preview = None;
+                browser.preview_session_id = Some(session_id);
+                browser.preview_scroll = 0;
+            }
+        }
+        SessionBrowserCommand::Back => {
+            // Return to the list, discarding the loaded preview.
+            browser.mode = BrowserMode::List;
+            browser.preview = None;
+            browser.preview_session_id = None;
+            browser.preview_scroll = 0;
+        }
+        SessionBrowserCommand::ScrollPreview(scroll) => {
+            apply_preview_scroll(browser, scroll);
+        }
     }
+}
+
+/// Number of transcript lines `render_session_browser` produces for a preview —
+/// one title + optional summary + body lines + a blank separator per item. Kept
+/// in sync with the preview line builder so scroll clamping matches the render.
+fn preview_total_lines(preview: &SessionPreview) -> usize {
+    preview
+        .items
+        .iter()
+        .map(|item| 1 + usize::from(item.summary.is_some()) + item.body.len() + 1)
+        .sum()
+}
+
+/// Apply a chat-style scroll command to the preview offset, clamped to the
+/// transcript length. A no-op while the preview is still loading.
+fn apply_preview_scroll(browser: &mut SessionBrowserState, scroll: EventScrollCommand) {
+    let Some(preview) = browser.preview.as_ref() else {
+        return;
+    };
+    const PAGE: usize = 10;
+    let max = preview_total_lines(preview).saturating_sub(1);
+    browser.preview_scroll = match scroll {
+        EventScrollCommand::Top => 0,
+        EventScrollCommand::Bottom => max,
+        EventScrollCommand::PageUp => browser.preview_scroll.saturating_sub(PAGE),
+        EventScrollCommand::PageDown => (browser.preview_scroll + PAGE).min(max),
+        EventScrollCommand::LinesUp(n) => browser.preview_scroll.saturating_sub(n),
+        EventScrollCommand::LinesDown(n) => (browser.preview_scroll + n).min(max),
+    };
 }
 
 fn agent_dropdown_key_command(key: KeyEvent) -> Option<TuiCommand> {
@@ -4331,6 +4489,10 @@ fn wrapped_event_line_count(lines: &[Line<'_>], width: u16) -> usize {
 /// sanitized (ADR-004) before display.
 fn render_session_browser(frame: &mut Frame, browser: &SessionBrowserState, theme: &Theme) {
     let area = centered_rect(78, 80, frame.area());
+    if browser.mode == BrowserMode::Preview {
+        render_session_preview(frame, area, browser, theme);
+        return;
+    }
     let filtered = browser.filtered_indices();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -4406,6 +4568,78 @@ fn render_session_browser(frame: &mut Frame, browser: &SessionBrowserState, them
         .wrap(Wrap { trim: false });
     frame.render_widget(Clear, area);
     frame.render_widget(widget, area);
+}
+
+/// Render the read-only transcript preview pane (task_08): a loading placeholder
+/// until the off-thread fold lands, then the sanitized, scrollable transcript.
+fn render_session_preview(
+    frame: &mut Frame,
+    area: Rect,
+    browser: &SessionBrowserState,
+    theme: &Theme,
+) {
+    let (lines, scroll) = match &browser.preview {
+        None => (
+            vec![Line::from(Span::styled(
+                "Loading transcript…".to_string(),
+                Style::default().fg(theme.text_dim),
+            ))],
+            0u16,
+        ),
+        Some(preview) if preview.items.is_empty() => (
+            vec![Line::from(Span::styled(
+                "This session has no transcript.".to_string(),
+                Style::default().fg(theme.text_dim),
+            ))],
+            0,
+        ),
+        Some(preview) => (
+            build_preview_lines(preview, theme),
+            browser.preview_scroll.min(u16::MAX as usize) as u16,
+        ),
+    };
+    let widget = Paragraph::new(lines)
+        .style(Style::default().fg(theme.text).bg(theme.ink))
+        .scroll((scroll, 0))
+        .block(
+            Block::default()
+                .title(" Session preview ")
+                .title(Line::from(" Esc back · PgUp/PgDn scroll ").right_aligned())
+                .title_style(
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .border_style(Style::default().fg(theme.accent))
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
+/// Build the styled transcript lines for a preview (already sanitized by the
+/// task_06 builder): a title + optional summary + body lines + a separator per
+/// item. The line count matches `preview_total_lines` so scroll clamping is exact.
+fn build_preview_lines(preview: &SessionPreview, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(preview_total_lines(preview));
+    for item in &preview.items {
+        lines.push(Line::from(Span::styled(
+            item.title.clone(),
+            severity_title_style(theme, &item.severity).add_modifier(Modifier::BOLD),
+        )));
+        if let Some(summary) = &item.summary {
+            lines.push(Line::from(Span::styled(
+                summary.clone(),
+                Style::default().fg(theme.text_muted),
+            )));
+        }
+        for line in &item.body {
+            lines.push(chat_body_line(theme, line));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
 }
 
 fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState, theme: &Theme) {
@@ -12750,7 +12984,10 @@ runtime = "fake"
     #[test]
     fn session_browser_keys_route_to_filter_nav_and_close() {
         use SessionBrowserCommand as Cmd;
-        let cmd = |code| session_browser_key_command(KeyEvent::new(code, KeyModifiers::NONE));
+        // Default browser is in List mode.
+        let browser = SessionBrowserState::default();
+        let cmd =
+            |code| session_browser_key_command(&browser, KeyEvent::new(code, KeyModifiers::NONE));
         assert_eq!(
             cmd(KeyCode::Char('a')),
             Some(TuiCommand::SessionBrowser(Cmd::FilterChar('a')))
@@ -12860,6 +13097,158 @@ runtime = "fake"
         let newest = text.find("newest session").expect("newest rendered");
         let older = text.find("older session").expect("older rendered");
         assert!(newest < older, "newest-first order in the rendered list");
+    }
+
+    // ── session preview pane (task_08) ──
+
+    fn preview_with_items(n: usize) -> SessionPreview {
+        SessionPreview {
+            session_id: "s".to_string(),
+            items: (0..n)
+                .map(|i| chat_item(&format!("item {i}"), ChatItemKind::RunSummary))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn enter_opens_preview_and_esc_returns_to_list() {
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        ui.browser.summaries = vec![browser_summary("a session")];
+
+        // List-mode Enter routes to OpenPreview.
+        assert_eq!(
+            session_browser_key_command(
+                &ui.browser,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(
+                SessionBrowserCommand::OpenPreview
+            ))
+        );
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::OpenPreview);
+        assert_eq!(ui.browser.mode, BrowserMode::Preview);
+        assert_eq!(
+            ui.browser.preview_session_id.as_deref(),
+            Some("id-a session")
+        );
+
+        // Preview-mode Esc routes to Back, returning to the list.
+        assert_eq!(
+            session_browser_key_command(
+                &ui.browser,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Back))
+        );
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::Back);
+        assert_eq!(ui.browser.mode, BrowserMode::List);
+        assert_eq!(ui.browser.preview_session_id, None);
+    }
+
+    #[test]
+    fn preview_shows_loading_placeholder_then_transcript() {
+        let state = state_with_input("", false);
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        ui.browser.mode = BrowserMode::Preview;
+
+        // No preview yet → loading placeholder.
+        let loading = render_to_text_with_ui_mut(&state, &mut ui, 100, 30);
+        assert!(
+            loading.contains("Loading"),
+            "expected loading state: {loading}"
+        );
+
+        // The off-thread fold lands → the transcript renders.
+        ui.browser.preview = Some(SessionPreview {
+            session_id: "s".to_string(),
+            items: vec![chat_item("a remembered step", ChatItemKind::RunSummary)],
+        });
+        let rendered = render_to_text_with_ui_mut(&state, &mut ui, 100, 30);
+        assert!(
+            rendered.contains("a remembered step"),
+            "expected transcript: {rendered}"
+        );
+    }
+
+    #[test]
+    fn preview_scroll_stays_within_bounds() {
+        let mut ui = TuiUiState::default();
+        ui.browser.mode = BrowserMode::Preview;
+        // 5 items × (title + separator) = 10 lines ⇒ max scroll 9.
+        ui.browser.preview = Some(preview_with_items(5));
+
+        let scroll = |ui: &mut TuiUiState, cmd| {
+            apply_session_browser_command(ui, SessionBrowserCommand::ScrollPreview(cmd))
+        };
+        scroll(&mut ui, EventScrollCommand::Bottom);
+        assert_eq!(ui.browser.preview_scroll, 9);
+        scroll(&mut ui, EventScrollCommand::PageDown);
+        assert_eq!(ui.browser.preview_scroll, 9, "clamped at the end");
+        scroll(&mut ui, EventScrollCommand::Top);
+        assert_eq!(ui.browser.preview_scroll, 0);
+        scroll(&mut ui, EventScrollCommand::LinesUp(3));
+        assert_eq!(ui.browser.preview_scroll, 0, "clamped at the top");
+        scroll(&mut ui, EventScrollCommand::LinesDown(2));
+        assert_eq!(ui.browser.preview_scroll, 2);
+    }
+
+    #[tokio::test]
+    async fn entering_preview_does_not_mutate_app_state() {
+        let mut state = state_with_input("", false);
+        state.chat_items = vec![chat_item("live transcript", ChatItemKind::UserPrompt)];
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        ui.browser.summaries = vec![browser_summary("x")];
+
+        let chat_before = state.chat_items.clone();
+        let run_before = state.run_state.clone();
+        let (sender, _receiver) = mpsc::channel(1);
+        execute_tui_command(
+            &mut state,
+            &mut ui,
+            &sender,
+            TuiCommand::SessionBrowser(SessionBrowserCommand::OpenPreview),
+        )
+        .await
+        .unwrap();
+        // The UI switched to preview, but live app state is untouched (read-only).
+        assert_eq!(ui.browser.mode, BrowserMode::Preview);
+        assert_eq!(state.chat_items, chat_before);
+        assert_eq!(state.run_state, run_before);
+    }
+
+    #[test]
+    fn preview_matches_the_on_disk_fold() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let store = crate::history::HistoryStore::create(dir.path()).unwrap();
+        let id = store.session_id().to_string();
+        for (kind, payload) in [
+            ("prompt_submitted", serde_json::json!({ "prompt": "do it" })),
+            ("run_completed", serde_json::json!({ "summary": "done" })),
+        ] {
+            store
+                .append_event(&crate::history::HistoryEvent::new(
+                    id.clone(),
+                    Some("r".to_string()),
+                    None,
+                    kind,
+                    payload,
+                ))
+                .unwrap();
+        }
+        let root = dir.path().join(".atelier");
+        let preview = crate::app::chat::build_session_preview(&root, &id).unwrap();
+        assert!(!preview.items.is_empty());
+        // What the off-thread loader publishes equals a fresh on-disk fold.
+        assert_eq!(
+            preview.items,
+            crate::app::chat::build_session_preview(&root, &id)
+                .unwrap()
+                .items
+        );
     }
 
     #[test]

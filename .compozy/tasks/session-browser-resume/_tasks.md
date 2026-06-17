@@ -13,7 +13,7 @@ Derived from `_techspec.md` (Build Order). Phase 1 (read-only browse + preview M
 | 05 | `GitContext` HEAD+dirty, HEAD baseline, `detect_drift` | completed | medium | — |
 | 06 | Read-only preview fold + transcript sanitization | completed | medium | task_02, task_04 |
 | 07 | Session browser modal + off-thread session list | completed | high | task_03 |
-| 08 | Transcript preview pane (off-thread fold load) | pending | high | task_06, task_07 |
+| 08 | Transcript preview pane (off-thread fold load) | completed | high | task_06, task_07 |
 | 09 | Discoverability: `/sessions` command + welcome cue | pending | low | task_07 |
 | 10 | `LoadedSession` + `App::adopt_session()` + exhaustiveness test | pending | high | task_01, task_02, task_04 |
 | 11 | Resume flow (re-adopt → write lifecycle events → re-render → Idle) | pending | high | task_04, task_05, task_08, task_10 |
