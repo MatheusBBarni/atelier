@@ -50,6 +50,10 @@ pub enum ChatItemKind {
     /// Synthetic branded welcome item, injected at startup (ADR-005). Not an
     /// orchestration event; carries no lifecycle key and never updates.
     Welcome,
+    /// A sub-task DAG run rendered as one durable, in-place evolving item: the
+    /// whole graph (every node's status + scope) and its WaitingApproval gate
+    /// (ADR-005). Per-node live items are suppressed in favor of this one view.
+    Plan,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +168,11 @@ pub enum ChatLifecycleKey {
         handler_index: usize,
         event: String,
     },
+    /// One sub-task DAG run's single evolving Plan item, keyed by `graph_id`
+    /// (ADR-005). Every graph/node event re-renders into this one item.
+    Plan {
+        graph_id: String,
+    },
 }
 
 impl ChatLineView {
@@ -257,6 +266,7 @@ impl ChatLifecycleKey {
                 handler_index,
                 event,
             } => format!("chat:hook:{run_id}:{handler_index}:{event}"),
+            ChatLifecycleKey::Plan { graph_id } => format!("chat:plan:{graph_id}"),
         }
     }
 }
@@ -279,6 +289,7 @@ impl ChatItemKind {
             ChatItemKind::RunSummary => "run_summary",
             ChatItemKind::HookInvocation => "hook_invocation",
             ChatItemKind::Welcome => "welcome",
+            ChatItemKind::Plan => "plan",
         }
     }
 }
