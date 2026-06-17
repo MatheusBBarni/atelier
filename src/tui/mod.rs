@@ -10,6 +10,7 @@ use crate::app::{
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
 use crate::governance::{GovernanceAnswer, GovernanceDecisionView};
+use crate::hooks::{self, HookLifecycleRecord};
 use crate::keybindings::{self, KeyAction, Keymap};
 use crate::orchestrator::RunState;
 use crate::skills::{
@@ -290,6 +291,9 @@ enum QueueSelectionCommand {
 #[derive(Debug)]
 enum AppWorkerCommand {
     Event(AppEvent),
+    /// A `hook_started`/`hook_completed` record from the off-thread dispatcher,
+    /// forwarded here so the worker (the only `&mut App`) records it (ADR-003).
+    RecordHookLifecycle(HookLifecycleRecord),
     Shutdown,
 }
 
@@ -536,6 +540,9 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let hide_banner = config.ui.hide_banner;
     let prompt_history_enabled = config.ui.prompt_history_enabled;
     let prompt_history_max = config.ui.prompt_history_max;
+    // Captured before `config` is moved into the app; drives whether the hook
+    // dispatcher is spawned (zero cost when no handlers) and which notifier backend.
+    let hooks_config = config.hooks.clone();
     // Resolve the active keymap from defaults + validated config overrides (task_08).
     // Captured before `config` is moved into the app; no overrides ⇒ default keymap.
     let keymap = Keymap::resolve(&keybindings::DEFAULTS, &config.keybindings);
@@ -554,6 +561,42 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     // gated on the toggle) projects `prompt_submitted` history off-thread and
     // publishes the ring once; the render loop syncs it into `TuiUiState`.
     let (prompt_history_sender, prompt_history_receiver) = watch::channel(Vec::<String>::new());
+
+    // Lifecycle hooks (ADR-003): only when handlers are configured, create the
+    // bounded dispatch channel + drop counter, wire the event tap
+    // (`App.hook_sender`), spawn the off-thread dispatcher, and forward its
+    // `hook_started`/`hook_completed` records back into the worker (the only
+    // `&mut App`) to be recorded. Skipped entirely otherwise, so the write path
+    // stays zero-cost when no hooks are present.
+    if !hooks_config.handlers.is_empty() {
+        let (hook_sender, hook_receiver) = hooks::hook_channel();
+        let (lifecycle_sender, mut lifecycle_receiver) =
+            mpsc::channel::<HookLifecycleRecord>(hooks::HOOK_CHANNEL_CAPACITY);
+        app.attach_hook_sender(hook_sender, hooks::DroppedHookCounter::new());
+        let notifier: Arc<dyn hooks::Notifier> = match hooks_config.notify_fallback_command.clone()
+        {
+            Some(command) => Arc::new(hooks::CommandNotifier::new(command)),
+            None => Arc::new(hooks::OscNotifier::to_terminal()),
+        };
+        tokio::spawn(hooks::run_hook_dispatcher(
+            hook_receiver,
+            lifecycle_sender,
+            notifier,
+            hooks::DEFAULT_HOOK_TIMEOUT,
+        ));
+        let lifecycle_command_sender = command_sender.clone();
+        tokio::spawn(async move {
+            while let Some(record) = lifecycle_receiver.recv().await {
+                if lifecycle_command_sender
+                    .send(AppWorkerCommand::RecordHookLifecycle(record))
+                    .await
+                    .is_err()
+                {
+                    break; // Worker is gone; stop forwarding.
+                }
+            }
+        });
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1070,6 +1113,11 @@ async fn run_app_worker(
             command = command_receiver.recv() => match command {
                 Some(AppWorkerCommand::Event(event)) => {
                     if let Err(error) = app.handle_event(event).await {
+                        app.record_diagnostic(error.to_string())?;
+                    }
+                }
+                Some(AppWorkerCommand::RecordHookLifecycle(record)) => {
+                    if let Err(error) = app.record_hook_lifecycle(record) {
                         app.record_diagnostic(error.to_string())?;
                     }
                 }

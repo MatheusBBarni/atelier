@@ -17,6 +17,10 @@ use crate::governance::{
     GOVERNANCE_DECISION_RESOLVED,
 };
 use crate::history::{HistoryEvent, HistoryStore};
+use crate::hooks::{
+    normalize, public_name_for_kind, try_dispatch, ActorCtx, DroppedHookCounter, HookDispatch,
+    HookLifecycleRecord, MatchedHandler, PayloadDetail,
+};
 use crate::ids::new_id;
 use crate::orchestrator::{
     agent_results, build_orchestrator_prompt, validate_orchestrator_decision, AgentResult,
@@ -409,6 +413,14 @@ pub struct App {
     /// gone when the process exits. A `Vec` preserves grant order so the `/trust`
     /// listing and 1-based `revoke_index` line up.
     trust_store: TrustStore,
+    /// Sender to the off-thread hook dispatcher (ADR-003). `None` until
+    /// `attach_hook_sender` wires it (only when handlers are configured), so the
+    /// event tap is zero-cost when no hooks are present and recording behaves
+    /// exactly as before.
+    hook_sender: Option<mpsc::Sender<HookDispatch>>,
+    /// Shared best-effort drop counter, incremented by the tap when the dispatch
+    /// channel is full. Surfaced by `--doctor` (task_08).
+    dropped_hooks: DroppedHookCounter,
 }
 
 /// In-memory, session-scoped allow-list of exact trust targets (ADR-004). Granted
@@ -1022,6 +1034,8 @@ impl App {
             approval_sender,
             approval_receiver,
             trust_store: TrustStore::default(),
+            hook_sender: None,
+            dropped_hooks: DroppedHookCounter::new(),
         };
         app.record_event(
             None,
@@ -1044,6 +1058,23 @@ impl App {
     pub fn attach_state_sender(&mut self, sender: watch::Sender<AppState>) {
         self.state_sender = Some(sender);
         self.publish_state();
+    }
+
+    /// Wire the event tap to the off-thread hook dispatcher (ADR-003). Called by
+    /// `run_tui` only when handlers are configured; the shared `dropped` counter
+    /// is the one the tap increments and `--doctor` reports.
+    pub fn attach_hook_sender(
+        &mut self,
+        sender: mpsc::Sender<HookDispatch>,
+        dropped: DroppedHookCounter,
+    ) {
+        self.hook_sender = Some(sender);
+        self.dropped_hooks = dropped;
+    }
+
+    /// Count of hook dispatches dropped on a full channel (best-effort delivery).
+    pub fn dropped_hook_count(&self) -> u64 {
+        self.dropped_hooks.count()
     }
 
     pub fn interrupt_handle(&self) -> InterruptHandle {
@@ -4717,6 +4748,11 @@ impl App {
             payload,
         );
         self.history.append_event(&event)?;
+        // Non-blocking hook tap (ADR-003): immediately after the durable append,
+        // map the event to the public vocabulary, resolve the actor, normalize,
+        // and `try_send` to the dispatcher. Gated on a wired sender, so it is
+        // zero-cost when no hooks are configured and never `.await`s here.
+        self.dispatch_hooks_for_event(&event);
         if self.debug_enabled {
             self.history.append_debug_event(&event)?;
         }
@@ -4725,6 +4761,95 @@ impl App {
         self.state.events.push(display.into());
         self.publish_state();
         Ok(())
+    }
+
+    /// The event tap (ADR-003): resolve actor + normalize + match handlers +
+    /// `try_send` to the off-thread dispatcher. Non-blocking and pure-read of
+    /// `&self`; returns immediately when no sender is wired or the event is
+    /// outside the public vocabulary. `hook_started`/`hook_completed` map to
+    /// `None` here, so recording them never re-triggers a hook (recursion guard).
+    fn dispatch_hooks_for_event(&self, event: &HistoryEvent) {
+        let Some(sender) = self.hook_sender.as_ref() else {
+            return; // No hooks wired ⇒ zero cost.
+        };
+        let Some(public_event) = public_name_for_kind(&event.kind) else {
+            return; // Outside the public vocabulary (incl. hook_* events).
+        };
+        let matched: Vec<MatchedHandler> = self
+            .config
+            .hooks
+            .handlers
+            .iter()
+            .enumerate()
+            .filter(|(_, handler)| handler.matches(public_event))
+            .map(|(index, handler)| MatchedHandler {
+                index,
+                handler: handler.clone(),
+            })
+            .collect();
+        if matched.is_empty() {
+            return;
+        }
+        let actor = self.resolve_actor_ctx(event);
+        // Normalize with the full body so the dispatcher can project per-handler
+        // detail (metadata strips it); redaction happens in the dispatcher.
+        let Some(payload) = normalize(event, actor, PayloadDetail::Full) else {
+            return;
+        };
+        try_dispatch(
+            sender,
+            HookDispatch {
+                payload,
+                handlers: matched,
+            },
+            &self.dropped_hooks,
+        );
+    }
+
+    /// Resolve the uniform cross-runtime actor for an event (ADR-003): the agent
+    /// of the step the event belongs to (matched by `step_id`, falling back to
+    /// the current `active_step`) plus that agent profile's runtime. Both `None`
+    /// for an orchestrator-level event emitted before any agent step is active.
+    fn resolve_actor_ctx(&self, event: &HistoryEvent) -> ActorCtx {
+        let agent = event
+            .step_id
+            .as_ref()
+            .and_then(|step_id| {
+                self.active_steps
+                    .iter()
+                    .chain(self.active_step.iter())
+                    .find(|step| &step.step_id == step_id)
+                    .map(|step| step.agent.clone())
+            })
+            .or_else(|| self.active_step.as_ref().map(|step| step.agent.clone()));
+        let Some(agent) = agent else {
+            return ActorCtx::default();
+        };
+        let runtime = self
+            .agent(&agent)
+            .ok()
+            .map(|profile| profile.runtime.clone());
+        ActorCtx {
+            agent: Some(agent),
+            runtime,
+        }
+    }
+
+    /// Record a `hook_started`/`hook_completed` lifecycle event sent back from the
+    /// dispatcher (ADR-003). This is the only `&mut App` site for hook events;
+    /// the dispatcher never calls `record_event` directly. The event kind is
+    /// outside the public vocabulary, so the tap above ignores it (no re-trigger).
+    pub(crate) fn record_hook_lifecycle(&mut self, record: HookLifecycleRecord) -> Result<()> {
+        let display = hook_lifecycle_display(&record);
+        let payload = serde_json::to_value(&record.payload)?;
+        self.record_event_with_group(
+            record.run_id,
+            None,
+            record.step_id,
+            record.kind.event_kind(),
+            payload,
+            display,
+        )
     }
 
     fn record_parallel_group_rejected_if_present(
@@ -6751,6 +6876,23 @@ fn loaded_skills_display(metadata: &[LoadedSkillMetadata]) -> String {
     format!("Skills loaded: {skills}.")
 }
 
+/// Transcript line for a `hook_started`/`hook_completed` lifecycle event.
+fn hook_lifecycle_display(record: &HookLifecycleRecord) -> String {
+    let payload = &record.payload;
+    match record.kind {
+        crate::hooks::HookLifecycleKind::Started => {
+            format!("Hook started: {} on {}.", payload.action, payload.event)
+        }
+        crate::hooks::HookLifecycleKind::Completed => {
+            let status = payload.status.as_deref().unwrap_or("done");
+            format!(
+                "Hook completed: {} on {} ({status}).",
+                payload.action, payload.event
+            )
+        }
+    }
+}
+
 fn config_status_display(status: &ConfigStatusView) -> String {
     let sources = status.sources.join(", ");
     let preset = status.preset.as_deref().unwrap_or("none");
@@ -8582,6 +8724,293 @@ prompt = "{reviewer_prompt}"
             .iter()
             .any(|event| event.kind == "runtime_stream_delta"));
         assert!(dir.path().join(".atelier/runs").exists());
+    }
+
+    // ── lifecycle hooks: event tap + dispatcher wiring (task_05) ──
+
+    /// A fake-runtime config whose agents all use `runtime_id` (type `fake`),
+    /// with `hooks_toml` appended as a user-scope `[hooks]` section (honored, not
+    /// dropped, because it is loaded as the explicit `--config` layer).
+    fn fake_config_with_hooks(dir: &Path, runtime_id: &str, hooks_toml: &str) -> EffectiveConfig {
+        let config_path = dir.join("atelier.toml");
+        let toml = format!(
+            "[runtimes.{rid}]\ntype = \"fake\"\n\
+             [agents.orchestrator]\nruntime = \"{rid}\"\n\
+             [agents.explorer]\nruntime = \"{rid}\"\n\
+             [agents.fixer]\nruntime = \"{rid}\"\n\
+             [agents.reviewer]\nruntime = \"{rid}\"\n\
+             [agents.oracle]\nruntime = \"{rid}\"\n\
+             [agents.consul]\nruntime = \"{rid}\"\n\
+             [council.presets.default.architect]\nruntime = \"{rid}\"\n\
+             [council.presets.default.security]\nruntime = \"{rid}\"\n\
+             [council.presets.default.reviewer]\nruntime = \"{rid}\"\n\
+             {hooks}",
+            rid = runtime_id,
+            hooks = hooks_toml,
+        );
+        fs::write(&config_path, toml).unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn command_hook_handler(public_event: &str, command: &str) -> crate::hooks::HookHandler {
+        crate::hooks::HookHandler {
+            on: vec![public_event.to_string()],
+            action: crate::hooks::HookAction::Command(command.to_string()),
+            payload: PayloadDetail::Metadata,
+        }
+    }
+
+    struct NoopNotifier;
+    impl crate::hooks::Notifier for NoopNotifier {
+        fn notify(&self, _title: &str, _body: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Wire `app`'s tap to a freshly-spawned dispatcher and return the lifecycle
+    /// back-channel receiver (the records `run_tui` would forward to the worker).
+    fn wire_hook_dispatcher(
+        app: &mut App,
+        notifier: Arc<dyn crate::hooks::Notifier>,
+    ) -> mpsc::Receiver<HookLifecycleRecord> {
+        let (hook_tx, hook_rx) = crate::hooks::hook_channel();
+        let (life_tx, life_rx) = mpsc::channel(256);
+        app.attach_hook_sender(hook_tx, DroppedHookCounter::new());
+        tokio::spawn(crate::hooks::run_hook_dispatcher(
+            hook_rx,
+            life_tx,
+            notifier,
+            crate::hooks::DEFAULT_HOOK_TIMEOUT,
+        ));
+        life_rx
+    }
+
+    #[tokio::test]
+    async fn tap_does_no_dispatch_when_no_hooks_configured() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        // A sender is wired, but no handlers are configured.
+        let (tx, mut rx) = crate::hooks::hook_channel();
+        app.attach_hook_sender(tx, DroppedHookCounter::new());
+        app.record_event(
+            Some("run-1".into()),
+            None,
+            "run_completed",
+            json!({}),
+            "done",
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err(), "no item should be dispatched");
+        assert_eq!(app.dropped_hook_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn tap_resolves_actor_runtime_from_active_step_agent() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.config
+            .hooks
+            .handlers
+            .push(command_hook_handler("step_started", "true"));
+        let (tx, mut rx) = crate::hooks::hook_channel();
+        app.attach_hook_sender(tx, DroppedHookCounter::new());
+        app.active_step = Some(ActiveStep {
+            run_id: "run-1".into(),
+            group_id: None,
+            step_id: "step-1".into(),
+            step_label: None,
+            file_scope: None,
+            agent: "explorer".into(),
+        });
+        app.record_event_with_group(
+            Some("run-1".into()),
+            None,
+            Some("step-1".into()),
+            "agent_step_started",
+            json!({ "agent": "explorer" }),
+            "started",
+        )
+        .unwrap();
+        let item = rx.try_recv().expect("a dispatch item");
+        assert_eq!(item.payload.event, "step_started");
+        assert_eq!(item.payload.actor.agent.as_deref(), Some("explorer"));
+        // fake_config's explorer agent uses runtime "fake".
+        assert_eq!(item.payload.actor.runtime.as_deref(), Some("fake"));
+    }
+
+    #[tokio::test]
+    async fn tap_increments_dropped_counter_on_full_channel_without_blocking() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.config
+            .hooks
+            .handlers
+            .push(command_hook_handler("run_completed", "true"));
+        // Capacity 1, never drained: the first fits, the second is dropped.
+        let (tx, _rx) = mpsc::channel(1);
+        let dropped = DroppedHookCounter::new();
+        app.attach_hook_sender(tx, dropped.clone());
+        app.record_event(Some("run-1".into()), None, "run_completed", json!({}), "a")
+            .unwrap();
+        app.record_event(Some("run-1".into()), None, "run_completed", json!({}), "b")
+            .unwrap();
+        assert_eq!(dropped.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn tap_ignores_kinds_outside_public_vocabulary() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.config
+            .hooks
+            .handlers
+            .push(command_hook_handler("run_completed", "true"));
+        let (tx, mut rx) = crate::hooks::hook_channel();
+        app.attach_hook_sender(tx, DroppedHookCounter::new());
+        // `runtime_stream_delta` is not in the public vocabulary → no dispatch.
+        app.record_event(
+            Some("run-1".into()),
+            None,
+            "runtime_stream_delta",
+            json!({ "agent": "explorer", "content": "x" }),
+            "delta",
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn end_to_end_command_hook_writes_normalized_payload() {
+        let dir = tempdir().unwrap();
+        let sentinel = dir.path().join("hook.json");
+        let hooks = format!(
+            "[[hooks.handler]]\non = \"run_completed\"\ncommand = \"cat > '{}'\"\n",
+            sentinel.display()
+        );
+        let config = fake_config_with_hooks(dir.path(), "fake", &hooks);
+        let mut app = App::new(config).await.unwrap();
+        let mut life_rx = wire_hook_dispatcher(&mut app, Arc::new(NoopNotifier));
+
+        app.submit_prompt("create a feature").await.unwrap();
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        // hook_started arrives, then hook_completed once the command has run.
+        let _started = tokio::time::timeout(Duration::from_secs(5), life_rx.recv())
+            .await
+            .expect("hook_started within timeout")
+            .expect("hook_started present");
+        let _completed = tokio::time::timeout(Duration::from_secs(5), life_rx.recv())
+            .await
+            .expect("hook_completed within timeout")
+            .expect("hook_completed present");
+
+        let written = std::fs::read_to_string(&sentinel).expect("hook wrote the sentinel");
+        assert!(
+            written.contains("\"event\":\"run_completed\""),
+            "payload: {written}"
+        );
+        assert!(
+            written.contains("\"outcome\":\"success\""),
+            "payload: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_runtime_run_completed_payload_shape_is_uniform() {
+        async fn captured_run_completed(dir: &Path, runtime_id: &str) -> crate::hooks::HookPayload {
+            let config = fake_config_with_hooks(
+                dir,
+                runtime_id,
+                "[[hooks.handler]]\non = \"run_completed\"\nnotify = true\n",
+            );
+            let mut app = App::new(config).await.unwrap();
+            let (tx, mut rx) = crate::hooks::hook_channel();
+            app.attach_hook_sender(tx, DroppedHookCounter::new());
+            app.submit_prompt("create a feature").await.unwrap();
+            let mut found = None;
+            while let Ok(item) = rx.try_recv() {
+                if item.payload.event == "run_completed" {
+                    found = Some(item.payload);
+                }
+            }
+            found.expect("run_completed dispatched")
+        }
+
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let a = captured_run_completed(dir_a.path(), "fake").await;
+        // A distinct runtime id (also of type `fake`): the actor.runtime value
+        // differs, but the payload SHAPE must be identical — the PRD's
+        // cross-runtime conformance proceed-criterion.
+        let b = captured_run_completed(dir_b.path(), "alt").await;
+
+        let key_set = |payload: &crate::hooks::HookPayload| {
+            let value = serde_json::to_value(payload).unwrap();
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            key_set(&a),
+            key_set(&b),
+            "run_completed payload shape differs across runtimes"
+        );
+        assert_eq!(a.event, b.event);
+        assert_eq!(a.outcome, b.outcome);
+        assert_eq!(a.schema_version, b.schema_version);
+        // The actor field is present and structurally uniform in both.
+        assert!(serde_json::to_value(&a).unwrap().get("actor").is_some());
+        assert!(serde_json::to_value(&b).unwrap().get("actor").is_some());
+    }
+
+    #[tokio::test]
+    async fn hook_lifecycle_events_are_recorded_into_history() {
+        let dir = tempdir().unwrap();
+        let sentinel = dir.path().join("hook.json");
+        let hooks = format!(
+            "[[hooks.handler]]\non = \"run_completed\"\ncommand = \"cat > '{}'\"\n",
+            sentinel.display()
+        );
+        let config = fake_config_with_hooks(dir.path(), "fake", &hooks);
+        let mut app = App::new(config).await.unwrap();
+        let mut life_rx = wire_hook_dispatcher(&mut app, Arc::new(NoopNotifier));
+
+        app.submit_prompt("create a feature").await.unwrap();
+        let started = tokio::time::timeout(Duration::from_secs(5), life_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(5), life_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Record them as the worker would (the only &mut App site).
+        app.record_hook_lifecycle(started).unwrap();
+        app.record_hook_lifecycle(completed).unwrap();
+
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "hook_started"));
+        let completed_event = events
+            .iter()
+            .find(|event| event.kind == "hook_completed")
+            .expect("hook_completed recorded");
+        assert_eq!(
+            completed_event
+                .payload
+                .get("exit_code")
+                .and_then(Value::as_i64),
+            Some(0)
+        );
+        // Recording hook_* events must NOT re-trigger hooks: exactly one
+        // hook_completed exists (no recursive cascade).
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "hook_completed").count(),
+            1
+        );
     }
 
     #[tokio::test]
