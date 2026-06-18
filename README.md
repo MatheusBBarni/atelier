@@ -20,7 +20,7 @@ an orchestrator and a sequence of specialized agent profiles.
   - `codex` (Codex CLI runtime)
   - `claude` (Claude CLI runtime)
   - `cursor` (Cursor Agent CLI runtime)
-  - `zai` (HTTP API runtime)
+  - `http_api` (configurable OpenAI-compatible HTTP API runtime — BYOK)
   - `fake` (test/runtime simulation)
 - Configurable agents with explicit capabilities and scopes.
 - Preset-based agent overrides, model fallback chains, and per-agent tool allowlists.
@@ -35,9 +35,9 @@ an orchestrator and a sequence of specialized agent profiles.
 - Node.js 20+ and npm 10+ for the recommended npm install path.
 - Rust toolchain only if you build from source.
 - `ZAI_API_KEY` (or another env var configured as `api_key_env`): required for a real run
-  with stock defaults — the default orchestrator runs on the `zai` runtime (`glm-5.1`), which
-  fails without it. Only the `fake` runtime needs no credentials, and it simulates rather than
-  doing real work.
+  with stock defaults — the default orchestrator runs on the `http_api` runtime (`glm-5.1`),
+  which fails without it. Only the `fake` runtime needs no credentials, and it simulates rather
+  than doing real work.
 - `codex` CLI with `codex login` completed: required for the default worker agents (explorer,
   fixer, reviewer), which run on the `codex` runtime out of the box.
 - Optional: `claude` CLI — only if you opt agents into the Claude runtime through config.
@@ -275,7 +275,7 @@ Important values:
 
 Lifecycle hooks run a desktop notification or a shell command when the harness
 reaches a lifecycle event. The hook receives a **normalized, versioned payload**
-that is identical across every runtime (Codex / Claude / Cursor / Z.ai), so one
+that is identical across every runtime (Codex / Claude / Cursor / HTTP API), so one
 config governs all of them.
 
 > **Security:** hooks are honored only from your **home config**
@@ -374,9 +374,12 @@ notify_fallback_command = "terminal-notifier -message"
   - Uses `cursor-agent --print --output-format stream-json` internally from an isolated deny-all Cursor permission sandbox.
   - Keeps Cursor-native tool calls behind Harness Actions.
   - Built-in agents do not use Cursor unless you opt in through config.
-- `zai`
-  - Default runtime for the orchestrator (`glm-5.1`), so `ZAI_API_KEY` is effectively required for any real run.
-  - Uses an API key from an env var (example: `ZAI_API_KEY`) and posts to `https://api.z.ai/api/paas/v4`.
+- `http_api`
+  - Configurable OpenAI-compatible HTTP API runtime (BYOK). Speaks the OpenAI chat-completions protocol over HTTPS, so any compatible provider (OpenRouter, DeepSeek, Groq, Together, Verboo, a local server, …) works as config alone — no new code.
+  - Default runtime for the orchestrator (`glm-5.1`), so `ZAI_API_KEY` is effectively required for any real run with stock defaults.
+  - Uses an API key from an env var (example: `ZAI_API_KEY`) and posts to `{base_url}/chat/completions` (default `base_url` is `https://api.z.ai/api/paas/v4`).
+  - Auth header defaults to `Authorization: Bearer <key>`; set `auth_header_name` / `auth_header_prefix` for providers that differ (e.g. Verboo's `api-key: <key>` — name `api-key`, empty prefix).
+  - Replaces the former `zai` runtime kind; configs using `type = "zai"` must update to `type = "http_api"`.
 - `fake`
   - Local test/runtime simulation mode.
 

@@ -90,6 +90,7 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
     checks.push(approval_check(config));
     checks.push(governance_metrics_check(config));
     checks.push(hooks_check(config));
+    checks.extend(legacy_runtime_type_checks(config));
 
     // Runtimes guaranteed to run on every prompt (V1: the orchestrator's). An
     // unavailable one is a hard error; everything else stays a warning (ADR-003).
@@ -632,6 +633,58 @@ fn probe_history_writable(history_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Migration hint (ADR-002): the `zai` runtime type was renamed to `http_api`.
+/// Scans each loaded config source for a `type = "zai"` declaration and emits a
+/// warning suggesting the rename.
+///
+/// Note: a config whose active runtime uses `type = "zai"` no longer
+/// deserializes, so `--doctor` bails during config load before this runs; this
+/// guards configs that still load yet reference the legacy literal. See task_05
+/// follow-up notes re: surfacing the same hint on a load failure.
+fn legacy_runtime_type_checks(config: &EffectiveConfig) -> Vec<DoctorCheck> {
+    legacy_runtime_type_checks_for_sources(&config.config_sources)
+}
+
+fn legacy_runtime_type_checks_for_sources(sources: &[std::path::PathBuf]) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+    for (index, path) in sources.iter().enumerate() {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        if config_text_uses_legacy_zai_type(&text) {
+            checks.push(DoctorCheck {
+                id: format!("config.legacy_runtime_type.{index}"),
+                title: "Legacy Runtime Type".to_string(),
+                status: DoctorStatus::Warn,
+                severity: DoctorSeverity::Warning,
+                message: format!(
+                    "{} declares the legacy runtime `type = \"zai\"`, which was renamed to `http_api`",
+                    path.display()
+                ),
+                remediation: Some(
+                    "Update `type = \"zai\"` to `type = \"http_api\"` in your config (ADR-002)."
+                        .to_string(),
+                ),
+                context: Some(serde_json::json!({ "path": path })),
+            });
+        }
+    }
+    checks
+}
+
+/// Whether `text` declares a runtime with the legacy `type = "zai"`, tolerant of
+/// whitespace around `=` and ignoring commented lines.
+fn config_text_uses_legacy_zai_type(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            return false;
+        }
+        let collapsed: String = trimmed.split_whitespace().collect();
+        collapsed == "type=\"zai\""
+    })
+}
+
 fn permission_checks(config: &EffectiveConfig) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
     for (index, path) in config.config_sources.iter().enumerate() {
@@ -1072,6 +1125,38 @@ mod tests {
         assert_eq!(runtime_title(&RuntimeKind::HttpApi), "HTTP API Runtime");
         assert_eq!(runtime_title(&RuntimeKind::Codex), "Codex Runtime");
         assert_eq!(runtime_title(&RuntimeKind::Fake), "Fake Runtime");
+    }
+
+    #[test]
+    fn config_text_uses_legacy_zai_type_detects_legacy_and_ignores_http_api() {
+        assert!(config_text_uses_legacy_zai_type(
+            "[runtimes.x]\ntype = \"zai\"\n"
+        ));
+        assert!(config_text_uses_legacy_zai_type("type=\"zai\""));
+        assert!(!config_text_uses_legacy_zai_type("type = \"http_api\""));
+        // Commented references are not flagged.
+        assert!(!config_text_uses_legacy_zai_type("# type = \"zai\""));
+    }
+
+    #[test]
+    fn legacy_runtime_type_check_warns_on_zai_and_not_http_api() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("legacy.toml");
+        fs::write(&legacy, "[runtimes.x]\ntype = \"zai\"\n").unwrap();
+        let modern = dir.path().join("modern.toml");
+        fs::write(&modern, "[runtimes.x]\ntype = \"http_api\"\n").unwrap();
+
+        let legacy_checks = legacy_runtime_type_checks_for_sources(&[legacy]);
+        assert_eq!(legacy_checks.len(), 1);
+        assert!(matches!(legacy_checks[0].status, DoctorStatus::Warn));
+        assert!(legacy_checks[0].message.contains("zai"));
+        assert!(legacy_checks[0]
+            .remediation
+            .as_deref()
+            .unwrap()
+            .contains("http_api"));
+
+        assert!(legacy_runtime_type_checks_for_sources(&[modern]).is_empty());
     }
 
     #[test]

@@ -3141,6 +3141,20 @@ type = "http_api"
 base_url = "https://api.z.ai/api/paas/v4"
 api_key_env = "ZAI_API_KEY"
 
+# Bring your own OpenAI-compatible provider (BYOK). The `http_api` runtime kind
+# speaks the OpenAI chat-completions protocol over HTTPS, so any compatible
+# endpoint (OpenRouter, DeepSeek, Groq, Together, Verboo, a local server, …)
+# works as config alone — no new code. Copy this block, uncomment it, and point
+# an agent at the runtime id with `runtime = "openrouter"`.
+# [runtimes.openrouter]
+# type = "http_api"
+# base_url = "https://openrouter.ai/api/v1"   # {base_url}/chat/completions is called
+# api_key_env = "OPENROUTER_API_KEY"          # env var NAME holding the key (never the key)
+# # Auth defaults to `Authorization: Bearer <key>`. Override for providers with a
+# # different scheme, e.g. Verboo, which expects `api-key: <key>` with no prefix:
+# # auth_header_name = "api-key"   # default "Authorization"
+# # auth_header_prefix = ""        # default "Bearer"; an empty string sends the bare key
+
 # Optional harness-owned MCP servers. Declare each under [mcp.servers.<id>] just
 # like a runtime. V1 wires transport = "stdio" only (the `url`/HTTP transport is
 # parsed but inert until V1.1). `command` is required for stdio. `env` sets the
@@ -3661,6 +3675,19 @@ mod tests {
         assert!(text.contains("[[hooks.handler]]"));
         // The scaffold is commented so a fresh config registers no hooks, and it
         // still parses cleanly through the ladder.
+        assert!(toml::from_str::<RawConfig>(&text).is_ok());
+    }
+
+    #[test]
+    fn starter_config_text_documents_http_api_byok_example() {
+        let text = starter_config_text();
+        // The active default runtime uses the renamed kind.
+        assert!(text.contains("type = \"http_api\""));
+        // A commented BYOK example documents the auth-header override fields.
+        assert!(text.contains("# [runtimes.openrouter]"));
+        assert!(text.contains("# auth_header_name = \"api-key\""));
+        assert!(text.contains("# auth_header_prefix = \"\""));
+        // The commented example must not break parsing of a fresh config.
         assert!(toml::from_str::<RawConfig>(&text).is_ok());
     }
 
