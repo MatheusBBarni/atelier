@@ -44,6 +44,17 @@ pub struct ToolCatalog {
     pub servers: Vec<ToolCatalogServer>,
 }
 
+impl ToolCatalog {
+    /// Find a tool's current definition by `(server, tool)`, for the validation
+    /// pin diff (task_05).
+    pub fn tool(&self, server: &str, tool: &str) -> Option<&McpTool> {
+        self.servers
+            .iter()
+            .find(|entry| entry.server == server)
+            .and_then(|entry| entry.tools.iter().find(|candidate| candidate.name == tool))
+    }
+}
+
 /// One server's slice of the [`ToolCatalog`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCatalogServer {

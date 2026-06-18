@@ -1179,6 +1179,28 @@ mod tests {
     }
 
     #[test]
+    fn claude_runtime_strips_mcp_so_model_cannot_self_invoke_mcp_tools() {
+        // MCP is harness-owned (ADR-001): the model reaches MCP tools only by
+        // emitting a `CallMcpTool` action through the harness, never via Claude
+        // Code's native MCP. `--strict-mcp-config` with no `--mcp-config` loads
+        // ZERO MCP servers, and `--tools ""` plus the stripped system prompt
+        // leave the model no native tool surface. Regression guard for task_05.
+        let args = claude_step_args(&[], "claude-opus-4");
+        assert!(
+            args.iter().any(|arg| arg == "--strict-mcp-config"),
+            "claude args must keep --strict-mcp-config so no MCP servers load"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--mcp-config"),
+            "claude args must NOT pass --mcp-config (that would load servers)"
+        );
+        assert!(
+            args.windows(2).any(|pair| pair == ["--tools", ""]),
+            "claude args must disable the native tool surface"
+        );
+    }
+
+    #[test]
     fn claude_step_args_pass_verbose_with_print_stream_json() {
         // `claude --print --output-format=stream-json` errors without --verbose.
         let args = claude_step_args(&[], "default");

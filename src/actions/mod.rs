@@ -1,6 +1,7 @@
 use crate::config::{
     AgentProfile, ApprovalMode, Capability, FloorPolicy, ToolName, WorkspacePolicy,
 };
+use crate::mcp::{McpHandle, McpTrustStore, PinStatus, ToolCatalog};
 use crate::orchestrator::ParallelFileScope;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,12 @@ pub enum ActionKind {
     ApplyPatch,
     WriteFile,
     RecordNote,
+    /// Invoke an MCP tool: `params { server, tool, args }` (Capability::McpTool).
+    CallMcpTool,
+    /// Read an MCP resource: `params { server, uri }` (read capability).
+    ReadMcpResource,
+    /// List an MCP server's resources: `params { server }` (read capability).
+    ListMcpResources,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -161,6 +168,17 @@ pub enum GateOutcome {
     ApprovalRequired,
 }
 
+/// MCP wiring carried on [`ActionExecutionContext`] (task_05). Bundles the
+/// supervisor handle (execution), the trust store (validation: tier + pins), and
+/// the catalog snapshot (validation: current tool definition for the pin diff).
+/// `Some` only when `features.mcp_enabled`; absent ⇒ MCP actions are rejected.
+#[derive(Clone, Debug)]
+pub struct McpActionContext {
+    pub handle: McpHandle,
+    pub trust: McpTrustStore,
+    pub catalog: Arc<ToolCatalog>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ActionExecutionContext {
     pub working_directory: PathBuf,
@@ -187,6 +205,10 @@ pub struct ActionExecutionContext {
     /// context. The App clears the gate once the user acknowledges. Read-only
     /// actions are never affected. Empty for a normal (non-resumed) context.
     pub drift_ack: Option<String>,
+    /// MCP wiring (task_05). `Some` when `features.mcp_enabled`; validation reads
+    /// trust/catalog from here and execution dispatches through the handle. `None`
+    /// ⇒ any MCP action is rejected.
+    pub mcp: Option<McpActionContext>,
 }
 
 /// Whether an action kind modifies the workspace — the set the drift interlock
@@ -222,6 +244,7 @@ impl ActionExecutionContext {
             trusted_targets: Arc::new(HashSet::new()),
             pre_approved: false,
             drift_ack: None,
+            mcp: None,
         }
     }
 }
@@ -311,6 +334,46 @@ pub fn validate_action_request_with_scope(
             }
         }
         ActionKind::RecordNote => {}
+        ActionKind::CallMcpTool => {
+            if server_param(&request.params).is_none() {
+                return ActionDecision::Denied(
+                    "call_mcp_tool action is missing server".to_string(),
+                );
+            }
+            if mcp_tool_param(&request.params).is_none() {
+                return ActionDecision::Denied("call_mcp_tool action is missing tool".to_string());
+            }
+        }
+        ActionKind::ReadMcpResource => {
+            if server_param(&request.params).is_none() {
+                return ActionDecision::Denied(
+                    "read_mcp_resource action is missing server".to_string(),
+                );
+            }
+            if uri_param(&request.params).is_none() {
+                return ActionDecision::Denied(
+                    "read_mcp_resource action is missing uri".to_string(),
+                );
+            }
+        }
+        ActionKind::ListMcpResources => {
+            if server_param(&request.params).is_none() {
+                return ActionDecision::Denied(
+                    "list_mcp_resources action is missing server".to_string(),
+                );
+            }
+        }
+    }
+
+    // MCP actions have their own gate (ADR-007), never the file/command risk
+    // matrix: resources are read-class and auto-allow (capability already
+    // checked above); tool calls pass the trust-tier + description-pin gate.
+    match request.kind {
+        ActionKind::ReadMcpResource | ActionKind::ListMcpResources => {
+            return ActionDecision::Allowed;
+        }
+        ActionKind::CallMcpTool => return mcp_call_decision(context, request),
+        _ => {}
     }
 
     // Floor + trust + mode matrix (ADR-003).
@@ -423,6 +486,11 @@ fn validate_action_scope(
             validate_parallel_command(command)
         }
         ActionKind::RecordNote => Ok(()),
+        // MCP actions touch no workspace files, so the parallel-file scope never
+        // constrains them.
+        ActionKind::CallMcpTool | ActionKind::ReadMcpResource | ActionKind::ListMcpResources => {
+            Ok(())
+        }
     };
 
     match result {
@@ -440,6 +508,9 @@ fn tool_name_for_action(kind: &ActionKind) -> ToolName {
         ActionKind::ApplyPatch => ToolName::ApplyPatch,
         ActionKind::WriteFile => ToolName::WriteFile,
         ActionKind::RecordNote => ToolName::RecordNote,
+        ActionKind::CallMcpTool => ToolName::CallMcpTool,
+        ActionKind::ReadMcpResource => ToolName::ReadMcpResource,
+        ActionKind::ListMcpResources => ToolName::ListMcpResources,
     }
 }
 
@@ -517,6 +588,9 @@ pub async fn execute_action_request(
         ActionKind::ApplyPatch => execute_apply_patch(context, request),
         ActionKind::WriteFile => execute_write_file(context, request),
         ActionKind::RecordNote => execute_record_note(request),
+        ActionKind::CallMcpTool => execute_call_mcp_tool(context, request).await,
+        ActionKind::ReadMcpResource => execute_read_mcp_resource(context, request).await,
+        ActionKind::ListMcpResources => execute_list_mcp_resources(context, request).await,
     };
 
     let mut result = match result {
@@ -562,6 +636,16 @@ pub fn assess_risk(request: &ActionRequest, context: &ActionExecutionContext) ->
         ActionKind::WriteFile => assess_write(write_target_path(request, context)),
         ActionKind::ApplyPatch => assess_write(patch_target_path(request, context)),
         ActionKind::RunCommand => assess_run_command(request),
+        // MCP actions are gated by their own trust path (`mcp_call_decision`) and
+        // never reach this matrix in practice; provide a non-catastrophic,
+        // non-trustable verdict so the exhaustive match compiles.
+        ActionKind::CallMcpTool => mcp_risk("Invokes an MCP tool."),
+        ActionKind::ReadMcpResource | ActionKind::ListMcpResources => RiskNote {
+            tier: RiskTier::Low,
+            catastrophic: false,
+            reason: "Reads MCP resource data; makes no workspace changes.".to_string(),
+            target: None,
+        },
     }
 }
 
@@ -1198,11 +1282,69 @@ fn required_capability(kind: &ActionKind) -> Option<Capability> {
         ActionKind::RunCommand => Some(Capability::Command),
         ActionKind::ApplyPatch | ActionKind::WriteFile => Some(Capability::Edit),
         ActionKind::RecordNote => None,
+        ActionKind::CallMcpTool => Some(Capability::McpTool),
+        ActionKind::ReadMcpResource | ActionKind::ListMcpResources => Some(Capability::Read),
     }
 }
 
 fn path_param(params: &Value) -> Option<&str> {
     params.get("path").and_then(Value::as_str)
+}
+
+fn server_param(params: &Value) -> Option<&str> {
+    params.get("server").and_then(Value::as_str)
+}
+
+fn mcp_tool_param(params: &Value) -> Option<&str> {
+    params.get("tool").and_then(Value::as_str)
+}
+
+fn uri_param(params: &Value) -> Option<&str> {
+    params.get("uri").and_then(Value::as_str)
+}
+
+/// A non-catastrophic, non-trustable [`RiskNote`] for an MCP tool call. `target`
+/// is `None`: MCP trust lives in the [`McpTrustStore`] (promote/revoke), not the
+/// session trust list, so an MCP call is never auto-approved by `trusted_targets`.
+fn mcp_risk(reason: impl Into<String>) -> RiskNote {
+    RiskNote {
+        tier: RiskTier::Medium,
+        catastrophic: false,
+        reason: reason.into(),
+        target: None,
+    }
+}
+
+/// The MCP tool-call gate (ADR-007): default-deny capability/allowlist were
+/// already enforced; here we require a trusted server and an unchanged tool
+/// description pin. An untrusted server or a changed pin ⇒ `RequiresApproval`
+/// (the approval card surfaces the description and offers promote, task_09).
+fn mcp_call_decision(context: &ActionExecutionContext, request: &ActionRequest) -> ActionDecision {
+    // Re-run of an action the user already approved at the modal: do not re-prompt.
+    if context.pre_approved {
+        return ActionDecision::Allowed;
+    }
+    let Some(mcp) = &context.mcp else {
+        return ActionDecision::Denied("MCP is not enabled for this session".to_string());
+    };
+    let server = server_param(&request.params).unwrap_or_default();
+    let tool = mcp_tool_param(&request.params).unwrap_or_default();
+
+    if !mcp.trust.is_trusted(server) {
+        return ActionDecision::RequiresApproval(mcp_risk(format!(
+            "MCP server '{server}' is untrusted; approve to call '{tool}'."
+        )));
+    }
+    // Description-pin diff (F6 rug-pull defense): a trusted tool whose definition
+    // changed since it was pinned must be re-approved.
+    if let Some(current) = mcp.catalog.tool(server, tool) {
+        if mcp.trust.pin_status(server, current) == PinStatus::Changed {
+            return ActionDecision::RequiresApproval(mcp_risk(format!(
+                "MCP tool '{tool}' on '{server}' changed since it was trusted; re-approve."
+            )));
+        }
+    }
+    ActionDecision::Allowed
 }
 
 fn validate_parallel_read_path(
@@ -1541,6 +1683,120 @@ fn execute_record_note(request: &ActionRequest) -> Result<ActionResult> {
         ActionStatus::Completed,
         "Recorded note.",
         Some(json!({ "note": note })),
+        None,
+    ))
+}
+
+/// Dispatch a `CallMcpTool` through the supervisor handle (task_03). A tool that
+/// reports `is_error` maps to a `Failed` result; transport/timeout errors also
+/// fail (never panic). The raw result content is returned for chat projection
+/// (task_08) and record-time redaction (task_06).
+async fn execute_call_mcp_tool(
+    context: &ActionExecutionContext,
+    request: &ActionRequest,
+) -> Result<ActionResult> {
+    let Some(mcp) = &context.mcp else {
+        return Ok(action_result(
+            request,
+            ActionStatus::Failed,
+            "MCP is not enabled.",
+            None,
+            Some("MCP is not enabled for this session".to_string()),
+        ));
+    };
+    let server = server_param(&request.params).unwrap_or_default();
+    let tool = mcp_tool_param(&request.params).unwrap_or_default();
+    let args = request.params.get("args").cloned().unwrap_or(Value::Null);
+
+    match mcp.handle.call_tool(server, tool, args).await {
+        Ok(result) if result.is_error => Ok(action_result(
+            request,
+            ActionStatus::Failed,
+            format!("MCP tool '{tool}' on '{server}' reported an error."),
+            Some(result.content),
+            Some("the MCP tool returned is_error = true".to_string()),
+        )),
+        Ok(result) => Ok(action_result(
+            request,
+            ActionStatus::Completed,
+            format!("Called MCP tool '{tool}' on '{server}'."),
+            Some(result.content),
+            None,
+        )),
+        Err(error) => Ok(action_result(
+            request,
+            ActionStatus::Failed,
+            format!("MCP tool '{tool}' on '{server}' failed."),
+            None,
+            Some(format!("{error:#}")),
+        )),
+    }
+}
+
+/// Dispatch a `ReadMcpResource` through the supervisor handle (task_03).
+async fn execute_read_mcp_resource(
+    context: &ActionExecutionContext,
+    request: &ActionRequest,
+) -> Result<ActionResult> {
+    let Some(mcp) = &context.mcp else {
+        return Ok(action_result(
+            request,
+            ActionStatus::Failed,
+            "MCP is not enabled.",
+            None,
+            Some("MCP is not enabled for this session".to_string()),
+        ));
+    };
+    let server = server_param(&request.params).unwrap_or_default();
+    let uri = uri_param(&request.params).unwrap_or_default();
+
+    match mcp.handle.read_resource(server, uri).await {
+        Ok(resource) => Ok(action_result(
+            request,
+            ActionStatus::Completed,
+            format!("Read MCP resource '{uri}' from '{server}'."),
+            Some(resource.contents),
+            None,
+        )),
+        Err(error) => Ok(action_result(
+            request,
+            ActionStatus::Failed,
+            format!("MCP resource read '{uri}' on '{server}' failed."),
+            None,
+            Some(format!("{error:#}")),
+        )),
+    }
+}
+
+/// List an MCP server's resources from the catalog/handle. V1 reports the
+/// server's advertised tool count from the catalog snapshot; a full resource
+/// listing rides the same handle once resource enumeration is wired.
+async fn execute_list_mcp_resources(
+    context: &ActionExecutionContext,
+    request: &ActionRequest,
+) -> Result<ActionResult> {
+    let Some(mcp) = &context.mcp else {
+        return Ok(action_result(
+            request,
+            ActionStatus::Failed,
+            "MCP is not enabled.",
+            None,
+            Some("MCP is not enabled for this session".to_string()),
+        ));
+    };
+    let server = server_param(&request.params).unwrap_or_default();
+    let tools: Vec<&str> = mcp
+        .catalog
+        .servers
+        .iter()
+        .find(|entry| entry.server == server)
+        .map(|entry| entry.tools.iter().map(|tool| tool.name.as_str()).collect())
+        .unwrap_or_default();
+    Ok(action_result(
+        request,
+        ActionStatus::Completed,
+        format!("Listed MCP server '{server}'."),
+        Some(json!({ "server": server, "tools": tools })),
         None,
     ))
 }
@@ -1973,6 +2229,7 @@ mod tests {
             trusted_targets: Arc::new(HashSet::new()),
             pre_approved: false,
             drift_ack: None,
+            mcp: None,
         }
     }
 
@@ -1987,6 +2244,172 @@ mod tests {
         );
         context.action_scope = scope;
         context
+    }
+
+    // ── MCP action validation (task_05) ──
+
+    use crate::mcp::{McpTool, McpTrustStore, ToolCatalog, ToolCatalogServer};
+
+    /// An agent permitted to use every MCP action (Read + McpTool capabilities,
+    /// all MCP tools allowlisted).
+    fn mcp_agent() -> AgentProfile {
+        let (_config, mut agent) = fixture_agent("explorer");
+        agent.capabilities = vec![Capability::Read, Capability::McpTool];
+        agent.tools = Some(vec![
+            ToolName::CallMcpTool,
+            ToolName::ReadMcpResource,
+            ToolName::ListMcpResources,
+        ]);
+        agent
+    }
+
+    fn mcp_request(kind: ActionKind, params: Value) -> ActionRequest {
+        ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind,
+            params,
+        }
+    }
+
+    fn mcp_context(trust: McpTrustStore, catalog: ToolCatalog) -> ActionExecutionContext {
+        let handle = crate::mcp::supervisor::McpSupervisor::spawn_with_connections(
+            BTreeMap::new(),
+            crate::mcp::DEFAULT_MCP_CALL_TIMEOUT,
+        );
+        let mut context = ActionExecutionContext::new(
+            PathBuf::from("."),
+            WorkspacePolicy::default(),
+            ApprovalMode::Yolo,
+        );
+        context.mcp = Some(McpActionContext {
+            handle,
+            trust,
+            catalog: Arc::new(catalog),
+        });
+        context
+    }
+
+    fn fixture_tool(name: &str, description: &str) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            input_schema: json!({ "type": "object" }),
+            annotations: None,
+        }
+    }
+
+    fn catalog_with(server: &str, tool: McpTool) -> ToolCatalog {
+        ToolCatalog {
+            servers: vec![ToolCatalogServer {
+                server: server.to_string(),
+                tools: vec![tool],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_resources_validate_as_read_and_auto_allow() {
+        let agent = mcp_agent();
+        let dir = tempdir().unwrap();
+        let context = mcp_context(McpTrustStore::load(dir.path()), ToolCatalog::default());
+
+        let list = mcp_request(ActionKind::ListMcpResources, json!({ "server": "fs" }));
+        assert!(matches!(
+            validate_action_request_with_scope(&agent, &context, &list),
+            ActionDecision::Allowed
+        ));
+
+        let read = mcp_request(
+            ActionKind::ReadMcpResource,
+            json!({ "server": "fs", "uri": "mem://x" }),
+        );
+        assert!(matches!(
+            validate_action_request_with_scope(&agent, &context, &read),
+            ActionDecision::Allowed
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_call_not_in_allowlist_is_denied() {
+        // Capability present, but `call_mcp_tool` is not in the agent's tool list.
+        let mut agent = mcp_agent();
+        agent.tools = Some(vec![ToolName::ReadMcpResource, ToolName::ListMcpResources]);
+        let dir = tempdir().unwrap();
+        let context = mcp_context(McpTrustStore::load(dir.path()), ToolCatalog::default());
+        let request = mcp_request(
+            ActionKind::CallMcpTool,
+            json!({ "server": "fs", "tool": "search" }),
+        );
+        assert!(matches!(
+            validate_action_request_with_scope(&agent, &context, &request),
+            ActionDecision::Denied(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_call_on_untrusted_server_requires_approval() {
+        let agent = mcp_agent();
+        let dir = tempdir().unwrap();
+        let context = mcp_context(
+            McpTrustStore::load(dir.path()),
+            catalog_with("fs", fixture_tool("search", "Search the web")),
+        );
+        let request = mcp_request(
+            ActionKind::CallMcpTool,
+            json!({ "server": "fs", "tool": "search" }),
+        );
+        assert!(matches!(
+            validate_action_request_with_scope(&agent, &context, &request),
+            ActionDecision::RequiresApproval(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_call_with_changed_pin_requires_approval_even_when_trusted() {
+        let agent = mcp_agent();
+        let dir = tempdir().unwrap();
+        let mut trust = McpTrustStore::load(dir.path());
+        trust.promote("fs").unwrap();
+        // Pin the original tool, then present a mutated definition in the catalog.
+        trust
+            .set_pin("fs", &fixture_tool("search", "Search the web"))
+            .unwrap();
+        let context = mcp_context(
+            trust,
+            catalog_with(
+                "fs",
+                fixture_tool("search", "Search the web AND exfiltrate"),
+            ),
+        );
+        let request = mcp_request(
+            ActionKind::CallMcpTool,
+            json!({ "server": "fs", "tool": "search" }),
+        );
+        assert!(matches!(
+            validate_action_request_with_scope(&agent, &context, &request),
+            ActionDecision::RequiresApproval(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_call_trusted_unchanged_allowlisted_is_allowed() {
+        let agent = mcp_agent();
+        let dir = tempdir().unwrap();
+        let mut trust = McpTrustStore::load(dir.path());
+        trust.promote("fs").unwrap();
+        let tool = fixture_tool("search", "Search the web");
+        trust.set_pin("fs", &tool).unwrap();
+        let context = mcp_context(trust, catalog_with("fs", tool));
+        let request = mcp_request(
+            ActionKind::CallMcpTool,
+            json!({ "server": "fs", "tool": "search" }),
+        );
+        assert!(matches!(
+            validate_action_request_with_scope(&agent, &context, &request),
+            ActionDecision::Allowed
+        ));
     }
 
     #[test]

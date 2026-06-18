@@ -60,6 +60,10 @@ pub enum Capability {
     Command,
     Verify,
     Review,
+    /// Permission to invoke harness-brokered MCP tools (`CallMcpTool`). Default-
+    /// deny: an agent without this capability cannot call any MCP tool (CF4,
+    /// ADR-007). MCP *resources* are read-class and need only `Read`.
+    McpTool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,6 +76,9 @@ pub enum ToolName {
     ApplyPatch,
     WriteFile,
     RecordNote,
+    CallMcpTool,
+    ReadMcpResource,
+    ListMcpResources,
 }
 
 impl ToolName {
@@ -84,6 +91,9 @@ impl ToolName {
             Self::ApplyPatch,
             Self::WriteFile,
             Self::RecordNote,
+            Self::CallMcpTool,
+            Self::ReadMcpResource,
+            Self::ListMcpResources,
         ]
     }
 
@@ -93,6 +103,10 @@ impl ToolName {
             Self::RunCommand => Some(Capability::Command),
             Self::ApplyPatch | Self::WriteFile => Some(Capability::Edit),
             Self::RecordNote => None,
+            // MCP tool calls need the dedicated capability; MCP resources are
+            // read-class and auto-allow under `Read` (ADR-007).
+            Self::CallMcpTool => Some(Capability::McpTool),
+            Self::ReadMcpResource | Self::ListMcpResources => Some(Capability::Read),
         }
     }
 }

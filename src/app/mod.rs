@@ -1451,6 +1451,21 @@ impl App {
         &self.mcp_trust
     }
 
+    /// The MCP wiring for one action's `ActionExecutionContext` (task_05): the
+    /// supervisor handle plus a snapshot of the trust store and tool catalog.
+    /// `None` when MCP is disabled. The catalog is empty here in V1; task_07
+    /// (catalog-snapshot advertisement) populates it so the validation pin-diff
+    /// has current tool definitions to compare against.
+    fn mcp_action_context(&self) -> Option<crate::actions::McpActionContext> {
+        self.mcp_handle
+            .clone()
+            .map(|handle| crate::actions::McpActionContext {
+                handle,
+                trust: self.mcp_trust.clone(),
+                catalog: std::sync::Arc::new(crate::mcp::ToolCatalog::default()),
+            })
+    }
+
     /// Promote an MCP server to `Trusted`: persist the file and, only on a real
     /// change, record an `mcp_server_trusted` event (the audit trail, ADR-006).
     pub fn promote_mcp_server(&mut self, server: &str) -> Result<()> {
@@ -4505,6 +4520,7 @@ impl App {
             trusted_targets: self.trust_store.snapshot(),
             pre_approved: false,
             drift_ack: self.drift_ack_context(),
+            mcp: self.mcp_action_context(),
         };
         self.record_command_started_if_executable_with_group(
             &run.run_id,
@@ -6052,6 +6068,7 @@ impl App {
                         trusted_targets: self.trust_store.snapshot(),
                         pre_approved: false,
                         drift_ack: self.drift_ack_context(),
+                        mcp: self.mcp_action_context(),
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -9199,6 +9216,35 @@ fn action_target_display(request: &ActionRequest) -> String {
         ActionKind::ApplyPatch => "apply patch".to_string(),
         ActionKind::WriteFile => format!("write {}", required_path_display(&request.params)),
         ActionKind::RecordNote => "record note".to_string(),
+        ActionKind::CallMcpTool => format!(
+            "call MCP tool {}/{}",
+            request
+                .params
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing server>"),
+            request
+                .params
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing tool>")
+        ),
+        ActionKind::ReadMcpResource => format!(
+            "read MCP resource {}",
+            request
+                .params
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing uri>")
+        ),
+        ActionKind::ListMcpResources => format!(
+            "list MCP resources on {}",
+            request
+                .params
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing server>")
+        ),
     }
 }
 
@@ -10922,6 +10968,7 @@ runtime = "fake"
             trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
             pre_approved: false,
             drift_ack: None,
+            mcp: None,
         };
         let rendered_context = ActionExecutionContext {
             user_prompt: Some(request.prompt.clone()),
