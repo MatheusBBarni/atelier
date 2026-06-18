@@ -351,6 +351,110 @@ impl AgentResult {
     }
 }
 
+/// The outcome of a grading round (ADR-004). Harness-constructed from canonical
+/// command exit codes — never deserialized from agent output, so a fabricated
+/// `AgentResult.status`/`verification` cannot manufacture a `Pass`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GradeOutcome {
+    Pass,
+    Fail,
+    Skip,
+}
+
+/// The decisive grading verdict. `command`/`exit_code` record the canonical
+/// check that grounded it; `critique` carries the failure excerpt fed to the
+/// producing agent on `Fail`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraderVerdict {
+    pub outcome: GradeOutcome,
+    pub command: Option<String>,
+    pub exit_code: Option<i64>,
+    pub critique: Option<String>,
+}
+
+/// One command the grade sub-step ran, sourced from the structured
+/// `command_completed` record (never model-authored text). `exit_code` is
+/// `None` when the command was denied or never produced a completion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandOutcome {
+    pub command: String,
+    pub exit_code: Option<i64>,
+    /// Optional captured output excerpt, used to seed the `critique` on failure.
+    pub excerpt: Option<String>,
+}
+
+/// Derive the grading verdict purely from the grade step's recorded command
+/// results (ADR-004):
+/// - `Pass` — at least one canonical verification command ran and every
+///   canonical command exited `0`.
+/// - `Fail` — at least one canonical command ran and any exited non-zero (or
+///   produced no exit code, treated as a non-pass for that check).
+/// - `Skip` — no canonical verification command ran at all.
+///
+/// Only commands accepted by [`crate::actions::is_canonical_verification_command`]
+/// count; everything else (e.g. `echo`, `cargo run`) is ignored.
+pub fn derive_grade_verdict(commands: &[CommandOutcome]) -> GraderVerdict {
+    let canonical: Vec<&CommandOutcome> = commands
+        .iter()
+        .filter(|outcome| crate::actions::is_canonical_verification_command(&outcome.command))
+        .collect();
+
+    if canonical.is_empty() {
+        return GraderVerdict {
+            outcome: GradeOutcome::Skip,
+            command: None,
+            exit_code: None,
+            critique: None,
+        };
+    }
+
+    // First canonical command that did not cleanly exit 0 decides a Fail.
+    if let Some(failed) = canonical
+        .iter()
+        .find(|outcome| outcome.exit_code != Some(0))
+    {
+        let critique = match &failed.excerpt {
+            Some(excerpt) if !excerpt.trim().is_empty() => format!(
+                "`{}` failed (exit {}):\n{}",
+                failed.command,
+                describe_exit(failed.exit_code),
+                excerpt.trim()
+            ),
+            _ => format!(
+                "`{}` failed (exit {})",
+                failed.command,
+                describe_exit(failed.exit_code)
+            ),
+        };
+        return GraderVerdict {
+            outcome: GradeOutcome::Fail,
+            command: Some(failed.command.clone()),
+            exit_code: failed.exit_code,
+            critique: Some(critique),
+        };
+    }
+
+    // Every canonical command exited 0 → Pass, attributed to the last one.
+    let decided = canonical
+        .last()
+        .expect("non-empty canonical set has a last element");
+    GraderVerdict {
+        outcome: GradeOutcome::Pass,
+        command: Some(decided.command.clone()),
+        exit_code: decided.exit_code,
+        critique: None,
+    }
+}
+
+/// Render an exit code for a critique, naming the no-completion case explicitly.
+fn describe_exit(exit_code: Option<i64>) -> String {
+    match exit_code {
+        Some(code) => code.to_string(),
+        None => "no exit code".to_string(),
+    }
+}
+
 impl OrchestratorDecision {
     pub fn normalized_next_step(&self) -> Result<Option<DecisionNextStep>> {
         if self.next_agent.is_some() && self.next_step.is_some() {
@@ -1097,6 +1201,85 @@ mod tests {
     use super::*;
     use crate::config::{load_effective_config, ConfigLoadOptions};
     use tempfile::tempdir;
+
+    fn outcome(command: &str, exit_code: Option<i64>) -> CommandOutcome {
+        CommandOutcome {
+            command: command.to_string(),
+            exit_code,
+            excerpt: None,
+        }
+    }
+
+    #[test]
+    fn derive_grade_verdict_passes_when_canonical_check_exits_zero() {
+        let verdict = derive_grade_verdict(&[outcome("cargo test", Some(0))]);
+        assert_eq!(verdict.outcome, GradeOutcome::Pass);
+        assert_eq!(verdict.command.as_deref(), Some("cargo test"));
+        assert_eq!(verdict.exit_code, Some(0));
+        assert!(verdict.critique.is_none());
+    }
+
+    #[test]
+    fn derive_grade_verdict_fails_with_critique_on_nonzero() {
+        let verdict = derive_grade_verdict(&[CommandOutcome {
+            command: "cargo test".to_string(),
+            exit_code: Some(1),
+            excerpt: Some("test foo ... FAILED".to_string()),
+        }]);
+        assert_eq!(verdict.outcome, GradeOutcome::Fail);
+        assert_eq!(verdict.exit_code, Some(1));
+        let critique = verdict.critique.expect("fail carries a critique");
+        assert!(
+            critique.contains("cargo test"),
+            "critique names the command"
+        );
+        assert!(
+            critique.contains("exit 1"),
+            "critique carries the exit code"
+        );
+        assert!(critique.contains("FAILED"), "critique carries the excerpt");
+    }
+
+    #[test]
+    fn derive_grade_verdict_skips_when_no_canonical_command_ran() {
+        // Non-canonical command only → Skip (the echo is ignored).
+        assert_eq!(
+            derive_grade_verdict(&[outcome("echo hi", Some(0))]).outcome,
+            GradeOutcome::Skip
+        );
+        // Empty set → Skip.
+        assert_eq!(derive_grade_verdict(&[]).outcome, GradeOutcome::Skip);
+    }
+
+    #[test]
+    fn derive_grade_verdict_fails_if_any_canonical_command_nonzero() {
+        let verdict = derive_grade_verdict(&[
+            outcome("cargo fmt --check", Some(0)),
+            outcome("cargo test", Some(1)),
+        ]);
+        assert_eq!(verdict.outcome, GradeOutcome::Fail);
+        assert_eq!(verdict.command.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn derive_grade_verdict_passes_when_all_canonical_commands_zero() {
+        let verdict = derive_grade_verdict(&[
+            outcome("cargo clippy --all-targets", Some(0)),
+            outcome("cargo test", Some(0)),
+        ]);
+        assert_eq!(verdict.outcome, GradeOutcome::Pass);
+    }
+
+    #[test]
+    fn derive_grade_verdict_treats_missing_exit_code_as_fail() {
+        // A canonical command that produced no completion is not a clean pass.
+        let verdict = derive_grade_verdict(&[outcome("cargo test", None)]);
+        assert_eq!(verdict.outcome, GradeOutcome::Fail);
+        assert!(verdict
+            .critique
+            .expect("critique present")
+            .contains("no exit code"));
+    }
 
     #[test]
     fn run_state_is_terminal_truth_table() {
