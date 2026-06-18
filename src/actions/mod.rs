@@ -209,6 +209,10 @@ pub struct ActionExecutionContext {
     /// trust/catalog from here and execution dispatches through the handle. `None`
     /// ⇒ any MCP action is rejected.
     pub mcp: Option<McpActionContext>,
+    /// The executing runtime's degrade-not-abandon flag (task_11). When `true`, a
+    /// failed MCP tool call degrades to a skipped (run-continues) result rather
+    /// than a hard failure. Set by `App` from the agent's runtime config.
+    pub degrade_not_abandon: bool,
 }
 
 /// Whether an action kind modifies the workspace — the set the drift interlock
@@ -245,6 +249,7 @@ impl ActionExecutionContext {
             pre_approved: false,
             drift_ack: None,
             mcp: None,
+            degrade_not_abandon: false,
         }
     }
 }
@@ -1315,6 +1320,70 @@ fn mcp_risk(reason: impl Into<String>) -> RiskNote {
     }
 }
 
+/// Maximum structured repair re-prompts for a malformed `CallMcpTool` (task_11):
+/// one repair with the tool schema + diagnostic, then fall through to the
+/// existing parse-error path.
+pub const MAX_MCP_REPAIR_ATTEMPTS: u32 = 1;
+
+/// How to handle a runtime that emitted (or executed) a malformed `CallMcpTool`
+/// (task_11), decided by [`mcp_emission_disposition`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpEmissionDisposition {
+    /// Re-prompt once with the tool schema + validator diagnostic.
+    Repair,
+    /// Give up on this tool but keep the run alive (degrade-not-abandon).
+    Degrade,
+    /// Surface the failure through the existing parse-error path.
+    Surface,
+}
+
+/// Decide what to do after a malformed MCP emission, given how many repairs have
+/// already been attempted and the runtime's `degrade_not_abandon` flag. Below the
+/// cap → `Repair`; at the cap → `Degrade` if the runtime degrades, else `Surface`.
+pub fn mcp_emission_disposition(
+    repair_attempts: u32,
+    degrade_not_abandon: bool,
+) -> McpEmissionDisposition {
+    if repair_attempts < MAX_MCP_REPAIR_ATTEMPTS {
+        McpEmissionDisposition::Repair
+    } else if degrade_not_abandon {
+        McpEmissionDisposition::Degrade
+    } else {
+        McpEmissionDisposition::Surface
+    }
+}
+
+/// Build the structured repair re-prompt for a malformed `CallMcpTool` (task_11):
+/// the offending tool's input schema (from the recorded catalog) plus the
+/// validator/executor `diagnostic`, instructing the model to re-emit a corrected
+/// call. Returns `None` for non-tool-call actions.
+pub fn mcp_repair_hint(
+    request: &ActionRequest,
+    diagnostic: &str,
+    catalog: &ToolCatalog,
+) -> Option<String> {
+    if request.kind != ActionKind::CallMcpTool {
+        return None;
+    }
+    let server = server_param(&request.params).unwrap_or("<server>");
+    let tool = mcp_tool_param(&request.params).unwrap_or("<tool>");
+    let mut hint = format!(
+        "Your CallMcpTool for `{server}/{tool}` was rejected: {diagnostic}\n\
+         Re-emit a corrected CallMcpTool with params {{ \"server\", \"tool\", \"args\" }}."
+    );
+    match catalog.tool(server, tool) {
+        Some(tool_def) => {
+            let schema = serde_json::to_string_pretty(&tool_def.input_schema).unwrap_or_default();
+            hint.push_str(&format!("\nThe tool's input schema is:\n{schema}"));
+        }
+        None => hint.push_str(&format!(
+            "\nNote: `{server}/{tool}` is not in the advertised tool catalog; \
+             check the server id and tool name against the listed MCP tools."
+        )),
+    }
+    Some(hint)
+}
+
 /// The MCP tool-call gate (ADR-007): default-deny capability/allowlist were
 /// already enforced; here we require a trusted server and an unchanged tool
 /// description pin. An untrusted server or a changed pin ⇒ `RequiresApproval`
@@ -1708,13 +1777,35 @@ async fn execute_call_mcp_tool(
     let tool = mcp_tool_param(&request.params).unwrap_or_default();
     let args = request.params.get("args").cloned().unwrap_or(Value::Null);
 
+    // A failed MCP call carries a structured repair hint (schema + diagnostic) so
+    // the model's next turn can correct its emission (task_11). Under
+    // degrade-not-abandon the tool is SKIPPED and the run continues (a `Completed`
+    // no-op); otherwise the failure is surfaced.
+    let on_failure = |diagnostic: String, content: Option<Value>| -> ActionResult {
+        let hint = mcp_repair_hint(request, &diagnostic, &mcp.catalog).unwrap_or(diagnostic);
+        if context.degrade_not_abandon {
+            action_result(
+                request,
+                ActionStatus::Completed,
+                format!("MCP tool '{tool}' on '{server}' skipped (degrade-not-abandon)."),
+                content,
+                Some(hint),
+            )
+        } else {
+            action_result(
+                request,
+                ActionStatus::Failed,
+                format!("MCP tool '{tool}' on '{server}' failed."),
+                content,
+                Some(hint),
+            )
+        }
+    };
+
     match mcp.handle.call_tool(server, tool, args).await {
-        Ok(result) if result.is_error => Ok(action_result(
-            request,
-            ActionStatus::Failed,
-            format!("MCP tool '{tool}' on '{server}' reported an error."),
+        Ok(result) if result.is_error => Ok(on_failure(
+            "the MCP tool returned is_error = true".to_string(),
             Some(result.content),
-            Some("the MCP tool returned is_error = true".to_string()),
         )),
         Ok(result) => Ok(action_result(
             request,
@@ -1723,13 +1814,7 @@ async fn execute_call_mcp_tool(
             Some(result.content),
             None,
         )),
-        Err(error) => Ok(action_result(
-            request,
-            ActionStatus::Failed,
-            format!("MCP tool '{tool}' on '{server}' failed."),
-            None,
-            Some(format!("{error:#}")),
-        )),
+        Err(error) => Ok(on_failure(format!("{error:#}"), None)),
     }
 }
 
@@ -2230,6 +2315,7 @@ mod tests {
             pre_approved: false,
             drift_ack: None,
             mcp: None,
+            degrade_not_abandon: false,
         }
     }
 
@@ -2410,6 +2496,58 @@ mod tests {
             validate_action_request_with_scope(&agent, &context, &request),
             ActionDecision::Allowed
         ));
+    }
+
+    // ── Emission repair loop + degrade-not-abandon (task_11) ──
+
+    #[test]
+    fn mcp_emission_disposition_repairs_once_then_degrades_or_surfaces() {
+        // Below the cap: always repair.
+        assert_eq!(
+            mcp_emission_disposition(0, false),
+            McpEmissionDisposition::Repair
+        );
+        assert_eq!(
+            mcp_emission_disposition(0, true),
+            McpEmissionDisposition::Repair
+        );
+        // At the cap: degrade-not-abandon decides between skipping and surfacing.
+        assert_eq!(
+            mcp_emission_disposition(MAX_MCP_REPAIR_ATTEMPTS, true),
+            McpEmissionDisposition::Degrade
+        );
+        assert_eq!(
+            mcp_emission_disposition(MAX_MCP_REPAIR_ATTEMPTS, false),
+            McpEmissionDisposition::Surface
+        );
+    }
+
+    #[test]
+    fn mcp_repair_hint_carries_schema_and_diagnostic() {
+        let catalog = catalog_with("fs", fixture_tool("search", "Search the web"));
+        let request = mcp_request(
+            ActionKind::CallMcpTool,
+            json!({ "server": "fs", "tool": "search", "args": {} }),
+        );
+        let hint = mcp_repair_hint(&request, "missing required arg `q`", &catalog)
+            .expect("repair hint for a malformed tool call");
+        assert!(hint.contains("missing required arg `q`"));
+        assert!(hint.contains("input schema"));
+        assert!(hint.contains("fs/search"));
+        // Non-tool-call actions get no repair hint.
+        let read = mcp_request(ActionKind::ReadFile, json!({ "path": "x" }));
+        assert!(mcp_repair_hint(&read, "x", &catalog).is_none());
+    }
+
+    #[test]
+    fn mcp_repair_hint_flags_unknown_tool_not_in_catalog() {
+        let catalog = catalog_with("fs", fixture_tool("search", "Search the web"));
+        let request = mcp_request(
+            ActionKind::CallMcpTool,
+            json!({ "server": "fs", "tool": "ghost", "args": {} }),
+        );
+        let hint = mcp_repair_hint(&request, "unknown tool", &catalog).unwrap();
+        assert!(hint.contains("not in the advertised tool catalog"));
     }
 
     #[test]

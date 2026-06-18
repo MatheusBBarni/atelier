@@ -546,6 +546,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "explorer");
         let result = collect_runtime_step_result(|events, cancellation| {
@@ -812,6 +813,7 @@ exit 65
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            degrade_not_abandon: false,
         });
 
         let error = runtime
@@ -905,6 +907,7 @@ exit 65
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            degrade_not_abandon: false,
         });
 
         let request = runtime_request(dir.path().to_path_buf(), "explorer");
@@ -958,6 +961,7 @@ exit 65
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "explorer");
         let (events, mut receiver) = RuntimeEventSink::channel(8);
@@ -1035,6 +1039,7 @@ exit 65
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            degrade_not_abandon: false,
         }
     }
 

@@ -201,3 +201,142 @@ async fn first_contact_prompts_then_promote_allows_then_revoke_prompts() {
 
     handle.shutdown().await.ok();
 }
+
+/// Build an MCP action context over `handle`/`catalog` with the given trust and
+/// degrade-not-abandon flag.
+fn mcp_context(
+    handle: &multiagent::mcp::McpHandle,
+    catalog: &multiagent::mcp::ToolCatalog,
+    trust: McpTrustStore,
+    degrade_not_abandon: bool,
+) -> ActionExecutionContext {
+    let mut context = ActionExecutionContext::new(
+        PathBuf::from("."),
+        WorkspacePolicy::default(),
+        ApprovalMode::Yolo,
+    );
+    context.mcp = Some(McpActionContext {
+        handle: handle.clone(),
+        trust,
+        catalog: Arc::new(catalog.clone()),
+    });
+    context.degrade_not_abandon = degrade_not_abandon;
+    context
+}
+
+fn call_request(tool: &str, args: serde_json::Value) -> ActionRequest {
+    ActionRequest {
+        schema_version: 1,
+        action_id: "a".to_string(),
+        step_id: "s".to_string(),
+        kind: ActionKind::CallMcpTool,
+        params: json!({ "server": "fake", "tool": tool, "args": args }),
+    }
+}
+
+#[tokio::test]
+async fn malformed_mcp_call_carries_repair_hint_then_valid_call_recovers() {
+    let agent = mcp_caller_agent();
+    let handle = McpSupervisor::spawn(vec![fake_server_config("fake")], Duration::from_secs(5));
+    let catalog = handle.snapshot_catalog().await.expect("catalog");
+    let trust_dir = tempdir().unwrap();
+    let mut trust = McpTrustStore::load(trust_dir.path());
+    trust.promote("fake").unwrap();
+    let context = mcp_context(&handle, &catalog, trust, false);
+
+    // Malformed: an unknown tool fails at the server; the result carries a
+    // structured repair hint for the model's next emission.
+    let bad = call_request("nonexistent_tool", json!({}));
+    let failed = execute_action_request(&agent, &context, &bad).await;
+    assert_eq!(failed.status, ActionStatus::Failed);
+    assert!(
+        failed
+            .diagnostic
+            .as_deref()
+            .unwrap_or_default()
+            .contains("CallMcpTool"),
+        "failure should carry the repair re-prompt"
+    );
+
+    // Repair: a corrected (valid) call executes successfully.
+    let good = call_request("effect_tool", json!({ "echo": "ok" }));
+    let recovered = execute_action_request(&agent, &context, &good).await;
+    assert_eq!(recovered.status, ActionStatus::Completed);
+
+    handle.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn degrade_not_abandon_skips_failed_tool_instead_of_failing() {
+    let agent = mcp_caller_agent();
+    let handle = McpSupervisor::spawn(vec![fake_server_config("fake")], Duration::from_secs(5));
+    let catalog = handle.snapshot_catalog().await.expect("catalog");
+    let trust_dir = tempdir().unwrap();
+    let mut trust = McpTrustStore::load(trust_dir.path());
+    trust.promote("fake").unwrap();
+    let bad = call_request("nonexistent_tool", json!({}));
+
+    // degrade_not_abandon = true ⇒ a failed tool is skipped (run continues).
+    let degrade = mcp_context(&handle, &catalog, trust.clone(), true);
+    let result = execute_action_request(&agent, &degrade, &bad).await;
+    assert_eq!(result.status, ActionStatus::Completed);
+
+    // degrade_not_abandon = false ⇒ the failure is surfaced.
+    let strict = mcp_context(&handle, &catalog, trust, false);
+    let result = execute_action_request(&agent, &strict, &bad).await;
+    assert_eq!(result.status, ActionStatus::Failed);
+
+    handle.shutdown().await.ok();
+}
+
+/// Emission spike harness (task_11): measures p95 emission-with-repair latency
+/// against a high-tool-count fake server. `#[ignore]`d behind an env var like the
+/// repo's other live/heavy suites.
+#[tokio::test]
+#[ignore = "emission spike harness; run with MULTIAGENT_RUN_MCP_SPIKE=1"]
+async fn emission_spike_reports_p95_with_repair() {
+    if std::env::var("MULTIAGENT_RUN_MCP_SPIKE").is_err() {
+        return;
+    }
+    let agent = mcp_caller_agent();
+    let mut server = fake_server_config("fake");
+    server
+        .env
+        .insert("FAKE_MCP_TOOL_COUNT".to_string(), "50".to_string());
+    let handle = McpSupervisor::spawn(vec![server], Duration::from_secs(10));
+    let catalog = handle.snapshot_catalog().await.expect("catalog");
+    assert!(
+        catalog.servers[0].tools.len() >= 50,
+        "high-tool-count catalog expected"
+    );
+    let trust_dir = tempdir().unwrap();
+    let mut trust = McpTrustStore::load(trust_dir.path());
+    trust.promote("fake").unwrap();
+    let context = mcp_context(&handle, &catalog, trust, false);
+
+    // Each iteration: one malformed emission (fails, yields a repair hint) then
+    // the repaired valid emission — the "emission-with-repair" round-trip.
+    let mut latencies = Vec::new();
+    for _ in 0..20u32 {
+        let start = std::time::Instant::now();
+        let _ = execute_action_request(
+            &agent,
+            &context,
+            &call_request("nonexistent_tool", json!({})),
+        )
+        .await;
+        let ok = execute_action_request(
+            &agent,
+            &context,
+            &call_request("effect_tool", json!({ "echo": "x" })),
+        )
+        .await;
+        assert_eq!(ok.status, ActionStatus::Completed);
+        latencies.push(start.elapsed());
+    }
+    latencies.sort();
+    let p95 = latencies[(latencies.len() as f64 * 0.95) as usize - 1];
+    println!("emission-with-repair p95 (high-tool-count fake server): {p95:?}");
+
+    handle.shutdown().await.ok();
+}

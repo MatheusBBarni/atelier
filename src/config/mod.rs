@@ -347,6 +347,10 @@ pub struct RuntimeConfig {
     pub prompt_mode: PromptMode,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// Degrade-not-abandon (task_11): when `true`, a runtime that cannot emit a
+    /// well-formed `CallMcpTool` after the capped repair skips that MCP tool and
+    /// the run continues, rather than failing the whole run. Off by default.
+    pub degrade_not_abandon: bool,
 }
 
 /// Transport an MCP server speaks. V1 wires `Stdio` only; `Http` parses but is
@@ -736,6 +740,7 @@ struct RawRuntimeConfig {
     prompt_mode: Option<PromptMode>,
     base_url: Option<String>,
     api_key_env: Option<String>,
+    degrade_not_abandon: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -781,6 +786,7 @@ struct MergedRuntimeConfig {
     prompt_mode: Option<PromptMode>,
     base_url: Option<String>,
     api_key_env: Option<String>,
+    degrade_not_abandon: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -979,6 +985,7 @@ impl MergedConfig {
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
                 api_key_env: None,
+                degrade_not_abandon: None,
             },
         );
         runtimes.insert(
@@ -990,6 +997,7 @@ impl MergedConfig {
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
                 api_key_env: None,
+                degrade_not_abandon: None,
             },
         );
         runtimes.insert(
@@ -1001,6 +1009,7 @@ impl MergedConfig {
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
                 api_key_env: None,
+                degrade_not_abandon: None,
             },
         );
         runtimes.insert(
@@ -1012,6 +1021,7 @@ impl MergedConfig {
                 prompt_mode: None,
                 base_url: Some("https://api.z.ai/api/paas/v4".to_string()),
                 api_key_env: Some("ZAI_API_KEY".to_string()),
+                degrade_not_abandon: None,
             },
         );
 
@@ -1555,6 +1565,7 @@ impl MergedConfig {
                 prompt_mode: None,
                 base_url: None,
                 api_key_env: None,
+                degrade_not_abandon: None,
             });
 
         if let Some(kind) = raw.runtime_type {
@@ -1583,6 +1594,9 @@ impl MergedConfig {
         }
         if let Some(api_key_env) = raw.api_key_env {
             entry.api_key_env = Some(api_key_env);
+        }
+        if let Some(degrade_not_abandon) = raw.degrade_not_abandon {
+            entry.degrade_not_abandon = Some(degrade_not_abandon);
         }
 
         Ok(())
@@ -1726,6 +1740,7 @@ impl MergedConfig {
                     did_you_mean(&id, runtime_ids.iter().map(String::as_str))
                 )
             })?;
+            let degrade_not_abandon = runtime.degrade_not_abandon.unwrap_or(false);
 
             let config = match kind {
                 RuntimeKind::Codex => RuntimeConfig {
@@ -1736,6 +1751,7 @@ impl MergedConfig {
                     prompt_mode: runtime.prompt_mode.unwrap_or_default(),
                     base_url: None,
                     api_key_env: None,
+                    degrade_not_abandon,
                 },
                 RuntimeKind::Claude => {
                     if runtime.api_key_env.is_some() {
@@ -1757,6 +1773,7 @@ impl MergedConfig {
                         prompt_mode,
                         base_url: None,
                         api_key_env: None,
+                        degrade_not_abandon,
                     }
                 }
                 RuntimeKind::Cursor => {
@@ -1783,6 +1800,7 @@ impl MergedConfig {
                         prompt_mode,
                         base_url: None,
                         api_key_env: None,
+                        degrade_not_abandon,
                     }
                 }
                 RuntimeKind::Zai => {
@@ -1803,6 +1821,7 @@ impl MergedConfig {
                                 .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
                         ),
                         api_key_env: Some(api_key_env),
+                        degrade_not_abandon,
                     }
                 }
                 RuntimeKind::Fake => RuntimeConfig {
@@ -1813,6 +1832,7 @@ impl MergedConfig {
                     prompt_mode: PromptMode::Stdin,
                     base_url: None,
                     api_key_env: None,
+                    degrade_not_abandon,
                 },
             };
             runtimes.insert(id, config);
@@ -4024,6 +4044,19 @@ env = { SECRET_TOKEN = "super-secret-value" }
         let starter = starter_config_text();
         assert!(starter.contains("[mcp.servers.filesystem]"));
         assert!(starter.contains("mcp_enabled"));
+    }
+
+    #[test]
+    fn runtime_degrade_not_abandon_parses_and_defaults_false() {
+        let on = load_from_temp(
+            "schema_version = 1\n[runtimes.codex]\ntype = \"codex\"\ndegrade_not_abandon = true\n",
+        )
+        .unwrap();
+        assert!(on.runtimes["codex"].degrade_not_abandon);
+
+        let off =
+            load_from_temp("schema_version = 1\n[runtimes.codex]\ntype = \"codex\"\n").unwrap();
+        assert!(!off.runtimes["codex"].degrade_not_abandon);
     }
 
     #[test]

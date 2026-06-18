@@ -1493,6 +1493,16 @@ impl App {
             })
     }
 
+    /// Whether `agent`'s runtime opts into degrade-not-abandon (task_11): a failed
+    /// MCP tool call then skips the tool instead of failing the run.
+    fn agent_runtime_degrades(&self, agent: &AgentProfile) -> bool {
+        self.config
+            .runtimes
+            .get(&agent.runtime)
+            .map(|runtime| runtime.degrade_not_abandon)
+            .unwrap_or(false)
+    }
+
     /// Refresh and record the MCP tool-catalog snapshot at run entry (task_07).
     /// A no-op when MCP is disabled. The recorded `mcp_catalog_snapshot` event is
     /// the replay source for the orchestrator prompt's MCP-tools section.
@@ -4590,6 +4600,7 @@ impl App {
             pre_approved: false,
             drift_ack: self.drift_ack_context(),
             mcp: self.mcp_action_context(),
+            degrade_not_abandon: self.agent_runtime_degrades(&child.request.agent_profile),
         };
         self.record_command_started_if_executable_with_group(
             &run.run_id,
@@ -6144,6 +6155,7 @@ impl App {
                         pre_approved: false,
                         drift_ack: self.drift_ack_context(),
                         mcp: self.mcp_action_context(),
+                        degrade_not_abandon: self.agent_runtime_degrades(&request.agent_profile),
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -11127,6 +11139,7 @@ runtime = "fake"
             pre_approved: false,
             drift_ack: None,
             mcp: None,
+            degrade_not_abandon: false,
         };
         let rendered_context = ActionExecutionContext {
             user_prompt: Some(request.prompt.clone()),

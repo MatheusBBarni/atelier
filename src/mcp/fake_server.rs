@@ -110,6 +110,20 @@ impl ServerHandler for FakeMcpServer {
                 object_schema(json!({})),
             ),
         ];
+        let mut tools = tools;
+        // High-tool-count mode for the emission spike (task_11): pad with N
+        // synthetic tools so the prompt advertises a large catalog.
+        if let Ok(extra) = std::env::var("FAKE_MCP_TOOL_COUNT") {
+            if let Ok(count) = extra.parse::<usize>() {
+                for index in 0..count {
+                    tools.push(Tool::new(
+                        format!("spike_tool_{index}"),
+                        format!("Synthetic spike tool #{index}"),
+                        object_schema(json!({ "n": { "type": "integer" } })),
+                    ));
+                }
+            }
+        }
         Ok(ListToolsResult::with_all_items(tools))
     }
 

@@ -578,6 +578,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: Some(format!("http://{addr}")),
             api_key_env: Some("MULTIAGENT_TEST_ZAI_KEY".to_string()),
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "oracle");
         let result = collect_runtime_step_result(|events, cancellation| {
@@ -635,6 +636,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: Some(format!("http://{addr}")),
             api_key_env: Some("MULTIAGENT_TEST_ZAI_KEY".to_string()),
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "oracle");
         let result = tokio::time::timeout(Duration::from_secs(2), async {
@@ -692,6 +694,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: Some(format!("http://{addr}")),
             api_key_env: Some("MULTIAGENT_TEST_ZAI_KEY".to_string()),
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "oracle");
 
@@ -733,6 +736,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: Some(format!("http://{addr}")),
             api_key_env: Some("MULTIAGENT_TEST_ZAI_KEY".to_string()),
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "oracle");
 
@@ -810,6 +814,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: Some("http://127.0.0.1:1".to_string()),
             api_key_env: Some("MULTIAGENT_TEST_MISSING_ZAI_KEY".to_string()),
+            degrade_not_abandon: false,
         });
 
         let availability = runtime.check_availability().await;

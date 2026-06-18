@@ -1077,6 +1077,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            degrade_not_abandon: false,
         });
 
         let availability = runtime.check_availability().await;
@@ -1999,6 +2000,7 @@ exec sleep 30
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            degrade_not_abandon: false,
         }
     }
 
