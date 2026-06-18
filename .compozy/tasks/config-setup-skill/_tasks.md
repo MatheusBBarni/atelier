@@ -5,7 +5,7 @@
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
 | 01 | Author canonical `SKILL.md` wizard (scaffold + protocol) | completed | medium | — |
-| 02 | `references/config-schema.md` — whole-config schema reference | pending | medium | — |
+| 02 | `references/config-schema.md` — whole-config schema reference | completed | medium | — |
 | 03 | `references/presets.md` — named starter presets | pending | medium | — |
 | 04 | Add `all()` enum iteration for the drift test | pending | low | — |
 | 05 | `sync-skills` harness + generated discovery mirrors | pending | medium | task_01, task_02, task_03 |
