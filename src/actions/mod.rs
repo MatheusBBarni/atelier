@@ -1001,6 +1001,32 @@ pub fn classify_command(command: &str) -> CommandClassification {
     CommandClassification::Approve
 }
 
+/// The canonical Rust verification commands (ADR-004): a "real check" whose exit
+/// code grounds a grading PASS/FAIL. Defined once and shared by both the
+/// read-only auto-approval allowlist and the grading verdict deriver (task 03)
+/// so the two can never drift apart.
+const CANONICAL_VERIFICATION_PREFIXES: [&str; 5] = [
+    "cargo test",
+    "cargo check",
+    "cargo build",
+    "cargo fmt",
+    "cargo clippy",
+];
+
+/// Whether `command` is a canonical verification command — one of
+/// [`CANONICAL_VERIFICATION_PREFIXES`] matched by prefix on the trimmed/
+/// lowercased command, with any shell-control syntax (pipes, `&&`, redirects)
+/// disqualifying it. `cargo run`, `make test`, `echo`, etc. are not canonical.
+pub fn is_canonical_verification_command(command: &str) -> bool {
+    let lower = command.trim().to_lowercase();
+    if has_shell_control_syntax(&lower) {
+        return false;
+    }
+    CANONICAL_VERIFICATION_PREFIXES
+        .iter()
+        .any(|prefix| command_has_prefix(&lower, prefix))
+}
+
 fn is_default_read_only_command(lower: &str) -> bool {
     if has_shell_control_syntax(lower) {
         return false;
@@ -1013,12 +1039,10 @@ fn is_default_read_only_command(lower: &str) -> bool {
         return false;
     }
 
-    let allow_prefixes = [
-        "cargo test",
-        "cargo check",
-        "cargo build",
-        "cargo fmt",
-        "cargo clippy",
+    // Canonical verification prefixes come from the shared set (task 02) so the
+    // allowlist and the grading deriver never drift; the rest are read-only
+    // helpers that are not verification checks.
+    let other_prefixes = [
         "cargo metadata",
         "cargo tree",
         "cargo locate-project",
@@ -1044,8 +1068,9 @@ fn is_default_read_only_command(lower: &str) -> bool {
         "atelier --help",
         "atelier --version",
     ];
-    allow_prefixes
+    CANONICAL_VERIFICATION_PREFIXES
         .iter()
+        .chain(other_prefixes.iter())
         .any(|prefix| command_has_prefix(lower, prefix))
         || is_read_only_git_branch_command(lower)
         || is_read_only_git_remote_command(lower)
@@ -2503,6 +2528,56 @@ mod tests {
             validate_action_request_with_scope(&agent, &context, &request),
             ActionDecision::Allowed
         ));
+    }
+
+    // ── Canonical verification command predicate (self-grading task_02) ──
+
+    #[test]
+    fn canonical_verification_command_accepts_real_checks() {
+        for command in [
+            "cargo test",
+            "cargo test --all",
+            "cargo clippy --all-targets",
+            "cargo fmt --check",
+            "cargo build",
+            "cargo check",
+            "  CARGO TEST  ", // trimmed + case-insensitive
+        ] {
+            assert!(
+                is_canonical_verification_command(command),
+                "{command:?} should be canonical"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_verification_command_rejects_non_checks_and_shell_control() {
+        for command in [
+            "echo hi",
+            "ls",
+            "cargo run",     // runs the binary, not a check
+            "cargo testfoo", // not a whole-word prefix
+            "make test",
+            "cargo test && cargo clippy", // shell-control disqualifies
+            "cargo test | tee out.log",
+        ] {
+            assert!(
+                !is_canonical_verification_command(command),
+                "{command:?} should NOT be canonical"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_set_is_a_subset_of_the_read_only_allowlist() {
+        // The refactor must keep every canonical check auto-approving (shared set,
+        // no drift): each canonical prefix is still classified read-only.
+        for prefix in CANONICAL_VERIFICATION_PREFIXES {
+            assert!(
+                is_default_read_only_command(prefix),
+                "{prefix:?} must remain read-only after the extraction"
+            );
+        }
     }
 
     // ── Emission repair loop + degrade-not-abandon (task_11) ──
