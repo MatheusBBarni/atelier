@@ -1009,6 +1009,7 @@ async fn execute_tui_command_with_interrupt(
                 AppEvent::PromptSubmitted(_, _)
                     | AppEvent::ApprovalAnswered(_)
                     | AppEvent::GovernanceDecisionResolved(_, _)
+                    | AppEvent::PlanApprovalResolved(_, _)
             );
             if let AppEvent::ApprovalAnswered(resolution) = &event {
                 if let (Some(approval_handle), Some(pending)) =

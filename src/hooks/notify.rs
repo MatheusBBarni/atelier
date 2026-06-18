@@ -57,7 +57,12 @@ pub fn osc9_sequence(title: &str, body: &str) -> Vec<u8> {
 /// which a terminal supports is unreliable (ADR-005 rejects it) and emitting
 /// both would double-notify where both are understood.
 pub fn osc777_sequence(title: &str, body: &str) -> Vec<u8> {
-    let (title, body) = (sanitize_osc_text(title), sanitize_osc_text(body));
+    // `;` delimits the OSC 777 fields (`notify;<title>;<body>`); replace it in the
+    // payload (it is not a control char, so sanitize_osc_text leaves it) so a
+    // semicolon in title/body can't break protocol framing. OSC 9 needs no such
+    // step — its payload is a single field.
+    let title = sanitize_osc_text(title).replace(';', " ");
+    let body = sanitize_osc_text(body).replace(';', " ");
     format!("\u{1b}]777;notify;{title};{body}{BEL}").into_bytes()
 }
 
@@ -267,6 +272,15 @@ mod tests {
     #[test]
     fn osc777_variant_carries_title_and_body_separately() {
         assert_eq!(osc777_sequence("T", "B"), b"\x1b]777;notify;T;B\x07");
+    }
+
+    #[test]
+    fn osc777_strips_field_delimiter_semicolons_from_payload() {
+        // A `;` in title/body must not break the notify;<title>;<body> framing.
+        assert_eq!(
+            osc777_sequence("a;b", "c;d"),
+            b"\x1b]777;notify;a b;c d\x07"
+        );
     }
 
     #[test]
