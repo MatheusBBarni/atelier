@@ -17,7 +17,7 @@ Repo convention is to prefix shell commands with `rtk` (a token-compacting wrapp
 - A single test: `cargo test --lib <substring>` — Cargo takes **one** filter substring, so run multiple invocations to target several names.
 - One integration suite: `cargo test --test cli` (suites under `tests/`: `cli`, `skill_prompt_loading`, `skills_foundation`, `slash_command_catalog`, `runtime_integration`)
 - Lint: `cargo clippy --all-targets` · Format: `cargo fmt` (check only: `cargo fmt --check`)
-- Full pre-commit gate (mirrors CI in `.github/workflows/release.yml`): `cargo fmt --check && cargo clippy --all-targets && cargo test --locked`
+- Full pre-commit gate (mirrors CI in `.github/workflows/release.yml`): `cargo fmt --check && cargo clippy --all-targets && cargo test --locked && npm --prefix npm run check:skills` (the last guards that the `skills/atelier-config-setup/` discovery mirrors are in sync — regenerate with `npm --prefix npm run sync:skills`)
 
 Testing notes:
 - The **`fake` runtime** (`src/runtime/fake.rs`) drives deterministic end-to-end app/orchestrator tests: behavior is triggered by control phrases embedded in the prompt (e.g. `retryable provider error`, `non-retryable provider error`, plus clarification/workflow markers). Most `app`/`orchestrator` tests run a real run through `FakeRuntime` rather than mocking internals.
