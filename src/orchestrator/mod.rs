@@ -1,4 +1,5 @@
 use crate::config::{AgentProfile, Capability, EffectiveConfig};
+use crate::mcp::ToolCatalog;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -928,6 +929,20 @@ fn validate_agent_reference(
 }
 
 pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
+    // No MCP advertisement without a recorded snapshot (replay-safe default).
+    build_orchestrator_prompt_with_mcp(config, &ToolCatalog::default())
+}
+
+/// Build the orchestrator prompt, advertising MCP tools from a **recorded
+/// snapshot** (ADR-001). `mcp_catalog` must come from the `mcp_catalog_snapshot`
+/// event, never a live supervisor handle, so the prompt is deterministic and
+/// replay-stable. The orchestrator module deliberately never imports the live
+/// supervisor handle type (guard test
+/// `orchestrator_prompt_never_reads_live_mcp_handle`).
+pub fn build_orchestrator_prompt_with_mcp(
+    config: &EffectiveConfig,
+    mcp_catalog: &ToolCatalog,
+) -> String {
     let base = config
         .agents
         .get("orchestrator")
@@ -963,6 +978,32 @@ pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
             config.council.default_preset
         ),
     ]);
+
+    // Advertise MCP tools from the recorded snapshot (ADR-001). Omitted entirely
+    // when no servers/tools were snapshotted, so prompts for MCP-disabled or
+    // server-less runs are unchanged.
+    let mcp_lines: Vec<String> = mcp_catalog
+        .servers
+        .iter()
+        .flat_map(|server| {
+            server.tools.iter().map(move |tool| {
+                let description = tool
+                    .description
+                    .as_deref()
+                    .unwrap_or("(no description)")
+                    .trim();
+                format!("- {}/{}: {description}", server.server, tool.name)
+            })
+        })
+        .collect();
+    if !mcp_lines.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "Available MCP tools (invoke via a CallMcpTool action through a specialist agent):"
+                .to_string(),
+        );
+        lines.extend(mcp_lines);
+    }
 
     lines.extend([
         String::new(),
@@ -1111,6 +1152,78 @@ mod tests {
             config_path: None,
         })
         .unwrap()
+    }
+
+    // ── MCP tool-catalog advertisement (task_07) ──
+
+    fn mcp_catalog_fixture() -> ToolCatalog {
+        use crate::mcp::{McpTool, ToolCatalogServer};
+        let tool = |name: &str, desc: &str| McpTool {
+            name: name.to_string(),
+            description: Some(desc.to_string()),
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        ToolCatalog {
+            servers: vec![
+                ToolCatalogServer {
+                    server: "filesystem".to_string(),
+                    tools: vec![tool("read_file", "Read a file")],
+                },
+                ToolCatalogServer {
+                    server: "search".to_string(),
+                    tools: vec![tool("web_search", "Search the web")],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn orchestrator_prompt_lists_snapshot_tools_with_servers() {
+        let config = validation_config();
+        let prompt = build_orchestrator_prompt_with_mcp(&config, &mcp_catalog_fixture());
+        assert!(prompt.contains("Available MCP tools"));
+        assert!(prompt.contains("- filesystem/read_file: Read a file"));
+        assert!(prompt.contains("- search/web_search: Search the web"));
+    }
+
+    #[test]
+    fn orchestrator_prompt_omits_mcp_section_for_empty_snapshot() {
+        let config = validation_config();
+        let prompt = build_orchestrator_prompt_with_mcp(&config, &ToolCatalog::default());
+        assert!(!prompt.contains("Available MCP tools"));
+        // The no-arg builder also omits it (empty default catalog).
+        assert!(!build_orchestrator_prompt(&config).contains("Available MCP tools"));
+    }
+
+    #[test]
+    fn orchestrator_prompt_is_byte_identical_across_replay() {
+        let config = validation_config();
+        let catalog = mcp_catalog_fixture();
+        // Simulate record → replay: serialize the catalog into the event payload
+        // and deserialize it back, then rebuild the prompt from the reconstructed
+        // snapshot. A pure builder over a serde-stable snapshot is replay-safe.
+        let payload = serde_json::to_value(&catalog).unwrap();
+        let replayed: ToolCatalog = serde_json::from_value(payload).unwrap();
+        let live = build_orchestrator_prompt_with_mcp(&config, &catalog);
+        let from_replay = build_orchestrator_prompt_with_mcp(&config, &replayed);
+        assert_eq!(live, from_replay);
+    }
+
+    #[test]
+    fn orchestrator_prompt_never_reads_live_mcp_handle() {
+        // Guard (mirrors `colors_live_only_in_theme_module`): the orchestrator
+        // module advertises tools from a recorded snapshot only, so it must never
+        // name the live supervisor handle type — that would let live, non-replayable
+        // state into the prompt. `concat!` keeps the needle out of this test's own
+        // source.
+        let needle = concat!("Mcp", "Handle");
+        let source = include_str!("mod.rs");
+        assert!(
+            !source.contains(needle),
+            "src/orchestrator/mod.rs must not reference the live MCP handle type; \
+             advertise tools from the recorded ToolCatalog snapshot instead"
+        );
     }
 
     fn clarification_option(id: &str, label: &str) -> ClarificationOption {

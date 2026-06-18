@@ -28,8 +28,8 @@ use crate::hooks::{
 };
 use crate::ids::new_id;
 use crate::orchestrator::{
-    agent_results, build_orchestrator_prompt, validate_orchestrator_decision, AgentResult,
-    AgentResultStatus, ClarificationOption, DecisionNextStep, DecisionStatus, ParallelBlockedScope,
+    agent_results, validate_orchestrator_decision, AgentResult, AgentResultStatus,
+    ClarificationOption, DecisionNextStep, DecisionStatus, ParallelBlockedScope,
     ParallelChildResultRef, ParallelFailedScope, ParallelFileScope, ParallelGroupPlan,
     ParallelGroupResult, ParallelGroupStatus, RunState, RunStepResult, COUNCIL_WORKFLOW_AGENT_ID,
 };
@@ -516,6 +516,12 @@ pub struct App {
     /// task_04). Loaded once at startup for synchronous reads during validation
     /// (task_05); promote/revoke write the file and record an event.
     mcp_trust: crate::mcp::McpTrustStore,
+    /// Cached immutable MCP tool-catalog snapshot (ADR-001, task_07). Refreshed
+    /// from the supervisor at each top-level run entry and recorded as an
+    /// `mcp_catalog_snapshot` event; the orchestrator prompt and the action
+    /// context read this snapshot, never a live handle, so prompts are
+    /// replay-deterministic. Empty until the first snapshot.
+    mcp_catalog: crate::mcp::ToolCatalog,
 }
 
 /// In-memory, session-scoped allow-list of exact trust targets (ADR-004). Granted
@@ -1261,6 +1267,7 @@ impl App {
             pending_drift_ack: None,
             mcp_handle,
             mcp_trust,
+            mcp_catalog: crate::mcp::ToolCatalog::default(),
         };
         app.record_event(
             None,
@@ -1452,18 +1459,39 @@ impl App {
     }
 
     /// The MCP wiring for one action's `ActionExecutionContext` (task_05): the
-    /// supervisor handle plus a snapshot of the trust store and tool catalog.
-    /// `None` when MCP is disabled. The catalog is empty here in V1; task_07
-    /// (catalog-snapshot advertisement) populates it so the validation pin-diff
-    /// has current tool definitions to compare against.
+    /// supervisor handle plus a snapshot of the trust store and the cached tool
+    /// catalog (recorded at run entry, task_07). `None` when MCP is disabled. The
+    /// catalog gives the validation pin-diff current tool definitions to compare.
     fn mcp_action_context(&self) -> Option<crate::actions::McpActionContext> {
         self.mcp_handle
             .clone()
             .map(|handle| crate::actions::McpActionContext {
                 handle,
                 trust: self.mcp_trust.clone(),
-                catalog: std::sync::Arc::new(crate::mcp::ToolCatalog::default()),
+                catalog: std::sync::Arc::new(self.mcp_catalog.clone()),
             })
+    }
+
+    /// Refresh and record the MCP tool-catalog snapshot at run entry (task_07).
+    /// A no-op when MCP is disabled. The recorded `mcp_catalog_snapshot` event is
+    /// the replay source for the orchestrator prompt's MCP-tools section.
+    async fn record_mcp_catalog_snapshot(&mut self, run_id: &str) -> Result<()> {
+        let Some(handle) = self.mcp_handle.clone() else {
+            return Ok(());
+        };
+        let catalog = handle.snapshot_catalog().await.unwrap_or_default();
+        self.record_event(
+            Some(run_id.to_string()),
+            None,
+            "mcp_catalog_snapshot",
+            serde_json::to_value(&catalog).unwrap_or_else(|_| json!({ "servers": [] })),
+            format!(
+                "Recorded MCP tool catalog snapshot ({} server(s)).",
+                catalog.servers.len()
+            ),
+        )?;
+        self.mcp_catalog = catalog;
+        Ok(())
     }
 
     /// Promote an MCP server to `Trusted`: persist the file and, only on a real
@@ -1867,6 +1895,10 @@ impl App {
             )?;
         }
         self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
+        // Snapshot the MCP tool catalog at run entry (ADR-001, task_07): records
+        // the `mcp_catalog_snapshot` event and refreshes the cached snapshot the
+        // orchestrator prompt advertises from. No-op when MCP is disabled.
+        self.record_mcp_catalog_snapshot(run_id.as_str()).await?;
 
         let run = RunDriveContext::new(
             run_id,
@@ -5872,7 +5904,12 @@ impl App {
     ) -> Result<RuntimeRequest> {
         let mut agent_profile = agent_profile;
         if agent_profile.id == "orchestrator" {
-            agent_profile.instructions = build_orchestrator_prompt(&self.config);
+            // Advertise MCP tools from the recorded snapshot, never a live handle
+            // (ADR-001, task_07), so the prompt is replay-deterministic.
+            agent_profile.instructions = crate::orchestrator::build_orchestrator_prompt_with_mcp(
+                &self.config,
+                &self.mcp_catalog,
+            );
         }
         let prompt = skills::render_runtime_prompt(prompt.skill_context, prompt.text);
         Ok(RuntimeRequest {
@@ -16143,6 +16180,38 @@ runtime = "fake"
         );
         let reloaded = crate::mcp::McpTrustStore::load(&dir.path().join(".atelier"));
         assert!(!reloaded.is_trusted("fs"));
+    }
+
+    #[tokio::test]
+    async fn record_mcp_catalog_snapshot_emits_event_only_when_enabled() {
+        // Enabled: a (server-less) supervisor produces an empty snapshot that is
+        // still recorded as the replay source for the orchestrator prompt.
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.mcp_handle = Some(crate::mcp::McpSupervisor::spawn(
+            Vec::new(),
+            crate::mcp::DEFAULT_MCP_CALL_TIMEOUT,
+        ));
+        app.record_mcp_catalog_snapshot("run1").await.unwrap();
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "mcp_catalog_snapshot")
+                .count(),
+            1
+        );
+
+        // Disabled (no handle): recording is a no-op.
+        let dir2 = tempdir().unwrap();
+        let mut disabled = App::new(fake_config(dir2.path())).await.unwrap();
+        disabled.record_mcp_catalog_snapshot("run1").await.unwrap();
+        assert!(!disabled
+            .history
+            .read_events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "mcp_catalog_snapshot"));
     }
 
     #[tokio::test]

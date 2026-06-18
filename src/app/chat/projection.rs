@@ -73,6 +73,9 @@ impl ChatProjection {
     pub fn apply_history_event(&mut self, event: &HistoryEvent) {
         match event.kind.as_str() {
             "session_started" | "session_ended" => {}
+            // Audit-only MCP events: preserved in the durable log, never rendered
+            // as chat (task_07). Tool calls/results are projected in task_08.
+            "mcp_catalog_snapshot" => {}
             "run_started" => self.apply_run_started(event),
             "prompt_submitted" => self.apply_user_prompt(event),
             "clarification_requested" => self.apply_clarification_requested(event),
