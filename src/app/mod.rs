@@ -640,6 +640,9 @@ struct PendingClarification {
 struct GradeEscalation {
     producing_agent_id: String,
     changed_files: Vec<String>,
+    /// Total grade rounds already consumed; a `retry` continues numbering from
+    /// here so the collapsing Grade chat item accumulates instead of resetting.
+    rounds_used: u32,
 }
 
 /// The captured run context behind a pending governance decision, mirroring
@@ -1061,22 +1064,29 @@ enum AgentStepOutcome {
     Stop,
 }
 
-/// Result of the externally-grounded auto-verification loop (ADR-003). `Concluded`
-/// lets the caller return `Completed`; `Escalated` (attempts exhausted on FAIL)
-/// is handled by the cycle-exhaustion escalation (task 07).
+/// Result of the externally-grounded auto-verification loop (ADR-003), mapped to
+/// an `AgentStepOutcome` by `run_agent_step`: `Concluded`→Completed,
+/// `Escalated`→Paused (a user accept/retry/abort card is pending), `Paused`→Paused
+/// (a grade/fix sub-step is waiting on action approval), `Stopped`→Stop (a
+/// sub-step hit a limit/interrupt/error, or the wall-clock guard tripped).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GradingOutcome {
     Concluded,
     Escalated,
+    Paused,
+    Stopped,
 }
 
 /// Outcome of a single grade/fix sub-step run through the action-executing path.
 #[derive(Debug)]
 enum GradingSubstep {
     Completed(Box<AgentResult>),
-    /// The sub-step paused (approval) or stopped (limit/interrupt/error); the
-    /// grading loop cannot conclude and yields control to the caller.
-    Halted,
+    /// The sub-step paused on an action approval; `pending_approval` +
+    /// `WaitingForUser` are already set, so the run must yield (not conclude).
+    Paused,
+    /// The sub-step hit a step/wall limit, an interrupt, an unexpected output, or
+    /// a runtime error — the run must stop rather than report a clean verdict.
+    Stopped,
 }
 
 /// The built-in agent that runs the project's checks during grading. It already
@@ -2754,10 +2764,14 @@ impl App {
     ) -> Result<()> {
         self.state.pending_clarification = None;
         let run_id = run.run_id.clone();
+        let GradeEscalation {
+            producing_agent_id,
+            changed_files,
+            rounds_used,
+        } = escalation;
 
         match answer.selected_option_id.as_deref() {
             Some("abort") => {
-                self.state.run_state = RunState::Failed;
                 self.record_event(
                     Some(run_id),
                     None,
@@ -2765,23 +2779,34 @@ impl App {
                     json!({ "reason": "verification failed; aborted by user at grade escalation" }),
                     "Run aborted after verification failed.",
                 )?;
+                // Finalize like the governance-abort path: persist the run record
+                // and clear the active run BEFORE pausing the queue, otherwise
+                // active_run_id dangles (blocking resume) and the record is never
+                // written. write_run_record snapshots run_state, so set it first.
+                self.state.active_run_id = None;
+                self.state.live_step = None;
+                self.state.live_steps.clear();
+                self.state.run_state = RunState::Failed;
+                self.write_run_record(&run)?;
+                self.sync_chat_items();
                 self.publish_state();
+                self.pause_oldest_pending_for_queue()?;
                 Ok(())
             }
             Some("retry") => {
                 self.state.run_state = RunState::Running;
                 self.publish_state();
+                // Continue round numbering from the prior cycle so the collapsing
+                // Grade item accumulates rather than resetting to round 1.
                 match self
-                    .run_grading_workflow(
-                        &mut run,
-                        &escalation.producing_agent_id,
-                        escalation.changed_files,
-                    )
+                    .run_grading_workflow(&mut run, &producing_agent_id, changed_files, rounds_used)
                     .await?
                 {
-                    // Re-escalated: `run_grading_workflow` already set up a fresh
-                    // accept/retry/abort pause.
-                    GradingOutcome::Escalated => Ok(()),
+                    // Re-escalated or paused on approval: the workflow already set
+                    // up the pending state; stopped: the run was already halted.
+                    GradingOutcome::Escalated
+                    | GradingOutcome::Paused
+                    | GradingOutcome::Stopped => Ok(()),
                     GradingOutcome::Concluded => {
                         self.state.run_state = RunState::Planning;
                         self.publish_state();
@@ -5363,11 +5388,14 @@ impl App {
                     if triggers_grading {
                         return Ok(
                             match self
-                                .run_grading_workflow(run, next_agent_id, changed_files)
+                                .run_grading_workflow(run, next_agent_id, changed_files, 0)
                                 .await?
                             {
                                 GradingOutcome::Concluded => AgentStepOutcome::Completed,
-                                GradingOutcome::Escalated => AgentStepOutcome::Paused,
+                                GradingOutcome::Escalated | GradingOutcome::Paused => {
+                                    AgentStepOutcome::Paused
+                                }
+                                GradingOutcome::Stopped => AgentStepOutcome::Stop,
                             },
                         );
                     }
@@ -5614,26 +5642,48 @@ impl App {
         run: &mut RunDriveContext,
         producing_agent_id: &str,
         changed_files: Vec<String>,
+        base_round: u32,
     ) -> Result<GradingOutcome> {
         let max_attempts = self.config.grading.max_attempts.max(1);
+        // Round numbers continue across retry cycles (`base_round` > 0 on retry) so
+        // the single Grade chat item accumulates rather than colliding on round 1.
+        let max_rounds = base_round.saturating_add(max_attempts);
 
-        for round in 1..=max_attempts {
-            if self.wall_clock_limit_reached(run) {
-                self.stop_for_wall_clock_limit(run)?;
+        // The grader profile is fixed for the whole loop; clone it once. If the
+        // configured grader is absent, degrade to "unverified" rather than failing
+        // an otherwise-successful edit run (grading is opt-in).
+        let grader = match self.agent(GRADING_GRADER_AGENT_ID) {
+            Ok(agent) => agent.clone(),
+            Err(_) => {
+                self.record_grade_round(
+                    run,
+                    base_round.saturating_add(1),
+                    max_rounds,
+                    "skip",
+                    None,
+                )?;
                 return Ok(GradingOutcome::Concluded);
             }
-            self.record_grade_round(run, round, max_attempts, "working", None)?;
+        };
+
+        for attempt in 1..=max_attempts {
+            let round = base_round.saturating_add(attempt);
+            if self.wall_clock_limit_reached(run) {
+                self.stop_for_wall_clock_limit(run)?;
+                return Ok(GradingOutcome::Stopped);
+            }
+            self.record_grade_round(run, round, max_rounds, "working", None)?;
 
             // Grader sub-step: run the project's checks through the action path.
             let grader_step_id = new_id();
             let grade_prompt = grading_grader_prompt(&run.prompt, &changed_files, round);
-            let grader = self.agent(GRADING_GRADER_AGENT_ID)?.clone();
-            if matches!(
-                self.run_grading_substep(run, grader, &grader_step_id, &grade_prompt)
-                    .await?,
-                GradingSubstep::Halted
-            ) {
-                return Ok(GradingOutcome::Concluded);
+            match self
+                .run_grading_substep(run, grader.clone(), &grader_step_id, &grade_prompt)
+                .await?
+            {
+                GradingSubstep::Completed(_) => {}
+                GradingSubstep::Paused => return Ok(GradingOutcome::Paused),
+                GradingSubstep::Stopped => return Ok(GradingOutcome::Stopped),
             }
 
             // Verdict from the structured command exit codes — never agent text.
@@ -5649,23 +5699,24 @@ impl App {
 
             match verdict.outcome {
                 crate::orchestrator::GradeOutcome::Pass => {
-                    self.record_grade_round(run, round, max_attempts, "pass", Some(&verdict))?;
+                    self.record_grade_round(run, round, max_rounds, "pass", Some(&verdict))?;
                     self.push_grade_conclusion(run, &verdict, round)?;
                     return Ok(GradingOutcome::Concluded);
                 }
                 crate::orchestrator::GradeOutcome::Skip => {
-                    self.record_grade_round(run, round, max_attempts, "skip", Some(&verdict))?;
+                    self.record_grade_round(run, round, max_rounds, "skip", Some(&verdict))?;
                     self.push_grade_conclusion(run, &verdict, round)?;
                     return Ok(GradingOutcome::Concluded);
                 }
                 crate::orchestrator::GradeOutcome::Fail => {
-                    self.record_grade_round(run, round, max_attempts, "fail", Some(&verdict))?;
-                    if round >= max_attempts {
+                    self.record_grade_round(run, round, max_rounds, "fail", Some(&verdict))?;
+                    if attempt >= max_attempts {
                         self.pause_for_grade_escalation(
                             run,
                             producing_agent_id,
                             &changed_files,
                             &verdict,
+                            max_rounds,
                         )?;
                         return Ok(GradingOutcome::Escalated);
                     }
@@ -5681,12 +5732,16 @@ impl App {
                             run.previous_results
                                 .push(RunStepResult::Agent { result: *result });
                         }
-                        GradingSubstep::Halted => return Ok(GradingOutcome::Concluded),
+                        GradingSubstep::Paused => return Ok(GradingOutcome::Paused),
+                        GradingSubstep::Stopped => return Ok(GradingOutcome::Stopped),
                     }
                 }
             }
         }
-        Ok(GradingOutcome::Escalated)
+        // The bounded loop always returns within its body (the final attempt's
+        // Fail arm escalates), so this is unreachable; assert it rather than
+        // silently returning an un-paused Escalated.
+        unreachable!("grade loop must return within 1..=max_attempts")
     }
 
     /// Run one grade/fix sub-step through the action-executing runtime path
@@ -5739,15 +5794,36 @@ impl App {
                     self.clear_active_step(step_id);
                     Ok(GradingSubstep::Completed(Box::new(result)))
                 }
+                // A grade sub-step should only ever yield an agent_result; any
+                // other output is unexpected — stop rather than fake a verdict.
                 _ => {
                     self.clear_active_step(step_id);
-                    Ok(GradingSubstep::Halted)
+                    Ok(GradingSubstep::Stopped)
                 }
             },
-            Ok(StepOutcome::Paused) => Ok(GradingSubstep::Halted),
-            Ok(StepOutcome::LimitReached) | Ok(StepOutcome::Interrupted) | Err(_) => {
+            // The action loop already set `pending_approval` + `WaitingForUser`;
+            // leave the step active so the user can resolve the approval.
+            Ok(StepOutcome::Paused) => Ok(GradingSubstep::Paused),
+            Ok(StepOutcome::LimitReached) | Ok(StepOutcome::Interrupted) => {
                 self.clear_active_step(step_id);
-                Ok(GradingSubstep::Halted)
+                Ok(GradingSubstep::Stopped)
+            }
+            Err(error) => {
+                // A grader/fixer runtime error must fail the run loudly, not be
+                // swallowed into a clean "verified" completion.
+                self.state.run_state = RunState::Failed;
+                self.record_event(
+                    Some(run.run_id.clone()),
+                    Some(step_id.to_string()),
+                    "run_failed",
+                    json!({ "reason": error.to_string() }),
+                    format!(
+                        "Grading sub-step failed: {}",
+                        concise_diagnostic(&error.to_string())
+                    ),
+                )?;
+                self.clear_active_step(step_id);
+                Ok(GradingSubstep::Stopped)
             }
         }
     }
@@ -5862,6 +5938,7 @@ impl App {
         producing_agent_id: &str,
         changed_files: &[String],
         verdict: &crate::orchestrator::GraderVerdict,
+        rounds_used: u32,
     ) -> Result<()> {
         self.state.run_state = RunState::WaitingForUser;
         self.pending_clarification = Some(PendingClarification {
@@ -5869,6 +5946,7 @@ impl App {
             grade_escalation: Some(GradeEscalation {
                 producing_agent_id: producing_agent_id.to_string(),
                 changed_files: changed_files.to_vec(),
+                rounds_used,
             }),
         });
 
@@ -18255,7 +18333,7 @@ runtime = "fake"
         let mut run = grading_run("apply the edit grade pass");
 
         let outcome = app
-            .run_grading_workflow(&mut run, "fixer", vec!["src/x.rs".to_string()])
+            .run_grading_workflow(&mut run, "fixer", vec!["src/x.rs".to_string()], 0)
             .await
             .unwrap();
 
@@ -18272,7 +18350,7 @@ runtime = "fake"
         let mut run = grading_run("apply the edit grade skip");
 
         let outcome = app
-            .run_grading_workflow(&mut run, "fixer", vec![])
+            .run_grading_workflow(&mut run, "fixer", vec![], 0)
             .await
             .unwrap();
 
@@ -18288,7 +18366,7 @@ runtime = "fake"
         let mut run = grading_run("apply the edit grade fail");
 
         let outcome = app
-            .run_grading_workflow(&mut run, "fixer", vec![])
+            .run_grading_workflow(&mut run, "fixer", vec![], 0)
             .await
             .unwrap();
 
@@ -18309,7 +18387,7 @@ runtime = "fake"
         let mut run = grading_run("apply the edit grade flaky");
 
         let outcome = app
-            .run_grading_workflow(&mut run, "fixer", vec!["src/x.rs".to_string()])
+            .run_grading_workflow(&mut run, "fixer", vec!["src/x.rs".to_string()], 0)
             .await
             .unwrap();
 
@@ -18505,6 +18583,27 @@ runtime = "fake"
             fail_round_count(&app),
             4,
             "retry ran a fresh 2-attempt loop"
+        );
+        // Round numbers continue across the retry (1,2 then 3,4) rather than
+        // resetting to 1, so the collapsing Grade chat item accumulates instead
+        // of overwriting the first cycle.
+        let max_round = app
+            .history
+            .read_events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == crate::history::GRADE_ROUND_KIND)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("round")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_round, 4,
+            "retry continues round numbering, not reset to 1"
         );
     }
 

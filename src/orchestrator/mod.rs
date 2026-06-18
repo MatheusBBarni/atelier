@@ -416,13 +416,13 @@ pub fn derive_grade_verdict(commands: &[CommandOutcome]) -> GraderVerdict {
     {
         let critique = match &failed.excerpt {
             Some(excerpt) if !excerpt.trim().is_empty() => format!(
-                "`{}` failed (exit {}):\n{}",
+                "`{}` failed ({}):\n{}",
                 failed.command,
                 describe_exit(failed.exit_code),
                 excerpt.trim()
             ),
             _ => format!(
-                "`{}` failed (exit {})",
+                "`{}` failed ({})",
                 failed.command,
                 describe_exit(failed.exit_code)
             ),
@@ -450,7 +450,7 @@ pub fn derive_grade_verdict(commands: &[CommandOutcome]) -> GraderVerdict {
 /// Render an exit code for a critique, naming the no-completion case explicitly.
 fn describe_exit(exit_code: Option<i64>) -> String {
     match exit_code {
-        Some(code) => code.to_string(),
+        Some(code) => format!("exit {code}"),
         None => "no exit code".to_string(),
     }
 }
