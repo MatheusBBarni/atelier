@@ -175,22 +175,24 @@ A named agent profile. `<id>` is the agent name (e.g. `orchestrator`). Use **inl
 `instructions`** for a self-contained config; the `*_file` variants point at paths that must
 exist.
 
+For a **new** (non-built-in) agent, `runtime`, `capabilities`, and one of
+`instructions`/`instructions_file` are **required** — omitting any of them fails the load.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `name` | string | `<id>` | Internal name override. |
-| `display_name` | string | — | Human-facing label. |
-| `runtime` | string | — | A `[runtimes.<id>]` id. |
+| `runtime` | string | — | **Required** (new agent). A `[runtimes.<id>]` id. |
+| `capabilities` | list of `Capability` | — | **Required** (new agent). What the agent is allowed to do. |
+| `instructions` | string | — | **Required** unless `instructions_file` is set. Inline system prompt. |
+| `instructions_file` | path | — | System prompt from a file (must exist). Mutually exclusive with `instructions`. |
 | `model` | string | — | Model name (free-form; not validated — confirm it is current). |
 | `model_fallbacks` | list of strings | `[]` | Ordered fallback models. |
 | `effort` | `AgentEffort` | `medium` | Reasoning effort. |
 | `thinking` | bool | — | Enable extended thinking where the runtime supports it. |
-| `capabilities` | list of `Capability` | `[]` | What the agent is allowed to do. |
-| `tools` | list of `ToolName` | — | Action tools the agent may use (each tool implies a capability). |
-| `instructions` | string | — | Inline system prompt. |
-| `instructions_file` | path | — | System prompt from a file (must exist). |
+| `tools` | list of `ToolName` | all | Action tools the agent may use. A tool whose required capability is **not** in `capabilities` is silently dropped — list the capability too. |
+| `name` / `display_name` | string | title-cased `<id>` | Two spellings of the **same** label. Set **at most one** — setting both fails the load. |
 | `instructions_append_file` | path | — | Extra prompt appended from a file (must exist). |
 | `orchestrator_description` | string | — | How the orchestrator describes/dispatches this agent. |
-| `orchestrator_description_file` | path | — | Same, from a file (must exist). |
+| `orchestrator_description_file` | path | — | Same, from a file (must exist). Mutually exclusive with `orchestrator_description`. |
 | `enabled` | bool | `true` | Set `false` to keep a profile defined but inactive. |
 
 ## `[presets.<name>]`

@@ -3302,8 +3302,23 @@ mod tests {
             }
         }
 
-        // `ToolName::all()` predates this task; assert it stays in sync too.
+        // `ToolName::all()` predates this task; guard it the same way so a new
+        // variant missing from `all()` is a compile error, not a silent gap.
         assert_eq!(ToolName::all().len(), 10);
+        for v in ToolName::all() {
+            match v {
+                ToolName::ReadFile
+                | ToolName::ListFiles
+                | ToolName::SearchText
+                | ToolName::RunCommand
+                | ToolName::ApplyPatch
+                | ToolName::WriteFile
+                | ToolName::RecordNote
+                | ToolName::CallMcpTool
+                | ToolName::ReadMcpResource
+                | ToolName::ListMcpResources => {}
+            }
+        }
     }
 
     fn load_from_temp(contents: &str) -> Result<EffectiveConfig> {

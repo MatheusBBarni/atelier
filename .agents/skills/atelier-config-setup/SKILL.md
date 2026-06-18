@@ -78,8 +78,11 @@ they decline, run the essentials flow below.
 
 Ask which backend agent runs the work. `runtime` is one of the five `RuntimeKind` values:
 `codex`, `claude`, `cursor`, `zai`, `fake` (`fake` is for tests only — do not ship it). Declare
-it under `[runtimes.<id>]` with a `type = "<kind>"`. CLI runtimes need a `command`; the `zai`
-HTTP runtime needs a `base_url` and an `api_key_env`.
+it under `[runtimes.<id>]` with a `type = "<kind>"`. The only field the loader *requires* is
+`api_key_env` on the `zai` runtime; everything else has a default (CLI runtimes default
+`command` to `codex`/`claude`/`cursor-agent`, and `zai` defaults `base_url` to the Z.ai API).
+Set `command` explicitly when your CLI isn't on the default name, and note that the `claude` and
+`cursor` runtimes **reject** `api_key_env` (those CLIs own their own credentials).
 
 ### Step 2 — Model (+ fallbacks)
 

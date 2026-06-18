@@ -433,6 +433,11 @@ struct TuiUiState {
     prompt_history_max: usize,
     agent_selection_index: usize,
     skill_suggestions: Vec<SkillSuggestion>,
+    /// Whether the deferred skill scan has populated `skill_suggestions` yet. The
+    /// first frame renders before the scan runs (see `run_loop`), so the
+    /// config-setup nudge must not fire until this is `true` — otherwise an
+    /// already-installed skill is briefly reported absent (task_07).
+    skill_suggestions_loaded: bool,
     skill_selection_index: usize,
     command_selection_index: usize,
     /// Input value the command dropdown was last dismissed for (Escape). The
@@ -495,6 +500,7 @@ impl Default for TuiUiState {
             prompt_history_max: 200,
             agent_selection_index: 0,
             skill_suggestions: Vec::new(),
+            skill_suggestions_loaded: false,
             skill_selection_index: 0,
             command_selection_index: 0,
             command_dropdown_dismissed: None,
@@ -788,6 +794,7 @@ async fn run_loop(
     terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
     if let Some(working_directory) = ui_state.working_directory.clone() {
         ui_state.skill_suggestions = load_skill_suggestions(&working_directory);
+        ui_state.skill_suggestions_loaded = true;
     }
     loop {
         sync_worker_state(&mut state, &mut state_receiver);
@@ -1055,6 +1062,7 @@ fn reload_skills(state: &mut AppState, ui_state: &mut TuiUiState) {
     let skill_suggestions = reload_skill_suggestions(working_directory);
     let skill_count = skill_suggestions.len();
     ui_state.skill_suggestions = skill_suggestions;
+    ui_state.skill_suggestions_loaded = true;
     ui_state.skill_selection_index = 0;
     clear_input(state, ui_state);
     ui_state.status_message = Some(format!("Skills reloaded: {skill_count}"));
@@ -3733,7 +3741,10 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
     // until task_05 supplies `AppState.git_context`.
     // task_07: derive the config-setup skill's presence from the real discovery
     // result so the welcome can nudge first-run users who haven't installed it.
-    let config_skill_present = config_setup_skill_present(&ui_state.skill_suggestions);
+    // Before the deferred scan has run (the first frame), treat the skill as
+    // present so the nudge never flashes for users who actually have it.
+    let config_skill_present = !ui_state.skill_suggestions_loaded
+        || config_setup_skill_present(&ui_state.skill_suggestions);
     let welcome_facts = WelcomeFacts {
         version: env!("CARGO_PKG_VERSION"),
         working_directory: working_directory.as_deref(),
