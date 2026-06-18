@@ -217,6 +217,26 @@ fn presets_declare_runtime_and_orchestrator_without_secrets() {
 }
 
 #[test]
+fn readme_documents_install_and_invocation() {
+    // task_08: the README is the human-facing discovery surface; guard that it
+    // can't silently drop the install command or the skill name/invocation.
+    let readme = read_repo("README.md");
+    assert!(
+        readme.contains("npx skills add MatheusBBarni/atelier atelier-config-setup"),
+        "README must document the name-targeted install command"
+    );
+    assert!(
+        readme.contains("atelier-config-setup"),
+        "README must name the skill"
+    );
+    assert!(
+        readme.contains("/skill:atelier-config-setup")
+            || readme.contains("set up my atelier config"),
+        "README must document how to invoke the skill"
+    );
+}
+
+#[test]
 fn mirrors_equal_canonical_source() {
     let canonical = repo_path(CANONICAL);
     let canonical_files = list_rel_files(&canonical);

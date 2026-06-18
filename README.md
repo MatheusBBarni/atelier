@@ -75,6 +75,47 @@ cargo install --path .
 GitHub Releases provide standalone native binary archives and checksum
 manifests for release traceability.
 
+## Configure with the `atelier-config-setup` skill
+
+`atelier.toml` spans several sections and five enums, and the loader rejects
+unknown keys — so a single typo fails the whole config. The
+**`atelier-config-setup`** skill is a portable wizard any LLM agent (atelier's
+own runtime *or* an external agent like Claude Code / Cursor / Codex) can load to
+author a valid config: it runs an essentials-first flow with named presets,
+writes the TOML, and self-validates it.
+
+**Install into an external agent's skill roots** (name-targeted so the repo's
+discovery mirrors aren't installed twice):
+
+```bash
+npx skills add MatheusBBarni/atelier atelier-config-setup
+```
+
+atelier's **own runtime already bundles it** — it ships in the repo's skill roots
+(`.agents/skills`, `.claude/skills`) and shows up in the `/skill:` dropdown, so no
+install step is needed there.
+
+**Manual-copy fallback** (works without skills.sh): copy the canonical skill into
+any discovery root, e.g.
+
+```bash
+cp -R skills/atelier-config-setup ~/.claude/skills/
+```
+
+**Invoke** it with `/skill:atelier-config-setup` (in atelier or a host agent) or
+just ask: "set up my atelier config". When `atelier` is on PATH it self-validates
+with `atelier --print-config` (the hard schema gate) and `atelier --doctor`
+(advisory runtime checks); otherwise it writes a schema-correct config and tells
+you how to verify later.
+
+**Secrets stay out of the config**: the skill only sets `api_key_env` (the *name*
+of the environment variable holding your key, e.g. `ZAI_API_KEY`) — you export the
+key yourself; it is never written into `atelier.toml`.
+
+This skill builds a **fresh** config (greenfield). Importing existing tool
+conventions (`CLAUDE.md`, `.claude/skills`, `.mcp.json`) is a separate
+config-importer roadmap item and is out of scope here.
+
 ## Quick Start
 
 ```bash
