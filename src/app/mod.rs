@@ -512,6 +512,10 @@ pub struct App {
     /// `end_session`, which closes the command channel so the actor tears down
     /// every connection (`kill_on_drop` backstop).
     mcp_handle: Option<crate::mcp::McpHandle>,
+    /// Durable, workspace-scoped MCP trust + tool-description pins (ADR-006,
+    /// task_04). Loaded once at startup for synchronous reads during validation
+    /// (task_05); promote/revoke write the file and record an event.
+    mcp_trust: crate::mcp::McpTrustStore,
 }
 
 /// In-memory, session-scoped allow-list of exact trust targets (ADR-004). Granted
@@ -1196,6 +1200,10 @@ impl App {
         } else {
             None
         };
+        // Trust is loaded unconditionally (cheap, no secrets): validation needs a
+        // synchronous read path whenever an MCP action is evaluated (task_05). The
+        // `.atelier` root already exists — `HistoryStore::create` made it above.
+        let mcp_trust = crate::mcp::McpTrustStore::load(&config.working_directory.join(".atelier"));
         let (interrupt_sender, interrupt_receiver) = watch::channel(0);
         let (approval_sender, approval_receiver) = watch::channel(ApprovalSignal {
             sequence: 0,
@@ -1252,6 +1260,7 @@ impl App {
             resume_approval_mode: None,
             pending_drift_ack: None,
             mcp_handle,
+            mcp_trust,
         };
         app.record_event(
             None,
@@ -1435,6 +1444,41 @@ impl App {
     /// action-execution path (task_05) and the catalog-snapshot path (task_07).
     pub fn mcp_handle(&self) -> Option<crate::mcp::McpHandle> {
         self.mcp_handle.clone()
+    }
+
+    /// Synchronous read access to the MCP trust store, for validation (task_05).
+    pub fn mcp_trust(&self) -> &crate::mcp::McpTrustStore {
+        &self.mcp_trust
+    }
+
+    /// Promote an MCP server to `Trusted`: persist the file and, only on a real
+    /// change, record an `mcp_server_trusted` event (the audit trail, ADR-006).
+    pub fn promote_mcp_server(&mut self, server: &str) -> Result<()> {
+        if self.mcp_trust.promote(server)? {
+            self.record_event(
+                None,
+                None,
+                "mcp_server_trusted",
+                json!({ "server": server }),
+                format!("Trusted MCP server {server}."),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Revoke an MCP server's trust: persist the file and, only on a real change,
+    /// record an `mcp_server_revoked` event.
+    pub fn revoke_mcp_server(&mut self, server: &str) -> Result<()> {
+        if self.mcp_trust.revoke(server)? {
+            self.record_event(
+                None,
+                None,
+                "mcp_server_revoked",
+                json!({ "server": server }),
+                format!("Revoked trust for MCP server {server}."),
+            )?;
+        }
+        Ok(())
     }
 
     /// The single atomic point that swaps the running session for `loaded`
@@ -16012,6 +16056,46 @@ runtime = "fake"
             .state
             .events
             .contains(&"Harness session ended.".to_string()));
+    }
+
+    #[tokio::test]
+    async fn promote_mcp_server_persists_file_and_records_event() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.promote_mcp_server("fs").unwrap();
+
+        // The trust file was written under the workspace `.atelier/` root.
+        let trust_path = dir.path().join(".atelier").join("mcp-trust.json");
+        assert!(trust_path.exists(), "promote must write mcp-trust.json");
+
+        // An audit event landed in history.
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "mcp_server_trusted")
+                .count(),
+            1
+        );
+
+        // Cross-session remember: a fresh store loaded from the file reflects it.
+        let reloaded = crate::mcp::McpTrustStore::load(&dir.path().join(".atelier"));
+        assert!(reloaded.is_trusted("fs"));
+
+        // Revoke records its own event and flips the persisted tier back.
+        app.revoke_mcp_server("fs").unwrap();
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "mcp_server_revoked")
+                .count(),
+            1
+        );
+        let reloaded = crate::mcp::McpTrustStore::load(&dir.path().join(".atelier"));
+        assert!(!reloaded.is_trusted("fs"));
     }
 
     #[tokio::test]

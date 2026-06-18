@@ -13,9 +13,11 @@
 pub mod client;
 pub mod fake_server;
 pub mod supervisor;
+pub mod trust_store;
 
 pub use client::{McpClient, McpResource, McpTool, McpToolResult, RmcpClient};
 pub use fake_server::FakeMcpServer;
 pub use supervisor::{
     McpHandle, McpSupervisor, ToolCatalog, ToolCatalogServer, DEFAULT_MCP_CALL_TIMEOUT,
 };
+pub use trust_store::{tool_pin_hash, McpTrustStore, PinStatus, TrustTier};

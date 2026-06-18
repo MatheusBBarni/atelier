@@ -7,7 +7,7 @@
 | 01 | Add rmcp dependency, McpClient trait, and fake stdio server | completed | medium | — |
 | 02 | Add mcp.servers config section, mcp_enabled flag, and redaction | completed | medium | — |
 | 03 | Build the McpSupervisor actor and McpHandle | completed | high | task_01, task_02 |
-| 04 | Add the McpTrustStore with durable trust tiers and pins | pending | medium | task_01 |
+| 04 | Add the McpTrustStore with durable trust tiers and pins | completed | medium | task_01 |
 | 05 | Add MCP action kinds, capability, validation, and execution | pending | high | task_03, task_04 |
 | 06 | Apply record-time redaction at event write | pending | medium | task_05 |
 | 07 | Advertise an MCP tool-catalog snapshot to the orchestrator | pending | medium | task_03 |
