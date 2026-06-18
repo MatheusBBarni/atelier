@@ -6,7 +6,7 @@
 |---|-------|--------|------------|--------------|
 | 01 | Author canonical `SKILL.md` wizard (scaffold + protocol) | completed | medium | — |
 | 02 | `references/config-schema.md` — whole-config schema reference | completed | medium | — |
-| 03 | `references/presets.md` — named starter presets | pending | medium | — |
+| 03 | `references/presets.md` — named starter presets | completed | medium | — |
 | 04 | Add `all()` enum iteration for the drift test | pending | low | — |
 | 05 | `sync-skills` harness + generated discovery mirrors | pending | medium | task_01, task_02, task_03 |
 | 06 | Rust drift/correctness guard (`tests/atelier_config_skill.rs`) | pending | high | task_01, task_02, task_03, task_04, task_05 |
