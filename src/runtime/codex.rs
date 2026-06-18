@@ -1,9 +1,9 @@
+use super::http_util::parse_runtime_output;
 use super::{
     prompt_envelope_json, Runtime, RuntimeAvailability, RuntimeAvailabilityStatus,
     RuntimeEventSink, RuntimeOutput, RuntimeRequest,
 };
 use crate::config::RuntimeConfig;
-use crate::orchestrator::{parse_agent_result, parse_contract, parse_orchestrator_decision};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use std::path::Path;
@@ -466,32 +466,6 @@ fn codex_login_status_is_known_auth_failure(message: &str) -> bool {
         || message.contains("authentication required")
         || message.contains("unauthorized")
         || message.contains("forbidden")
-}
-
-fn parse_runtime_output(agent_id: &str, raw_output: String) -> Result<RuntimeOutput> {
-    if let Ok(request) = parse_contract(&raw_output) {
-        return Ok(RuntimeOutput::ActionRequest { request });
-    }
-
-    if agent_id == "orchestrator" {
-        match parse_orchestrator_decision(&raw_output) {
-            Ok(decision) => Ok(RuntimeOutput::OrchestratorDecision { decision }),
-            Err(error) => Ok(RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output,
-                diagnostic: error.to_string(),
-            }),
-        }
-    } else {
-        match parse_agent_result(&raw_output) {
-            Ok(result) => Ok(RuntimeOutput::AgentResult { result }),
-            Err(error) => Ok(RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output,
-                diagnostic: error.to_string(),
-            }),
-        }
-    }
 }
 
 fn resolve_command(command: &str) -> Option<std::path::PathBuf> {

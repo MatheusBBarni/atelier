@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Extract shared HTTP utilities into http_util.rs"
 type: refactor
 complexity: high
@@ -32,13 +32,13 @@ The codebase has 6 duplicated functions across `src/runtime/mod.rs` and `src/run
 </requirements>
 
 ## Subtasks
-- [ ] 01.1 Create `src/runtime/http_util.rs` with the 6 functions extracted from `mod.rs` (the `pub(crate)` canonical copies)
-- [ ] 01.2 Expand `SECRET_PREFIXES` in the shared module to include `"or-"` and `"ov-"` prefixes
-- [ ] 01.3 Update `src/runtime/mod.rs` to re-export `redact_sensitive_text`, `redact_bearer_tokens`, and `parse_runtime_output` from `http_util`
-- [ ] 01.4 Remove the 5 duplicated private functions from `src/runtime/zai.rs` (lines 465-530) and import from `super::http_util`
-- [ ] 01.5 Remove the private `parse_runtime_output` from `src/runtime/codex.rs` (line 471) and import from `super::http_util`
-- [ ] 01.6 Verify that `src/hooks/follow.rs` and `src/hooks/dispatch.rs` still compile (they import `crate::runtime::redact_sensitive_text` which is now re-exported)
-- [ ] 01.7 Run `cargo test --lib` and `cargo clippy --all-targets` to verify no regressions
+- [x] 01.1 Create `src/runtime/http_util.rs` with the 6 functions extracted from `mod.rs` (the `pub(crate)` canonical copies)
+- [x] 01.2 Expand `SECRET_PREFIXES` in the shared module to include `"or-"` and `"ov-"` prefixes
+- [x] 01.3 Update `src/runtime/mod.rs` to re-export `redact_sensitive_text` and `parse_runtime_output` from `http_util` (see follow-up note re: `redact_bearer_tokens`)
+- [x] 01.4 Remove the 5 duplicated private functions from `src/runtime/zai.rs` and import from `super::http_util`
+- [x] 01.5 Remove the private `parse_runtime_output` from `src/runtime/codex.rs` and import from `super::http_util`
+- [x] 01.6 Verify that `src/hooks/follow.rs` and `src/hooks/dispatch.rs` still compile (they import `crate::runtime::redact_sensitive_text` which is now re-exported) — confirmed by clean `cargo build`/`clippy --all-targets`
+- [x] 01.7 Run `cargo test --lib` and `cargo clippy --all-targets` to verify no regressions
 
 ## Implementation Details
 
@@ -77,18 +77,21 @@ See TechSpec "Implementation Design" section for the shared module structure.
 - All existing tests pass **(REQUIRED)**
 
 ## Tests
-- Unit tests:
-  - [ ] `redact_sensitive_text` redacts `sk-`, `zai-`, `or-`, and `ov-` prefixed tokens
-  - [ ] `redact_bearer_tokens` redacts `Authorization: Bearer <token>` patterns
-  - [ ] `parse_runtime_output` correctly parses valid JSON agent results
-  - [ ] `parse_runtime_output` returns `ParseError` for invalid JSON
-  - [ ] `next_raw_secret_prefix` returns all 4 prefixes in sequence
-  - [ ] `is_secret_token_character` correctly identifies token characters
+- Unit tests (all in `src/runtime/http_util.rs`):
+  - [x] `redact_sensitive_text` redacts `sk-`, `zai-`, `or-`, and `ov-` prefixed tokens
+  - [x] `redact_bearer_tokens` redacts `Authorization: Bearer <token>` patterns
+  - [x] `parse_runtime_output` correctly parses valid JSON agent results
+  - [x] `parse_runtime_output` returns `ParseError` for invalid JSON
+  - [x] `next_raw_secret_prefix` returns all 4 prefixes in sequence
+  - [x] `is_secret_token_character` correctly identifies token characters
 - Integration tests:
-  - [ ] `cargo test --lib` passes with no regressions
-  - [ ] `cargo clippy --all-targets` passes with no warnings
-- Test coverage target: >=80%
+  - [x] `cargo test --lib` passes with no regressions (1347 passed; the 12 failures are pre-existing skill-discovery env failures on an external malformed `~/.claude/skills/cy-archive-tasks/SKILL.md` — none in `runtime::`)
+  - [x] `cargo clippy --all-targets` passes with no warnings ("No issues found")
+- Test coverage target: >=80% (6 unit tests cover all 6 functions)
 - All tests must pass
+
+## Follow-up Notes
+- **`redact_bearer_tokens` re-export omitted from `mod.rs`:** Subtask 01.3 originally listed re-exporting `redact_bearer_tokens` alongside `redact_sensitive_text` and `parse_runtime_output`. No module references `crate::runtime::redact_bearer_tokens` (it is only used internally by `redact_sensitive_text`), so a `pub(crate) use` re-export produced an `unused_imports` warning, which would violate the "clippy clean / zero warnings" success criterion. It remains `pub(crate)` in `http_util` (reachable as `http_util::redact_bearer_tokens`) and is covered by a unit test. If a future provider needs it via the `crate::runtime::` path, add it back to the re-export at that point.
 
 ## Success Criteria
 - All tests passing

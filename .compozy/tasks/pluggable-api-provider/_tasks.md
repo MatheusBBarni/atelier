@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Extract shared HTTP utilities into http_util.rs | pending | high | — |
+| 01 | Extract shared HTTP utilities into http_util.rs | completed | high | — |
 | 02 | Rename RuntimeKind::Zai to HttpApi and zai.rs to http_api.rs | pending | critical | task_01 |
 | 03 | Add auth header config fields to RuntimeConfig | pending | medium | task_02 |
 | 04 | Generalize HttpApiRuntime auth header construction | pending | medium | task_03 |

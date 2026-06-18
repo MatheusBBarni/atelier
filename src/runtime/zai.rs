@@ -1,9 +1,9 @@
+use super::http_util::{parse_runtime_output, redact_sensitive_text};
 use super::{
     prompt_envelope_json, Runtime, RuntimeAvailability, RuntimeAvailabilityStatus,
     RuntimeEventSink, RuntimeOutput, RuntimeProviderError, RuntimeRequest,
 };
 use crate::config::RuntimeConfig;
-use crate::orchestrator::{parse_agent_result, parse_contract, parse_orchestrator_decision};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::header::CONTENT_TYPE;
@@ -170,34 +170,6 @@ async fn run_non_streaming_completion(
     let content = content_from_non_streaming_response(&text)?;
     events.delta("message", content.clone()).await?;
     Ok(content)
-}
-
-fn parse_runtime_output(agent_id: &str, content: String) -> Result<RuntimeOutput> {
-    let output = if let Ok(action_request) = parse_contract(&content) {
-        RuntimeOutput::ActionRequest {
-            request: action_request,
-        }
-    } else if agent_id == "orchestrator" {
-        match parse_orchestrator_decision(&content) {
-            Ok(decision) => RuntimeOutput::OrchestratorDecision { decision },
-            Err(error) => RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output: content,
-                diagnostic: error.to_string(),
-            },
-        }
-    } else {
-        match parse_agent_result(&content) {
-            Ok(result) => RuntimeOutput::AgentResult { result },
-            Err(error) => RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output: content,
-                diagnostic: error.to_string(),
-            },
-        }
-    };
-
-    Ok(output)
 }
 
 fn chat_completion_body(request: &RuntimeRequest, stream: bool) -> Result<Value> {
@@ -460,69 +432,6 @@ fn concise_response_text(text: &str) -> String {
             .take(MAX_CHARS.saturating_sub(3))
             .collect::<String>()
     )
-}
-
-fn redact_sensitive_text(text: &str) -> String {
-    redact_raw_secret_tokens(&redact_bearer_tokens(text))
-}
-
-fn redact_bearer_tokens(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut remaining = text;
-    while let Some(auth_start) = remaining.to_ascii_lowercase().find("bearer ") {
-        output.push_str(&remaining[..auth_start]);
-        output.push_str("Bearer <redacted>");
-        let token_start = auth_start + "bearer ".len();
-        let token = &remaining[token_start..];
-        let token_len = token
-            .find(|character: char| {
-                character.is_whitespace()
-                    || matches!(character, '"' | '\'' | '\\' | ',' | ';' | ')' | ']')
-            })
-            .unwrap_or(token.len());
-        remaining = &token[token_len..];
-    }
-    output.push_str(remaining);
-    output
-}
-
-fn redact_raw_secret_tokens(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut remaining = text;
-
-    while let Some((secret_start, _prefix)) = next_raw_secret_prefix(remaining) {
-        let absolute_start = text.len() - remaining.len() + secret_start;
-        let preceding_character = text[..absolute_start].chars().next_back();
-        if preceding_character.is_some_and(is_secret_token_character) {
-            output.push_str(&remaining[..secret_start + 1]);
-            remaining = &remaining[secret_start + 1..];
-            continue;
-        }
-
-        output.push_str(&remaining[..secret_start]);
-        output.push_str("<redacted secret>");
-        let token = &remaining[secret_start..];
-        let token_length = token
-            .find(|character: char| !is_secret_token_character(character))
-            .unwrap_or(token.len());
-        remaining = &token[token_length..];
-    }
-
-    output.push_str(remaining);
-    output
-}
-
-fn next_raw_secret_prefix(text: &str) -> Option<(usize, &'static str)> {
-    const SECRET_PREFIXES: [&str; 2] = ["sk-", "zai-"];
-    let lower = text.to_ascii_lowercase();
-    SECRET_PREFIXES
-        .into_iter()
-        .filter_map(|prefix| lower.find(prefix).map(|index| (index, prefix)))
-        .min_by_key(|(index, _prefix)| *index)
-}
-
-fn is_secret_token_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
 
 #[cfg(test)]
