@@ -234,6 +234,10 @@ pub struct Features {
     /// disables the DAG even when this flag is on (mirroring the flat-group
     /// preflight contract).
     pub execution_graph: bool,
+    /// Gate harness-owned MCP tool access (CF8). Off by default: when unset the
+    /// configured `[mcp.servers.*]` are parsed but no supervisor is started and
+    /// no MCP actions are offered. Opt in with `[features] mcp_enabled = true`.
+    pub mcp_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -329,6 +333,31 @@ pub struct RuntimeConfig {
     pub prompt_mode: PromptMode,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+}
+
+/// Transport an MCP server speaks. V1 wires `Stdio` only; `Http` parses but is
+/// inert until V1.1 (ADR-002 — config is transport-agnostic so HTTP is purely
+/// additive later).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+}
+
+/// An effective MCP server declaration (`[mcp.servers.<id>]`). Mirrors the
+/// runtime ladder. `command`/`args`/`env` drive a stdio subprocess; `url` is
+/// parsed but inert in V1 (HTTP transport ships in V1.1, ADR-002). Secrets in
+/// `env` values never print — `--print-config` shows only the env-var names.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub id: String,
+    pub transport: McpTransport,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -454,6 +483,10 @@ pub struct EffectiveConfig {
     pub hooks: HooksConfig,
     pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
+    /// Effective MCP servers declared via `[mcp.servers.*]` (task_02). Parsed
+    /// regardless of `features.mcp_enabled`; the flag gates whether they are
+    /// actually started/offered (CF8). Empty when none are configured.
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub agents: BTreeMap<String, AgentProfile>,
     /// Validated, post-merge keybinding overrides from user-scope config
     /// (home/CLI). Empty when no `[keybindings]` is present ⇒ default keymap.
@@ -500,6 +533,7 @@ struct RawConfig {
     limits: Option<RawLimits>,
     council: Option<RawCouncilConfig>,
     runtimes: Option<BTreeMap<String, RawRuntimeConfig>>,
+    mcp: Option<RawMcpConfig>,
     presets: Option<BTreeMap<String, RawPreset>>,
     agents: Option<BTreeMap<String, RawAgentProfile>>,
     /// `[keybindings.<context>]` → action → key string or `false` (unbind).
@@ -559,6 +593,26 @@ struct RawFeatures {
     parallel_step_groups: Option<bool>,
     governance_early_abort: Option<bool>,
     execution_graph: Option<bool>,
+    mcp_enabled: Option<bool>,
+}
+
+/// Raw `[mcp]` section. Only `servers` exists in V1; nesting it under `[mcp]`
+/// (rather than a flat `[mcp.servers]` map at the root) leaves room for future
+/// `[mcp]`-level knobs without another schema break.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpConfig {
+    servers: Option<BTreeMap<String, RawMcpServerConfig>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpServerConfig {
+    transport: Option<McpTransport>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<BTreeMap<String, String>>,
+    url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -715,6 +769,15 @@ struct MergedRuntimeConfig {
     api_key_env: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct MergedMcpServerConfig {
+    transport: Option<McpTransport>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<BTreeMap<String, String>>,
+    url: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct MergedAgentProfile {
     name: Option<String>,
@@ -786,6 +849,7 @@ struct MergedConfig {
     hooks: HooksConfig,
     council: MergedCouncilConfig,
     runtimes: BTreeMap<String, MergedRuntimeConfig>,
+    mcp_servers: BTreeMap<String, MergedMcpServerConfig>,
     presets: BTreeMap<String, RawPresetDefinition>,
     agents: BTreeMap<String, MergedAgentProfile>,
     agent_layers: Vec<PendingAgentLayer>,
@@ -1086,6 +1150,7 @@ impl MergedConfig {
             hooks: HooksConfig::default(),
             council: builtin_council_config(),
             runtimes,
+            mcp_servers: BTreeMap::new(),
             presets: BTreeMap::new(),
             agents,
             agent_layers: Vec::new(),
@@ -1146,6 +1211,9 @@ impl MergedConfig {
             if let Some(value) = features.execution_graph {
                 self.features.execution_graph = value;
             }
+            if let Some(value) = features.mcp_enabled {
+                self.features.mcp_enabled = value;
+            }
         }
 
         if let Some(ui) = raw.ui {
@@ -1191,6 +1259,14 @@ impl MergedConfig {
         if let Some(runtimes) = raw.runtimes {
             for (runtime_id, runtime) in runtimes {
                 self.apply_runtime(runtime_id, runtime, source_name)?;
+            }
+        }
+
+        if let Some(mcp) = raw.mcp {
+            if let Some(servers) = mcp.servers {
+                for (server_id, server) in servers {
+                    self.apply_mcp_server(server_id, server, source_name)?;
+                }
             }
         }
 
@@ -1498,6 +1574,34 @@ impl MergedConfig {
         Ok(())
     }
 
+    /// Merge one `[mcp.servers.<id>]` layer into the accumulating config,
+    /// mirroring `apply_runtime`: each present field replaces the prior layer's
+    /// value (so a local config overrides home's `args`/`env` wholesale).
+    fn apply_mcp_server(
+        &mut self,
+        server_id: String,
+        raw: RawMcpServerConfig,
+        _source_name: &str,
+    ) -> Result<()> {
+        let entry = self.mcp_servers.entry(server_id).or_default();
+        if let Some(transport) = raw.transport {
+            entry.transport = Some(transport);
+        }
+        if let Some(command) = raw.command {
+            entry.command = Some(command);
+        }
+        if let Some(args) = raw.args {
+            entry.args = Some(args);
+        }
+        if let Some(env) = raw.env {
+            entry.env = Some(env);
+        }
+        if let Some(url) = raw.url {
+            entry.url = Some(url);
+        }
+        Ok(())
+    }
+
     fn apply_agent(
         &mut self,
         agent_id: String,
@@ -1700,6 +1804,45 @@ impl MergedConfig {
             runtimes.insert(id, config);
         }
 
+        let mut mcp_servers = BTreeMap::new();
+        // Sibling server ids for near-miss "did you mean?" hints (ADR-004).
+        let mcp_server_ids: Vec<String> = self.mcp_servers.keys().cloned().collect();
+        for (id, server) in self.mcp_servers {
+            let transport = server.transport.unwrap_or_default();
+            let command = server.command;
+            let args = server.args.unwrap_or_default();
+            let env = server.env.unwrap_or_default();
+            let url = server.url;
+            match transport {
+                McpTransport::Stdio => {
+                    let has_command = command
+                        .as_deref()
+                        .map(|command| !command.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_command {
+                        bail!(
+                            "mcp server {id} with transport \"stdio\" is missing required field command{}",
+                            did_you_mean(&id, mcp_server_ids.iter().map(String::as_str))
+                        );
+                    }
+                }
+                // HTTP is parsed but inert in V1 (ADR-002): no validation wired
+                // until the V1.1 transport lands.
+                McpTransport::Http => {}
+            }
+            mcp_servers.insert(
+                id.clone(),
+                McpServerConfig {
+                    id,
+                    transport,
+                    command,
+                    args,
+                    env,
+                    url,
+                },
+            );
+        }
+
         let mut agents = BTreeMap::new();
         // Sibling agent ids for near-miss hints, captured before the loop consumes
         // the map (ADR-004).
@@ -1789,6 +1932,7 @@ impl MergedConfig {
             hooks: self.hooks,
             council,
             runtimes,
+            mcp_servers,
             agents,
             keybindings: self.keybindings,
             keybinding_warnings: self.keybinding_warnings,
@@ -2381,6 +2525,12 @@ pub(crate) struct PrintableConfig {
     pub(crate) hooks: PrintableHooks,
     pub(crate) council: PrintableCouncilConfig,
     pub(crate) runtimes: BTreeMap<String, PrintableRuntime>,
+    /// Redacted MCP section; omitted entirely when no servers are configured so
+    /// the `[mcp.servers]` block only appears for users who declared one. Nested
+    /// under `mcp` so the rendered TOML matches the `[mcp.servers.<id>]` input
+    /// shape (symmetric in/out, like `[runtimes.<id>]`).
+    #[serde(skip_serializing_if = "PrintableMcp::is_empty")]
+    pub(crate) mcp: PrintableMcp,
     pub(crate) agents: BTreeMap<String, PrintableAgent>,
     /// The effective keymap (defaults + user overrides), as `context → action →
     /// key`. Emitted in `--print-config` so the resolved bindings are visible.
@@ -2430,6 +2580,37 @@ pub(crate) struct PrintableRuntime {
     pub(crate) base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) api_key_env: Option<String>,
+}
+
+/// Redacted `[mcp]` section wrapper, so the printed TOML nests servers under
+/// `[mcp.servers.<id>]` exactly as they are declared.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct PrintableMcp {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) servers: BTreeMap<String, PrintableMcpServer>,
+}
+
+impl PrintableMcp {
+    fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+}
+
+/// Redacted projection of an MCP server. `env` is rendered as the sorted list of
+/// variable **names** only — values (which may be literal secrets or `${VAR}`
+/// references) are never emitted, mirroring how `api_key_env` exposes a name and
+/// not a secret.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PrintableMcpServer {
+    pub(crate) transport: McpTransport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) args: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) env: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2570,6 +2751,25 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
                 )
             })
             .collect(),
+        mcp: PrintableMcp {
+            servers: config
+                .mcp_servers
+                .iter()
+                .map(|(id, server)| {
+                    (
+                        id.clone(),
+                        PrintableMcpServer {
+                            transport: server.transport.clone(),
+                            command: server.command.clone(),
+                            args: server.args.clone(),
+                            // Names only — never the values (redaction invariant).
+                            env: server.env.keys().cloned().collect(),
+                            url: server.url.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        },
         agents: config
             .agents
             .iter()
@@ -2756,6 +2956,22 @@ prompt_mode = "stdin"
 type = "zai"
 base_url = "https://api.z.ai/api/paas/v4"
 api_key_env = "ZAI_API_KEY"
+
+# Optional harness-owned MCP servers. Declare each under [mcp.servers.<id>] just
+# like a runtime. V1 wires transport = "stdio" only (the `url`/HTTP transport is
+# parsed but inert until V1.1). `command` is required for stdio. `env` sets the
+# server subprocess's environment — values may reference ${VAR}; only the names
+# are ever shown by `atelier --print-config`, never the values. MCP is gated by
+# the `mcp_enabled` feature below: servers are parsed regardless, but no
+# connection is started and no MCP tools are offered until you opt in.
+# [features]
+# mcp_enabled = true
+#
+# [mcp.servers.filesystem]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# env = { FASTMCP_LOG_LEVEL = "ERROR" }
 
 [limits]
 max_agent_steps = 12
@@ -3646,6 +3862,154 @@ max_parallel_agent_steps = 0
         .unwrap();
 
         assert!(!config.features.execution_graph);
+    }
+
+    // ── MCP servers + features.mcp_enabled + redaction (task_02) ──
+
+    #[test]
+    fn mcp_stdio_server_parses_into_one_effective_server() {
+        let config = load_from_temp(
+            r#"
+schema_version = 1
+[mcp.servers.fs]
+transport = "stdio"
+command = "mcp-fs"
+args = ["--root", "."]
+env = { FS_TOKEN_ENV = "MY_TOKEN" }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.mcp_servers.len(), 1);
+        let server = &config.mcp_servers["fs"];
+        assert_eq!(server.id, "fs");
+        assert_eq!(server.transport, McpTransport::Stdio);
+        assert_eq!(server.command.as_deref(), Some("mcp-fs"));
+        assert_eq!(server.args, vec!["--root".to_string(), ".".to_string()]);
+        assert_eq!(
+            server.env.get("FS_TOKEN_ENV").map(String::as_str),
+            Some("MY_TOKEN")
+        );
+    }
+
+    #[test]
+    fn mcp_stdio_server_missing_command_fails_with_server_id() {
+        let error = load_from_temp(
+            r#"
+schema_version = 1
+[mcp.servers.fs]
+transport = "stdio"
+"#,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("fs"),
+            "error should name the server id: {message}"
+        );
+        assert!(
+            message.contains("command"),
+            "error should mention the missing command: {message}"
+        );
+    }
+
+    #[test]
+    fn mcp_http_transport_parses_without_command() {
+        // HTTP is parsed but inert in V1 (ADR-002) — and not subject to the
+        // stdio command requirement.
+        let config = load_from_temp(
+            r#"
+schema_version = 1
+[mcp.servers.remote]
+transport = "http"
+url = "https://example.test/mcp"
+"#,
+        )
+        .unwrap();
+        let server = &config.mcp_servers["remote"];
+        assert_eq!(server.transport, McpTransport::Http);
+        assert_eq!(server.url.as_deref(), Some("https://example.test/mcp"));
+        assert!(server.command.is_none());
+    }
+
+    #[test]
+    fn mcp_enabled_defaults_false_and_flips_true() {
+        let off = load_from_temp("schema_version = 1\n").unwrap();
+        assert!(!off.features.mcp_enabled);
+
+        let on = load_from_temp("schema_version = 1\n[features]\nmcp_enabled = true\n").unwrap();
+        assert!(on.features.mcp_enabled);
+    }
+
+    #[test]
+    fn printable_mcp_server_shows_env_names_not_values() {
+        let config = load_from_temp(
+            r#"
+schema_version = 1
+[mcp.servers.fs]
+transport = "stdio"
+command = "mcp-fs"
+env = { SECRET_TOKEN = "super-secret-value" }
+"#,
+        )
+        .unwrap();
+
+        let printable = build_printable_config(&config);
+        let server = printable
+            .mcp
+            .servers
+            .get("fs")
+            .expect("printable mcp server present");
+        assert_eq!(server.env, vec!["SECRET_TOKEN".to_string()]);
+
+        let rendered = to_redacted_toml(&config).unwrap();
+        assert!(
+            rendered.contains("SECRET_TOKEN"),
+            "env var name should appear in --print-config: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "secret env value must never leak into --print-config: {rendered}"
+        );
+    }
+
+    #[test]
+    fn mcp_server_local_overrides_home_args() {
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(
+            &home_path,
+            "schema_version = 1\n[mcp.servers.fs]\ntransport = \"stdio\"\ncommand = \"mcp-fs\"\nargs = [\"--root\", \"/home\"]\n",
+        )
+        .unwrap();
+
+        let local_dir = tempdir().unwrap();
+        fs::write(
+            local_dir.path().join("atelier.toml"),
+            "[mcp.servers.fs]\nargs = [\"--root\", \"/local\"]\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: local_dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        let server = &config.mcp_servers["fs"];
+        // command is inherited from home; local only overrode args.
+        assert_eq!(server.command.as_deref(), Some("mcp-fs"));
+        assert_eq!(
+            server.args,
+            vec!["--root".to_string(), "/local".to_string()]
+        );
+    }
+
+    #[test]
+    fn starter_config_documents_mcp_servers() {
+        let starter = starter_config_text();
+        assert!(starter.contains("[mcp.servers.filesystem]"));
+        assert!(starter.contains("mcp_enabled"));
     }
 
     #[test]

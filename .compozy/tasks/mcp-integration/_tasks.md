@@ -5,7 +5,7 @@
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
 | 01 | Add rmcp dependency, McpClient trait, and fake stdio server | completed | medium | — |
-| 02 | Add mcp.servers config section, mcp_enabled flag, and redaction | pending | medium | — |
+| 02 | Add mcp.servers config section, mcp_enabled flag, and redaction | completed | medium | — |
 | 03 | Build the McpSupervisor actor and McpHandle | pending | high | task_01, task_02 |
 | 04 | Add the McpTrustStore with durable trust tiers and pins | pending | medium | task_01 |
 | 05 | Add MCP action kinds, capability, validation, and execution | pending | high | task_03, task_04 |
