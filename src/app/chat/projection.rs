@@ -55,6 +55,10 @@ struct ActionContext {
     /// Capped slice of a `write_file` action's content, so a created file can
     /// show a preview of what was written (not just its byte count).
     content_preview: Option<String>,
+    /// MCP action params (task_08): the server id and (for `call_mcp_tool`) the
+    /// tool name, so the transcript shows `server/tool` in the title.
+    server: Option<String>,
+    tool: Option<String>,
 }
 
 impl ChatProjection {
@@ -73,9 +77,13 @@ impl ChatProjection {
     pub fn apply_history_event(&mut self, event: &HistoryEvent) {
         match event.kind.as_str() {
             "session_started" | "session_ended" => {}
-            // Audit-only MCP events: preserved in the durable log, never rendered
-            // as chat (task_07). Tool calls/results are projected in task_08.
-            "mcp_catalog_snapshot" => {}
+            // Audit/observability-only MCP events: preserved in the durable log,
+            // never rendered as chat. The catalog snapshot (task_07) feeds the
+            // orchestrator prompt; `mcp_tool_called`/`mcp_tool_result` are metric
+            // events for `--doctor` (task_10). The transcript view of an MCP call
+            // comes from the standard `action_requested`/`action_completed` events
+            // (task_08), so rendering these too would duplicate it.
+            "mcp_catalog_snapshot" | "mcp_tool_called" | "mcp_tool_result" => {}
             "run_started" => self.apply_run_started(event),
             "prompt_submitted" => self.apply_user_prompt(event),
             "clarification_requested" => self.apply_clarification_requested(event),
@@ -629,6 +637,14 @@ impl ChatProjection {
                 .get("params")
                 .and_then(|params| string_field(params, "content"))
                 .map(|content| capped_content_preview(&content)),
+            server: event
+                .payload
+                .get("params")
+                .and_then(|params| string_field(params, "server")),
+            tool: event
+                .payload
+                .get("params")
+                .and_then(|params| string_field(params, "tool")),
         };
         if context.kind.as_deref() == Some("write_file") && context.content_bytes.is_none() {
             context.content_bytes = event
@@ -1001,8 +1017,68 @@ impl ChatProjection {
             Some("apply_patch" | "write_file") => {
                 self.apply_action_completed_file_edit(event, &action_id, &status, &context)
             }
+            Some("call_mcp_tool" | "read_mcp_resource" | "list_mcp_resources") => {
+                self.apply_action_completed_mcp(event, &action_id, &status, &context)
+            }
             _ => self.apply_action_completed_generic(event, &action_id, &status, &context),
         }
+    }
+
+    /// Project a completed MCP action (task_08): the tool/server in the title,
+    /// the result content as a body capped at [`CONTENT_PREVIEW_CAP_BYTES`] (8KB),
+    /// and an error status on failure (mirroring command failures).
+    fn apply_action_completed_mcp(
+        &mut self,
+        event: &HistoryEvent,
+        action_id: &str,
+        status: &str,
+        context: &ActionContext,
+    ) {
+        let Some(key) = action_key(event, action_id) else {
+            return;
+        };
+        let label = context
+            .kind
+            .as_deref()
+            .map(action_kind_label)
+            .unwrap_or("MCP action");
+        let target = match (context.server.as_deref(), context.tool.as_deref()) {
+            (Some(server), Some(tool)) => format!("{server}/{tool}"),
+            (Some(server), None) => server.to_string(),
+            _ => label.to_string(),
+        };
+        let mut body = Vec::new();
+        // Result content preview, capped at 8KB.
+        if let Some(content) = event.payload.get("content") {
+            let rendered = match content.as_str() {
+                Some(text) => text.to_string(),
+                None => content.to_string(),
+            };
+            if !rendered.is_empty() {
+                body.push(ChatLineView::code(capped_content_preview(&rendered)));
+            }
+        }
+        if let Some(diagnostic) = string_field(&event.payload, "diagnostic") {
+            let line = if status == "failed" {
+                ChatLineView::error(concise(&diagnostic, MAX_SUMMARY_CHARS))
+            } else {
+                ChatLineView::warning(concise(&diagnostic, MAX_SUMMARY_CHARS))
+            };
+            body.push(line);
+        }
+        self.upsert(ItemInput {
+            lifecycle_key: Some(key),
+            kind: ChatItemKind::ActionRequested,
+            status: status_to_item_status(status, None),
+            severity: severity_for_action_status(status, None),
+            title: format!("{label} {}: {target}", status.replace('_', " ")),
+            summary: string_field(&event.payload, "summary"),
+            body,
+            details: history_detail(event, "result"),
+            source: source_from_event(event, Some(action_id.to_string())),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
     }
 
     fn apply_action_completed_command(
@@ -2006,6 +2082,25 @@ fn action_requested_view(
                 format!("File write requested: {path}"),
                 Some(summary),
                 write_file_preview_body(context),
+            )
+        }
+        Some("call_mcp_tool") => {
+            let server = context.server.as_deref().unwrap_or("<server>");
+            let tool = context.tool.as_deref().unwrap_or("<tool>");
+            (
+                ChatItemKind::ActionRequested,
+                format!("MCP tool requested: {server}/{tool}"),
+                Some("pending".to_string()),
+                Vec::new(),
+            )
+        }
+        Some(kind @ ("read_mcp_resource" | "list_mcp_resources")) => {
+            let server = context.server.as_deref().unwrap_or("<server>");
+            (
+                ChatItemKind::ActionRequested,
+                format!("{} requested: {server}", action_kind_label(kind)),
+                Some("pending".to_string()),
+                Vec::new(),
             )
         }
         Some(kind) => (
@@ -3013,6 +3108,9 @@ fn action_kind_label(kind: &str) -> &'static str {
         "apply_patch" => "Apply patch",
         "write_file" => "Write file",
         "record_note" => "Record note",
+        "call_mcp_tool" => "Call MCP tool",
+        "read_mcp_resource" => "Read MCP resource",
+        "list_mcp_resources" => "List MCP resources",
         _ => "Action",
     }
 }
@@ -4352,6 +4450,141 @@ mod tests {
         assert_eq!(projection.items().len(), 1);
         assert_eq!(projection.items()[0].kind, ChatItemKind::CommandResult);
         assert_eq!(projection.items()[0].severity, ChatSeverity::Success);
+    }
+
+    // ── MCP tool-call projection (task_08) ──
+
+    fn mcp_call_requested() -> HistoryEvent {
+        event(
+            "action_requested",
+            Some("run"),
+            Some("step"),
+            json!({
+                "schema_version": 1,
+                "action_id": "mcp-1",
+                "step_id": "step",
+                "kind": "call_mcp_tool",
+                "params": { "server": "filesystem", "tool": "read_file", "args": {} }
+            }),
+        )
+    }
+
+    #[test]
+    fn mcp_call_requested_projects_pending_with_tool_name() {
+        let projection = ChatProjection::rebuild(&[mcp_call_requested()]);
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Pending);
+        assert!(
+            item.title.contains("filesystem/read_file"),
+            "title should name the tool: {}",
+            item.title
+        );
+    }
+
+    #[test]
+    fn mcp_call_completed_projects_completed_item() {
+        let events = vec![
+            mcp_call_requested(),
+            event(
+                "action_completed",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "mcp-1",
+                    "status": "completed",
+                    "summary": "Called MCP tool 'read_file' on 'filesystem'.",
+                    "content": [ { "type": "text", "text": "file contents" } ],
+                    "diagnostic": null
+                }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        assert_eq!(
+            projection.items().len(),
+            1,
+            "call→result is one evolving item"
+        );
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert!(item.title.contains("filesystem/read_file"));
+        assert!(
+            item.body
+                .iter()
+                .any(|line| line.text.contains("file contents")),
+            "result content should appear in the body"
+        );
+    }
+
+    #[test]
+    fn mcp_call_failed_projects_error_item() {
+        let events = vec![
+            mcp_call_requested(),
+            event(
+                "action_completed",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "mcp-1",
+                    "status": "failed",
+                    "summary": "MCP tool 'read_file' on 'filesystem' failed.",
+                    "content": null,
+                    "diagnostic": "connection closed"
+                }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Failed);
+        assert_eq!(item.severity, ChatSeverity::Error);
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text.contains("connection closed")));
+    }
+
+    #[test]
+    fn mcp_result_body_is_capped_at_8kb() {
+        let big = "x".repeat(20 * 1024);
+        let events = vec![
+            mcp_call_requested(),
+            event(
+                "action_completed",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "mcp-1",
+                    "status": "completed",
+                    "summary": "ok",
+                    "content": big,
+                    "diagnostic": null
+                }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        let body_text = &projection.items()[0].body[0].text;
+        assert!(
+            body_text.len() <= CONTENT_PREVIEW_CAP_BYTES + 128,
+            "MCP result body should be capped near 8KB, was {}",
+            body_text.len()
+        );
+        assert!(
+            body_text.len() < 20 * 1024,
+            "the 20KB content must be truncated"
+        );
+    }
+
+    #[test]
+    fn action_kind_label_resolves_mcp_kinds() {
+        assert_eq!(action_kind_label("call_mcp_tool"), "Call MCP tool");
+        assert_eq!(action_kind_label("read_mcp_resource"), "Read MCP resource");
+        assert_eq!(
+            action_kind_label("list_mcp_resources"),
+            "List MCP resources"
+        );
     }
 
     #[test]
