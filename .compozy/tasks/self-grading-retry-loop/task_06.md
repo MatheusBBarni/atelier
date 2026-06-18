@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Grading trigger gate at run_agent_step
 type: backend
 complexity: medium
@@ -29,11 +29,21 @@ Wire the grading executor into the run loop: after a top-level single-agent Edit
 </requirements>
 
 ## Subtasks
-- [ ] 06.1 Compute the grade gate (enabled + Edit capability + changed files + top-level single-agent) before the result push.
-- [ ] 06.2 Invoke `run_grading_workflow` when the gate passes.
-- [ ] 06.3 Map the executor outcome to `Completed`/`Paused`.
-- [ ] 06.4 Confirm sub-steps and subtasks bypass the gate.
-- [ ] 06.5 Cover trigger / no-trigger paths with integration tests.
+- [x] 06.1 Compute the grade gate (enabled + Edit capability + changed files + top-level single-agent) before the result push.
+- [x] 06.2 Invoke `run_grading_workflow` when the gate passes.
+- [x] 06.3 Map the executor outcome to `Completed`/`Paused`.
+- [x] 06.4 Confirm sub-steps and subtasks bypass the gate.
+- [x] 06.5 Cover trigger / no-trigger paths with integration tests.
+
+## Implementation Note
+The gate sits in the `run_agent_step` `AgentResult` arm: `triggers_grading = grading.enabled &&
+run.subtask.is_none() && !result.changed_files.is_empty() && agent.has_capability(Edit)`, computed
+(with a `changed_files` clone) BEFORE `result` is moved into `run.previous_results`. On a hit it calls
+`run_grading_workflow`, mapping `Concluded → Completed` and `Escalated → Paused`. Parallel children
+never reach `run_agent_step`, and the grade/fix sub-steps run via `run_grading_substep`, so grading
+never recurses. The task_05 `#[allow(dead_code)]` stubs were removed now that the caller is live.
+Four e2e tests: triggers on enabled+Edit+changes; not when disabled; not on a no-change step; bounded
+(no recursion) on the flaky path. Default-off behavior preserved.
 
 ## Implementation Details
 The gate lives in the `run_agent_step` `AgentResult` arm; re-fetch the producing profile via `self.agent(next_agent_id)` (it was moved into the request) and read `result.changed_files` before the push. See TechSpec "System Architecture" (Grading trigger) and "Build Order" step 6. The dispatch-loop findings in `_research-techspec.json` flag the move-at-:3092 and profile-out-of-scope gotchas.

@@ -1051,8 +1051,6 @@ enum AgentStepOutcome {
 /// Result of the externally-grounded auto-verification loop (ADR-003). `Concluded`
 /// lets the caller return `Completed`; `Escalated` (attempts exhausted on FAIL)
 /// is handled by the cycle-exhaustion escalation (task 07).
-// `dead_code` allow removed in task 06, which wires this into `run_agent_step`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GradingOutcome {
     Concluded,
@@ -1060,7 +1058,6 @@ enum GradingOutcome {
 }
 
 /// Outcome of a single grade/fix sub-step run through the action-executing path.
-#[allow(dead_code)] // wired in task 06
 #[derive(Debug)]
 enum GradingSubstep {
     Completed(Box<AgentResult>),
@@ -1072,7 +1069,6 @@ enum GradingSubstep {
 /// The built-in agent that runs the project's checks during grading. It already
 /// ships with `read`/`command`/`verify` capabilities, so its canonical
 /// verification commands auto-approve under the read-only allowlist.
-#[allow(dead_code)] // wired in task 06
 const GRADING_GRADER_AGENT_ID: &str = "reviewer";
 
 #[derive(Debug)]
@@ -5258,8 +5254,33 @@ impl App {
                         serde_json::to_value(&result)?,
                         format!("{}: {}", result.agent, result.summary),
                     )?;
+                    // Grading trigger (ADR-002/003): auto-verify a top-level
+                    // single-agent Edit step that produced changes, when enabled.
+                    // Compute the gate BEFORE `result` is moved into the run, and
+                    // exclude subtasks (parallel children never reach this path).
+                    // The grade/fix sub-steps run via `run_grading_substep`, not
+                    // `run_agent_step`, so grading never recurses.
+                    let triggers_grading = self.config.grading.enabled
+                        && run.subtask.is_none()
+                        && !result.changed_files.is_empty()
+                        && self
+                            .agent(next_agent_id)
+                            .map(|agent| agent.has_capability(&Capability::Edit))
+                            .unwrap_or(false);
+                    let changed_files = result.changed_files.clone();
                     run.previous_results.push(RunStepResult::Agent { result });
                     self.clear_active_step(&step_id);
+                    if triggers_grading {
+                        return Ok(
+                            match self
+                                .run_grading_workflow(run, next_agent_id, changed_files)
+                                .await?
+                            {
+                                GradingOutcome::Concluded => AgentStepOutcome::Completed,
+                                GradingOutcome::Escalated => AgentStepOutcome::Paused,
+                            },
+                        );
+                    }
                     Ok(AgentStepOutcome::Completed)
                 }
                 RuntimeOutput::ParseError {
@@ -5498,7 +5519,6 @@ impl App {
     /// `max_agent_steps` (grade/fix sub-steps never touch `run.step_count`). The
     /// wall-clock guard and per-command timeout still apply. Returns `Escalated`
     /// when attempts exhaust on FAIL (handled in task 07), `Concluded` otherwise.
-    #[allow(dead_code)] // wired into run_agent_step in task 06
     async fn run_grading_workflow(
         &mut self,
         run: &mut RunDriveContext,
@@ -5578,7 +5598,6 @@ impl App {
     /// ADR-003). Records `agent_step_started` + the terminal `agent_result`; the
     /// in-loop command execution records `command_completed` events the verdict
     /// reads back. Returns `Halted` on pause/limit/interrupt/error.
-    #[allow(dead_code)] // wired in task 06
     async fn run_grading_substep(
         &mut self,
         run: &mut RunDriveContext,
@@ -5640,7 +5659,6 @@ impl App {
     /// Collect the grade sub-step's executed commands from the recorded
     /// `command_completed` events (the structured ground truth — never
     /// model-authored text), scoped to `step_id`.
-    #[allow(dead_code)] // wired in task 06
     fn collect_grade_command_outcomes(
         &self,
         step_id: &str,
@@ -5674,7 +5692,6 @@ impl App {
     /// Record a `grade_round` event (task 04 projects it into the one evolving
     /// grade item). `verdict` supplies the command/exit/critique for resolved
     /// rounds; pass `None` for the in-progress `working` round.
-    #[allow(dead_code)] // wired in task 06
     fn record_grade_round(
         &mut self,
         run: &RunDriveContext,
@@ -5710,7 +5727,6 @@ impl App {
 
     /// Push the concluding grade result into `run.previous_results` so the run
     /// record reflects the verification outcome.
-    #[allow(dead_code)] // wired in task 06
     fn push_grade_conclusion(
         &mut self,
         run: &mut RunDriveContext,
@@ -8286,7 +8302,6 @@ fn council_member_prompt(
 /// Prompt for the grader sub-step: ask the grader to run the project's checks on
 /// the changed files. The round number is embedded so a replay/runtime can vary
 /// behavior per round (the fake runtime keys its scripted outcomes off it).
-#[allow(dead_code)] // wired in task 06
 fn grading_grader_prompt(user_prompt: &str, changed_files: &[String], round: u32) -> String {
     let files = if changed_files.is_empty() {
         "the working tree".to_string()
@@ -8302,7 +8317,6 @@ fn grading_grader_prompt(user_prompt: &str, changed_files: &[String], round: u32
 
 /// Prompt for the fix sub-step: re-dispatch the producing agent with the
 /// grader's concrete critique so it can address the verification failure.
-#[allow(dead_code)] // wired in task 06
 fn grading_fix_prompt(user_prompt: &str, critique: Option<&str>) -> String {
     let critique = critique.unwrap_or("Verification failed; address the reported issues.");
     format!(
@@ -18141,6 +18155,79 @@ runtime = "fake"
         );
         // A 2-round grade loop must not consume the max_agent_steps budget.
         assert_eq!(run.step_count, 0, "grading is step-budget exempt");
+    }
+
+    // ── grading trigger gate at run_agent_step (task_06) ──
+
+    #[tokio::test]
+    async fn grading_triggers_on_enabled_edit_step_with_changes() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+
+        app.submit_prompt("write action create a feature grade pass")
+            .await
+            .unwrap();
+
+        assert!(
+            grade_round_outcomes(&app).contains(&"pass".to_string()),
+            "an enabled Edit step with changes triggers a grade loop that passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn grading_does_not_trigger_when_disabled() {
+        let dir = tempdir().unwrap();
+        // Default config: grading disabled. Same edit-producing prompt.
+        let config = fake_config(dir.path());
+        assert!(!config.grading.enabled);
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("write action create a feature grade pass")
+            .await
+            .unwrap();
+
+        assert!(
+            grade_round_outcomes(&app).is_empty(),
+            "no grade loop runs when grading is disabled (default behavior preserved)"
+        );
+    }
+
+    #[tokio::test]
+    async fn grading_does_not_trigger_for_a_no_change_edit_step() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+
+        // A `typo` prompt routes to the Edit-capable fixer, but with no write
+        // marker it changes no files → empty `changed_files` → gate is false.
+        // (Read-only agents likewise produce no changes, so this also covers the
+        // no-Edit-capability path.)
+        app.submit_prompt("fix the typo grade pass").await.unwrap();
+
+        assert!(
+            grade_round_outcomes(&app).is_empty(),
+            "a no-change step does not trigger grading"
+        );
+    }
+
+    #[tokio::test]
+    async fn grading_does_not_recurse_through_fix_substeps() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+
+        app.submit_prompt("write action create a feature grade flaky")
+            .await
+            .unwrap();
+
+        // The flaky loop re-dispatches the fixer once (a grade fix sub-step). That
+        // sub-step runs via run_grading_substep, NOT run_agent_step, so it cannot
+        // re-trigger grading: the loop stays bounded at exactly max_attempts
+        // `working` rounds rather than spawning nested grade loops.
+        let working = grade_round_outcomes(&app)
+            .iter()
+            .filter(|outcome| *outcome == "working")
+            .count();
+        assert_eq!(working, 2, "exactly max_attempts rounds — no recursion");
+        assert!(grade_round_outcomes(&app).contains(&"pass".to_string()));
     }
 
     #[tokio::test]
