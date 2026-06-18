@@ -195,6 +195,15 @@ pub const SESSION_RESUMED_KIND: &str = "session_resumed";
 /// Additive — no schema bump.
 pub const RESUME_DRIFT_ACK_KIND: &str = "resume_drift_acknowledged";
 
+/// Kind string for one round of the externally-grounded auto-verification loop
+/// (self-grading retry loop, ADR-003). Payload: `round`, `max_rounds`,
+/// `outcome` (`working|pass|fail|skip`), optional `command`/`exit_code`/`critique`.
+/// Additive — no schema bump.
+pub const GRADE_ROUND_KIND: &str = "grade_round";
+/// Kind string for the durable record of a grading round's decisive verdict
+/// (the serialized `GraderVerdict`). Additive — no schema bump.
+pub const GRADER_VERDICT_KIND: &str = "grader_verdict";
+
 /// Execution-graph (DAG) lifecycle event kinds (ADR-005). All additive at
 /// history `schema_version 1`: the scheduler (task_04) emits them through the
 /// `graph_id`-keyed recorder path and the projection (task_06) registers each

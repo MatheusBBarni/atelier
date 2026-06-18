@@ -4633,6 +4633,7 @@ fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
         ChatItemKind::HookInvocation => "hook",
         ChatItemKind::Welcome => "welcome",
         ChatItemKind::Plan => "plan",
+        ChatItemKind::GradeLoop => "verify",
     }
 }
 
