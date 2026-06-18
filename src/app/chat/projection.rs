@@ -426,10 +426,18 @@ impl ChatProjection {
     /// tracked `graph_id`). Per-node live items for graph nodes are suppressed in
     /// favor of the single Plan item (ADR-005); detail stays in the Agent Roster.
     fn belongs_to_graph(&self, event: &HistoryEvent) -> bool {
+        // Graph identity arrives in either column depending on the emit path:
+        // node lifecycle / agent_result events carry `graph_id` (group_id None);
+        // the reused streaming / active-step events overload `group_id` with the
+        // graph_id. Check both so every per-node event for a known graph is caught.
         event
             .group_id
             .as_ref()
-            .is_some_and(|group_id| self.graph_ids.contains(group_id))
+            .is_some_and(|id| self.graph_ids.contains(id))
+            || event
+                .graph_id
+                .as_ref()
+                .is_some_and(|id| self.graph_ids.contains(id))
     }
 
     fn apply_agent_step_started(&mut self, event: &HistoryEvent) {
@@ -1153,6 +1161,11 @@ impl ChatProjection {
     }
 
     fn apply_agent_result(&mut self, event: &HistoryEvent) {
+        // A graph node's terminal result is rendered in the single Plan item, not
+        // as a standalone per-node AgentResult chat item (ADR-005).
+        if self.belongs_to_graph(event) {
+            return;
+        }
         let agent = string_field(&event.payload, "agent")
             .or_else(|| string_field(&event.payload, "member_id"))
             .unwrap_or_else(|| "agent".to_string());

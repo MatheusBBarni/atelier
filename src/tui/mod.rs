@@ -5,8 +5,8 @@ use crate::app::chat::{
 use crate::app::git::GitContext;
 use crate::app::{
     ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, ApprovalResolution,
-    InterruptHandle, PendingApprovalView, PendingClarificationView, PromptSource,
-    QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
+    InterruptHandle, PendingApprovalView, PendingClarificationView, PendingPlanApprovalView,
+    PlanApprovalAnswer, PromptSource, QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
@@ -95,6 +95,8 @@ const CLARIFICATION_HINT_MULTI: &str =
     "↑/↓ or 1-9 move · Space toggle · type for custom · Enter confirm · Ctrl-C interrupt";
 const GOVERNANCE_DECISION_HINT: &str =
     "Ctrl-Y accept · Esc reject · type a redirect then Enter to reject with guidance · Ctrl-C interrupt";
+const PLAN_APPROVAL_HINT: &str =
+    "Ctrl-Y accept plan · Esc reject · type a reason then Enter to reject with guidance · Ctrl-C interrupt";
 const QUEUE_VISIBLE_MAX: usize = 6;
 const QUEUE_SELECTED_MARKER: &str = "> ";
 const QUEUE_UNSELECTED_MARKER: &str = "  ";
@@ -1475,6 +1477,9 @@ fn key_event_to_tui_command_with_ui(
     } else if state.pending_governance_decision.is_some() {
         // Ctrl-C is handled by the reserved-key guard above.
         governance_decision_key_command(state, key)
+    } else if state.pending_plan_approval.is_some() {
+        // The whole-plan DAG approval gate (ADR-005); Ctrl-C handled above.
+        plan_approval_key_command(state, key)
     } else if state.pending_approval.is_some() {
         // Modal contexts keep default chat-scroll (PageUp/PageDown/Home/End) as a
         // fallback so keyboard users can still scroll while the modal is open, but the
@@ -1611,6 +1616,7 @@ fn queue_control_active(state: &AppState, ui_state: &TuiUiState) -> bool {
         && !ui_state.help_visible
         && state.pending_clarification.is_none()
         && state.pending_governance_decision.is_none()
+        && state.pending_plan_approval.is_none()
         && state.pending_approval.is_none()
 }
 
@@ -2000,6 +2006,56 @@ fn governance_decision_key_command(state: &AppState, key: KeyEvent) -> Option<Tu
     }
 }
 
+/// Key routing for the whole-plan DAG approval gate (ADR-005), mirroring
+/// `governance_decision_key_command`: Ctrl-Y accepts; Esc rejects; Enter rejects
+/// with the composed reason (empty line = no-op so the default key never
+/// accepts); other keys compose the optional reason.
+fn plan_approval_key_command(state: &AppState, key: KeyEvent) -> Option<TuiCommand> {
+    let question_id = state.pending_plan_approval.as_ref()?.question_id.clone();
+    match key {
+        KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+            question_id,
+            PlanApprovalAnswer::Accept,
+        ))),
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        } => Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+            question_id,
+            PlanApprovalAnswer::Reject { reason: None },
+        ))),
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        } => {
+            let reason = state.input.trim();
+            (!reason.is_empty()).then(|| {
+                TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+                    question_id,
+                    PlanApprovalAnswer::Reject {
+                        reason: Some(reason.to_string()),
+                    },
+                ))
+            })
+        }
+        KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        } => Some(TuiCommand::InputBackspace),
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            ..
+        } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            Some(TuiCommand::InputCharacter(ch))
+        }
+        _ => None,
+    }
+}
+
 /// The reserved interrupt/quit chord: `Ctrl-C`. Matched at the single chokepoint in
 /// `key_event_to_tui_command_with_ui` so it can never be shadowed by a modal context
 /// or a user keymap. Structurally non-bindable (excluded from `keybindings::is_portable`).
@@ -2050,7 +2106,8 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
             ..
         } if state.pending_approval.is_none()
             && state.pending_clarification.is_none()
-            && state.pending_governance_decision.is_none() =>
+            && state.pending_governance_decision.is_none()
+            && state.pending_plan_approval.is_none() =>
         {
             Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
         }
@@ -3478,6 +3535,16 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
             ui_state,
         );
         render_governance_decision_status(frame, areas.status, &theme);
+        if ui_state.help_visible {
+            render_help_modal(frame, state, ui_state, &theme);
+        }
+        return;
+    }
+
+    if let Some(pending) = &state.pending_plan_approval {
+        let areas = clarification_input_areas(composer_area);
+        render_plan_approval_composer(frame, areas.input, pending, &state.input, ui_state);
+        render_plan_approval_status(frame, areas.status, &theme);
         if ui_state.help_visible {
             render_help_modal(frame, state, ui_state, &theme);
         }
@@ -6096,6 +6163,79 @@ fn render_governance_decision_status(frame: &mut Frame, status_area: Rect, theme
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             GOVERNANCE_DECISION_HINT,
+            Style::default().fg(theme.text_muted),
+        ))),
+        line_area,
+    );
+}
+
+fn render_plan_approval_composer(
+    frame: &mut Frame,
+    area: Rect,
+    view: &PendingPlanApprovalView,
+    input: &str,
+    ui_state: &TuiUiState,
+) {
+    let theme = ui_state.theme;
+    // The full graph is already rendered in the durable Plan chat item; the
+    // composer just restates the decision and echoes the reject reason being typed.
+    let lines = vec![
+        Line::from(Span::styled(
+            view.summary.clone(),
+            Style::default().fg(theme.text),
+        )),
+        Line::from(Span::styled(
+            "Accept to run the plan, or reject to send it back to the orchestrator.",
+            Style::default().fg(theme.text_muted),
+        )),
+        Line::from(String::new()),
+        Line::from(vec![
+            Span::styled(
+                "Reject reason (optional): ",
+                Style::default().fg(theme.text_muted),
+            ),
+            Span::styled(input.to_string(), Style::default().fg(theme.text)),
+        ]),
+    ];
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let focus_line = if input.is_empty() {
+        0
+    } else {
+        lines.len().saturating_sub(1)
+    };
+    let scroll = clarification_scroll_offset(
+        &lines,
+        focus_line,
+        clarification_inner_width(area),
+        inner_height,
+    );
+    let composer = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll.min(usize::from(u16::MAX)) as u16, 0))
+        .block(
+            Block::default()
+                .title(" Review plan · approval ")
+                .title_style(Style::default().fg(theme.accent))
+                .border_style(Style::default().fg(theme.accent))
+                .borders(Borders::ALL),
+        );
+    frame.render_widget(composer, area);
+}
+
+fn render_plan_approval_status(frame: &mut Frame, status_area: Rect, theme: &Theme) {
+    if status_area.width == 0 || status_area.height == 0 {
+        return;
+    }
+    let line_area = Rect {
+        x: status_area.x + 1,
+        y: status_area.y,
+        width: status_area.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(Clear, status_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            PLAN_APPROVAL_HINT,
             Style::default().fg(theme.text_muted),
         ))),
         line_area,
@@ -10023,6 +10163,102 @@ mod tests {
         }];
         // A pending governance decision suppresses queue keys even with an empty
         // composer and queued items present.
+        assert!(!queue_control_active(&state, &TuiUiState::default()));
+    }
+
+    // ── whole-plan DAG approval gate key routing (review fix) ──
+
+    fn state_with_plan_approval(input: &str) -> AppState {
+        let mut state = state_with_input(input, false);
+        state.run_state = RunState::WaitingForUser;
+        state.active_run_id = Some("run".to_string());
+        state.pending_plan_approval = Some(PendingPlanApprovalView {
+            run_id: "run".to_string(),
+            graph_id: "graph-1".to_string(),
+            question_id: "plan-approval:graph-1".to_string(),
+            summary: "Review the proposed plan: 4 node(s), 4 edge(s).".to_string(),
+        });
+        state
+    }
+
+    #[test]
+    fn plan_approval_accept_key_routes_to_resolve_accept() {
+        let state = state_with_plan_approval("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+                "plan-approval:graph-1".to_string(),
+                PlanApprovalAnswer::Accept
+            )))
+        );
+    }
+
+    #[test]
+    fn plan_approval_esc_rejects_without_reason() {
+        let state = state_with_plan_approval("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+                "plan-approval:graph-1".to_string(),
+                PlanApprovalAnswer::Reject { reason: None }
+            )))
+        );
+    }
+
+    #[test]
+    fn plan_approval_enter_rejects_with_typed_reason() {
+        let state = state_with_plan_approval("too risky");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+                "plan-approval:graph-1".to_string(),
+                PlanApprovalAnswer::Reject {
+                    reason: Some("too risky".to_string())
+                }
+            )))
+        );
+    }
+
+    #[test]
+    fn plan_approval_enter_on_empty_line_never_accepts() {
+        let state = state_with_plan_approval("");
+        let ui = TuiUiState::default();
+        // The safe default must never land on Accept; an empty line is a no-op.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn queue_control_inactive_during_pending_plan_approval() {
+        let mut state = state_with_plan_approval("");
+        state.queued_follow_ups = vec![QueuedFollowUpView {
+            id: "q1".to_string(),
+            prompt: "later".to_string(),
+            created_at: "t".to_string(),
+            status: QueuedFollowUpStatus::Pending,
+            pause_reason: None,
+        }];
         assert!(!queue_control_active(&state, &TuiUiState::default()));
     }
 

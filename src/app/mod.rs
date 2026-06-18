@@ -2665,6 +2665,11 @@ impl App {
                     self.pending_governance_decision
                         .as_ref()
                         .map(|pending| pending.run.clone())
+                })
+                .or_else(|| {
+                    self.pending_plan_approval
+                        .as_ref()
+                        .map(|pending| pending.run.clone())
                 });
             self.record_step_cancelled_if_active()?;
             self.record_event(
@@ -2706,19 +2711,29 @@ impl App {
     ) -> Result<()> {
         let drive_result = self.drive_run_inner(&mut run, resume).await;
         if drive_result.is_ok() {
-            if !matches!(self.state.run_state, RunState::WaitingForUser) {
-                self.record_workflow_completed(
-                    &mut run,
-                    matches!(self.state.run_state, RunState::Interrupted),
-                )?;
-            }
-            self.write_run_record(&run)?;
-            if !matches!(self.state.run_state, RunState::WaitingForUser) {
-                self.state.active_run_id = None;
-                self.publish_state();
-            }
+            self.finalize_run_record(&mut run)?;
         }
         drive_result
+    }
+
+    /// Persist the run record and release `active_run_id` at run end, unless the
+    /// run paused for the user (then the record is written but the run stays
+    /// active). Shared by `drive_run` and the plan-approval accept path so a
+    /// directly-driven graph that ends on a limit/interrupt isn't left with a
+    /// stale record or a dangling active run.
+    fn finalize_run_record(&mut self, run: &mut RunDriveContext) -> Result<()> {
+        if !matches!(self.state.run_state, RunState::WaitingForUser) {
+            self.record_workflow_completed(
+                run,
+                matches!(self.state.run_state, RunState::Interrupted),
+            )?;
+        }
+        self.write_run_record(run)?;
+        if !matches!(self.state.run_state, RunState::WaitingForUser) {
+            self.state.active_run_id = None;
+            self.publish_state();
+        }
+        Ok(())
     }
 
     async fn drive_run_inner(
@@ -3351,6 +3366,15 @@ impl App {
         decision: &crate::orchestrator::OrchestratorDecision,
         graph: crate::orchestrator::ExecutionGraph,
     ) -> Result<bool> {
+        // Honor the review/fix cycle cap for fixer-bearing graphs, mirroring the
+        // single-agent and parallel-group paths so a DAG-routed fixer can't
+        // bypass the loop-protection invariant.
+        if self.review_fix_cycle_limit_reached(run, "fixer")
+            && graph.nodes.iter().any(|node| node.agent == "fixer")
+        {
+            self.stop_for_review_fix_cycle_limit(run)?;
+            return Ok(false);
+        }
         self.emit_execution_graph_proposed(run, &graph, &decision.decision_id)?;
         if self.config.approval_mode == ApprovalMode::Normal {
             // Pause: capture the run + graph + decision so accept can run the
@@ -3420,7 +3444,11 @@ impl App {
                 match self.run_execution_graph(&mut run, &decision, graph).await? {
                     AgentStepOutcome::Completed => self.drive_and_replay(run, None).await?,
                     AgentStepOutcome::Paused | AgentStepOutcome::Stop => {
-                        self.react_to_run_end_for_queue().await?
+                        // The graph ended the run (limit/interrupt) without
+                        // continuing the orchestrator loop; finalize like
+                        // drive_run so the record and active_run_id aren't stale.
+                        self.finalize_run_record(&mut run)?;
+                        self.react_to_run_end_for_queue().await?;
                     }
                 }
             }
@@ -3853,6 +3881,34 @@ impl App {
             }
         }
 
+        // Backfill any node terminalized by a reused helper (the limit-check /
+        // approval sweep sets terminal_result directly without going through
+        // finalize_node), so its agent_result event, node lifecycle event, and
+        // workflow-ledger entry are still recorded. Mirrors the flat parallel
+        // path's unrecorded sweep.
+        let unrecorded: Vec<(String, AgentResult)> = children
+            .iter()
+            .filter(|(_, child)| child.terminal_result.is_some() && !child.result_recorded)
+            .map(|(node_id, child)| {
+                (
+                    node_id.clone(),
+                    child.terminal_result.clone().expect("filtered to Some"),
+                )
+            })
+            .collect();
+        for (node_id, result) in unrecorded {
+            let kind = execution_graph_node_kind(&result.status);
+            self.finalize_node(
+                run,
+                &graph,
+                &mut children,
+                &skipped_nodes,
+                &node_id,
+                result,
+                kind,
+            )?;
+        }
+
         let node_results = children
             .values()
             .filter_map(|child| child.terminal_result.clone().map(|result| (child, result)))
@@ -3955,7 +4011,10 @@ impl App {
                 }
             })
             .collect();
-        let decision = compute_admission(&snapshots);
+        // The DAG reuses `max_parallel_agent_steps` as its concurrency ceiling;
+        // admission never spawns more than that many nodes at once.
+        let max_concurrent = self.config.limits.max_parallel_agent_steps as usize;
+        let decision = compute_admission(&snapshots, max_concurrent);
 
         for node_id in decision.skip {
             let agent_id = children
@@ -8350,7 +8409,7 @@ struct AdmissionDecision {
 ///
 /// `Pending` (planned-not-admitted) nodes are never counted as "running", so
 /// their write scopes do not pre-occupy the running set.
-fn compute_admission(nodes: &[DagNodeSnapshot]) -> AdmissionDecision {
+fn compute_admission(nodes: &[DagNodeSnapshot], max_concurrent: usize) -> AdmissionDecision {
     let index: BTreeMap<&str, usize> = nodes
         .iter()
         .enumerate()
@@ -8383,7 +8442,11 @@ fn compute_admission(nodes: &[DagNodeSnapshot]) -> AdmissionDecision {
     }
 
     // Admission over the surviving Pending nodes (deterministic by slice order).
-    let initially_running = nodes.iter().any(|n| n.run_state == NodeRunState::Running);
+    let running_count = nodes
+        .iter()
+        .filter(|n| n.run_state == NodeRunState::Running)
+        .count();
+    let initially_running = running_count > 0;
     let mut command_active = nodes
         .iter()
         .any(|n| n.run_state == NodeRunState::Running && n.is_command);
@@ -8401,6 +8464,12 @@ fn compute_admission(nodes: &[DagNodeSnapshot]) -> AdmissionDecision {
         // A command node, once running or admitted this pass, monopolizes the
         // graph: nothing else may be admitted alongside it.
         if command_active {
+            break;
+        }
+        // Honor the reused concurrency ceiling: never let running + newly-admitted
+        // nodes exceed `max_parallel_agent_steps` (ADR-004 — the DAG reuses the
+        // same bound the flat parallel path enforces).
+        if running_count + admit.len() >= max_concurrent {
             break;
         }
         let ready = node.predecessors.iter().all(|pred_id| {
@@ -11560,7 +11629,7 @@ runtime = "fake"
             dag_snapshot("b", NodeRunState::Pending, false, false, &["b.rs"], &["a"]),
             dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &["a"]),
         ];
-        let decision = compute_admission(&nodes);
+        let decision = compute_admission(&nodes, 8);
         assert_eq!(decision.admit, vec!["b".to_string(), "c".to_string()]);
         assert!(decision.skip.is_empty());
     }
@@ -11587,7 +11656,7 @@ runtime = "fake"
                 &["a"],
             ),
         ];
-        let decision = compute_admission(&nodes);
+        let decision = compute_admission(&nodes, 8);
         assert_eq!(decision.admit, vec!["b".to_string()]);
         assert!(decision.skip.is_empty());
     }
@@ -11599,7 +11668,7 @@ runtime = "fake"
             dag_snapshot("x", NodeRunState::Running, false, false, &["x.rs"], &[]),
             dag_snapshot("y", NodeRunState::Pending, false, true, &[], &[]),
         ];
-        let decision = compute_admission(&nodes);
+        let decision = compute_admission(&nodes, 8);
         assert!(decision.admit.is_empty());
     }
 
@@ -11611,7 +11680,7 @@ runtime = "fake"
             dag_snapshot("y", NodeRunState::Pending, false, true, &[], &[]),
             dag_snapshot("z", NodeRunState::Pending, false, false, &["z.rs"], &[]),
         ];
-        let decision = compute_admission(&nodes);
+        let decision = compute_admission(&nodes, 8);
         assert_eq!(decision.admit, vec!["y".to_string()]);
     }
 
@@ -11622,7 +11691,7 @@ runtime = "fake"
             dag_snapshot("a", NodeRunState::Terminal, false, false, &["a.rs"], &[]),
             dag_snapshot("d", NodeRunState::Pending, false, false, &["d.rs"], &["a"]),
         ];
-        let decision = compute_admission(&nodes);
+        let decision = compute_admission(&nodes, 8);
         assert!(decision.admit.is_empty());
         assert_eq!(decision.skip, vec!["d".to_string()]);
     }
@@ -11637,7 +11706,7 @@ runtime = "fake"
             dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &["b"]),
             dag_snapshot("d", NodeRunState::Pending, false, false, &["d.rs"], &["c"]),
         ];
-        let decision = compute_admission(&nodes);
+        let decision = compute_admission(&nodes, 8);
         assert!(decision.admit.is_empty());
         assert_eq!(
             decision.skip,
@@ -11668,8 +11737,31 @@ runtime = "fake"
                 &[],
             ),
         ];
-        let decision = compute_admission(&nodes);
+        let decision = compute_admission(&nodes, 8);
         assert_eq!(decision.admit, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn admission_respects_the_max_concurrent_ceiling() {
+        // Four independent, write-disjoint, ready nodes but a ceiling of 2: only
+        // two are admitted in one pass (the reused max_parallel_agent_steps bound).
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Pending, false, false, &["a.rs"], &[]),
+            dag_snapshot("b", NodeRunState::Pending, false, false, &["b.rs"], &[]),
+            dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &[]),
+            dag_snapshot("d", NodeRunState::Pending, false, false, &["d.rs"], &[]),
+        ];
+        let decision = compute_admission(&nodes, 2);
+        assert_eq!(decision.admit, vec!["a".to_string(), "b".to_string()]);
+
+        // With one node already running, only one more slot remains.
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Running, false, false, &["a.rs"], &[]),
+            dag_snapshot("b", NodeRunState::Pending, false, false, &["b.rs"], &[]),
+            dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &[]),
+        ];
+        let decision = compute_admission(&nodes, 2);
+        assert_eq!(decision.admit, vec!["b".to_string()]);
     }
 
     #[tokio::test]
