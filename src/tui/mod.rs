@@ -3706,6 +3706,18 @@ fn render_queue_panel(frame: &mut Frame, area: Rect, state: &AppState, ui_state:
     frame.render_widget(panel, area);
 }
 
+/// Whether the discovered skill suggestions include the `atelier-config-setup`
+/// skill (task_07). Drives the welcome's first-run nudge — read-only, derived
+/// from the real discovery result rather than a hardcoded path.
+const CONFIG_SETUP_SKILL_NAME: &str = "atelier-config-setup";
+
+fn config_setup_skill_present(suggestions: &[SkillSuggestion]) -> bool {
+    suggestions.iter().any(|suggestion| {
+        suggestion.alias == CONFIG_SETUP_SKILL_NAME
+            || suggestion.display_name == CONFIG_SETUP_SKILL_NAME
+    })
+}
+
 fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: &mut TuiUiState) {
     let theme = ui_state.theme;
     let hide_banner = ui_state.hide_banner;
@@ -3719,6 +3731,9 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
     let paragraph_width = inner_area.width.saturating_sub(1).max(1);
     // Facts shown in the welcome item, read from live state. `git` is `None`
     // until task_05 supplies `AppState.git_context`.
+    // task_07: derive the config-setup skill's presence from the real discovery
+    // result so the welcome can nudge first-run users who haven't installed it.
+    let config_skill_present = config_setup_skill_present(&ui_state.skill_suggestions);
     let welcome_facts = WelcomeFacts {
         version: env!("CARGO_PKG_VERSION"),
         working_directory: working_directory.as_deref(),
@@ -3730,6 +3745,7 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
             .as_ref()
             .map(|git| (git.repo_name.as_str(), git.branch.as_str())),
         recoverable_session: state.recoverable_session,
+        config_skill_present,
     };
     let event_lines = if !state.chat_items.is_empty() {
         chat_item_lines(
@@ -10393,6 +10409,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn config_setup_skill_present_reflects_discovery() {
+        // task_07: presence is derived from the discovery result, not a path.
+        let mut suggestions = test_skill_suggestions();
+        assert!(
+            !config_setup_skill_present(&suggestions),
+            "absent when only unrelated skills are discovered"
+        );
+        assert!(
+            !config_setup_skill_present(&[]),
+            "absent for an empty result"
+        );
+        suggestions.push(test_skill_suggestion(
+            "atelier-config-setup",
+            SkillSourceTag::Project,
+            ".agents/skills",
+        ));
+        assert!(
+            config_setup_skill_present(&suggestions),
+            "present once the config-setup skill is discovered"
+        );
+    }
+
     fn suggestion_aliases(suggestions: &[SkillSuggestion]) -> Vec<(String, String)> {
         suggestions
             .iter()
@@ -14253,6 +14292,7 @@ runtime = "fake"
             warnings: 0,
             git: None,
             recoverable_session: false,
+            config_skill_present: true,
         };
         let line_text = |line: &Line<'static>| -> String {
             line.spans.iter().map(|s| s.content.as_ref()).collect()

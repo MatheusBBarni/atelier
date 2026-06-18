@@ -10,7 +10,7 @@
 | 04 | Add `all()` enum iteration for the drift test | completed | low | — |
 | 05 | `sync-skills` harness + generated discovery mirrors | completed | medium | task_01, task_02, task_03 |
 | 06 | Rust drift/correctness guard (`tests/atelier_config_skill.rs`) | completed | high | task_01, task_02, task_03, task_04, task_05 |
-| 07 | First-run nudge when the config-setup skill is absent | pending | low | task_01 |
+| 07 | First-run nudge when the config-setup skill is absent | completed | low | task_01 |
 | 08 | README install + usage documentation | pending | low | task_01 |
 | 09 | CI wiring — mirror-equality check + skill tests | pending | low | task_05, task_06 |
 
