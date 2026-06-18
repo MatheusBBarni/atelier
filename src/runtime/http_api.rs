@@ -70,6 +70,7 @@ impl Runtime for HttpApiRuntime {
             .base_url
             .as_ref()
             .context("Z.ai base_url is not configured")?;
+        let (header_name, header_value) = self.build_auth_header(&api_key);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;
@@ -77,7 +78,7 @@ impl Runtime for HttpApiRuntime {
             .stream_or_fallback(
                 &client,
                 base_url,
-                &api_key,
+                (&header_name, &header_value),
                 &request,
                 &events,
                 &cancellation,
@@ -89,11 +90,37 @@ impl Runtime for HttpApiRuntime {
 }
 
 impl HttpApiRuntime {
+    /// Build the auth header `(name, value)` pair for this runtime.
+    ///
+    /// Defaults to `Authorization: Bearer <key>`. Providers can override the
+    /// header name (e.g. `api-key`) and/or the value prefix via config; an
+    /// empty prefix sends the bare key with no prefix (ADR-001). The api_key is
+    /// passed in (rather than read from the env here) so `stream_step` keeps a
+    /// single, error-handled env read and this method stays pure/testable.
+    fn build_auth_header(&self, api_key: &str) -> (String, String) {
+        let name = self
+            .config
+            .auth_header_name
+            .as_deref()
+            .unwrap_or("Authorization");
+        let prefix = self
+            .config
+            .auth_header_prefix
+            .as_deref()
+            .unwrap_or("Bearer");
+        let value = if prefix.is_empty() {
+            api_key.to_string()
+        } else {
+            format!("{prefix} {api_key}")
+        };
+        (name.to_string(), value)
+    }
+
     async fn stream_or_fallback(
         &self,
         client: &reqwest::Client,
         base_url: &str,
-        api_key: &str,
+        auth_header: (&str, &str),
         request: &RuntimeRequest,
         events: &RuntimeEventSink,
         cancellation: &CancellationToken,
@@ -101,7 +128,7 @@ impl HttpApiRuntime {
         let fallback_enabled = streaming_fallback_enabled(&self.config);
         let stream_body = chat_completion_body(request, true)?;
         let response =
-            send_chat_completion(client, base_url, api_key, &stream_body, cancellation).await?;
+            send_chat_completion(client, base_url, auth_header, &stream_body, cancellation).await?;
         let status = response.status();
         if !status.is_success() {
             let text = read_response_text(response, cancellation).await?;
@@ -115,7 +142,7 @@ impl HttpApiRuntime {
                 return run_non_streaming_completion(
                     client,
                     base_url,
-                    api_key,
+                    auth_header,
                     request,
                     events,
                     cancellation,
@@ -134,7 +161,7 @@ impl HttpApiRuntime {
                 return run_non_streaming_completion(
                     client,
                     base_url,
-                    api_key,
+                    auth_header,
                     request,
                     events,
                     cancellation,
@@ -155,13 +182,13 @@ impl HttpApiRuntime {
 async fn run_non_streaming_completion(
     client: &reqwest::Client,
     base_url: &str,
-    api_key: &str,
+    auth_header: (&str, &str),
     request: &RuntimeRequest,
     events: &RuntimeEventSink,
     cancellation: &CancellationToken,
 ) -> Result<String> {
     let body = chat_completion_body(request, false)?;
-    let response = send_chat_completion(client, base_url, api_key, &body, cancellation).await?;
+    let response = send_chat_completion(client, base_url, auth_header, &body, cancellation).await?;
     let status = response.status();
     let text = read_response_text(response, cancellation).await?;
     if !status.is_success() {
@@ -193,15 +220,16 @@ fn chat_completion_body(request: &RuntimeRequest, stream: bool) -> Result<Value>
 async fn send_chat_completion(
     client: &reqwest::Client,
     base_url: &str,
-    api_key: &str,
+    auth_header: (&str, &str),
     body: &Value,
     cancellation: &CancellationToken,
 ) -> Result<reqwest::Response> {
+    let (header_name, header_value) = auth_header;
     tokio::select! {
         _ = cancellation.cancelled() => anyhow::bail!("Z.ai runtime cancelled"),
         response = client
             .post(format!("{base_url}/chat/completions"))
-            .bearer_auth(api_key)
+            .header(header_name, header_value)
             .json(body)
             .send() => {
                 response.map_err(|error| {
@@ -517,6 +545,92 @@ mod tests {
         assert!(request.contains("authorization: Bearer test-token"));
         assert!(request.contains("\"model\":\"glm-5.1\""));
         assert!(request.contains("\"stream\":true"));
+    }
+
+    fn http_api_runtime_with_auth(
+        auth_header_name: Option<&str>,
+        auth_header_prefix: Option<&str>,
+    ) -> HttpApiRuntime {
+        HttpApiRuntime::new(RuntimeConfig {
+            id: "http_api".to_string(),
+            kind: RuntimeKind::HttpApi,
+            command: None,
+            args: Vec::new(),
+            prompt_mode: PromptMode::Stdin,
+            base_url: Some("http://localhost".to_string()),
+            api_key_env: Some("UNUSED".to_string()),
+            auth_header_name: auth_header_name.map(str::to_string),
+            auth_header_prefix: auth_header_prefix.map(str::to_string),
+            degrade_not_abandon: false,
+        })
+    }
+
+    #[test]
+    fn build_auth_header_defaults_to_authorization_bearer() {
+        let runtime = http_api_runtime_with_auth(None, None);
+        let (name, value) = runtime.build_auth_header("test-key");
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "Bearer test-key");
+    }
+
+    #[test]
+    fn build_auth_header_supports_empty_prefix_for_verboo_style_providers() {
+        // Verboo sends `api-key: <key>` with no prefix.
+        let runtime = http_api_runtime_with_auth(Some("api-key"), Some(""));
+        let (name, value) = runtime.build_auth_header("test-key");
+        assert_eq!(name, "api-key");
+        assert_eq!(value, "test-key");
+    }
+
+    #[test]
+    fn build_auth_header_supports_custom_name_and_prefix() {
+        let runtime = http_api_runtime_with_auth(Some("X-API-Key"), Some("Token"));
+        let (name, value) = runtime.build_auth_header("test-key");
+        assert_eq!(name, "X-API-Key");
+        assert_eq!(value, "Token test-key");
+    }
+
+    #[tokio::test]
+    async fn http_api_adapter_sends_custom_auth_header_over_the_wire() {
+        let dir = tempdir().unwrap();
+        let result = AgentResult::completed("oracle", "step", "verboo answer");
+        let wrapped = wrap_json_contract(&result).unwrap();
+        let (addr, request_rx) = spawn_mock_zai_sequence_server(vec![sse_response(&[
+            sse_data(&serde_json::json!({
+                "choices": [ { "delta": { "content": wrapped } } ]
+            })),
+            "data: [DONE]\n\n".to_string(),
+        ])])
+        .await;
+        // Unique env var so this test does not race the default-auth test.
+        std::env::set_var("MULTIAGENT_TEST_VERBOO_KEY", "test-token");
+
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
+            id: "verboo".to_string(),
+            kind: RuntimeKind::HttpApi,
+            command: None,
+            args: Vec::new(),
+            prompt_mode: PromptMode::Stdin,
+            base_url: Some(format!("http://{addr}")),
+            api_key_env: Some("MULTIAGENT_TEST_VERBOO_KEY".to_string()),
+            auth_header_name: Some("api-key".to_string()),
+            auth_header_prefix: Some(String::new()),
+            degrade_not_abandon: false,
+        });
+        let request = runtime_request(dir.path().to_path_buf(), "oracle");
+        collect_runtime_step_result(|events, cancellation| {
+            runtime.stream_step(request, events, cancellation)
+        })
+        .await
+        .unwrap();
+
+        let requests = request_rx.await.unwrap();
+        let request = &requests[0];
+        assert!(request.contains("POST /chat/completions HTTP/1.1"));
+        // The bare key is sent under the custom header, with no Bearer prefix
+        // and no Authorization header.
+        assert!(request.contains("api-key: test-token"));
+        assert!(!request.contains("authorization:"));
     }
 
     #[tokio::test]
