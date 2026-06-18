@@ -340,29 +340,29 @@ pub fn validate_action_request_with_scope(
         }
         ActionKind::RecordNote => {}
         ActionKind::CallMcpTool => {
-            if server_param(&request.params).is_none() {
+            if is_blank(server_param(&request.params)) {
                 return ActionDecision::Denied(
                     "call_mcp_tool action is missing server".to_string(),
                 );
             }
-            if mcp_tool_param(&request.params).is_none() {
+            if is_blank(mcp_tool_param(&request.params)) {
                 return ActionDecision::Denied("call_mcp_tool action is missing tool".to_string());
             }
         }
         ActionKind::ReadMcpResource => {
-            if server_param(&request.params).is_none() {
+            if is_blank(server_param(&request.params)) {
                 return ActionDecision::Denied(
                     "read_mcp_resource action is missing server".to_string(),
                 );
             }
-            if uri_param(&request.params).is_none() {
+            if is_blank(uri_param(&request.params)) {
                 return ActionDecision::Denied(
                     "read_mcp_resource action is missing uri".to_string(),
                 );
             }
         }
         ActionKind::ListMcpResources => {
-            if server_param(&request.params).is_none() {
+            if is_blank(server_param(&request.params)) {
                 return ActionDecision::Denied(
                     "list_mcp_resources action is missing server".to_string(),
                 );
@@ -1294,6 +1294,13 @@ fn required_capability(kind: &ActionKind) -> Option<Capability> {
 
 fn path_param(params: &Value) -> Option<&str> {
     params.get("path").and_then(Value::as_str)
+}
+
+/// A missing or empty/whitespace-only MCP identifier param — treated as missing
+/// so a `CallMcpTool { server: "" }` is denied cleanly rather than reaching trust
+/// lookups / dispatch with an empty id (mirrors `RunCommand`'s empty-command guard).
+fn is_blank(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim().is_empty())
 }
 
 fn server_param(params: &Value) -> Option<&str> {

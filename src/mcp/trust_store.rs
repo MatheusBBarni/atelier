@@ -160,9 +160,15 @@ impl McpTrustStore {
         }
         let json = serde_json::to_string_pretty(&self.data)
             .context("failed to serialize MCP trust store")?;
-        std::fs::write(&self.path, json.as_bytes())
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
-        set_private_permissions(&self.path);
+        // Write atomically (temp file + rename) so a crash mid-write can never
+        // leave a truncated `mcp-trust.json` that the next `load` would discard,
+        // silently dropping all trust tiers and pins.
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, json.as_bytes())
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        set_private_permissions(&tmp);
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("failed to persist {}", self.path.display()))?;
         Ok(())
     }
 }

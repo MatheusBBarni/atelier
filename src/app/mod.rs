@@ -1468,17 +1468,6 @@ impl App {
         Ok(())
     }
 
-    /// A clone of the MCP supervisor handle, if MCP is enabled. Consumed by the
-    /// action-execution path (task_05) and the catalog-snapshot path (task_07).
-    pub fn mcp_handle(&self) -> Option<crate::mcp::McpHandle> {
-        self.mcp_handle.clone()
-    }
-
-    /// Synchronous read access to the MCP trust store, for validation (task_05).
-    pub fn mcp_trust(&self) -> &crate::mcp::McpTrustStore {
-        &self.mcp_trust
-    }
-
     /// The MCP wiring for one action's `ActionExecutionContext` (task_05): the
     /// supervisor handle plus a snapshot of the trust store and the cached tool
     /// catalog (recorded at run entry, task_07). `None` when MCP is disabled. The

@@ -2630,10 +2630,10 @@ impl PrintableMcp {
     }
 }
 
-/// Redacted projection of an MCP server. `env` is rendered as the sorted list of
-/// variable **names** only — values (which may be literal secrets or `${VAR}`
-/// references) are never emitted, mirroring how `api_key_env` exposes a name and
-/// not a secret.
+/// Redacted projection of an MCP server. `env` keeps the input's table shape —
+/// each variable **name** mapped to a `<redacted>` placeholder — so the value
+/// (which may be a literal secret or a `${VAR}` reference) is never emitted while
+/// `--print-config` still round-trips back into a valid config.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PrintableMcpServer {
     pub(crate) transport: McpTransport,
@@ -2641,11 +2641,14 @@ pub(crate) struct PrintableMcpServer {
     pub(crate) command: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) args: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) env: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) url: Option<String>,
 }
+
+/// The placeholder a redacted env value renders as in `--print-config`.
+const REDACTED_ENV_VALUE: &str = "<redacted>";
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PrintableAgent {
@@ -2796,8 +2799,13 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
                             transport: server.transport.clone(),
                             command: server.command.clone(),
                             args: server.args.clone(),
-                            // Names only — never the values (redaction invariant).
-                            env: server.env.keys().cloned().collect(),
+                            // Names mapped to a placeholder — never the values
+                            // (redaction invariant), keeping the env table shape.
+                            env: server
+                                .env
+                                .keys()
+                                .map(|name| (name.clone(), REDACTED_ENV_VALUE.to_string()))
+                                .collect(),
                             url: server.url.clone(),
                         },
                     )
@@ -3994,7 +4002,12 @@ env = { SECRET_TOKEN = "super-secret-value" }
             .servers
             .get("fs")
             .expect("printable mcp server present");
-        assert_eq!(server.env, vec!["SECRET_TOKEN".to_string()]);
+        // The name is kept (as a table key) mapped to a redacted placeholder, so
+        // the value never leaks and the env table still round-trips.
+        assert_eq!(
+            server.env.get("SECRET_TOKEN").map(String::as_str),
+            Some("<redacted>")
+        );
 
         let rendered = to_redacted_toml(&config).unwrap();
         assert!(
@@ -4004,6 +4017,20 @@ env = { SECRET_TOKEN = "super-secret-value" }
         assert!(
             !rendered.contains("super-secret-value"),
             "secret env value must never leak into --print-config: {rendered}"
+        );
+        // env must render as a TABLE (matching the input shape), not an array, so
+        // the redacted output stays a valid `[mcp.servers.*]` env declaration.
+        let parsed: toml::Value = toml::from_str(&rendered).expect("redacted config is valid TOML");
+        let env = parsed
+            .get("mcp")
+            .and_then(|mcp| mcp.get("servers"))
+            .and_then(|servers| servers.get("fs"))
+            .and_then(|server| server.get("env"))
+            .expect("env present in rendered config");
+        assert!(env.is_table(), "env must render as a table, got: {env:?}");
+        assert_eq!(
+            env.get("SECRET_TOKEN").and_then(toml::Value::as_str),
+            Some("<redacted>")
         );
     }
 
