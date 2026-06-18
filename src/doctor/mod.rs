@@ -1,10 +1,14 @@
-use crate::config::{ApprovalMode, EffectiveConfig, FloorPolicy, RuntimeKind};
+use crate::config::{
+    ApprovalMode, EffectiveConfig, FloorPolicy, McpServerConfig, McpTransport, RuntimeKind,
+};
 use crate::history::{list_session_event_paths, read_events_from_path, HistoryEvent};
+use crate::mcp::McpClient;
 use crate::runtime::{check_runtime_availability, RuntimeAvailabilityStatus};
 use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -115,12 +119,211 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
         });
     }
 
+    // Harness-owned MCP checks (task_10): per-server reachability + a
+    // runtimes×servers parity matrix and the local trusted-completion metric.
+    // Cleanly skipped when MCP is disabled.
+    checks.extend(mcp_checks(config).await);
+
     DoctorReport {
         schema_version: 1,
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         working_directory: config.working_directory.display().to_string(),
         checks,
     }
+}
+
+/// Build the MCP doctor checks (task_10). Empty when `features.mcp_enabled` is
+/// false (clean skip). All data is local — no network telemetry.
+async fn mcp_checks(config: &EffectiveConfig) -> Vec<DoctorCheck> {
+    if !config.features.mcp_enabled {
+        return Vec::new();
+    }
+    let mut checks = Vec::new();
+    for server in config.mcp_servers.values() {
+        checks.push(mcp_server_check(server).await);
+    }
+    checks.push(mcp_parity_check(config));
+    checks
+}
+
+/// Per-server reachability: spawn the server and run the `initialize` handshake.
+/// A server that merely logs to stderr but completes the handshake is `Ok` — only
+/// a failed handshake (or a process that cannot start) is an error.
+async fn mcp_server_check(server: &McpServerConfig) -> DoctorCheck {
+    let id = format!("mcp_server.{}", server.id);
+    let title = format!("MCP Server {}", server.id);
+    if server.transport != McpTransport::Stdio {
+        return DoctorCheck {
+            id,
+            title,
+            status: DoctorStatus::Skipped,
+            severity: DoctorSeverity::Info,
+            message: "non-stdio transport is parsed but inert in V1".to_string(),
+            remediation: None,
+            context: None,
+        };
+    }
+    let Some(command) = server.command.as_deref() else {
+        return DoctorCheck {
+            id,
+            title,
+            status: DoctorStatus::Error,
+            severity: DoctorSeverity::Error,
+            message: "stdio server has no command".to_string(),
+            remediation: Some("Set `command` for this `[mcp.servers.*]` entry.".to_string()),
+            context: None,
+        };
+    };
+    let env: Vec<(String, String)> = server
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    match crate::mcp::RmcpClient::connect_stdio(command, &server.args, &env).await {
+        Ok(client) => {
+            let _ = client.shutdown().await;
+            DoctorCheck {
+                id,
+                title,
+                status: DoctorStatus::Ok,
+                severity: DoctorSeverity::Info,
+                message: "reachable; initialize handshake completed (server stderr is ignored)"
+                    .to_string(),
+                remediation: None,
+                context: Some(serde_json::json!({ "command": command, "args": server.args })),
+            }
+        }
+        Err(error) => DoctorCheck {
+            id,
+            title,
+            status: DoctorStatus::Error,
+            severity: DoctorSeverity::Error,
+            message: format!("unreachable: {error:#}"),
+            remediation: Some(
+                "Verify the command/args and that the server speaks MCP over stdio. A server \
+                 logging to stderr is NOT a failure — only a process that cannot start or never \
+                 completes the initialize handshake on stdout is."
+                    .to_string(),
+            ),
+            context: Some(serde_json::json!({ "command": command, "args": server.args })),
+        },
+    }
+}
+
+/// The runtimes×servers parity matrix + local trusted-completion metric, both
+/// derived from the local event log (`mcp_tool_result` events). A configured
+/// pair with no successful completion is the release gate (non-`Ok`).
+fn mcp_parity_check(config: &EffectiveConfig) -> DoctorCheck {
+    let servers: Vec<String> = config.mcp_servers.keys().cloned().collect();
+    // The runtimes enabled agents use — the set that should reach full parity.
+    let runtimes: Vec<String> = config
+        .agents
+        .values()
+        .filter(|agent| agent.enabled)
+        .map(|agent| agent.runtime.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let results = scan_mcp_tool_results(config);
+    let completed: BTreeSet<(String, String)> = results
+        .iter()
+        .filter(|payload| payload.get("status").and_then(Value::as_str) == Some("completed"))
+        .filter_map(|payload| {
+            let runtime = payload.get("runtime").and_then(Value::as_str)?;
+            let server = payload.get("server").and_then(Value::as_str)?;
+            Some((runtime.to_string(), server.to_string()))
+        })
+        .collect();
+    let trusted_completion_count = results
+        .iter()
+        .filter(|payload| payload.get("status").and_then(Value::as_str) == Some("completed"))
+        .filter(|payload| payload.get("trusted").and_then(Value::as_bool) == Some(true))
+        .count();
+
+    if servers.is_empty() || runtimes.is_empty() {
+        return DoctorCheck {
+            id: "mcp_parity".to_string(),
+            title: "MCP Parity".to_string(),
+            status: DoctorStatus::Skipped,
+            severity: DoctorSeverity::Info,
+            message: "no MCP servers or no enabled agents to verify parity against".to_string(),
+            remediation: None,
+            context: Some(serde_json::json!({
+                "runtimes": runtimes,
+                "servers": servers,
+                "trusted_completion_count": trusted_completion_count,
+            })),
+        };
+    }
+
+    let mut matrix = serde_json::Map::new();
+    let mut missing = Vec::new();
+    for runtime in &runtimes {
+        let mut row = serde_json::Map::new();
+        for server in &servers {
+            let ok = completed.contains(&(runtime.clone(), server.clone()));
+            if !ok {
+                missing.push(format!("{runtime}×{server}"));
+            }
+            row.insert(server.clone(), Value::Bool(ok));
+        }
+        matrix.insert(runtime.clone(), Value::Object(row));
+    }
+    let all_ok = missing.is_empty();
+    DoctorCheck {
+        id: "mcp_parity".to_string(),
+        title: "MCP Parity".to_string(),
+        status: if all_ok {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Warn
+        },
+        severity: if all_ok {
+            DoctorSeverity::Info
+        } else {
+            DoctorSeverity::Warning
+        },
+        message: if all_ok {
+            "every runtime has a successful call to every MCP server".to_string()
+        } else {
+            format!(
+                "{} runtime×server pair(s) have no successful MCP call yet",
+                missing.len()
+            )
+        },
+        remediation: if all_ok {
+            None
+        } else {
+            Some(
+                "Run each runtime against each MCP server at least once to prove cross-runtime \
+                 parity (the release gate)."
+                    .to_string(),
+            )
+        },
+        context: Some(serde_json::json!({
+            "matrix": matrix,
+            "runtimes": runtimes,
+            "servers": servers,
+            "missing_pairs": missing,
+            "trusted_completion_count": trusted_completion_count,
+        })),
+    }
+}
+
+/// Scan every local session's event log for `mcp_tool_result` payloads (task_10).
+/// Local-only; tolerant of unreadable session files.
+fn scan_mcp_tool_results(config: &EffectiveConfig) -> Vec<Value> {
+    let root = config.working_directory.join(".atelier");
+    let mut payloads = Vec::new();
+    for path in list_session_event_paths(&root).unwrap_or_default() {
+        for event in read_events_from_path(&path).unwrap_or_default() {
+            if event.kind == "mcp_tool_result" {
+                payloads.push(event.payload);
+            }
+        }
+    }
+    payloads
 }
 
 /// The doctor status/severity for a runtime's availability (ADR-003). An
@@ -1060,6 +1263,98 @@ mod tests {
             config_path: Some(config_path),
         })
         .unwrap()
+    }
+
+    // ── MCP doctor checks (task_10) ──
+
+    fn mcp_enabled_config(dir: &Path) -> EffectiveConfig {
+        let config_path = dir.join("home.toml");
+        fs::write(
+            &config_path,
+            "[features]\nmcp_enabled = true\n\
+             [runtimes.fake]\ntype = \"fake\"\n\
+             [agents.orchestrator]\nruntime = \"fake\"\ncapabilities = [\"plan\"]\ninstructions = \"o\"\n\
+             [mcp.servers.fs]\ntransport = \"stdio\"\ncommand = \"mcp-fs\"\n",
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mcp_checks_are_absent_when_disabled() {
+        let dir = tempdir().unwrap();
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+        assert!(mcp_checks(&config).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_server_check_reports_unreachable_command_as_error() {
+        let server = McpServerConfig {
+            id: "fs".to_string(),
+            transport: McpTransport::Stdio,
+            command: Some("atelier-no-such-mcp-binary-xyz".to_string()),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: None,
+        };
+        let check = mcp_server_check(&server).await;
+        assert_eq!(check.id, "mcp_server.fs");
+        assert_eq!(check.status, DoctorStatus::Error);
+        // Remediation distinguishes stderr noise from a real handshake failure.
+        assert!(check.remediation.as_ref().unwrap().contains("stderr"));
+    }
+
+    #[test]
+    fn mcp_parity_marks_uncompleted_pairs_not_ok() {
+        let dir = tempdir().unwrap();
+        let config = mcp_enabled_config(dir.path());
+        let check = mcp_parity_check(&config);
+        assert_eq!(check.id, "mcp_parity");
+        // No successful calls yet ⇒ the release gate is not met.
+        assert_eq!(check.status, DoctorStatus::Warn);
+        let ctx = check.context.as_ref().unwrap();
+        assert!(!ctx["missing_pairs"].as_array().unwrap().is_empty());
+        assert_eq!(ctx["trusted_completion_count"], json!(0));
+    }
+
+    #[test]
+    fn mcp_parity_counts_trusted_completions_and_marks_pair_complete() {
+        let dir = tempdir().unwrap();
+        let config = mcp_enabled_config(dir.path());
+        // Write two completed MCP results: one trusted, one not.
+        let store = crate::history::HistoryStore::create(dir.path()).unwrap();
+        let session = store.session_id().to_string();
+        for trusted in [true, false] {
+            store
+                .append_event(&HistoryEvent::new(
+                    session.clone(),
+                    Some("r".to_string()),
+                    None,
+                    "mcp_tool_result",
+                    json!({
+                        "server": "fs",
+                        "tool": "read",
+                        "runtime": "fake",
+                        "status": "completed",
+                        "trusted": trusted,
+                    }),
+                ))
+                .unwrap();
+        }
+        let check = mcp_parity_check(&config);
+        let ctx = check.context.as_ref().unwrap();
+        // Only the trusted completion counts toward the metric.
+        assert_eq!(ctx["trusted_completion_count"], json!(1));
+        // The (fake, fs) pair is now verified in the matrix.
+        assert_eq!(ctx["matrix"]["fake"]["fs"], json!(true));
     }
 
     #[test]

@@ -190,6 +190,12 @@ impl ServerHandler for FakeMcpServer {
 /// This is the entry point used by the `fake-mcp-server` binary that
 /// integration tests spawn as a subprocess.
 pub async fn run_stdio() -> anyhow::Result<()> {
+    // Opt-in startup noise on stderr (task_10): proves a healthy server that
+    // logs to stderr is NOT a doctor false-failure — only the stdout handshake
+    // matters.
+    if std::env::var("FAKE_MCP_STDERR_NOISE").is_ok() {
+        eprintln!("fake-mcp-server: starting up — this stderr line is harmless");
+    }
     let service = FakeMcpServer::default()
         .serve(rmcp::transport::stdio())
         .await?;

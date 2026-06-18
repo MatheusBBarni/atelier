@@ -2633,6 +2633,7 @@ impl App {
         self.record_action_completed(
             &pending.run_id,
             &pending.step_id,
+            &pending.agent_profile.runtime,
             &pending.action_request,
             &result,
         )?;
@@ -4800,6 +4801,7 @@ impl App {
             &pending.run_id,
             Some(&pending.group_id),
             &pending.step_id,
+            &pending.agent_profile.runtime,
             &pending.action_request,
             &result,
         )?;
@@ -6206,7 +6208,13 @@ impl App {
                         )?;
                         return Ok(StepOutcome::Paused);
                     }
-                    self.record_action_completed(run_id, &step_id, &action_request, &result)?;
+                    self.record_action_completed(
+                        run_id,
+                        &step_id,
+                        &request.agent_profile.runtime,
+                        &action_request,
+                        &result,
+                    )?;
                     request.action_results.push(result);
                 }
                 output => return Ok(StepOutcome::Output(Box::new(output))),
@@ -6678,10 +6686,11 @@ impl App {
         &mut self,
         run_id: &str,
         step_id: &str,
+        runtime: &str,
         request: &ActionRequest,
         result: &ActionResult,
     ) -> Result<()> {
-        self.record_action_completed_with_group(run_id, None, step_id, request, result)
+        self.record_action_completed_with_group(run_id, None, step_id, runtime, request, result)
     }
 
     fn record_action_completed_with_group(
@@ -6689,6 +6698,7 @@ impl App {
         run_id: &str,
         group_id: Option<&str>,
         step_id: &str,
+        runtime: &str,
         request: &ActionRequest,
         result: &ActionResult,
     ) -> Result<()> {
@@ -6711,7 +6721,45 @@ impl App {
             "action_completed",
             serde_json::to_value(&durable_result)?,
             action_completed_display(request, result),
-        )
+        )?;
+        // Observability event for MCP tool calls (task_10): {server, tool,
+        // runtime, status, trusted}. Feeds the `--doctor` parity matrix and
+        // trusted-completion metric; never rendered as chat (no-op projection
+        // arm). Local-only, no telemetry.
+        if request.kind == ActionKind::CallMcpTool {
+            let server = request
+                .params
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let tool = request
+                .params
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let trusted = self.mcp_trust.is_trusted(server);
+            let status_label = match durable_result.status {
+                ActionStatus::Completed => "completed",
+                ActionStatus::Denied => "denied",
+                ActionStatus::ApprovalRequired => "approval_required",
+                ActionStatus::Failed => "failed",
+            };
+            self.record_event_with_group(
+                Some(run_id.to_string()),
+                group_id.map(str::to_string),
+                Some(step_id.to_string()),
+                "mcp_tool_result",
+                json!({
+                    "server": server,
+                    "tool": tool,
+                    "runtime": runtime,
+                    "status": status_label,
+                    "trusted": trusted,
+                }),
+                format!("MCP tool {server}/{tool} {status_label}."),
+            )?;
+        }
+        Ok(())
     }
 
     fn record_command_started_if_executable(
