@@ -127,7 +127,9 @@ pub async fn follow_events(config: &EffectiveConfig) -> Result<()> {
     // tokio's `signal` feature (and its transitive deps) for this read-only
     // preview tool — default SIGINT termination is the right UX here.
     loop {
-        emitted = emit_new_payloads(&path, &agent_runtimes, emitted);
+        // A stdout write failure (e.g. the reader closed the pipe) ends follow
+        // mode instead of spinning forever, matching `tail -f | head`.
+        emitted = emit_new_payloads(&path, &agent_runtimes, emitted)?;
         tokio::time::sleep(FOLLOW_POLL).await;
     }
 }
@@ -139,17 +141,20 @@ fn emit_new_payloads(
     path: &Path,
     agent_runtimes: &BTreeMap<String, String>,
     already_emitted: usize,
-) -> usize {
+) -> Result<usize> {
+    // A transiently unreadable log (mid-write) is tolerated — keep the prior
+    // count and retry next poll. A stdout write failure, however, propagates so
+    // the caller can stop the loop rather than spin on a broken pipe.
     let Ok(events) = read_events_from_path(path) else {
-        return already_emitted;
+        return Ok(already_emitted);
     };
     let payloads = project_session_payloads(&events, agent_runtimes);
     let mut stdout = io::stdout().lock();
     for payload in payloads.iter().skip(already_emitted) {
-        let _ = writeln!(stdout, "{}", render_payload_line(payload));
+        writeln!(stdout, "{}", render_payload_line(payload))?;
     }
-    let _ = stdout.flush();
-    payloads.len()
+    stdout.flush()?;
+    Ok(payloads.len())
 }
 
 #[cfg(test)]

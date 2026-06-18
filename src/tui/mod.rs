@@ -1122,7 +1122,18 @@ fn sync_session_preview(
     receiver: &mut watch::Receiver<Option<SessionPreview>>,
 ) {
     if receiver.has_changed().unwrap_or(false) {
-        ui_state.browser.preview = receiver.borrow_and_update().clone();
+        let incoming = receiver.borrow_and_update().clone();
+        // Drop a stale preview from a previously-selected session: a slow load
+        // that resolves after the user moved on must not overwrite the preview
+        // for the session now selected. A `None` (loading/cleared) always applies.
+        let applies = match (&incoming, &ui_state.browser.preview_session_id) {
+            (Some(preview), Some(current)) => &preview.session_id == current,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if applies {
+            ui_state.browser.preview = incoming;
+        }
     }
 }
 
@@ -5754,6 +5765,16 @@ fn composer_height(state: &AppState, ui_state: &TuiUiState, area: Rect, reserved
         let mut lines = governance_decision_card_lines(&pending.view, &ui_state.theme);
         lines.push(Line::from(String::new()));
         lines.push(Line::from(format!("Redirect (optional): {}", state.input)));
+        wrapped_event_line_count(&lines, inner_width)
+    } else if let Some(pending) = &state.pending_plan_approval {
+        // Mirror render_plan_approval_composer's lines so the composer is tall
+        // enough to show the plan summary + the reject-reason line.
+        let lines = vec![
+            Line::from(pending.summary.clone()),
+            Line::from("Accept to run the plan, or reject to send it back to the orchestrator."),
+            Line::from(String::new()),
+            Line::from(format!("Reject reason (optional): {}", state.input)),
+        ];
         wrapped_event_line_count(&lines, inner_width)
     } else {
         return INPUT_COMPOSER_HEIGHT;
@@ -13447,6 +13468,39 @@ runtime = "fake"
                 .map(|i| chat_item(&format!("item {i}"), ChatItemKind::RunSummary))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn sync_session_preview_drops_a_stale_session_preview() {
+        let (sender, mut receiver) = watch::channel(None::<SessionPreview>);
+        let mut ui = TuiUiState::default();
+        ui.browser.preview_session_id = Some("current".to_string());
+
+        // A slow preview for a previously-selected session must not overwrite.
+        sender
+            .send(Some(SessionPreview {
+                session_id: "stale".to_string(),
+                items: Vec::new(),
+            }))
+            .unwrap();
+        sync_session_preview(&mut ui, &mut receiver);
+        assert!(
+            ui.browser.preview.is_none(),
+            "stale preview must be dropped"
+        );
+
+        // The preview for the currently-selected session applies.
+        sender
+            .send(Some(SessionPreview {
+                session_id: "current".to_string(),
+                items: Vec::new(),
+            }))
+            .unwrap();
+        sync_session_preview(&mut ui, &mut receiver);
+        assert_eq!(
+            ui.browser.preview.as_ref().map(|p| p.session_id.as_str()),
+            Some("current")
+        );
     }
 
     #[test]

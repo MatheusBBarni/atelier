@@ -27,12 +27,27 @@ pub trait Notifier: Send + Sync {
 /// BEL (`\x07`), the terminator for the OSC sequences used here.
 const BEL: char = '\u{0007}';
 
+/// Upper bound on notification text length (a desktop ping is a glance, not a log).
+const OSC_TEXT_MAX_CHARS: usize = 256;
+
+/// Strip control characters and cap length before interpolating text into an OSC
+/// escape sequence, so a hook-derived `title`/`body` can't inject terminal
+/// control sequences (BEL/ESC/ST) and break out of the notification (ADR-001
+/// no-injection posture). Removing C0/C1 controls also drops the OSC terminators.
+fn sanitize_osc_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(OSC_TEXT_MAX_CHARS)
+        .collect()
+}
+
 /// Build the OSC 9 desktop-notification sequence: `ESC ] 9 ; <text> BEL`. OSC 9
 /// carries a single text payload, so `title` and `body` are folded into one.
 /// Rendered by the terminal application (not the remote host), so it works over
 /// SSH (ADR-005). This is the default backend's wire format.
 pub fn osc9_sequence(title: &str, body: &str) -> Vec<u8> {
-    format!("\u{1b}]9;{}{BEL}", join_title_body(title, body)).into_bytes()
+    let (title, body) = (sanitize_osc_text(title), sanitize_osc_text(body));
+    format!("\u{1b}]9;{}{BEL}", join_title_body(&title, &body)).into_bytes()
 }
 
 /// Build the OSC 777 `notify` variant: `ESC ] 777 ; notify ; <title> ; <body> BEL`.
@@ -42,6 +57,7 @@ pub fn osc9_sequence(title: &str, body: &str) -> Vec<u8> {
 /// which a terminal supports is unreliable (ADR-005 rejects it) and emitting
 /// both would double-notify where both are understood.
 pub fn osc777_sequence(title: &str, body: &str) -> Vec<u8> {
+    let (title, body) = (sanitize_osc_text(title), sanitize_osc_text(body));
     format!("\u{1b}]777;notify;{title};{body}{BEL}").into_bytes()
 }
 

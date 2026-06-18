@@ -379,10 +379,14 @@ fn sanitize_chat_item(mut item: ChatItemView) -> ChatItemView {
     }
     for detail in &mut item.details {
         match detail {
-            ChatDetailRef::HistoryEvent { label, .. }
-            | ChatDetailRef::Artifact { label, .. }
-            | ChatDetailRef::Inline { label, .. } => {
+            ChatDetailRef::HistoryEvent { label, .. } | ChatDetailRef::Artifact { label, .. } => {
                 *label = sanitize_transcript_text(label);
+            }
+            // Inline carries rendered `content` in addition to its label; both
+            // are user-visible transcript text and must be sanitized.
+            ChatDetailRef::Inline { label, content, .. } => {
+                *label = sanitize_transcript_text(label);
+                *content = sanitize_transcript_text(content);
             }
         }
     }

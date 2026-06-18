@@ -749,6 +749,12 @@ pub fn validate_execution_graph(graph: &ExecutionGraph, config: &EffectiveConfig
     // Descendant reachability (the graph is acyclic here): descendants[i] is the
     // set of nodes reachable from i. Two nodes with no path either way could run
     // concurrently and must therefore write disjoint files.
+    //
+    // This is O(V^2) space (a full boolean reachability matrix). That is fine at
+    // the practical graph sizes here — total node count is bounded by the
+    // `max_agent_steps` step budget (validation rejects graphs that can't fit).
+    // If that ceiling is ever raised by orders of magnitude, switch to on-demand
+    // reachability (BFS per disjointness check) or a bitset transitive closure.
     let mut descendants = vec![vec![false; node_count]; node_count];
     for (start, reachable) in descendants.iter_mut().enumerate() {
         let mut stack = vec![start];
