@@ -9,7 +9,7 @@
 | 03 | Build the McpSupervisor actor and McpHandle | completed | high | task_01, task_02 |
 | 04 | Add the McpTrustStore with durable trust tiers and pins | completed | medium | task_01 |
 | 05 | Add MCP action kinds, capability, validation, and execution | completed | high | task_03, task_04 |
-| 06 | Apply record-time redaction at event write | pending | medium | task_05 |
+| 06 | Apply record-time redaction at event write | completed | medium | task_05 |
 | 07 | Advertise an MCP tool-catalog snapshot to the orchestrator | pending | medium | task_03 |
 | 08 | Project MCP tool calls and events into the chat transcript | pending | medium | task_05 |
 | 09 | Extend the approval card with MCP description and trust controls | pending | high | task_04, task_05 |

@@ -92,6 +92,63 @@ impl HistoryEvent {
     }
 }
 
+/// Redact secrets from an event payload before durable persistence (task_06).
+/// Returns `Some(redacted)` when a secret was found — the persisted record then
+/// also carries a `_redacted: true` flag when the payload is an object — or
+/// `None` when the payload had no secrets (it is written unchanged, so
+/// secret-free events pay no clone). The caller's in-memory payload is never
+/// mutated; redaction is only for the on-disk record.
+fn redact_event_payload(payload: &Value) -> Option<Value> {
+    let (redacted, changed) = redact_json(payload);
+    if !changed {
+        return None;
+    }
+    let flagged = match redacted {
+        Value::Object(mut map) => {
+            map.insert("_redacted".to_string(), Value::Bool(true));
+            Value::Object(map)
+        }
+        other => other,
+    };
+    Some(flagged)
+}
+
+/// Recursively redact every string in a JSON value using the runtime redaction
+/// patterns (Bearer / `sk-` / `zai-`), covering nested MCP result content and
+/// diagnostic strings. Returns the redacted value and whether anything changed.
+fn redact_json(value: &Value) -> (Value, bool) {
+    match value {
+        Value::String(text) => {
+            let redacted = crate::runtime::redact_sensitive_text(text);
+            let changed = redacted != *text;
+            (Value::String(redacted), changed)
+        }
+        Value::Array(items) => {
+            let mut changed = false;
+            let redacted = items
+                .iter()
+                .map(|item| {
+                    let (value, item_changed) = redact_json(item);
+                    changed |= item_changed;
+                    value
+                })
+                .collect();
+            (Value::Array(redacted), changed)
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            let mut redacted = serde_json::Map::with_capacity(map.len());
+            for (key, item) in map {
+                let (value, item_changed) = redact_json(item);
+                changed |= item_changed;
+                redacted.insert(key.clone(), value);
+            }
+            (Value::Object(redacted), changed)
+        }
+        other => (other.clone(), false),
+    }
+}
+
 /// Cross-session UI flags persisted at the `.atelier/` data root (ADR-004).
 /// Lives outside `sessions/`, so it survives `clean_sessions` and a fresh launch.
 /// New show-once flags are added here with `#[serde(default)]` for forward
@@ -299,7 +356,18 @@ impl HistoryStore {
             .create(true)
             .open(&self.events_path)
             .with_context(|| format!("failed to open {}", self.events_path.display()))?;
-        serde_json::to_writer(&mut file, event)?;
+        // Record-time redaction (ADR-006, task_06): secrets are stripped from the
+        // payload BEFORE it is persisted, so the durable audit log can never hold
+        // a credential in cleartext. The caller's in-memory `event` is untouched —
+        // we serialize a redacted clone only when a secret was actually present.
+        match redact_event_payload(&event.payload) {
+            Some(redacted) => {
+                let mut record = event.clone();
+                record.payload = redacted;
+                serde_json::to_writer(&mut file, &record)?;
+            }
+            None => serde_json::to_writer(&mut file, event)?,
+        }
         file.write_all(b"\n")?;
         file.flush()?;
         Ok(())
@@ -316,6 +384,9 @@ impl HistoryStore {
         if !existed {
             set_private_file_permissions(&path)?;
         }
+        // Redact the payload here too: the debug log is on-disk like the event
+        // log (task_06).
+        let payload = redact_event_payload(&event.payload).unwrap_or_else(|| event.payload.clone());
         let record = serde_json::json!({
             "schema_version": 1,
             "timestamp": event.timestamp,
@@ -326,7 +397,7 @@ impl HistoryStore {
             "graph_id": event.graph_id,
             "step_id": event.step_id,
             "kind": event.kind,
-            "payload": event.payload,
+            "payload": payload,
         });
         serde_json::to_writer(&mut file, &record)?;
         file.write_all(b"\n")?;
@@ -961,6 +1032,94 @@ mod tests {
         store.append_event(&event).unwrap();
         let events = store.read_events().unwrap();
         assert_eq!(events, vec![event]);
+    }
+
+    // ── Record-time redaction (task_06) ──
+
+    #[test]
+    fn redact_json_redacts_bearer_token() {
+        let (redacted, changed) =
+            redact_json(&json!({ "header": "Authorization: Bearer abc123secret" }));
+        assert!(changed);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("abc123secret"),
+            "token leaked: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn redact_json_redacts_nested_sk_token_in_mcp_content() {
+        let payload =
+            json!({ "content": [ { "type": "text", "text": "key sk-ABCDEF0123456789" } ] });
+        let (redacted, changed) = redact_json(&payload);
+        assert!(changed);
+        assert!(
+            !redacted.to_string().contains("sk-ABCDEF0123456789"),
+            "nested secret leaked"
+        );
+    }
+
+    #[test]
+    fn redact_json_leaves_clean_payload_unchanged() {
+        let payload = json!({ "summary": "all good", "count": 3 });
+        let (redacted, changed) = redact_json(&payload);
+        assert!(!changed);
+        assert_eq!(redacted, payload);
+    }
+
+    #[test]
+    fn append_event_redacts_secret_on_disk_but_not_in_memory() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let secret = "sk-DEADBEEF0123456789ABCDEF";
+        let event = HistoryEvent::new(
+            store.session_id().to_string(),
+            Some("run".to_string()),
+            None,
+            "mcp_tool_result",
+            json!({
+                "content": [ { "type": "text", "text": format!("token {secret}") } ],
+                "is_error": false,
+            }),
+        );
+        store.append_event(&event).unwrap();
+
+        // On-disk: the secret is gone and the redaction flag is recorded.
+        let raw = fs::read_to_string(store.session_dir().join("events.jsonl")).unwrap();
+        assert!(!raw.contains(secret), "secret must never reach disk: {raw}");
+        assert!(
+            raw.contains("_redacted"),
+            "redaction flag should be recorded"
+        );
+
+        // The caller's in-memory event is unaffected (control flow is unchanged).
+        assert!(event.payload.to_string().contains(secret));
+
+        // Reading the durable log back reflects the redacted record.
+        let read = store.read_events().unwrap();
+        assert!(!read[0].payload.to_string().contains(secret));
+    }
+
+    #[test]
+    fn append_event_with_no_secret_is_written_unchanged() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let event = HistoryEvent::new(
+            store.session_id().to_string(),
+            Some("run".to_string()),
+            None,
+            "mcp_tool_result",
+            json!({ "content": "ordinary output", "is_error": false }),
+        );
+        store.append_event(&event).unwrap();
+        let raw = fs::read_to_string(store.session_dir().join("events.jsonl")).unwrap();
+        assert!(
+            !raw.contains("_redacted"),
+            "clean payload must not be flagged"
+        );
+        assert_eq!(store.read_events().unwrap(), vec![event]);
     }
 
     // ── HistoryStore::open + self-healing metadata cache (task_02) ──
