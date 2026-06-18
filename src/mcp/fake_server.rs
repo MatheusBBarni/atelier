@@ -127,6 +127,21 @@ impl ServerHandler for FakeMcpServer {
                 "read-only fixture tool result",
             )])),
             "effect_tool" => {
+                // Opt-in side behaviors used by the supervisor's liveness tests
+                // (task_03). Plain calls just echo their arguments, so the
+                // task_01 contract is unchanged.
+                if let Some(ms) = arguments.get("sleep_ms").and_then(Value::as_u64) {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+                if let Some(ms) = arguments.get("exit_after_ms").and_then(Value::as_u64) {
+                    // Schedule this server process to exit shortly, simulating a
+                    // server that dies mid-session. The current call still
+                    // returns normally.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        std::process::exit(0);
+                    });
+                }
                 let echoed = Value::Object(arguments).to_string();
                 Ok(CallToolResult::success(vec![Content::text(echoed)]))
             }

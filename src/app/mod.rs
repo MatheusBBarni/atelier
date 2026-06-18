@@ -505,6 +505,13 @@ pub struct App {
     /// state-mutating action and is cleared once acknowledged. `None` on the clean
     /// path. Reset by `adopt_session`, set by `resume_session`.
     pending_drift_ack: Option<git::WorkspaceDrift>,
+    /// Handle to the MCP supervisor actor (ADR-005), owned here so its long-lived
+    /// connections live and die with the session. `Some` only when
+    /// `features.mcp_enabled` (task_03); cloned onto `ActionExecutionContext`
+    /// (task_05) and the catalog snapshot path (task_07). Dropped on
+    /// `end_session`, which closes the command channel so the actor tears down
+    /// every connection (`kill_on_drop` backstop).
+    mcp_handle: Option<crate::mcp::McpHandle>,
 }
 
 /// In-memory, session-scoped allow-list of exact trust targets (ADR-004). Granted
@@ -1178,6 +1185,17 @@ impl App {
             history.session_id(),
         );
         let availability = check_all_runtime_availability(&config).await;
+        // Own the MCP supervisor when enabled (ADR-005). Spawning returns a handle
+        // immediately; connections are established asynchronously on the actor
+        // task, so this never blocks or fails session startup.
+        let mcp_handle = if config.features.mcp_enabled {
+            Some(crate::mcp::McpSupervisor::spawn(
+                config.mcp_servers.values().cloned().collect(),
+                crate::mcp::DEFAULT_MCP_CALL_TIMEOUT,
+            ))
+        } else {
+            None
+        };
         let (interrupt_sender, interrupt_receiver) = watch::channel(0);
         let (approval_sender, approval_receiver) = watch::channel(ApprovalSignal {
             sequence: 0,
@@ -1233,6 +1251,7 @@ impl App {
             dropped_hooks: DroppedHookCounter::new(),
             resume_approval_mode: None,
             pending_drift_ack: None,
+            mcp_handle,
         };
         app.record_event(
             None,
@@ -1404,8 +1423,18 @@ impl App {
             }),
             "Harness session ended.",
         )?;
+        // Drop the supervisor handle: closing the command channel makes the actor
+        // exit and drop every connection, whose `TokioChildProcess::drop` kills
+        // the child (ADR-005 kill_on_drop backstop). Sync-safe — no await needed.
+        self.mcp_handle = None;
         self.session_ended = true;
         Ok(())
+    }
+
+    /// A clone of the MCP supervisor handle, if MCP is enabled. Consumed by the
+    /// action-execution path (task_05) and the catalog-snapshot path (task_07).
+    pub fn mcp_handle(&self) -> Option<crate::mcp::McpHandle> {
+        self.mcp_handle.clone()
     }
 
     /// The single atomic point that swaps the running session for `loaded`
