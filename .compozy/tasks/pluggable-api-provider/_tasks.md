@@ -9,4 +9,4 @@
 | 03 | Add auth header config fields to RuntimeConfig | completed | medium | task_02 |
 | 04 | Generalize HttpApiRuntime auth header construction | completed | medium | task_03 |
 | 05 | Config template, doctor migration hint, and docs | completed | low | task_02 |
-| 06 | Update all test files and run full test suite | pending | high | task_02, task_03, task_04 |
+| 06 | Update all test files and run full test suite | completed | high | task_02, task_03, task_04 |

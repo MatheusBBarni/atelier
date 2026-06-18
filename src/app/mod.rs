@@ -14929,8 +14929,8 @@ instructions_file = "agents/explorer.md"
     }
 
     fn fake_with_zai_config(dir: &std::path::Path) -> EffectiveConfig {
-        // Most agents use the deterministic fake runtime; one agent uses a Z.ai
-        // runtime whose api_key_env points at a guaranteed-unset, uniquely
+        // Most agents use the deterministic fake runtime; one agent uses an
+        // HTTP API runtime whose api_key_env points at a guaranteed-unset, uniquely
         // named variable. That resolves to a deterministic Unauthenticated
         // status in any environment (the var is never set), exercising the
         // partial-failure / share-safe path of `/provider:status`.

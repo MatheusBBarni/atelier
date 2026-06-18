@@ -56,7 +56,7 @@ async fn fake_adapter_returns_deterministic_rows_and_capabilities_through_servic
 #[tokio::test]
 async fn multiple_providers_return_independent_rows_when_one_fails() {
     let healthy = RuntimeAvailabilityProbe::new(runtime_config("fake", RuntimeKind::Fake, None));
-    // Z.ai with no api_key_env configured resolves to Misconfigured without
+    // HTTP API with no api_key_env configured resolves to Misconfigured without
     // reading any environment variable, so the failure is deterministic.
     let failing =
         RuntimeAvailabilityProbe::new(runtime_config("http_api", RuntimeKind::HttpApi, None));

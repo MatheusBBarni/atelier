@@ -30,8 +30,10 @@ impl Runtime for HttpApiRuntime {
             return RuntimeAvailability {
                 runtime_id: self.config.id.clone(),
                 status: RuntimeAvailabilityStatus::Unavailable,
-                message: "Z.ai api_key_env is not configured".to_string(),
-                remediation: Some("Set [runtimes.zai].api_key_env in atelier.toml.".to_string()),
+                message: "HTTP API api_key_env is not configured".to_string(),
+                remediation: Some(
+                    "Set [runtimes.http_api].api_key_env in atelier.toml.".to_string(),
+                ),
             };
         };
         match env::var(api_key_env) {
@@ -47,7 +49,7 @@ impl Runtime for HttpApiRuntime {
                 runtime_id: self.config.id.clone(),
                 status: RuntimeAvailabilityStatus::Unavailable,
                 message: format!("environment variable {api_key_env} is not set"),
-                remediation: Some(format!("Export {api_key_env} with a valid Z.ai API key.")),
+                remediation: Some(format!("Export {api_key_env} with a valid API key.")),
             },
         }
     }
@@ -62,14 +64,14 @@ impl Runtime for HttpApiRuntime {
             .config
             .api_key_env
             .as_ref()
-            .context("Z.ai api_key_env is not configured")?;
+            .context("HTTP API api_key_env is not configured")?;
         let api_key = env::var(api_key_env)
             .with_context(|| format!("environment variable {api_key_env} is not set"))?;
         let base_url = self
             .config
             .base_url
             .as_ref()
-            .context("Z.ai base_url is not configured")?;
+            .context("HTTP API base_url is not configured")?;
         let (header_name, header_value) = self.build_auth_header(&api_key);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
@@ -136,7 +138,7 @@ impl HttpApiRuntime {
                 let body = response_error_body(&text);
                 events
                     .status(format!(
-                        "Z.ai streaming rejected with status {status}; falling back to non-streaming chat completion: {body}"
+                        "HTTP API streaming rejected with status {status}; falling back to non-streaming chat completion: {body}"
                     ))
                     .await?;
                 return run_non_streaming_completion(
@@ -156,7 +158,7 @@ impl HttpApiRuntime {
             let text = read_response_text(response, cancellation).await?;
             if fallback_enabled {
                 events
-                    .status("Z.ai streaming response was not SSE; falling back to non-streaming chat completion")
+                    .status("HTTP API streaming response was not SSE; falling back to non-streaming chat completion")
                     .await?;
                 return run_non_streaming_completion(
                     client,
@@ -169,7 +171,7 @@ impl HttpApiRuntime {
                 .await;
             }
             return Err(RuntimeProviderError::non_retryable(format!(
-                "Z.ai streaming response was not SSE: {}",
+                "HTTP API streaming response was not SSE: {}",
                 concise_response_text(&text)
             ))
             .into());
@@ -226,7 +228,7 @@ async fn send_chat_completion(
 ) -> Result<reqwest::Response> {
     let (header_name, header_value) = auth_header;
     tokio::select! {
-        _ = cancellation.cancelled() => anyhow::bail!("Z.ai runtime cancelled"),
+        _ = cancellation.cancelled() => anyhow::bail!("HTTP API runtime cancelled"),
         response = client
             .post(format!("{base_url}/chat/completions"))
             .header(header_name, header_value)
@@ -234,7 +236,7 @@ async fn send_chat_completion(
             .send() => {
                 response.map_err(|error| {
                     RuntimeProviderError::retryable(format!(
-                        "Z.ai chat completions request failed: {error}"
+                        "HTTP API chat completions request failed: {error}"
                     ))
                 }.into())
             }
@@ -246,8 +248,8 @@ async fn read_response_text(
     cancellation: &CancellationToken,
 ) -> Result<String> {
     tokio::select! {
-        _ = cancellation.cancelled() => anyhow::bail!("Z.ai runtime cancelled"),
-        text = response.text() => text.context("failed to read Z.ai response body"),
+        _ = cancellation.cancelled() => anyhow::bail!("HTTP API runtime cancelled"),
+        text = response.text() => text.context("failed to read HTTP API response body"),
     }
 }
 
@@ -260,8 +262,8 @@ async fn read_sse_message_content(
     let mut content = String::new();
     loop {
         let chunk = tokio::select! {
-            _ = cancellation.cancelled() => anyhow::bail!("Z.ai runtime cancelled"),
-            chunk = response.chunk() => chunk.context("failed to read Z.ai streaming response")?,
+            _ = cancellation.cancelled() => anyhow::bail!("HTTP API runtime cancelled"),
+            chunk = response.chunk() => chunk.context("failed to read HTTP API streaming response")?,
         };
         let Some(chunk) = chunk else {
             break;
@@ -275,7 +277,7 @@ async fn read_sse_message_content(
     }
 
     if !buffer.iter().all(u8::is_ascii_whitespace) {
-        let frame = std::str::from_utf8(&buffer).context("malformed Z.ai SSE UTF-8 frame")?;
+        let frame = std::str::from_utf8(&buffer).context("malformed HTTP API SSE UTF-8 frame")?;
         if apply_sse_frame(parse_sse_frame(frame)?, events, &mut content).await? {
             return Ok(content);
         }
@@ -309,7 +311,7 @@ fn drain_next_sse_frame(buffer: &mut Vec<u8>) -> Result<Option<SseFrame>> {
         return Ok(None);
     };
     let frame = std::str::from_utf8(&buffer[..frame_end])
-        .context("malformed Z.ai SSE UTF-8 frame")
+        .context("malformed HTTP API SSE UTF-8 frame")
         .and_then(parse_sse_frame)?;
     buffer.drain(..frame_end + separator_len);
     Ok(Some(frame))
@@ -363,7 +365,7 @@ fn parse_sse_frame(frame: &str) -> Result<SseFrame> {
         }
         let value: Value = serde_json::from_str(data).with_context(|| {
             format!(
-                "malformed Z.ai SSE data frame: {}",
+                "malformed HTTP API SSE data frame: {}",
                 concise_response_text(data)
             )
         })?;
@@ -390,7 +392,8 @@ fn parse_sse_frame(frame: &str) -> Result<SseFrame> {
 }
 
 fn content_from_non_streaming_response(text: &str) -> Result<String> {
-    let value: Value = serde_json::from_str(text).context("failed to parse Z.ai response JSON")?;
+    let value: Value =
+        serde_json::from_str(text).context("failed to parse HTTP API response JSON")?;
     value
         .get("choices")
         .and_then(Value::as_array)
@@ -399,7 +402,7 @@ fn content_from_non_streaming_response(text: &str) -> Result<String> {
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("Z.ai response did not include choices[0].message.content"))
+        .ok_or_else(|| anyhow!("HTTP API response did not include choices[0].message.content"))
 }
 
 fn response_is_sse(response: &reqwest::Response) -> bool {
@@ -413,7 +416,7 @@ fn response_is_sse(response: &reqwest::Response) -> bool {
 
 fn zai_status_error(status: reqwest::StatusCode, text: &str) -> RuntimeProviderError {
     let body = response_error_body(text);
-    let message = format!("Z.ai request failed with status {status}: {body}");
+    let message = format!("HTTP API request failed with status {status}: {body}");
     if retryable_status(status) {
         RuntimeProviderError::retryable(message)
     } else {

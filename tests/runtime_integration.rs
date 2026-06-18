@@ -49,17 +49,17 @@ async fn codex_runtime_executes_real_agent_step() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires MULTIAGENT_RUN_ZAI_INTEGRATION=1 and a valid Z.ai API key"]
+#[ignore = "requires MULTIAGENT_RUN_ZAI_INTEGRATION=1 and a valid API key"]
 async fn zai_runtime_executes_real_agent_step() -> Result<()> {
     if std::env::var_os("MULTIAGENT_RUN_ZAI_INTEGRATION").is_none() {
-        eprintln!("skipping Z.ai integration test; set MULTIAGENT_RUN_ZAI_INTEGRATION=1");
+        eprintln!("skipping HTTP API integration test; set MULTIAGENT_RUN_ZAI_INTEGRATION=1");
         return Ok(());
     }
 
     let api_key_env =
         std::env::var("MULTIAGENT_ZAI_API_KEY_ENV").unwrap_or_else(|_| "ZAI_API_KEY".to_string());
     if std::env::var_os(&api_key_env).is_none() {
-        bail!("environment variable {api_key_env} is required for Z.ai integration testing");
+        bail!("environment variable {api_key_env} is required for HTTP API integration testing");
     }
 
     let dir = tempdir()?;

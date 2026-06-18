@@ -60,7 +60,7 @@ fn sample_statuses() -> Vec<ProviderRunwayStatus> {
         status(
             ProviderId::HttpApi,
             ProviderRunwayState::Misconfigured,
-            "Z.ai api_key_env is not configured",
+            "HTTP API api_key_env is not configured",
             ProviderNextAction::FixConfiguration,
             UsageAvailability::Unavailable {
                 reason: "provider is unavailable for this session".to_string(),

@@ -468,7 +468,7 @@ pub fn provider_capabilities(provider_id: ProviderId) -> ProviderStatusCapabilit
             caps.local_runtime_health = CapabilitySupport::Supported;
         }
         ProviderId::HttpApi => {
-            // Z.ai readiness is gated on a configured API key env var, so its
+            // HTTP API readiness is gated on a configured API key env var, so its
             // auth state is checkable even though usage is not exposed.
             caps.auth_state = CapabilitySupport::RequiresConfiguration;
         }
@@ -1496,9 +1496,7 @@ mod tests {
             runtime_id: "zai".to_string(),
             status: RuntimeAvailabilityStatus::Unavailable,
             message: "environment variable MULTIAGENT_TEST_ZAI_KEY is not set".to_string(),
-            remediation: Some(
-                "Export MULTIAGENT_TEST_ZAI_KEY with a valid Z.ai API key.".to_string(),
-            ),
+            remediation: Some("Export MULTIAGENT_TEST_ZAI_KEY with a valid API key.".to_string()),
         };
         let result = map_runtime_availability(ProviderId::HttpApi, None, &availability);
         assert_eq!(result.state, ProviderRunwayState::Unauthenticated);
@@ -1511,8 +1509,8 @@ mod tests {
         let availability = RuntimeAvailability {
             runtime_id: "zai".to_string(),
             status: RuntimeAvailabilityStatus::Unavailable,
-            message: "Z.ai api_key_env is not configured".to_string(),
-            remediation: Some("Set [runtimes.zai].api_key_env in atelier.toml.".to_string()),
+            message: "HTTP API api_key_env is not configured".to_string(),
+            remediation: Some("Set [runtimes.http_api].api_key_env in atelier.toml.".to_string()),
         };
         let result = map_runtime_availability(ProviderId::HttpApi, None, &availability);
         assert_eq!(result.state, ProviderRunwayState::Misconfigured);
