@@ -4,7 +4,7 @@
 
 | # | Title | Status | Complexity | Dependencies |
 |---|-------|--------|------------|--------------|
-| 01 | Add `[grading]` config section | pending | low | — |
+| 01 | Add `[grading]` config section | completed | low | — |
 | 02 | Extract canonical-verification-command predicate | pending | low | — |
 | 03 | GraderVerdict type and exit-code-derived verdict deriver | pending | low | task_02 |
 | 04 | Grade-round events and collapsing chat projection | pending | medium | task_03 |

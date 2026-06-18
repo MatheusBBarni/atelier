@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add [grading] config section
 type: backend
 complexity: low
@@ -28,11 +28,23 @@ Introduce an opt-in `[grading]` configuration section (`enabled`, default false;
 </requirements>
 
 ## Subtasks
-- [ ] 01.1 Define the resolved `GradingConfig` struct with its manual `Default` impl.
-- [ ] 01.2 Wire `grading` into `EffectiveConfig` and the built-in constructor.
-- [ ] 01.3 Add the `RawGradingConfig` mirror and the `apply_raw` merge arm.
-- [ ] 01.4 Add a `[grading]` block to the init-config scaffold text.
-- [ ] 01.5 Cover defaults, layered override, and unknown-field rejection with tests.
+- [x] 01.1 Define the resolved `GradingConfig` struct with its manual `Default` impl.
+- [x] 01.2 Wire `grading` into `EffectiveConfig` and the built-in constructor.
+- [x] 01.3 Add the `RawGradingConfig` mirror and the `apply_raw` merge arm.
+- [x] 01.4 Add a `[grading]` block to the init-config scaffold text.
+- [x] 01.5 Cover defaults, layered override, and unknown-field rejection with tests.
+
+## Implementation Note
+`GradingConfig { enabled, max_attempts }` threaded through every config representation: resolved
+`EffectiveConfig`, internal `MergedConfig` (+ builtin default), `RawConfig`/`RawGradingConfig`
+(`deny_unknown_fields`), the `apply_raw` merge arm (after features), and `PrintableConfig` (so
+`--print-config` renders it — verified). Init scaffold gained a commented-rationale `[grading]` block.
+Five tests cover defaults, local-enable, max_attempts, home→local override, and unknown-key rejection.
+
+## Follow-up (out of scope)
+The `config-setup-skill` packet's `references/config-schema.md` does not yet document the new
+`[grading]` section. Its drift test only covers the five enums (grading is a struct), so nothing
+breaks — but that reference should gain a `[grading]` row for completeness in a separate change.
 
 ## Implementation Details
 Follow the `Features.parallel_step_groups` opt-in precedent end-to-end (resolved struct, raw mirror, merge arm, scaffold). See TechSpec "Data Models" (the `GradingConfig` definition) and "Build Order" step 1. Exact insertion points are recorded in the config-discoverability findings of `_research-techspec.json`.

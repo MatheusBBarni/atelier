@@ -279,6 +279,28 @@ pub struct Features {
     pub mcp_enabled: bool,
 }
 
+/// Opt-in externally-grounded auto-verification loop (ADR-002/003). Off by
+/// default and visible-but-inert in the init scaffold; every grading component
+/// gates on `enabled`. `max_attempts` bounds the grade→fix loop, mirroring
+/// `limits.max_review_fix_cycles`. There is no `verify_command` field — the
+/// verification command is agent-discovered in V1 (ADR-002).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GradingConfig {
+    pub enabled: bool,
+    pub max_attempts: u32,
+}
+
+impl Default for GradingConfig {
+    fn default() -> Self {
+        // max_attempts matches the default limits.max_review_fix_cycles.
+        Self {
+            enabled: false,
+            max_attempts: 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct UiConfig {
@@ -544,6 +566,7 @@ pub struct EffectiveConfig {
     pub approval: ApprovalConfig,
     pub workspace: WorkspacePolicy,
     pub features: Features,
+    pub grading: GradingConfig,
     pub ui: UiConfig,
     pub limits: Limits,
     /// Validated lifecycle hooks (ADR-001, ADR-004), drawn only from user-scope
@@ -598,6 +621,7 @@ struct RawConfig {
     approval: Option<RawApprovalConfig>,
     workspace: Option<RawWorkspacePolicy>,
     features: Option<RawFeatures>,
+    grading: Option<RawGradingConfig>,
     ui: Option<RawUiConfig>,
     limits: Option<RawLimits>,
     council: Option<RawCouncilConfig>,
@@ -663,6 +687,13 @@ struct RawFeatures {
     governance_early_abort: Option<bool>,
     execution_graph: Option<bool>,
     mcp_enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGradingConfig {
+    enabled: Option<bool>,
+    max_attempts: Option<u32>,
 }
 
 /// Raw `[mcp]` section. Only `servers` exists in V1; nesting it under `[mcp]`
@@ -912,6 +943,7 @@ struct MergedConfig {
     approval: ApprovalConfig,
     workspace: WorkspacePolicy,
     features: Features,
+    grading: GradingConfig,
     ui: UiConfig,
     limits: Limits,
     /// Lifecycle hooks accumulated from user-scope layers only; a project-local
@@ -1220,6 +1252,7 @@ impl MergedConfig {
             approval: ApprovalConfig::default(),
             workspace: WorkspacePolicy::default(),
             features: Features::default(),
+            grading: GradingConfig::default(),
             ui: UiConfig::default(),
             limits: Limits::default(),
             hooks: HooksConfig::default(),
@@ -1288,6 +1321,15 @@ impl MergedConfig {
             }
             if let Some(value) = features.mcp_enabled {
                 self.features.mcp_enabled = value;
+            }
+        }
+
+        if let Some(grading) = raw.grading {
+            if let Some(value) = grading.enabled {
+                self.grading.enabled = value;
+            }
+            if let Some(value) = grading.max_attempts {
+                self.grading.max_attempts = value;
             }
         }
 
@@ -2012,6 +2054,7 @@ impl MergedConfig {
             approval: self.approval,
             workspace: self.workspace,
             features: self.features,
+            grading: self.grading,
             ui: self.ui,
             limits: self.limits,
             hooks: self.hooks,
@@ -2601,6 +2644,7 @@ pub(crate) struct PrintableConfig {
     pub(crate) approval_mode: ApprovalMode,
     pub(crate) workspace: WorkspacePolicy,
     pub(crate) features: Features,
+    pub(crate) grading: GradingConfig,
     pub(crate) approval: ApprovalConfig,
     pub(crate) ui: UiConfig,
     pub(crate) limits: Limits,
@@ -2757,6 +2801,7 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
         approval_mode: config.approval_mode.clone(),
         workspace: config.workspace.clone(),
         features: config.features.clone(),
+        grading: config.grading.clone(),
         approval: config.approval.clone(),
         ui: config.ui.clone(),
         limits: config.limits.clone(),
@@ -2980,6 +3025,15 @@ approval_mode = "yolo"
 
 [features]
 parallel_step_groups = false
+
+# Opt-in externally-grounded auto-verification loop (ADR-002/003). Off by
+# default; when enabled, after an editing agent finishes the harness runs the
+# agent-discovered verification command and, on failure, re-dispatches the
+# producing agent with the critique up to max_attempts times. No secrets, no
+# new fields beyond these two.
+[grading]
+enabled = false
+max_attempts = 2
 
 # Approval floor posture for gray-area actions (ADR-002). "warn" (default)
 # surfaces the risk but still auto-runs under yolo; "enforce" re-prompts
@@ -4024,6 +4078,67 @@ max_parallel_agent_steps = 0
         .unwrap();
 
         assert!(!config.features.execution_graph);
+    }
+
+    // ── grading config (task_01) ──
+
+    #[test]
+    fn grading_defaults_off_with_two_attempts() {
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+        assert!(!config.grading.enabled);
+        assert_eq!(config.grading.max_attempts, 2);
+    }
+
+    #[test]
+    fn grading_enabled_from_local_config_resolves_true() {
+        let config = load_from_temp("schema_version = 1\n[grading]\nenabled = true\n").unwrap();
+        assert!(config.grading.enabled);
+    }
+
+    #[test]
+    fn grading_max_attempts_parses() {
+        let config = load_from_temp("schema_version = 1\n[grading]\nmax_attempts = 5\n").unwrap();
+        assert_eq!(config.grading.max_attempts, 5);
+    }
+
+    #[test]
+    fn grading_enabled_local_overrides_home() {
+        // Layer precedence (built-in → home → local): home disables grading, the
+        // project file enables it; local wins (last-writer-wins via apply_raw).
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(
+            &home_path,
+            "schema_version = 1\n[grading]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let local_dir = tempdir().unwrap();
+        fs::write(
+            local_dir.path().join("atelier.toml"),
+            "[grading]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: local_dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        assert!(config.grading.enabled);
+    }
+
+    #[test]
+    fn grading_unknown_key_is_rejected_by_deny_unknown_fields() {
+        // A V1 config must not carry verify_command (ADR-002) — or any stray key.
+        let error =
+            load_from_temp("schema_version = 1\n[grading]\nverify_command = \"x\"\n").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("verify_command") || message.contains("unknown field"),
+            "deny_unknown_fields should reject the stray key: {message}"
+        );
     }
 
     // ── MCP servers + features.mcp_enabled + redaction (task_02) ──
