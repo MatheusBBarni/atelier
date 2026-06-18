@@ -2,9 +2,9 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod fake;
+pub mod http_api;
 pub mod http_util;
 pub mod status;
-pub mod zai;
 
 // Re-export the shared HTTP utilities so existing import paths keep working
 // after the extraction in ADR-003: `crate::runtime::redact_sensitive_text`
@@ -445,8 +445,8 @@ pub async fn check_runtime_availability(runtime: &RuntimeConfig) -> RuntimeAvail
                 .check_availability()
                 .await
         }
-        RuntimeKind::Zai => {
-            zai::ZaiRuntime::new(runtime.clone())
+        RuntimeKind::HttpApi => {
+            http_api::HttpApiRuntime::new(runtime.clone())
                 .check_availability()
                 .await
         }
@@ -573,8 +573,8 @@ async fn execute_runtime_step_once(
                 .stream_step(request, events, cancellation)
                 .await
         }
-        RuntimeKind::Zai => {
-            zai::ZaiRuntime::new(runtime.clone())
+        RuntimeKind::HttpApi => {
+            http_api::HttpApiRuntime::new(runtime.clone())
                 .stream_step(request, events, cancellation)
                 .await
         }

@@ -56,7 +56,8 @@ async fn multiple_providers_return_independent_rows_when_one_fails() {
     let healthy = RuntimeAvailabilityProbe::new(runtime_config("fake", RuntimeKind::Fake, None));
     // Z.ai with no api_key_env configured resolves to Misconfigured without
     // reading any environment variable, so the failure is deterministic.
-    let failing = RuntimeAvailabilityProbe::new(runtime_config("zai", RuntimeKind::Zai, None));
+    let failing =
+        RuntimeAvailabilityProbe::new(runtime_config("http_api", RuntimeKind::HttpApi, None));
 
     let service = ProviderStatusService::new(vec![Arc::new(healthy), Arc::new(failing)]);
     let rows = service.collect_status().await;
@@ -64,7 +65,7 @@ async fn multiple_providers_return_independent_rows_when_one_fails() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].provider_id, ProviderId::Fake);
     assert_eq!(rows[0].state, ProviderRunwayState::Ready);
-    assert_eq!(rows[1].provider_id, ProviderId::Zai);
+    assert_eq!(rows[1].provider_id, ProviderId::HttpApi);
     assert_eq!(rows[1].state, ProviderRunwayState::Misconfigured);
     // The failing provider did not suppress the healthy one.
     assert_ne!(rows[0].state, rows[1].state);
@@ -80,8 +81,8 @@ async fn from_config_discovers_only_provider_families_used_by_enabled_agents() {
 [runtimes.fake]
 type = "fake"
 
-[runtimes.zai]
-type = "zai"
+[runtimes.http_api]
+type = "http_api"
 
 [agents.orchestrator]
 runtime = "fake"
@@ -96,7 +97,7 @@ runtime = "fake"
 runtime = "fake"
 
 [agents.oracle]
-runtime = "zai"
+runtime = "http_api"
 
 [agents.consul]
 runtime = "fake"
@@ -126,7 +127,7 @@ runtime = "fake"
     let service = ProviderStatusService::from_config(&config);
     let ids = service.provider_ids();
     assert!(ids.contains(&ProviderId::Fake), "missing fake: {ids:?}");
-    assert!(ids.contains(&ProviderId::Zai), "missing zai: {ids:?}");
+    assert!(ids.contains(&ProviderId::HttpApi), "missing zai: {ids:?}");
     assert!(
         !ids.contains(&ProviderId::Codex),
         "unused codex probed: {ids:?}"

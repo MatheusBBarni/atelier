@@ -6,7 +6,7 @@ use multiagent::config::{
 use multiagent::runtime::claude::ClaudeRuntime;
 use multiagent::runtime::codex::CodexRuntime;
 use multiagent::runtime::cursor::CursorRuntime;
-use multiagent::runtime::zai::ZaiRuntime;
+use multiagent::runtime::http_api::HttpApiRuntime;
 use multiagent::runtime::{
     collect_runtime_step_result, Runtime, RuntimeOutput, RuntimeRecentContext, RuntimeRequest,
 };
@@ -61,9 +61,9 @@ async fn zai_runtime_executes_real_agent_step() -> Result<()> {
     }
 
     let dir = tempdir()?;
-    let runtime = ZaiRuntime::new(RuntimeConfig {
+    let runtime = HttpApiRuntime::new(RuntimeConfig {
         id: "zai".to_string(),
-        kind: RuntimeKind::Zai,
+        kind: RuntimeKind::HttpApi,
         command: None,
         args: Vec::new(),
         prompt_mode: PromptMode::Stdin,

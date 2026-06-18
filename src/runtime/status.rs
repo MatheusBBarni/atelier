@@ -43,7 +43,7 @@ pub enum ProviderId {
     Claude,
     Codex,
     Cursor,
-    Zai,
+    HttpApi,
     Fake,
     Local,
 }
@@ -56,7 +56,7 @@ impl ProviderId {
             ProviderId::Claude => "Claude",
             ProviderId::Codex => "Codex",
             ProviderId::Cursor => "Cursor",
-            ProviderId::Zai => "Z.ai",
+            ProviderId::HttpApi => "HTTP API",
             ProviderId::Fake => "Fake",
             ProviderId::Local => "Local",
         }
@@ -69,7 +69,7 @@ impl From<RuntimeKind> for ProviderId {
             RuntimeKind::Claude => ProviderId::Claude,
             RuntimeKind::Codex => ProviderId::Codex,
             RuntimeKind::Cursor => ProviderId::Cursor,
-            RuntimeKind::Zai => ProviderId::Zai,
+            RuntimeKind::HttpApi => ProviderId::HttpApi,
             RuntimeKind::Fake => ProviderId::Fake,
         }
     }
@@ -467,7 +467,7 @@ pub fn provider_capabilities(provider_id: ProviderId) -> ProviderStatusCapabilit
         ProviderId::Claude | ProviderId::Codex | ProviderId::Cursor | ProviderId::Fake => {
             caps.local_runtime_health = CapabilitySupport::Supported;
         }
-        ProviderId::Zai => {
+        ProviderId::HttpApi => {
             // Z.ai readiness is gated on a configured API key env var, so its
             // auth state is checkable even though usage is not exposed.
             caps.auth_state = CapabilitySupport::RequiresConfiguration;
@@ -487,7 +487,7 @@ pub fn provider_usage_url(provider_id: ProviderId) -> Option<String> {
         ProviderId::Claude => "https://claude.ai/settings/usage",
         ProviderId::Codex => "https://platform.openai.com/usage",
         ProviderId::Cursor => "https://www.cursor.com/settings",
-        ProviderId::Zai => "https://z.ai",
+        ProviderId::HttpApi => "https://z.ai",
         ProviderId::Fake | ProviderId::Local => return None,
     };
     Some(url.to_string())
@@ -1387,9 +1387,9 @@ mod tests {
         assert_eq!(ProviderId::from(RuntimeKind::Claude), ProviderId::Claude);
         assert_eq!(ProviderId::from(RuntimeKind::Codex), ProviderId::Codex);
         assert_eq!(ProviderId::from(RuntimeKind::Cursor), ProviderId::Cursor);
-        assert_eq!(ProviderId::from(RuntimeKind::Zai), ProviderId::Zai);
+        assert_eq!(ProviderId::from(RuntimeKind::HttpApi), ProviderId::HttpApi);
         assert_eq!(ProviderId::from(RuntimeKind::Fake), ProviderId::Fake);
-        assert_eq!(ProviderId::Zai.default_display_name(), "Z.ai");
+        assert_eq!(ProviderId::HttpApi.default_display_name(), "HTTP API");
         assert_eq!(ProviderId::Local.default_display_name(), "Local");
     }
 
@@ -1482,9 +1482,9 @@ mod tests {
     async fn exact_usage_with_supporting_capability_is_preserved() {
         let mut result = ready_probe_result();
         result.usage = UsageAvailability::Exact(sample_exact_usage());
-        let mut caps = provider_capabilities(ProviderId::Zai);
+        let mut caps = provider_capabilities(ProviderId::HttpApi);
         caps.subscription_usage = CapabilitySupport::Supported;
-        let probe = StaticStatusProbe::new(ProviderId::Zai, "Z.ai", caps, result);
+        let probe = StaticStatusProbe::new(ProviderId::HttpApi, "HTTP API", caps, result);
         let service = ProviderStatusService::new(vec![Arc::new(probe)]);
         let rows = service.collect_status().await;
         assert!(rows[0].usage.is_exact());
@@ -1500,7 +1500,7 @@ mod tests {
                 "Export MULTIAGENT_TEST_ZAI_KEY with a valid Z.ai API key.".to_string(),
             ),
         };
-        let result = map_runtime_availability(ProviderId::Zai, None, &availability);
+        let result = map_runtime_availability(ProviderId::HttpApi, None, &availability);
         assert_eq!(result.state, ProviderRunwayState::Unauthenticated);
         assert_eq!(result.reason.code, ReasonCode::AuthRequired);
         assert_eq!(result.next_action, ProviderNextAction::Authenticate);
@@ -1514,7 +1514,7 @@ mod tests {
             message: "Z.ai api_key_env is not configured".to_string(),
             remediation: Some("Set [runtimes.zai].api_key_env in atelier.toml.".to_string()),
         };
-        let result = map_runtime_availability(ProviderId::Zai, None, &availability);
+        let result = map_runtime_availability(ProviderId::HttpApi, None, &availability);
         assert_eq!(result.state, ProviderRunwayState::Misconfigured);
         assert_eq!(result.reason.code, ReasonCode::Misconfigured);
         assert_eq!(result.next_action, ProviderNextAction::FixConfiguration);
@@ -1539,7 +1539,7 @@ mod tests {
             message: "key is set; network check deferred".to_string(),
             remediation: None,
         };
-        let row = map_runtime_availability(ProviderId::Zai, None, &unknown);
+        let row = map_runtime_availability(ProviderId::HttpApi, None, &unknown);
         assert_eq!(row.state, ProviderRunwayState::UnavailableUsage);
         assert!(!row.usage.is_exact());
     }
@@ -1724,7 +1724,7 @@ mod tests {
     #[test]
     fn exact_usage_renders_only_when_usage_is_exact() {
         let exact_row = status(
-            ProviderId::Zai,
+            ProviderId::HttpApi,
             ProviderRunwayState::Ready,
             "ready",
             ProviderNextAction::Proceed,
@@ -1742,7 +1742,7 @@ mod tests {
         assert!(exact_out.contains("resets 2023-11-14"));
 
         let unsupported_row = status(
-            ProviderId::Zai,
+            ProviderId::HttpApi,
             ProviderRunwayState::UnavailableUsage,
             "exact remaining usage is unavailable",
             ProviderNextAction::CheckProviderUsage { provider_url: None },
@@ -1800,7 +1800,7 @@ mod tests {
     #[test]
     fn unknown_reset_renders_as_unknown_not_inferred_text() {
         let row = status(
-            ProviderId::Zai,
+            ProviderId::HttpApi,
             ProviderRunwayState::Ready,
             "ready",
             ProviderNextAction::Proceed,

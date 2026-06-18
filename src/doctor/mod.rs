@@ -66,6 +66,17 @@ impl DoctorReport {
     }
 }
 
+/// Human-readable doctor section title for a runtime kind.
+pub(crate) fn runtime_title(kind: &RuntimeKind) -> &'static str {
+    match kind {
+        RuntimeKind::Codex => "Codex Runtime",
+        RuntimeKind::Claude => "Claude Runtime",
+        RuntimeKind::Cursor => "Cursor Runtime",
+        RuntimeKind::HttpApi => "HTTP API Runtime",
+        RuntimeKind::Fake => "Fake Runtime",
+    }
+}
+
 pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(working_directory_check(config));
@@ -90,13 +101,7 @@ pub async fn run_doctor(config: &EffectiveConfig) -> DoctorReport {
             availability.status,
             required.contains(runtime.id.as_str()),
         );
-        let title = match runtime.kind {
-            RuntimeKind::Codex => "Codex Runtime",
-            RuntimeKind::Claude => "Claude Runtime",
-            RuntimeKind::Cursor => "Cursor Runtime",
-            RuntimeKind::Zai => "Z.ai Runtime",
-            RuntimeKind::Fake => "Fake Runtime",
-        };
+        let title = runtime_title(&runtime.kind);
         let protected_defaults = match runtime.kind {
             RuntimeKind::Claude => Some(crate::runtime::claude::protected_defaults_summary()),
             RuntimeKind::Cursor => Some(crate::runtime::cursor::protected_defaults_summary()),
@@ -1060,6 +1065,13 @@ mod tests {
             ),
             gov_event(run_id, "run_completed", json!({})),
         ]
+    }
+
+    #[test]
+    fn runtime_title_uses_generic_http_api_name() {
+        assert_eq!(runtime_title(&RuntimeKind::HttpApi), "HTTP API Runtime");
+        assert_eq!(runtime_title(&RuntimeKind::Codex), "Codex Runtime");
+        assert_eq!(runtime_title(&RuntimeKind::Fake), "Fake Runtime");
     }
 
     #[test]

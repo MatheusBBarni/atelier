@@ -13,18 +13,18 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
-pub struct ZaiRuntime {
+pub struct HttpApiRuntime {
     config: RuntimeConfig,
 }
 
-impl ZaiRuntime {
+impl HttpApiRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
         Self { config }
     }
 }
 
 #[async_trait]
-impl Runtime for ZaiRuntime {
+impl Runtime for HttpApiRuntime {
     async fn check_availability(&self) -> RuntimeAvailability {
         let Some(api_key_env) = &self.config.api_key_env else {
             return RuntimeAvailability {
@@ -88,7 +88,7 @@ impl Runtime for ZaiRuntime {
     }
 }
 
-impl ZaiRuntime {
+impl HttpApiRuntime {
     async fn stream_or_fallback(
         &self,
         client: &reqwest::Client,
@@ -479,9 +479,9 @@ mod tests {
         .await;
         std::env::set_var("MULTIAGENT_TEST_ZAI_KEY", "test-token");
 
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: Vec::new(),
             prompt_mode: PromptMode::Stdin,
@@ -537,9 +537,9 @@ mod tests {
         .await;
         std::env::set_var("MULTIAGENT_TEST_ZAI_KEY", "test-token");
 
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: Vec::new(),
             prompt_mode: PromptMode::Stdin,
@@ -595,9 +595,9 @@ mod tests {
         ])
         .await;
         std::env::set_var("MULTIAGENT_TEST_ZAI_KEY", "test-token");
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: Vec::new(),
             prompt_mode: PromptMode::Stdin,
@@ -637,9 +637,9 @@ mod tests {
         )])
         .await;
         std::env::set_var("MULTIAGENT_TEST_ZAI_KEY", "test-token");
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: vec!["--no-stream-fallback".to_string()],
             prompt_mode: PromptMode::Stdin,
@@ -715,9 +715,9 @@ mod tests {
 
     #[tokio::test]
     async fn zai_availability_reports_missing_credential_reference() {
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: Vec::new(),
             prompt_mode: PromptMode::Stdin,

@@ -355,7 +355,7 @@ pub enum RuntimeKind {
     Codex,
     Claude,
     Cursor,
-    Zai,
+    HttpApi,
     Fake,
 }
 
@@ -366,7 +366,7 @@ impl RuntimeKind {
             Self::Codex,
             Self::Claude,
             Self::Cursor,
-            Self::Zai,
+            Self::HttpApi,
             Self::Fake,
         ]
     }
@@ -1096,9 +1096,9 @@ impl MergedConfig {
             },
         );
         runtimes.insert(
-            "zai".to_string(),
+            "http_api".to_string(),
             MergedRuntimeConfig {
-                kind: Some(RuntimeKind::Zai),
+                kind: Some(RuntimeKind::HttpApi),
                 command: None,
                 args: None,
                 prompt_mode: None,
@@ -1114,7 +1114,7 @@ impl MergedConfig {
             BuiltinAgent {
                 id: "orchestrator",
                 name: "Orchestrator",
-                runtime: "zai",
+                runtime: "http_api",
                 model: "glm-5.1",
                 effort: AgentEffort::High,
                 thinking: true,
@@ -1144,7 +1144,7 @@ impl MergedConfig {
             BuiltinAgent {
                 id: "oracle",
                 name: "Oracle",
-                runtime: "zai",
+                runtime: "http_api",
                 model: "glm-5.1",
                 effort: AgentEffort::Medium,
                 thinking: true,
@@ -1159,7 +1159,7 @@ impl MergedConfig {
             BuiltinAgent {
                 id: "consul",
                 name: "Consul",
-                runtime: "zai",
+                runtime: "http_api",
                 model: "glm-5.1",
                 effort: AgentEffort::High,
                 thinking: true,
@@ -1214,7 +1214,7 @@ impl MergedConfig {
             BuiltinAgent {
                 id: "librarian",
                 name: "Librarian",
-                runtime: "zai",
+                runtime: "http_api",
                 model: "glm-5.1",
                 effort: AgentEffort::Medium,
                 thinking: true,
@@ -1896,10 +1896,10 @@ impl MergedConfig {
                         degrade_not_abandon,
                     }
                 }
-                RuntimeKind::Zai => {
+                RuntimeKind::HttpApi => {
                     let api_key_env = runtime
                         .api_key_env
-                        .ok_or_else(|| anyhow!("zai runtime {id} is missing api_key_env"))?;
+                        .ok_or_else(|| anyhow!("http_api runtime {id} is missing api_key_env"))?;
                     validate_env_reference(&api_key_env)
                         .with_context(|| format!("invalid api_key_env for runtime {id}"))?;
                     RuntimeConfig {
@@ -2161,7 +2161,7 @@ fn builtin_council_config() -> MergedCouncilConfig {
     for member in [
         BuiltinCouncilMember {
             id: "architect",
-            runtime: "zai",
+            runtime: "http_api",
             model: "glm-5.1",
             effort: AgentEffort::High,
             thinking: true,
@@ -2169,7 +2169,7 @@ fn builtin_council_config() -> MergedCouncilConfig {
         },
         BuiltinCouncilMember {
             id: "security",
-            runtime: "zai",
+            runtime: "http_api",
             model: "glm-5.1",
             effort: AgentEffort::High,
             thinking: true,
@@ -2177,7 +2177,7 @@ fn builtin_council_config() -> MergedCouncilConfig {
         },
         BuiltinCouncilMember {
             id: "reviewer",
-            runtime: "zai",
+            runtime: "http_api",
             model: "glm-5.1",
             effort: AgentEffort::Medium,
             thinking: true,
@@ -3099,8 +3099,8 @@ command = "cursor-agent"
 args = []
 prompt_mode = "stdin"
 
-[runtimes.zai]
-type = "zai"
+[runtimes.http_api]
+type = "http_api"
 base_url = "https://api.z.ai/api/paas/v4"
 api_key_env = "ZAI_API_KEY"
 
@@ -3135,28 +3135,28 @@ timeout_seconds = 900
 execution_mode = "serial"
 
 [council.presets.default.architect]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "high"
 thinking = true
 prompt_file = "agents/council-architect.md"
 
 [council.presets.default.security]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "high"
 thinking = true
 prompt_file = "agents/council-security.md"
 
 [council.presets.default.reviewer]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "medium"
 thinking = true
 prompt_file = "agents/council-reviewer.md"
 
 [agents.orchestrator]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "high"
 thinking = true
@@ -3172,7 +3172,7 @@ capabilities = ["read"]
 instructions_file = "agents/explorer.md"
 
 [agents.oracle]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "medium"
 thinking = true
@@ -3180,7 +3180,7 @@ capabilities = ["read", "answer"]
 instructions_file = "agents/oracle.md"
 
 [agents.consul]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "high"
 thinking = true
@@ -3204,7 +3204,7 @@ capabilities = ["read", "command", "verify", "review"]
 instructions_file = "agents/reviewer.md"
 
 [agents.librarian]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "medium"
 thinking = true
@@ -3317,7 +3317,7 @@ mod tests {
                 RuntimeKind::Codex
                 | RuntimeKind::Claude
                 | RuntimeKind::Cursor
-                | RuntimeKind::Zai
+                | RuntimeKind::HttpApi
                 | RuntimeKind::Fake => {}
             }
         }
@@ -4541,7 +4541,7 @@ prompt_history_max = 50
         // Guardrail: the elevated set is exactly the orchestrator's runtime and
         // must not broaden silently (ADR-003).
         let config = load_from_temp("schema_version = 1\n").unwrap();
-        assert_eq!(config.required_runtime_ids(), BTreeSet::from(["zai"]));
+        assert_eq!(config.required_runtime_ids(), BTreeSet::from(["http_api"]));
     }
 
     #[test]
@@ -4896,7 +4896,7 @@ prompt_file = "council/architect.md"
         let error = load_from_temp(
             r#"
 [runtimes.codex]
-type = "zai"
+type = "http_api"
 api_key_env = "ZAI_API_KEY"
 "#,
         )
@@ -4941,6 +4941,28 @@ runtime = "local_cursor"
         assert_eq!(
             config.runtimes["local_cursor"].command.as_deref(),
             Some("cursor-agent")
+        );
+    }
+
+    #[test]
+    fn http_api_runtime_type_deserializes() {
+        let config = load_from_temp(
+            r#"
+[runtimes.local_http]
+type = "http_api"
+api_key_env = "LOCAL_HTTP_API_KEY"
+
+[agents.explorer]
+runtime = "local_http"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.runtimes["local_http"].kind, RuntimeKind::HttpApi);
+        // Pure rename: the HTTP API runtime keeps the same default base URL.
+        assert_eq!(
+            config.runtimes["local_http"].base_url.as_deref(),
+            Some("https://api.z.ai/api/paas/v4")
         );
     }
 
@@ -5104,7 +5126,7 @@ instructions_file = "agents/fixer.md"
     fn raw_secret_in_credential_reference_is_invalid() {
         let error = load_from_temp(
             r#"
-[runtimes.zai]
+[runtimes.http_api]
 api_key_env = "sk-secret"
 "#,
         )

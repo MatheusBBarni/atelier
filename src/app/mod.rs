@@ -14941,8 +14941,8 @@ instructions_file = "agents/explorer.md"
 [runtimes.fake]
 type = "fake"
 
-[runtimes.zai]
-type = "zai"
+[runtimes.http_api]
+type = "http_api"
 api_key_env = "MULTIAGENT_TEST_PROVIDER_STATUS_NO_KEY"
 
 [agents.orchestrator]
@@ -14958,7 +14958,7 @@ runtime = "fake"
 runtime = "fake"
 
 [agents.oracle]
-runtime = "zai"
+runtime = "http_api"
 
 [agents.consul]
 runtime = "fake"
@@ -15075,7 +15075,7 @@ runtime = "fake"
         // Healthy and failing providers both appear, independently.
         assert!(display.contains("Fake"), "{display}");
         assert!(display.contains("ready"), "{display}");
-        assert!(display.contains("Z.ai"), "{display}");
+        assert!(display.contains("HTTP API"), "{display}");
         assert!(display.contains("unauthenticated"), "{display}");
         assert_eq!(app.state.run_state, RunState::Idle);
 
