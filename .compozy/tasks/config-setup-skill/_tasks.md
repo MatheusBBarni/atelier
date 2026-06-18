@@ -8,7 +8,7 @@
 | 02 | `references/config-schema.md` — whole-config schema reference | completed | medium | — |
 | 03 | `references/presets.md` — named starter presets | completed | medium | — |
 | 04 | Add `all()` enum iteration for the drift test | completed | low | — |
-| 05 | `sync-skills` harness + generated discovery mirrors | pending | medium | task_01, task_02, task_03 |
+| 05 | `sync-skills` harness + generated discovery mirrors | completed | medium | task_01, task_02, task_03 |
 | 06 | Rust drift/correctness guard (`tests/atelier_config_skill.rs`) | pending | high | task_01, task_02, task_03, task_04, task_05 |
 | 07 | First-run nudge when the config-setup skill is absent | pending | low | task_01 |
 | 08 | README install + usage documentation | pending | low | task_01 |
