@@ -27,6 +27,7 @@ an orchestrator and a sequence of specialized agent profiles.
 - Serial council workflow for high-risk or user-requested decision review.
 - Durable per-session history and artifacts under `.atelier/`.
 - Strict capability checks for file and command actions.
+- Lifecycle hooks: fire a desktop notification or a shell command on run/step/approval events, with a normalized cross-runtime payload on stdin (works over SSH).
 - Deterministic local tests with optional integration paths.
 
 ## Requirements
@@ -97,6 +98,7 @@ atelier --init-config
 atelier --codemap init
 atelier --codemap changes
 atelier --codemap update
+atelier --events follow
 atelier --clean-sessions
 atelier --clean-sessions --yes
 atelier --update
@@ -115,6 +117,9 @@ Notes:
 - `--print-config` prints merged config with secrets redacted.
 - `--init-config` creates starter config/instruction files if missing.
 - `--codemap changes` reports stale maps without writing files.
+- `--events follow` streams the normalized lifecycle-hook payload for each public
+  event of the active session to stdout — a dry-run preview of exactly what a hook
+  receives. Standalone (no TUI); exits on Ctrl-C. See [Lifecycle hooks](#lifecycle-hooks).
 - `--update` is handled by the npm launcher and updates the global npm package.
 
 ### Doctor exit codes
@@ -222,6 +227,93 @@ Important values:
   - `max_command_minutes`
   - `max_review_fix_cycles`
   - `max_parallel_agent_steps`
+- `[hooks]`: lifecycle hooks — a `[[hooks.handler]]` array plus an optional
+  `notify_fallback_command`. See [Lifecycle hooks](#lifecycle-hooks).
+
+## Lifecycle hooks
+
+Lifecycle hooks run a desktop notification or a shell command when the harness
+reaches a lifecycle event. The hook receives a **normalized, versioned payload**
+that is identical across every runtime (Codex / Claude / Cursor / Z.ai), so one
+config governs all of them.
+
+> **Security:** hooks are honored only from your **home config**
+> (`~/.config/.atelier/atelier.toml`) or an explicit `--config`. Hooks in a
+> project-local `./atelier.toml` are **ignored** (with a diagnostic), so cloning a
+> repository can never register a command that runs on your machine. The payload
+> reaches a command on **stdin only** — never interpolated into arguments — and is
+> redacted before delivery.
+
+### Schema
+
+```toml
+[[hooks.handler]]
+on = "run_completed"        # one public event name, or a list of them
+notify = true               # built-in notifier (XOR command)
+# command = "cat >> log"    # a shell command receiving the payload on stdin
+payload = "metadata"        # "metadata" (default) or "full" (includes the body)
+```
+
+Each `[[hooks.handler]]` declares `on` and exactly one action — `notify` or
+`command`. Public event names: `run_started`, `step_started`, `action_requested`,
+`approval_required`, `clarification_required`, `file_edited`, `run_completed`,
+`run_failed`, `run_limit_reached`, `run_interrupted`. The payload is
+metadata-only by default; `payload = "full"` adds the event body.
+
+### Recipes
+
+Desktop notification when a run needs you or finishes:
+
+```toml
+[[hooks.handler]]
+on = ["approval_required", "clarification_required", "run_completed"]
+notify = true
+```
+
+Append every terminal/edit event to an audit log (JSON on stdin):
+
+```toml
+[[hooks.handler]]
+on = ["run_completed", "run_failed", "file_edited"]
+command = "cat >> ~/atelier-audit.jsonl"
+payload = "full"
+```
+
+POST a webhook when a run fails:
+
+```toml
+[[hooks.handler]]
+on = "run_failed"
+command = "curl -sS -X POST -H 'Content-Type: application/json' -d @- https://example.com/atelier-hook"
+```
+
+### Preview and health
+
+- `atelier --events follow` tails the active session and prints the normalized
+  payload for each public event — exactly what a hook receives on stdin. Use it to
+  dry-run a hook before wiring a command.
+- `atelier --doctor` includes a **Lifecycle hooks** check: how many handlers are
+  configured, when one last fired, and the dropped-event count.
+- `/config` in the TUI lists active configuration, including hooks.
+
+### Notifications over SSH (and tmux)
+
+The built-in notifier emits a terminal **OSC escape sequence** by default, which
+the terminal application renders — so it works over SSH with zero dependency.
+Some terminals, and **tmux**, strip OSC sequences. For tmux, enable passthrough:
+
+```tmux
+set -g allow-passthrough on
+```
+
+Where OSC is unavailable, set `notify_fallback_command` (under `[hooks]`) to a
+notifier binary (e.g. `terminal-notifier -message`, `notify-send`); it receives
+the title and body as its final two arguments.
+
+```toml
+[hooks]
+notify_fallback_command = "terminal-notifier -message"
+```
 
 ## Runtimes
 

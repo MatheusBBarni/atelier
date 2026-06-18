@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Surface DAG state in /config"
 type: backend
 complexity: low
@@ -29,11 +29,11 @@ Make the DAG capability discoverable in-app by extending the `/config` output to
 </requirements>
 
 ## Subtasks
-- [ ] 7.1 Add the DAG/approval fields to `ConfigStatusView`.
-- [ ] 7.2 Populate them in `build_config_status` from the effective config.
-- [ ] 7.3 Render them in `config_status_display`.
-- [ ] 7.4 Add the enabled-but-ceiling-zero warning note.
-- [ ] 7.5 Add/refresh unit tests for the rendered output and the `config_viewed` payload.
+- [x] 7.1 Added `approval_mode`, `execution_graph_enabled`, `max_parallel_agent_steps` to `ConfigStatusView` (all `#[serde(default)]` so old `config_viewed` payloads still deserialize).
+- [x] 7.2 Populated them in `build_config_status` from the effective config.
+- [x] 7.3 Rendered them in `config_status_display` (`approval: …; dag: enabled (max_parallel_agent_steps=N) | disabled`) + `approval_mode_label` helper.
+- [x] 7.4 Added the enabled-but-ceiling-zero warning in `config_warning_messages`.
+- [x] 7.5 Unit + integration tests for the rendered output and the `config_viewed` payload. Updated the two `ConfigStatusView` test literals in `tui/mod.rs` (compiler-forced).
 
 ## Implementation Details
 Changes are in `src/app/mod.rs` (`ConfigStatusView`, `build_config_status`, `config_status_display`, `handle_config_command`). The new fields read from `EffectiveConfig` (`features.execution_graph`, `limits.max_parallel_agent_steps`, `approval_mode`). See TechSpec "Component Overview → Config" and ADR-005 (close the `/config` visibility gap). The `/config` command grammar is unchanged (exact-match `/config`).
@@ -56,13 +56,13 @@ Changes are in `src/app/mod.rs` (`ConfigStatusView`, `build_config_status`, `con
 
 ## Tests
 - Unit tests:
-  - [ ] With `execution_graph = true` and ceiling 3, `config_status_display` shows DAG enabled and `max_parallel_agent_steps = 3`.
-  - [ ] With `execution_graph = false`, the display shows DAG disabled.
-  - [ ] With `execution_graph = true` and ceiling 0, a warning note is present.
-  - [ ] `approval_mode` (yolo/normal) is shown in the display.
-  - [ ] The `config_viewed` event payload serializes the extended `ConfigStatusView` without error.
+  - [x] enabled + ceiling 3 → display shows DAG enabled + max_parallel_agent_steps=3. (`config_display_shows_dag_enabled_with_ceiling`)
+  - [x] disabled → display shows DAG disabled. (`config_display_shows_dag_disabled_by_default`)
+  - [x] enabled + ceiling 0 → warning present. (`config_warns_when_dag_enabled_but_ceiling_zero`)
+  - [x] approval mode (yolo/normal) shown. (`config_display_shows_approval_mode`)
+  - [x] `config_viewed` payload serializes the extended view. (`config_status_view_serializes_with_dag_fields`)
 - Integration tests:
-  - [ ] Submitting `/config` records a `config_viewed` event whose display contains the DAG fields.
+  - [x] Submitting `/config` records a `config_viewed` event whose payload + display carry the DAG fields. (`config_command_records_dag_fields`)
 - Test coverage target: >=80%
 - All tests must pass
 

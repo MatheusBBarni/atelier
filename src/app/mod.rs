@@ -9,14 +9,23 @@ use crate::actions::{
     RiskNote, RiskTier, TrustTarget,
 };
 use crate::config::{
-    AgentProfile, AgentPromptMetadata, Capability, CouncilExecutionMode, CouncilMemberProfile,
-    EffectiveConfig, Limit,
+    AgentProfile, AgentPromptMetadata, ApprovalMode, Capability, CouncilExecutionMode,
+    CouncilMemberProfile, EffectiveConfig, Limit,
 };
 use crate::governance::{
     GovernanceAnswer, GovernanceDecisionView, GovernanceKind, GOVERNANCE_DECISION_REQUESTED,
     GOVERNANCE_DECISION_RESOLVED,
 };
-use crate::history::{HistoryEvent, HistoryStore};
+use crate::history::{
+    dangling_run_from_events, derive_goal, derive_outcome, hash_events_digest,
+    last_recorded_head_sha, list_session_summaries, HistoryEvent, HistoryStore,
+    RunInterruptedPayload, SessionResumedPayload, RESUME_DRIFT_ACK_KIND, RUN_INTERRUPTED_KIND,
+    SESSION_RESUMED_KIND,
+};
+use crate::hooks::{
+    normalize, public_name_for_kind, try_dispatch, ActorCtx, DroppedHookCounter, HookDispatch,
+    HookLifecycleRecord, MatchedHandler, PayloadDetail,
+};
 use crate::ids::new_id;
 use crate::orchestrator::{
     agent_results, build_orchestrator_prompt, validate_orchestrator_decision, AgentResult,
@@ -38,7 +47,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::env;
 use std::future::{pending, Future};
 use std::path::{Component, Path, PathBuf};
@@ -129,6 +138,11 @@ pub struct AppState {
     pub show_first_approval_explainer: bool,
     pub pending_clarification: Option<PendingClarificationView>,
     pub pending_governance_decision: Option<PendingGovernanceDecisionView>,
+    /// A proposed execution graph awaiting whole-plan approval (normal mode,
+    /// ADR-005). Distinct from `pending_approval` (per-action) so the two never
+    /// collide; `None` outside the DAG plan-approval gate.
+    #[serde(default)]
+    pub pending_plan_approval: Option<PendingPlanApprovalView>,
     pub agents: Vec<AgentView>,
     /// Live-activity-first roster view-model, rebuilt on every publish (ADR-003).
     /// Empty until the roster builder (task 03) populates it.
@@ -141,6 +155,12 @@ pub struct AppState {
     /// Repo + branch of the working directory, refreshed by the git poller
     /// (ADR-006). `None` outside a git repo or while git is unavailable.
     pub git_context: Option<GitContext>,
+    /// True when the newest *prior* session (not this one) ended non-terminally,
+    /// computed once at startup from `list_session_summaries` (task_13). Drives the
+    /// dynamic post-crash hint in the welcome facts; the welcome only renders on an
+    /// empty chat, so it self-clears once the user resumes or starts working.
+    #[serde(default)]
+    pub recoverable_session: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -201,6 +221,18 @@ pub struct ConfigStatusView {
     pub sources: Vec<String>,
     pub preset: Option<String>,
     pub warnings: Vec<String>,
+    /// The resolved approval posture (ADR-005), surfaced in `/config` so the
+    /// gating mode is discoverable in-app. `#[serde(default)]` keeps older
+    /// `config_viewed` payloads deserializing.
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
+    /// Whether the sub-task DAG capability is enabled (`features.execution_graph`).
+    #[serde(default)]
+    pub execution_graph_enabled: bool,
+    /// The reused concurrency ceiling (`limits.max_parallel_agent_steps`); `0`
+    /// disables both flat groups and the DAG.
+    #[serde(default)]
+    pub max_parallel_agent_steps: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -235,6 +267,12 @@ pub struct PendingApprovalView {
     /// that option (e.g. for catastrophic actions).
     #[serde(default)]
     pub trust_target: Option<TrustTarget>,
+    /// Drift context for the first state-mutating action after a drifted resume
+    /// (ADR-004/007): the workspace moved or HEAD changed since this session
+    /// paused, so the user must acknowledge before this change. `None` on the
+    /// clean common path. Surfaced in the approval modal.
+    #[serde(default)]
+    pub drift_notice: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -248,6 +286,27 @@ pub struct PendingClarificationView {
     /// renders checkboxes instead of a single-choice list.
     #[serde(default)]
     pub multi_select: bool,
+}
+
+/// The user-facing snapshot of a proposed execution graph awaiting whole-plan
+/// approval in `normal` mode (ADR-005). A **distinct** slot from
+/// `pending_approval` (per-action) so the two never collide; resolved through
+/// the shared accept/reject approval channel (accept is the recommended
+/// default). The full graph rendering lives in the Plan chat item (task_06);
+/// this view carries just the identity + a one-line summary.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingPlanApprovalView {
+    pub run_id: String,
+    pub graph_id: String,
+    /// Stable id derived from `graph_id` so an accept/reject re-keys identically.
+    pub question_id: String,
+    pub summary: String,
+}
+
+/// Deterministic clarification/approval question id for an execution graph's
+/// whole-plan approval gate, derived from its `graph_id` (ADR-005).
+pub(crate) fn plan_question_id(graph_id: &str) -> String {
+    format!("plan-approval:{graph_id}")
 }
 
 /// The user-facing snapshot of a pending governance decision, mirroring
@@ -279,6 +338,15 @@ pub enum ApprovalResolution {
     Deny,
     ApproveOnce,
     ApproveAndTrust,
+}
+
+/// The user's answer at the whole-plan approval gate (ADR-005): accept runs the
+/// proposed graph; reject carries an optional free-text reason that returns the
+/// plan to the orchestrator to re-propose.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanApprovalAnswer {
+    Accept,
+    Reject { reason: Option<String> },
 }
 
 impl ApprovalResolution {
@@ -358,8 +426,16 @@ pub enum AppEvent {
     /// (governance spine, ADR-003). The `decision_id` lets the resolver reject a
     /// stale answer that does not match the pending decision.
     GovernanceDecisionResolved(String, GovernanceAnswer),
+    /// Resolve the pending whole-plan approval `question_id` with `answer`
+    /// (DAG, ADR-005). The `question_id` (derived from the graph_id) lets the
+    /// resolver reject a stale answer that does not match the pending plan.
+    PlanApprovalResolved(String, PlanApprovalAnswer),
     FollowUpCancelled(String),
     FollowUpResumeRequested(String),
+    /// Resume the session with this id (session browser, ADR-002): the worker
+    /// reads it off-thread, `adopt_session`s it, and appends the resume
+    /// lifecycle events. Rejected while a run is active (one-active-run guard).
+    ResumeSession(String),
     InputCharacter(char),
     InputBackspace,
     RunInterruptRequested,
@@ -395,6 +471,7 @@ pub struct App {
     pending_approval: Option<PendingApproval>,
     pending_clarification: Option<PendingClarification>,
     pending_governance_decision: Option<PendingGovernanceDecision>,
+    pending_plan_approval: Option<PendingPlanApproval>,
     active_step: Option<ActiveStep>,
     active_steps: Vec<ActiveStep>,
     follow_up_queue: VecDeque<QueuedFollowUp>,
@@ -409,6 +486,25 @@ pub struct App {
     /// gone when the process exits. A `Vec` preserves grant order so the `/trust`
     /// listing and 1-based `revoke_index` line up.
     trust_store: TrustStore,
+    /// Sender to the off-thread hook dispatcher (ADR-003). `None` until
+    /// `attach_hook_sender` wires it (only when handlers are configured), so the
+    /// event tap is zero-cost when no hooks are present and recording behaves
+    /// exactly as before.
+    hook_sender: Option<mpsc::Sender<HookDispatch>>,
+    /// Shared best-effort drop counter, incremented by the tap when the dispatch
+    /// channel is full. Surfaced by `--doctor` (task_08).
+    dropped_hooks: DroppedHookCounter,
+    /// Per-session approval-mode override for a resumed session (ADR-004):
+    /// `Some(Normal)` after resume forces an approval before any write/command,
+    /// independent of the global `config.approval_mode` (which may be `Yolo`).
+    /// `None` for a fresh session. Re-elevation to `Yolo` is a fresh explicit act;
+    /// prior approvals are never replayed (the trust store is cleared on adopt).
+    resume_approval_mode: Option<ApprovalMode>,
+    /// Armed when a resumed session detected workspace drift (cwd moved or HEAD
+    /// changed, ADR-004/007). Forces a positive acknowledgment on the FIRST
+    /// state-mutating action and is cleared once acknowledged. `None` on the clean
+    /// path. Reset by `adopt_session`, set by `resume_session`.
+    pending_drift_ack: Option<git::WorkspaceDrift>,
 }
 
 /// In-memory, session-scoped allow-list of exact trust targets (ADR-004). Granted
@@ -501,6 +597,17 @@ struct PendingClarification {
 #[derive(Clone, Debug)]
 struct PendingGovernanceDecision {
     run: RunDriveContext,
+}
+
+/// Captured state for a DAG whole-plan approval paused in `normal` mode
+/// (ADR-005): the run, the proposing decision, and the validated graph, all
+/// owned so accept can run the graph and reject can re-drive the orchestrator —
+/// the same pause/resume transport as [`PendingGovernanceDecision`].
+#[derive(Clone, Debug)]
+struct PendingPlanApproval {
+    run: RunDriveContext,
+    decision: crate::orchestrator::OrchestratorDecision,
+    graph: crate::orchestrator::ExecutionGraph,
 }
 
 #[derive(Clone, Debug)]
@@ -927,6 +1034,19 @@ struct ApprovalSignal {
     resolution: ApprovalResolution,
 }
 
+/// Per-node lifecycle discriminator for the DAG scheduler (ADR-004). The flat
+/// parallel path spawns every child immediately, so its children are `Running`
+/// from the start and never read this field; the DAG path uses it to tell a
+/// *planned-but-not-yet-admitted* node (`Pending`) apart from a *spawned*
+/// node (`Running`) — a distinction `terminal_result == None` alone cannot make.
+/// Terminality remains authoritative via `terminal_result.is_some()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeRunState {
+    Pending,
+    Running,
+    Terminal,
+}
+
 #[derive(Clone, Debug)]
 struct ParallelChildRuntimeState {
     step_id: String,
@@ -940,6 +1060,9 @@ struct ParallelChildRuntimeState {
     cancellation: CancellationToken,
     terminal_result: Option<AgentResult>,
     result_recorded: bool,
+    /// Admission state for the DAG scheduler; always `Running` on the flat
+    /// parallel path (which spawns all children up front).
+    node_run_state: NodeRunState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -966,6 +1089,81 @@ struct SubtaskRecord {
     request: String,
 }
 
+/// A fully replayed session ready to replace the running one in a single atomic
+/// swap (ADR-003/006). The heavy disk read (enumerating + reading `events.jsonl`)
+/// can run off-thread — see [`LoadedSession::from_history_and_events`], which
+/// folds an already-read `Vec<HistoryEvent>` on the worker; [`adopt_session`]
+/// then performs the cheap swap. Every session-scoped value the swap needs is
+/// captured here so adoption never re-reads disk or derives state piecemeal.
+///
+/// [`adopt_session`]: App::adopt_session
+pub struct LoadedSession {
+    /// The adopted durable store, bound via [`HistoryStore::open`] (schema
+    /// validated, so an incompatible log is unconstructible — ADR-003).
+    history: HistoryStore,
+    /// The chat transcript folded from the adopted log (`ChatProjection::rebuild`).
+    projection: ChatProjection,
+    /// The adopted session id (mirrors `history.session_id()`).
+    session_id: String,
+    /// The session goal folded from the log, or `None`.
+    session_goal: Option<String>,
+    /// `Some((run_id, prior_state))` when the last run never reached a terminal
+    /// state — a dangling run that adoption reconciles with a terminal
+    /// `run_interrupted` event (ADR-002). Already filtered to non-terminal by
+    /// [`dangling_run_from_events`], so a `Some` here always needs reconciling.
+    dangling_run: Option<(String, RunState)>,
+    /// The session's end-state before resume, recorded into `session_resumed`
+    /// (ADR-002): the dangling run's in-flight state, else the folded terminal
+    /// outcome. Captured by the resume flow before `adopt_session` consumes this.
+    prior_end_state: RunState,
+    /// A digest of the pre-resume log tail for tamper-evidence (ADR-007), recorded
+    /// into `session_resumed`. `None` for an empty log.
+    prior_tail_hash: Option<String>,
+    /// The session's last-recorded short HEAD (`last_recorded_head_sha`) — the
+    /// drift baseline (ADR-007). The resume flow compares it against the live HEAD
+    /// to detect a branch/rebase change. `None` for a non-git session.
+    stored_head_sha: Option<String>,
+}
+
+impl LoadedSession {
+    /// Open, read, and fold a stored session into an adoptable value. The schema
+    /// validation in [`HistoryStore::open`] makes an incompatible log
+    /// unconstructible (ADR-003), so adoption downstream never sees a stale or
+    /// raw event. The read happens on the calling thread here; the resume flow
+    /// (task_11) reads off-thread and calls [`from_history_and_events`] directly.
+    ///
+    /// [`from_history_and_events`]: LoadedSession::from_history_and_events
+    pub fn load(root: &Path, session_id: &str) -> Result<Self> {
+        let history = HistoryStore::open(root, session_id)?;
+        let events = history.read_events()?;
+        Ok(Self::from_history_and_events(history, &events))
+    }
+
+    /// Fold an already-read event log (from an opened store) into an adoptable
+    /// value. Pure + `Send`-friendly so the heavy read can be lifted off-thread
+    /// while this cheap fold runs on the worker (ADR-003/006).
+    pub fn from_history_and_events(history: HistoryStore, events: &[HistoryEvent]) -> Self {
+        let session_id = history.session_id().to_string();
+        let dangling_run = dangling_run_from_events(events);
+        // Prior end-state: the dangling run's in-flight state if any, else the
+        // folded terminal outcome (ADR-002).
+        let prior_end_state = dangling_run
+            .as_ref()
+            .map(|(_, state)| state.clone())
+            .unwrap_or_else(|| derive_outcome(events));
+        Self {
+            projection: ChatProjection::rebuild(events),
+            session_goal: derive_goal(events),
+            prior_tail_hash: hash_events_digest(events),
+            stored_head_sha: last_recorded_head_sha(events),
+            prior_end_state,
+            dangling_run,
+            session_id,
+            history,
+        }
+    }
+}
+
 impl App {
     pub async fn new(config: EffectiveConfig) -> Result<Self> {
         Self::new_with_debug(config, false).await
@@ -973,6 +1171,12 @@ impl App {
 
     pub async fn new_with_debug(config: EffectiveConfig, debug_enabled: bool) -> Result<Self> {
         let history = HistoryStore::create(&config.working_directory)?;
+        // Post-crash hint (task_13): does the newest *prior* session (not this
+        // just-created one) show as non-terminal? Computed once at startup.
+        let recoverable_session = newest_prior_session_recoverable(
+            &config.working_directory.join(".atelier"),
+            history.session_id(),
+        );
         let availability = check_all_runtime_availability(&config).await;
         let (interrupt_sender, interrupt_receiver) = watch::channel(0);
         let (approval_sender, approval_receiver) = watch::channel(ApprovalSignal {
@@ -991,6 +1195,7 @@ impl App {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: build_agent_views(&config, &availability),
             roster_rows: Vec::new(),
             // Branded welcome item present from the first frame (ADR-005);
@@ -1000,6 +1205,7 @@ impl App {
             events: Vec::new(),
             input: String::new(),
             git_context: None,
+            recoverable_session,
         };
         let mut app = Self {
             config,
@@ -1011,6 +1217,7 @@ impl App {
             pending_approval: None,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             active_step: None,
             active_steps: Vec::new(),
             follow_up_queue: VecDeque::new(),
@@ -1022,6 +1229,10 @@ impl App {
             approval_sender,
             approval_receiver,
             trust_store: TrustStore::default(),
+            hook_sender: None,
+            dropped_hooks: DroppedHookCounter::new(),
+            resume_approval_mode: None,
+            pending_drift_ack: None,
         };
         app.record_event(
             None,
@@ -1046,6 +1257,23 @@ impl App {
         self.publish_state();
     }
 
+    /// Wire the event tap to the off-thread hook dispatcher (ADR-003). Called by
+    /// `run_tui` only when handlers are configured; the shared `dropped` counter
+    /// is the one the tap increments and `--doctor` reports.
+    pub fn attach_hook_sender(
+        &mut self,
+        sender: mpsc::Sender<HookDispatch>,
+        dropped: DroppedHookCounter,
+    ) {
+        self.hook_sender = Some(sender);
+        self.dropped_hooks = dropped;
+    }
+
+    /// Count of hook dispatches dropped on a full channel (best-effort delivery).
+    pub fn dropped_hook_count(&self) -> u64 {
+        self.dropped_hooks.count()
+    }
+
     pub fn interrupt_handle(&self) -> InterruptHandle {
         InterruptHandle {
             sender: self.interrupt_sender.clone(),
@@ -1067,6 +1295,24 @@ impl App {
             json!({ "message": message.clone() }),
             format!("Error: {}", concise_diagnostic(&message)),
         )
+    }
+
+    /// The approval mode action decisions run under: a resumed session's cautious
+    /// override (ADR-004) when present, else the global config mode. Consulted
+    /// everywhere an `ActionExecutionContext` is built so a resumed `Yolo` session
+    /// still prompts before any write/command.
+    fn effective_approval_mode(&self) -> ApprovalMode {
+        self.resume_approval_mode
+            .clone()
+            .unwrap_or_else(|| self.config.approval_mode.clone())
+    }
+
+    /// The drift context to fold into the first mutating action's approval prompt
+    /// (ADR-004/007), or `None` when no drift gate is armed. Carried into the
+    /// `ActionExecutionContext` so the enforcement matrix forces the prompt and
+    /// the modal shows what moved.
+    fn drift_ack_context(&self) -> Option<String> {
+        self.pending_drift_ack.as_ref().map(drift_ack_message)
     }
 
     pub async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
@@ -1096,6 +1342,12 @@ impl App {
                 self.resolve_pending_governance_decision(&decision_id, answer)
                     .await
             }
+            AppEvent::PlanApprovalResolved(question_id, answer) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resolve_pending_plan_approval(&question_id, answer)
+                    .await
+            }
             AppEvent::FollowUpCancelled(id) => {
                 self.state.input.clear();
                 self.publish_state();
@@ -1111,6 +1363,11 @@ impl App {
                     self.react_to_run_end_for_queue().await?;
                 }
                 Ok(())
+            }
+            AppEvent::ResumeSession(session_id) => {
+                self.state.input.clear();
+                self.publish_state();
+                self.resume_session(session_id).await
             }
             AppEvent::InputCharacter(ch) => {
                 self.state.input.push(ch);
@@ -1149,6 +1406,258 @@ impl App {
         )?;
         self.session_ended = true;
         Ok(())
+    }
+
+    /// The single atomic point that swaps the running session for `loaded`
+    /// (ADR-003/006): reassign **every** session-scoped field, reconcile a
+    /// dangling run, and emit exactly one state broadcast. No other path may
+    /// rebind these fields piecemeal — the exhaustiveness test
+    /// `adopt_session_resets_every_session_scoped_field` guards that, and the
+    /// `AppState` subset is rebuilt via a full struct literal below so a new
+    /// `AppState` field forces a compile error here rather than silently
+    /// stranding prior-session state.
+    ///
+    /// The worker thread owns `App`, so this swap is atomic from the UI's
+    /// perspective regardless of the single broadcast (ADR-006).
+    ///
+    /// Kept private per ADR-006 (the single, audited swap point); the production
+    /// caller is [`resume_session`]. `prior_end_state` / `prior_tail_hash` are
+    /// the resume flow's to read off `loaded` *before* this consumes it, so they
+    /// are ignored here.
+    ///
+    /// [`resume_session`]: App::resume_session
+    fn adopt_session(&mut self, loaded: LoadedSession) -> Result<()> {
+        let LoadedSession {
+            history,
+            projection,
+            session_id,
+            session_goal,
+            dangling_run,
+            prior_end_state: _,
+            prior_tail_hash: _,
+            stored_head_sha: _,
+        } = loaded;
+
+        // Swap the durable store + folded transcript first, so the reconciling
+        // `run_interrupted` event below appends into the ADOPTED log/projection.
+        self.history = history;
+        self.chat_projection = projection;
+
+        // Reset every transient session-scoped field on `App` to its fresh value
+        // so no prior-session modal / queue / live step / trust grant leaks
+        // across the swap (mirrors the `interrupt()` teardown).
+        self.step_timings.clear();
+        self.pending_approval = None;
+        self.pending_clarification = None;
+        self.pending_governance_decision = None;
+        self.pending_plan_approval = None;
+        self.active_step = None;
+        self.active_steps.clear();
+        self.follow_up_queue.clear();
+        self.trust_store.clear();
+        self.session_ended = false;
+        // Resume safety state (ADR-004) is reset here and (re)armed by
+        // `resume_session` after this swap, so an adoption that is not a resume
+        // (or a re-resume) never inherits a stale cautious-mode/drift gate.
+        self.resume_approval_mode = None;
+        self.pending_drift_ack = None;
+
+        // Rebuild the session subset of `AppState` via a FULL struct literal (no
+        // `..` spread): a future `AppState` field then forces a compile error
+        // here, making the session-scoped set exhaustive at compile time
+        // (ADR-006). Process-scoped fields (config/availability-derived status,
+        // live git context) carry across unchanged; live agent activity resets
+        // to a fresh idle roster. `chat_items` is filled by `sync_chat_items`
+        // below. Resume always opens `Idle` with no active run (ADR-002).
+        self.state = AppState {
+            session_id,
+            run_state: RunState::Idle,
+            active_run_id: None,
+            session_goal,
+            config_status: self.state.config_status.clone(),
+            git_context: self.state.git_context.clone(),
+            agents: build_agent_views(&self.config, &self.availability),
+            live_step: None,
+            live_steps: Vec::new(),
+            pending_approval: None,
+            show_first_approval_explainer: false,
+            pending_clarification: None,
+            pending_governance_decision: None,
+            pending_plan_approval: None,
+            roster_rows: Vec::new(),
+            chat_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
+            events: Vec::new(),
+            input: String::new(),
+            // The post-crash hint is a startup-only welcome cue; a session adopted
+            // mid-run never shows the welcome, so this is always false here.
+            recoverable_session: false,
+        };
+
+        // Reconcile a dangling (non-terminal) run: append a terminal
+        // `run_interrupted` event so a future replay knows the run ended
+        // (ADR-002). `dangling_run` is pre-filtered to non-terminal, so its
+        // presence is the "detect dangling" signal. The no-publish append keeps
+        // the swap a single broadcast; `run_state` stays `Idle` either way.
+        if let Some((run_id, prior_state)) = dangling_run {
+            let payload = serde_json::to_value(RunInterruptedPayload {
+                run_id: run_id.clone(),
+                prior_state,
+            })?;
+            self.append_event_with_group(
+                Some(run_id),
+                None,
+                None,
+                RUN_INTERRUPTED_KIND,
+                payload,
+                "Prior run interrupted on resume.",
+            )?;
+        }
+
+        // Make `chat_items` reflect the adopted projection (+ the reconciliation
+        // event, if any), then broadcast exactly once.
+        self.sync_chat_items();
+        self.publish_state();
+        Ok(())
+    }
+
+    /// Resume the session `session_id` from the browser (ADR-002): read it
+    /// off-thread, adopt it on the worker, and append the resume lifecycle
+    /// events, landing `Idle` with the full prior transcript re-rendered so the
+    /// user can continue in the SAME durable log. No automatic re-execution of
+    /// the interrupted step (V1). A failed read degrades to a diagnostic rather
+    /// than crashing the worker.
+    async fn resume_session(&mut self, session_id: String) -> Result<()> {
+        // One-active-run guard (req): never swap the session out from under a
+        // live run. The browser is openable mid-run, so this can happen.
+        if self.state.active_run_id.is_some() {
+            self.record_diagnostic("Cannot resume a session while a run is active.")?;
+            return Ok(());
+        }
+
+        // Refresh git first so the resume boundary records the live HEAD/dirty
+        // and the drift baseline reflects where resume actually runs (ADR-007).
+        self.refresh_git_context().await;
+
+        // The heavy disk read (enumerate + read `events.jsonl`) runs off-thread;
+        // the cheap fold + swap run here on the worker (ADR-006). `LoadedSession`
+        // is `Send`, so it crosses the `spawn_blocking` boundary.
+        let root = self.config.working_directory.join(".atelier");
+        let load_id = session_id.clone();
+        let loaded = match tokio::task::spawn_blocking(move || LoadedSession::load(&root, &load_id))
+            .await
+        {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(err)) => {
+                self.record_diagnostic(format!("Failed to load session {session_id}: {err}"))?;
+                return Ok(());
+            }
+            Err(join_err) => {
+                self.record_diagnostic(format!("Failed to load session {session_id}: {join_err}"))?;
+                return Ok(());
+            }
+        };
+
+        // Capture the pre-resume context BEFORE `adopt_session` consumes `loaded`.
+        let prior_end_state = loaded.prior_end_state.clone();
+        let prior_tail_hash = loaded.prior_tail_hash.clone();
+
+        // Drift baseline (ADR-007): the session's stored working dir + last HEAD
+        // vs the live workspace (git just refreshed above). A moved cwd or a
+        // changed HEAD is drift; a merely dirty tree is not (handled by
+        // `detect_drift`).
+        let stored_cwd = loaded.history.read_metadata()?.working_directory;
+        let stored_head = loaded.stored_head_sha.clone();
+        let live_head = self
+            .state
+            .git_context
+            .as_ref()
+            .and_then(|context| context.head_sha.clone());
+        let drift = git::detect_drift(
+            &stored_cwd,
+            stored_head.as_deref(),
+            &self.config.working_directory,
+            live_head.as_deref(),
+        );
+
+        // Atomic swap: reconciles a dangling run (`run_interrupted`) and lands
+        // Idle, re-rendering the full prior transcript (ADR-002/006).
+        self.adopt_session(loaded)?;
+
+        // Re-consent to the cautious default and arm the first-mutation drift
+        // interlock (ADR-004). Set AFTER adopt (which resets both) and BEFORE the
+        // resume boundary, so `session_resumed.approval_mode` records the cautious
+        // override rather than the global config mode.
+        self.resume_approval_mode = Some(ApprovalMode::Normal);
+        if drift.any() {
+            self.pending_drift_ack = Some(drift);
+        }
+
+        // Append the tamper-evident resume boundary AFTER the swap, so it lands
+        // in the adopted log as the most recent event (ADR-002/007/008).
+        self.record_session_resumed(prior_end_state, prior_tail_hash)?;
+        Ok(())
+    }
+
+    /// Append the `session_resumed` boundary event capturing the resume context
+    /// (ADR-002/007/008). The approval mode recorded here is the current
+    /// effective mode; task_12 defaults resume to the cautious (`Normal`) mode.
+    fn record_session_resumed(
+        &mut self,
+        prior_end_state: RunState,
+        prior_tail_hash: Option<String>,
+    ) -> Result<()> {
+        let (head_sha, dirty) = self
+            .state
+            .git_context
+            .as_ref()
+            .map(|context| (context.head_sha.clone(), context.dirty))
+            .unwrap_or((None, false));
+        let approval_mode = serde_json::to_value(self.effective_approval_mode())
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "normal".to_string());
+        let payload = SessionResumedPayload {
+            resumed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            cwd: self.config.working_directory.clone(),
+            head_sha,
+            dirty,
+            prior_end_state,
+            approval_mode,
+            prior_tail_hash,
+        };
+        self.record_event(
+            None,
+            None,
+            SESSION_RESUMED_KIND,
+            serde_json::to_value(payload)?,
+            "Session resumed.",
+        )
+    }
+
+    /// On approving the first state-mutating action after a drifted resume,
+    /// record the acknowledgment and disarm the gate so later mutations run under
+    /// the normal cautious approval without re-prompting for drift (ADR-004). A
+    /// no-op when no gate is armed or the action is read-only (which never holds
+    /// the gate). Called from both the serial and parallel approve paths.
+    fn acknowledge_resume_drift(&mut self, action_request: &ActionRequest) -> Result<()> {
+        if !crate::actions::is_mutating_kind(&action_request.kind) {
+            return Ok(());
+        }
+        let Some(drift) = self.pending_drift_ack.take() else {
+            return Ok(());
+        };
+        self.record_event(
+            self.state.active_run_id.clone(),
+            Some(action_request.step_id.clone()),
+            RESUME_DRIFT_ACK_KIND,
+            json!({
+                "cwd_moved": drift.cwd_moved,
+                "head_changed": drift.head_changed,
+                "action_id": action_request.action_id.clone(),
+            }),
+            "Resume drift acknowledged before the first change.",
+        )
     }
 
     pub async fn submit_prompt(&mut self, prompt: impl Into<String>) -> Result<()> {
@@ -1248,7 +1757,16 @@ impl App {
             Some(run_id.clone()),
             None,
             "run_started",
-            json!({ "run_id": run_id }),
+            json!({
+                "run_id": run_id,
+                // Resume drift baseline (ADR-007): the short HEAD as of the last
+                // git poll, recoverable later by folding the log.
+                "head_sha": self
+                    .state
+                    .git_context
+                    .as_ref()
+                    .and_then(|context| context.head_sha.clone()),
+            }),
             "Run started.",
         )?;
         if let Some(start) = workflow_start.as_ref() {
@@ -1544,6 +2062,7 @@ impl App {
             && self.pending_approval.is_none()
             && self.pending_clarification.is_none()
             && self.pending_governance_decision.is_none()
+            && self.pending_plan_approval.is_none()
     }
 
     /// React to the Run that just ended: drain queued follow-ups FIFO after a
@@ -1649,6 +2168,8 @@ impl App {
                     "run is waiting for clarification"
                 } else if self.pending_governance_decision.is_some() {
                     "run is waiting for a governance decision"
+                } else if self.pending_plan_approval.is_some() {
+                    "run is waiting for plan approval"
                 } else {
                     "run is waiting for user"
                 }
@@ -1692,7 +2213,16 @@ impl App {
             Some(run_id.clone()),
             None,
             "run_started",
-            json!({ "run_id": run_id }),
+            json!({
+                "run_id": run_id,
+                // Resume drift baseline (ADR-007): the short HEAD as of the last
+                // git poll, recoverable later by folding the log.
+                "head_sha": self
+                    .state
+                    .git_context
+                    .as_ref()
+                    .and_then(|context| context.head_sha.clone()),
+            }),
             "Run started.",
         )?;
         self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
@@ -1897,6 +2427,9 @@ impl App {
             // the re-run runs it even when catastrophic or floor=Enforce (which
             // would otherwise re-prompt).
             pending.context.pre_approved = true;
+            // Approving the first mutating action after a drifted resume is the
+            // drift acknowledgment (ADR-004): record it and disarm the gate.
+            self.acknowledge_resume_drift(&pending.action_request)?;
             self.record_command_started_if_executable(
                 &pending.run.run_id,
                 &pending.step_id,
@@ -2132,6 +2665,11 @@ impl App {
                     self.pending_governance_decision
                         .as_ref()
                         .map(|pending| pending.run.clone())
+                })
+                .or_else(|| {
+                    self.pending_plan_approval
+                        .as_ref()
+                        .map(|pending| pending.run.clone())
                 });
             self.record_step_cancelled_if_active()?;
             self.record_event(
@@ -2152,9 +2690,11 @@ impl App {
             self.state.show_first_approval_explainer = false;
             self.state.pending_clarification = None;
             self.state.pending_governance_decision = None;
+            self.state.pending_plan_approval = None;
             self.pending_approval = None;
             self.pending_clarification = None;
             self.pending_governance_decision = None;
+            self.pending_plan_approval = None;
             self.active_step = None;
             self.active_steps.clear();
             self.sync_chat_items();
@@ -2171,19 +2711,29 @@ impl App {
     ) -> Result<()> {
         let drive_result = self.drive_run_inner(&mut run, resume).await;
         if drive_result.is_ok() {
-            if !matches!(self.state.run_state, RunState::WaitingForUser) {
-                self.record_workflow_completed(
-                    &mut run,
-                    matches!(self.state.run_state, RunState::Interrupted),
-                )?;
-            }
-            self.write_run_record(&run)?;
-            if !matches!(self.state.run_state, RunState::WaitingForUser) {
-                self.state.active_run_id = None;
-                self.publish_state();
-            }
+            self.finalize_run_record(&mut run)?;
         }
         drive_result
+    }
+
+    /// Persist the run record and release `active_run_id` at run end, unless the
+    /// run paused for the user (then the record is written but the run stays
+    /// active). Shared by `drive_run` and the plan-approval accept path so a
+    /// directly-driven graph that ends on a limit/interrupt isn't left with a
+    /// stale record or a dangling active run.
+    fn finalize_run_record(&mut self, run: &mut RunDriveContext) -> Result<()> {
+        if !matches!(self.state.run_state, RunState::WaitingForUser) {
+            self.record_workflow_completed(
+                run,
+                matches!(self.state.run_state, RunState::Interrupted),
+            )?;
+        }
+        self.write_run_record(run)?;
+        if !matches!(self.state.run_state, RunState::WaitingForUser) {
+            self.state.active_run_id = None;
+            self.publish_state();
+        }
+        Ok(())
     }
 
     async fn drive_run_inner(
@@ -2343,6 +2893,12 @@ impl App {
                     }
                     DecisionNextStep::ParallelGroup(group) => {
                         self.handle_parallel_group_decision(run, &decision, group)
+                            .await
+                    }
+                    DecisionNextStep::Dag(graph) => {
+                        // Propose the plan, then gate (normal) or auto-accept
+                        // (yolo) before the scheduler admits any node.
+                        self.handle_execution_graph_decision(run, &decision, graph)
                             .await
                     }
                 }
@@ -2798,6 +3354,940 @@ impl App {
         Ok(AgentStepOutcome::Completed)
     }
 
+    /// Propose an execution graph and gate it before scheduling (ADR-005). In
+    /// `normal` mode the whole plan pauses on a binary accept/reject resolved
+    /// through the clarification answer channel (a distinct `pending_plan_approval`
+    /// slot, never the per-action approval slot); `yolo` auto-accepts and runs
+    /// immediately. A node is admitted only after acceptance, so fail-closed
+    /// behavior (task_04) holds in both modes.
+    async fn handle_execution_graph_decision(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+        graph: crate::orchestrator::ExecutionGraph,
+    ) -> Result<bool> {
+        // Honor the review/fix cycle cap for fixer-bearing graphs, mirroring the
+        // single-agent and parallel-group paths so a DAG-routed fixer can't
+        // bypass the loop-protection invariant.
+        if self.review_fix_cycle_limit_reached(run, "fixer")
+            && graph.nodes.iter().any(|node| node.agent == "fixer")
+        {
+            self.stop_for_review_fix_cycle_limit(run)?;
+            return Ok(false);
+        }
+        self.emit_execution_graph_proposed(run, &graph, &decision.decision_id)?;
+        if self.config.approval_mode == ApprovalMode::Normal {
+            // Pause: capture the run + graph + decision so accept can run the
+            // graph and reject can re-drive the orchestrator (same transport as
+            // the governance gate). No node is admitted until the user accepts.
+            let question_id = plan_question_id(&graph.graph_id);
+            self.state.run_state = RunState::WaitingForUser;
+            self.pending_plan_approval = Some(PendingPlanApproval {
+                run: run.clone(),
+                decision: decision.clone(),
+                graph: graph.clone(),
+            });
+            self.state.pending_plan_approval = Some(PendingPlanApprovalView {
+                run_id: run.run_id.clone(),
+                graph_id: graph.graph_id.clone(),
+                question_id,
+                summary: format!(
+                    "Review the proposed plan: {} node(s), {} edge(s).",
+                    graph.nodes.len(),
+                    graph.edges.len()
+                ),
+            });
+            self.set_agent_status("orchestrator", "waiting_for_user");
+            self.publish_state();
+            Ok(false)
+        } else {
+            self.emit_execution_graph_approved(run, &graph, &decision.decision_id, true)?;
+            match self.run_execution_graph(run, decision, graph).await? {
+                AgentStepOutcome::Completed => Ok(true),
+                AgentStepOutcome::Paused | AgentStepOutcome::Stop => Ok(false),
+            }
+        }
+    }
+
+    /// Resolve a pending whole-plan approval (ADR-005). `Accept` records the
+    /// approval, runs the graph, and continues the orchestrator loop;
+    /// `Reject { reason }` records the rejection with its optional free-text
+    /// reason and returns the plan to the orchestrator to re-propose (not a hard
+    /// failure). Mirrors `resolve_pending_governance_decision`'s transport.
+    pub async fn resolve_pending_plan_approval(
+        &mut self,
+        question_id: &str,
+        answer: PlanApprovalAnswer,
+    ) -> Result<()> {
+        let expected = match self.state.pending_plan_approval.as_ref() {
+            Some(view) => view.question_id.clone(),
+            None => bail!("no plan approval is pending"),
+        };
+        if expected != question_id {
+            return Err(anyhow!(
+                "answer question id does not match pending plan approval (expected: {expected}, got: {question_id})"
+            ));
+        }
+        let Some(pending) = self.pending_plan_approval.take() else {
+            bail!("no plan approval is pending");
+        };
+        self.state.pending_plan_approval = None;
+        let mut run = pending.run;
+        let decision = pending.decision;
+        let graph = pending.graph;
+
+        match answer {
+            PlanApprovalAnswer::Accept => {
+                self.emit_execution_graph_approved(&run, &graph, &decision.decision_id, false)?;
+                self.state.run_state = RunState::Running;
+                self.publish_state();
+                match self.run_execution_graph(&mut run, &decision, graph).await? {
+                    AgentStepOutcome::Completed => self.drive_and_replay(run, None).await?,
+                    AgentStepOutcome::Paused | AgentStepOutcome::Stop => {
+                        // The graph ended the run (limit/interrupt) without
+                        // continuing the orchestrator loop; finalize like
+                        // drive_run so the record and active_run_id aren't stale.
+                        self.finalize_run_record(&mut run)?;
+                        self.react_to_run_end_for_queue().await?;
+                    }
+                }
+            }
+            PlanApprovalAnswer::Reject { reason } => {
+                let reason_text = reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+                self.emit_execution_graph_rejected(
+                    &run,
+                    &graph,
+                    &decision.decision_id,
+                    reason_text,
+                )?;
+                if let Some(reason_text) = reason_text {
+                    run.prompt = format!(
+                        "{}\n\nThe user rejected the proposed plan: {reason_text}",
+                        run.prompt
+                    );
+                }
+                self.state.run_state = RunState::Planning;
+                self.publish_state();
+                self.drive_and_replay(run, None).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_execution_graph_proposed(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        decision_id: &str,
+    ) -> Result<()> {
+        let snapshot = execution_graph_snapshot(graph, &BTreeMap::new(), &BTreeSet::new());
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            crate::history::EXECUTION_GRAPH_PROPOSED_KIND,
+            json!({
+                "graph_id": graph.graph_id,
+                "decision_id": decision_id,
+                "reason": graph.reason,
+                "graph": snapshot,
+            }),
+            "Execution graph proposed.",
+        )
+    }
+
+    fn emit_execution_graph_approved(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        decision_id: &str,
+        auto_accepted: bool,
+    ) -> Result<()> {
+        let snapshot = execution_graph_snapshot(graph, &BTreeMap::new(), &BTreeSet::new());
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            crate::history::EXECUTION_GRAPH_APPROVED_KIND,
+            json!({
+                "graph_id": graph.graph_id,
+                "decision_id": decision_id,
+                "auto_accepted": auto_accepted,
+                "graph": snapshot,
+            }),
+            "Execution graph approved.",
+        )
+    }
+
+    fn emit_execution_graph_rejected(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        decision_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let snapshot = execution_graph_snapshot(graph, &BTreeMap::new(), &BTreeSet::new());
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            crate::history::EXECUTION_GRAPH_REJECTED_KIND,
+            json!({
+                "graph_id": graph.graph_id,
+                "decision_id": decision_id,
+                "reason": reason,
+                "graph": snapshot,
+            }),
+            "Execution graph rejected.",
+        )
+    }
+
+    /// Lower a validated [`ExecutionGraph`](crate::orchestrator::ExecutionGraph)
+    /// onto the reused parallel executor with **lazy ready-set admission**
+    /// (ADR-004). Instead of spawning every node up front, the join loop re-runs
+    /// [`admit_ready_nodes`](Self::admit_ready_nodes) at the top of every
+    /// iteration: it spawns newly-ready nodes, fail-closed-skips nodes downstream
+    /// of a failure, and — because skip-propagation cascades to a fixpoint and a
+    /// blocked node always has a running node ahead of it — always drains to
+    /// all-terminal without deadlocking.
+    async fn run_execution_graph(
+        &mut self,
+        run: &mut RunDriveContext,
+        decision: &crate::orchestrator::OrchestratorDecision,
+        graph: crate::orchestrator::ExecutionGraph,
+    ) -> Result<AgentStepOutcome> {
+        self.state.run_state = RunState::Running;
+        if self.wall_clock_limit_reached(run) {
+            self.stop_for_wall_clock_limit(run)?;
+            return Ok(AgentStepOutcome::Stop);
+        }
+        if self.execution_graph_exceeds_agent_step_limit(run, &graph) {
+            self.stop_for_execution_graph_agent_step_limit(run, &graph)?;
+            return Ok(AgentStepOutcome::Stop);
+        }
+
+        let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let cancellation = CancellationToken::new();
+        let interrupt_start = *self.interrupt_receiver.borrow();
+        let approval_start = self.approval_receiver.borrow().sequence;
+
+        // Static graph metadata: predecessors and command-ness per node.
+        let mut predecessors: BTreeMap<String, Vec<String>> = graph
+            .nodes
+            .iter()
+            .map(|node| (node.node_id.clone(), Vec::new()))
+            .collect();
+        for edge in &graph.edges {
+            if let Some(preds) = predecessors.get_mut(&edge.to) {
+                preds.push(edge.from.clone());
+            }
+        }
+        let command_nodes: BTreeSet<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node_runs_commands(node))
+            .map(|node| node.node_id.clone())
+            .collect();
+
+        let child_specs = self.prepare_execution_graph_nodes(run, &graph)?;
+        if let Some(workflow) = run.workflow.as_mut() {
+            for child in &child_specs {
+                workflow.record_planned_targets(
+                    &graph.graph_id,
+                    Some(&child.step_id),
+                    &child.step_label,
+                    &child.file_scope,
+                    &self.config.working_directory,
+                    &self.config.workspace.extra_write_roots,
+                )?;
+            }
+        }
+
+        let (sender, mut receiver) =
+            mpsc::channel(RUNTIME_EVENT_CHANNEL_CAPACITY * child_specs.len().max(1));
+        let resume_handle = ParallelRuntimeResumeHandle {
+            cancellation: cancellation.clone(),
+            sender: sender.clone(),
+        };
+        let mut children = BTreeMap::new();
+        let mut coalescers = BTreeMap::new();
+        for mut child in child_specs {
+            child.cancellation = cancellation.child_token();
+            coalescers.insert(
+                child.step_id.clone(),
+                RuntimeStreamCoalescer::new(child.agent_id.clone()),
+            );
+            children.insert(child.step_id.clone(), child);
+        }
+        let mut skipped_nodes: BTreeSet<String> = BTreeSet::new();
+
+        // Each node_pending event carries the full graph snapshot, so the Plan
+        // projection (task_06) can render the whole graph from the first event
+        // even before task_05's proposed/approved events exist.
+        for node in &graph.nodes {
+            let node_id = node.node_id.clone();
+            self.emit_node_lifecycle_event(
+                run,
+                &graph,
+                &children,
+                &skipped_nodes,
+                &node_id,
+                crate::history::NODE_PENDING_KIND,
+            )?;
+        }
+
+        let interrupt_requested =
+            wait_for_interrupt(self.interrupt_receiver.clone(), interrupt_start);
+        tokio::pin!(interrupt_requested);
+        let mut approval_answered = Box::pin(wait_for_approval(
+            self.approval_receiver.clone(),
+            approval_start,
+        ));
+        let mut approval_queue: VecDeque<PendingParallelApproval> = VecDeque::new();
+        let mut limit_tick = tokio::time::interval(Duration::from_millis(100));
+
+        let mut interrupted = false;
+        loop {
+            // Re-run admission at the top of every iteration: this is where the
+            // no-deadlock invariant is enforced (spawn ready nodes, fail-closed
+            // skip doomed ones, all cascaded to a fixpoint).
+            self.admit_ready_nodes(
+                &graph,
+                &mut children,
+                &predecessors,
+                &command_nodes,
+                run,
+                &sender,
+                &mut coalescers,
+                &mut skipped_nodes,
+            )?;
+            self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
+            self.publish_parallel_approval_head(&approval_queue)?;
+            if children
+                .values()
+                .all(|child| child.terminal_result.is_some())
+            {
+                break;
+            }
+
+            let message = tokio::select! {
+                message = receiver.recv() => message,
+                _ = &mut interrupt_requested => {
+                    cancellation.cancel();
+                    interrupted = true;
+                    self.state.run_state = RunState::Interrupted;
+                    self.state.pending_approval = None;
+                    self.state.show_first_approval_explainer = false;
+                    approval_queue.clear();
+                    self.record_step_cancelled_if_active()?;
+                    self.record_event(
+                        Some(run.run_id.clone()),
+                        None,
+                        "run_interrupted",
+                        json!({}),
+                        "Run interrupted.",
+                    )?;
+                    let to_cancel: Vec<(String, String)> = children
+                        .values()
+                        .filter(|child| child.terminal_result.is_none())
+                        .map(|child| (child.step_id.clone(), child.agent_id.clone()))
+                        .collect();
+                    for (node_id, agent_id) in to_cancel {
+                        let result = cancelled_agent_result(
+                            &agent_id,
+                            &node_id,
+                            "Execution graph cancelled by run interrupt.",
+                        );
+                        self.finalize_node(
+                            run,
+                            &graph,
+                            &mut children,
+                            &skipped_nodes,
+                            &node_id,
+                            result,
+                            crate::history::NODE_CANCELLED_KIND,
+                        )?;
+                    }
+                    None
+                }
+                approval = &mut approval_answered => {
+                    approval_answered = Box::pin(wait_for_approval(
+                        self.approval_receiver.clone(),
+                        approval.sequence,
+                    ));
+                    if let Some(pending) = approval_queue.pop_front() {
+                        self.publish_parallel_approval_head(&approval_queue)?;
+                        if let Some(child) = children.get_mut(&pending.step_id) {
+                            if child.terminal_result.is_none() {
+                                self.resolve_parallel_approval(
+                                    run,
+                                    child,
+                                    pending,
+                                    approval.resolution,
+                                    resume_handle.clone(),
+                                )
+                                .await?;
+                            }
+                        }
+                        self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
+                    }
+                    continue;
+                }
+                _ = limit_tick.tick() => {
+                    if self.apply_parallel_limit_checks(run, &mut children, &cancellation)? {
+                        self.drop_terminal_parallel_approvals(&children, &mut approval_queue);
+                        self.publish_parallel_approval_head(&approval_queue)?;
+                    }
+                    continue;
+                }
+            };
+            let Some(message) = message else {
+                break;
+            };
+            match message {
+                ParallelRuntimeMessage::RuntimeEvent { step_id, event } => {
+                    if let Some(child) = children.get(&step_id) {
+                        if child.terminal_result.is_some() {
+                            continue;
+                        }
+                        let coalescer = coalescers
+                            .get_mut(&step_id)
+                            .context("missing execution graph stream coalescer")?;
+                        self.record_parallel_runtime_event(
+                            run,
+                            &graph.graph_id,
+                            &step_id,
+                            coalescer,
+                            event,
+                        )?;
+                        self.set_agent_status(&child.agent_id, "running_parallel");
+                    }
+                }
+                ParallelRuntimeMessage::Output { step_id, output } => {
+                    if children
+                        .get(&step_id)
+                        .map(|child| child.terminal_result.is_some())
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    if let Some(coalescer) = coalescers.get_mut(&step_id) {
+                        self.flush_runtime_stream_coalescer_with_group(
+                            run,
+                            Some(&graph.graph_id),
+                            &step_id,
+                            coalescer,
+                            true,
+                        )?;
+                    }
+                    match *output {
+                        Ok(RuntimeOutput::AgentResult { result }) => {
+                            let kind = execution_graph_node_kind(&result.status);
+                            self.finalize_node(
+                                run,
+                                &graph,
+                                &mut children,
+                                &skipped_nodes,
+                                &step_id,
+                                result,
+                                kind,
+                            )?;
+                        }
+                        Ok(RuntimeOutput::ActionRequest { request }) => {
+                            let Some(child) = children.get_mut(&step_id) else {
+                                continue;
+                            };
+                            if self
+                                .handle_parallel_child_action(
+                                    run,
+                                    &graph.graph_id,
+                                    child,
+                                    request,
+                                    resume_handle.clone(),
+                                    &mut approval_queue,
+                                )
+                                .await?
+                            {
+                                continue;
+                            }
+                            self.publish_parallel_approval_head(&approval_queue)?;
+                        }
+                        Ok(RuntimeOutput::ParseError {
+                            agent,
+                            raw_output,
+                            diagnostic,
+                        }) => {
+                            let result = self.persist_parse_error_with_group(
+                                &run.run_id,
+                                &graph.graph_id,
+                                &step_id,
+                                &agent,
+                                raw_output,
+                                diagnostic,
+                            )?;
+                            self.finalize_node(
+                                run,
+                                &graph,
+                                &mut children,
+                                &skipped_nodes,
+                                &step_id,
+                                result,
+                                crate::history::NODE_FAILED_KIND,
+                            )?;
+                        }
+                        Ok(RuntimeOutput::OrchestratorDecision { .. }) => {
+                            let agent_id = children
+                                .get(&step_id)
+                                .map(|child| child.agent_id.clone())
+                                .unwrap_or_default();
+                            let result = failed_agent_result(
+                                &agent_id,
+                                &step_id,
+                                "Execution graph node returned an orchestrator decision.",
+                            );
+                            self.finalize_node(
+                                run,
+                                &graph,
+                                &mut children,
+                                &skipped_nodes,
+                                &step_id,
+                                result,
+                                crate::history::NODE_FAILED_KIND,
+                            )?;
+                        }
+                        Err(error) => {
+                            let agent_id = children
+                                .get(&step_id)
+                                .map(|child| child.agent_id.clone())
+                                .unwrap_or_default();
+                            let result = failed_agent_result(
+                                &agent_id,
+                                &step_id,
+                                &format!("Execution graph node runtime failed: {error:#}"),
+                            );
+                            self.finalize_node(
+                                run,
+                                &graph,
+                                &mut children,
+                                &skipped_nodes,
+                                &step_id,
+                                result,
+                                crate::history::NODE_FAILED_KIND,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Backfill any node terminalized by a reused helper (the limit-check /
+        // approval sweep sets terminal_result directly without going through
+        // finalize_node), so its agent_result event, node lifecycle event, and
+        // workflow-ledger entry are still recorded. Mirrors the flat parallel
+        // path's unrecorded sweep.
+        let unrecorded: Vec<(String, AgentResult)> = children
+            .iter()
+            .filter(|(_, child)| child.terminal_result.is_some() && !child.result_recorded)
+            .map(|(node_id, child)| {
+                (
+                    node_id.clone(),
+                    child.terminal_result.clone().expect("filtered to Some"),
+                )
+            })
+            .collect();
+        for (node_id, result) in unrecorded {
+            let kind = execution_graph_node_kind(&result.status);
+            self.finalize_node(
+                run,
+                &graph,
+                &mut children,
+                &skipped_nodes,
+                &node_id,
+                result,
+                kind,
+            )?;
+        }
+
+        let node_results = children
+            .values()
+            .filter_map(|child| child.terminal_result.clone().map(|result| (child, result)))
+            .collect::<Vec<_>>();
+        for (_child, result) in &node_results {
+            run.previous_results.push(RunStepResult::Agent {
+                result: result.clone(),
+            });
+        }
+        let graph_result = synthesize_execution_graph_result(
+            &run.run_id,
+            &graph.graph_id,
+            &started_at,
+            &node_results,
+            &skipped_nodes,
+        );
+        let mut completed_payload = serde_json::to_value(&graph_result)?;
+        if let serde_json::Value::Object(map) = &mut completed_payload {
+            map.insert(
+                "decision_id".to_string(),
+                serde_json::Value::String(decision.decision_id.clone()),
+            );
+            map.insert(
+                "graph".to_string(),
+                execution_graph_snapshot(&graph, &children, &skipped_nodes),
+            );
+        }
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            crate::history::EXECUTION_GRAPH_COMPLETED_KIND,
+            completed_payload,
+            "Execution graph completed.",
+        )?;
+        run.previous_results.push(RunStepResult::Dag {
+            result: graph_result,
+        });
+        for child in children.values() {
+            self.clear_active_step(&child.step_id);
+        }
+        self.state.pending_approval = None;
+        self.state.show_first_approval_explainer = false;
+        self.sync_chat_items();
+        self.publish_state();
+        if interrupted {
+            self.record_workflow_completed(run, true)?;
+            return Ok(AgentStepOutcome::Stop);
+        }
+        Ok(AgentStepOutcome::Completed)
+    }
+
+    /// Apply one ready-set admission pass (ADR-004): sync terminal nodes, compute
+    /// the pure [`compute_admission`] decision, fail-closed-skip the doomed
+    /// nodes, and spawn the admitted ones on the reused parallel runtime.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_ready_nodes(
+        &mut self,
+        graph: &crate::orchestrator::ExecutionGraph,
+        children: &mut BTreeMap<String, ParallelChildRuntimeState>,
+        predecessors: &BTreeMap<String, Vec<String>>,
+        command_nodes: &BTreeSet<String>,
+        run: &mut RunDriveContext,
+        sender: &mpsc::Sender<ParallelRuntimeMessage>,
+        coalescers: &mut BTreeMap<String, RuntimeStreamCoalescer>,
+        skipped_nodes: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        // Any node carrying a terminal_result is terminal regardless of how it
+        // got there (a reused limit/approval/interrupt path may set the result
+        // without the discriminator); reconcile before snapshotting.
+        for child in children.values_mut() {
+            if child.terminal_result.is_some() {
+                child.node_run_state = NodeRunState::Terminal;
+            }
+        }
+
+        let snapshots: Vec<DagNodeSnapshot> = graph
+            .nodes
+            .iter()
+            .map(|node| {
+                let child = children.get(&node.node_id);
+                let succeeded = child
+                    .and_then(|child| child.terminal_result.as_ref())
+                    .map(|result| {
+                        matches!(
+                            result.status,
+                            AgentResultStatus::Completed | AgentResultStatus::NoChanges
+                        )
+                    })
+                    .unwrap_or(false);
+                DagNodeSnapshot {
+                    node_id: node.node_id.clone(),
+                    run_state: child
+                        .map(|child| child.node_run_state)
+                        .unwrap_or(NodeRunState::Pending),
+                    succeeded,
+                    is_command: command_nodes.contains(&node.node_id),
+                    write_files: node.file_scope.write_files.iter().cloned().collect(),
+                    predecessors: predecessors.get(&node.node_id).cloned().unwrap_or_default(),
+                }
+            })
+            .collect();
+        // The DAG reuses `max_parallel_agent_steps` as its concurrency ceiling;
+        // admission never spawns more than that many nodes at once.
+        let max_concurrent = self.config.limits.max_parallel_agent_steps as usize;
+        let decision = compute_admission(&snapshots, max_concurrent);
+
+        for node_id in decision.skip {
+            let agent_id = children
+                .get(&node_id)
+                .map(|child| child.agent_id.clone())
+                .unwrap_or_default();
+            if let Some(child) = children.get_mut(&node_id) {
+                child.cancellation.cancel();
+            }
+            skipped_nodes.insert(node_id.clone());
+            let result = skipped_agent_result(
+                &agent_id,
+                &node_id,
+                "Skipped: an upstream node did not succeed.",
+            );
+            self.finalize_node(
+                run,
+                graph,
+                children,
+                skipped_nodes,
+                &node_id,
+                result,
+                crate::history::NODE_SKIPPED_KIND,
+            )?;
+        }
+
+        for node_id in decision.admit {
+            let spawn = {
+                let child = children
+                    .get_mut(&node_id)
+                    .context("admitted execution graph node missing")?;
+                child.node_run_state = NodeRunState::Running;
+                child.step_started_at = Instant::now();
+                let sequence = child.next_runtime_sequence;
+                child.next_runtime_sequence = child.next_runtime_sequence.saturating_add(1);
+                (
+                    child.step_id.clone(),
+                    child.agent_id.clone(),
+                    child.step_label.clone(),
+                    child.file_scope.clone(),
+                    child.request.clone(),
+                    child.cancellation.clone(),
+                    sequence,
+                )
+            };
+            let (step_id, agent_id, step_label, file_scope, request, child_cancellation, sequence) =
+                spawn;
+            self.set_active_step_with_metadata(
+                &run.run_id,
+                Some(graph.graph_id.clone()),
+                &step_id,
+                Some(step_label.clone()),
+                Some(file_scope.clone()),
+                &agent_id,
+            );
+            self.set_agent_status(&agent_id, "running_parallel");
+            coalescers
+                .entry(step_id.clone())
+                .or_insert_with(|| RuntimeStreamCoalescer::new(agent_id.clone()));
+            spawn_parallel_runtime_task(
+                self.config.clone(),
+                step_id.clone(),
+                request,
+                sequence,
+                child_cancellation,
+                sender.clone(),
+            );
+            self.emit_node_lifecycle_event(
+                run,
+                graph,
+                children,
+                skipped_nodes,
+                &node_id,
+                crate::history::NODE_RUNNING_KIND,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Terminalize one node: persist its `agent_result`, record the terminal
+    /// result + run-state, fold it into the workflow ledger, and emit the
+    /// matching node lifecycle event (succeeded/failed/skipped/cancelled) with a
+    /// full graph snapshot.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_node(
+        &mut self,
+        run: &mut RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        children: &mut BTreeMap<String, ParallelChildRuntimeState>,
+        skipped_nodes: &BTreeSet<String>,
+        node_id: &str,
+        result: AgentResult,
+        lifecycle_kind: &str,
+    ) -> Result<()> {
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            Some(node_id.to_string()),
+            "agent_result",
+            serde_json::to_value(&result)?,
+            format!("{}: {}", result.agent, result.summary),
+        )?;
+        let file_scope = {
+            let child = children
+                .get_mut(node_id)
+                .context("finalized execution graph node missing")?;
+            child.terminal_result = Some(result.clone());
+            child.result_recorded = true;
+            child.node_run_state = NodeRunState::Terminal;
+            child.file_scope.clone()
+        };
+        self.set_live_step_status(
+            node_id,
+            if matches!(
+                result.status,
+                AgentResultStatus::Completed | AgentResultStatus::NoChanges
+            ) {
+                LiveStepStatus::Completed
+            } else {
+                LiveStepStatus::Failed
+            },
+        );
+        if let Some(workflow) = run.workflow.as_mut() {
+            workflow.record_child_result(
+                &graph.graph_id,
+                node_id,
+                &file_scope,
+                &result,
+                &self.config.working_directory,
+                &self.config.workspace.extra_write_roots,
+            )?;
+        }
+        self.emit_node_lifecycle_event(
+            run,
+            graph,
+            children,
+            skipped_nodes,
+            node_id,
+            lifecycle_kind,
+        )?;
+        self.clear_active_step(node_id);
+        Ok(())
+    }
+
+    /// Emit one node lifecycle event keyed by `graph_id` + `node_id`, carrying a
+    /// full graph snapshot so the Plan projection can re-render from it.
+    fn emit_node_lifecycle_event(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+        children: &BTreeMap<String, ParallelChildRuntimeState>,
+        skipped_nodes: &BTreeSet<String>,
+        node_id: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let status = children
+            .get(node_id)
+            .map(|child| node_status_label(child, skipped_nodes))
+            .unwrap_or("pending");
+        let payload = json!({
+            "graph_id": graph.graph_id,
+            "node_id": node_id,
+            "status": status,
+            "graph": execution_graph_snapshot(graph, children, skipped_nodes),
+        });
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            Some(node_id.to_string()),
+            kind,
+            payload,
+            format!("Execution graph node {node_id}: {status}."),
+        )
+    }
+
+    fn prepare_execution_graph_nodes(
+        &mut self,
+        run: &mut RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+    ) -> Result<Vec<ParallelChildRuntimeState>> {
+        let sibling_contexts = graph
+            .nodes
+            .iter()
+            .map(|node| ParallelSiblingContext {
+                step_id: node.node_id.clone(),
+                step_label: node.step_label.clone(),
+                agent: node.agent.clone(),
+                file_scope: node.file_scope.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut children = Vec::with_capacity(graph.nodes.len());
+        // The whole-graph agent-step fit is pre-checked in
+        // execution_graph_exceeds_agent_step_limit, so every node is prepared.
+        for node in &graph.nodes {
+            let agent = self.agent(&node.agent)?.clone();
+            run.step_count += 1;
+            let step = crate::orchestrator::ParallelChildStepPlan {
+                step_label: node.step_label.clone(),
+                agent: node.agent.clone(),
+                instruction: node.instruction.clone(),
+                required_capabilities: node.required_capabilities.clone(),
+                file_scope: node.file_scope.clone(),
+            };
+            let prompt = parallel_child_prompt(&run.prompt, &step);
+            let mut request = self.runtime_request(
+                &run.run_id,
+                &node.node_id,
+                RuntimePrompt::new(&prompt, run.skill_context.as_ref()),
+                agent,
+                run.previous_results.clone(),
+                "agent_result",
+            )?;
+            request.parallel_context = Some(ParallelRuntimeContext {
+                group_id: graph.graph_id.clone(),
+                step_label: node.step_label.clone(),
+                file_scope: node.file_scope.clone(),
+                parallel_siblings: sibling_contexts
+                    .iter()
+                    .filter(|sibling| sibling.step_id != node.node_id)
+                    .cloned()
+                    .collect(),
+                scope_policy_summary: parallel_scope_policy_summary(&node.file_scope),
+            });
+            children.push(ParallelChildRuntimeState {
+                step_id: node.node_id.clone(),
+                step_label: node.step_label.clone(),
+                agent_id: node.agent.clone(),
+                file_scope: node.file_scope.clone(),
+                request,
+                step_started_at: Instant::now(),
+                next_runtime_sequence: 1,
+                action_count: 0,
+                cancellation: CancellationToken::new(),
+                terminal_result: None,
+                result_recorded: false,
+                node_run_state: NodeRunState::Pending,
+            });
+        }
+        Ok(children)
+    }
+
+    fn execution_graph_exceeds_agent_step_limit(
+        &self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+    ) -> bool {
+        match self.config.limits.max_agent_steps {
+            Limit::Value(limit) => run.step_count.saturating_add(graph.nodes.len() as u32) > limit,
+            Limit::Unlimited => false,
+        }
+    }
+
+    fn stop_for_execution_graph_agent_step_limit(
+        &mut self,
+        run: &RunDriveContext,
+        graph: &crate::orchestrator::ExecutionGraph,
+    ) -> Result<()> {
+        self.state.run_state = RunState::LimitReached;
+        self.record_event_with_graph(
+            Some(run.run_id.clone()),
+            Some(graph.graph_id.clone()),
+            None,
+            "run_limit_reached",
+            json!({
+                "limit": "max_agent_steps",
+                "value": run.step_count,
+                "requested_graph_nodes": graph.nodes.len(),
+                "graph_id": graph.graph_id
+            }),
+            "Run limit reached before the execution graph could start.",
+        )
+    }
+
     fn parallel_group_exceeds_agent_step_limit(
         &self,
         run: &RunDriveContext,
@@ -2896,6 +4386,8 @@ impl App {
                 cancellation: CancellationToken::new(),
                 terminal_result: None,
                 result_recorded: false,
+                // The flat parallel path spawns every child immediately.
+                node_run_state: NodeRunState::Running,
             });
         }
         Ok(children)
@@ -2932,13 +4424,14 @@ impl App {
         let context = ActionExecutionContext {
             working_directory: self.config.working_directory.clone(),
             workspace: self.config.workspace.clone(),
-            approval_mode: self.config.approval_mode.clone(),
+            approval_mode: self.effective_approval_mode(),
             command_timeout: command_timeout(&self.config.limits.max_command_minutes),
             user_prompt: Some(run.prompt.clone()),
             action_scope: crate::actions::ActionScope::ParallelFileScope(child.file_scope.clone()),
             floor: self.config.approval.floor,
             trusted_targets: self.trust_store.snapshot(),
             pre_approved: false,
+            drift_ack: self.drift_ack_context(),
         };
         self.record_command_started_if_executable_with_group(
             &run.run_id,
@@ -3098,6 +4591,8 @@ impl App {
             // Pre-approve the re-run so catastrophic / floor=Enforce actions execute
             // instead of re-prompting (mirrors the serial path).
             pending.context.pre_approved = true;
+            // First-mutation drift acknowledgment, mirroring the serial path (ADR-004).
+            self.acknowledge_resume_drift(&pending.action_request)?;
             self.record_command_started_if_executable_with_group(
                 &pending.run_id,
                 Some(&pending.group_id),
@@ -3263,7 +4758,12 @@ impl App {
         let timed_out = children
             .values()
             .filter(|child| {
+                // Only spawned (Running) nodes can hit the per-step time limit; a
+                // DAG node still Pending (planned, not admitted) has a stale
+                // step_started_at and must not be terminalized for "timing out"
+                // before it ever runs.
                 child.terminal_result.is_none()
+                    && child.node_run_state == NodeRunState::Running
                     && self.step_time_limit_reached(child.step_started_at)
             })
             .map(|child| {
@@ -4471,13 +5971,14 @@ impl App {
                     let context = ActionExecutionContext {
                         working_directory: self.config.working_directory.clone(),
                         workspace: self.config.workspace.clone(),
-                        approval_mode: self.config.approval_mode.clone(),
+                        approval_mode: self.effective_approval_mode(),
                         command_timeout: command_timeout(&self.config.limits.max_command_minutes),
                         user_prompt: Some(run.prompt.clone()),
                         action_scope: crate::actions::ActionScope::Unrestricted,
                         floor: self.config.approval.floor,
                         trusted_targets: self.trust_store.snapshot(),
                         pre_approved: false,
+                        drift_ack: self.drift_ack_context(),
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -4708,6 +6209,25 @@ impl App {
         payload: serde_json::Value,
         display: impl Into<String>,
     ) -> Result<()> {
+        self.append_event_with_group(run_id, group_id, step_id, kind, payload, display)?;
+        self.publish_state();
+        Ok(())
+    }
+
+    /// Durably append an event and fold it into the projection/chat **without**
+    /// broadcasting. [`record_event_with_group`] is this plus a `publish_state`;
+    /// `adopt_session` (ADR-006) appends its reconciling `run_interrupted` event
+    /// through this path so the swap emits exactly one `watch` broadcast rather
+    /// than one mid-swap and one at the end.
+    fn append_event_with_group(
+        &mut self,
+        run_id: Option<String>,
+        group_id: Option<String>,
+        step_id: Option<String>,
+        kind: &str,
+        payload: serde_json::Value,
+        display: impl Into<String>,
+    ) -> Result<()> {
         let event = HistoryEvent::new_with_group(
             self.history.session_id().to_string(),
             run_id,
@@ -4717,14 +6237,155 @@ impl App {
             payload,
         );
         self.history.append_event(&event)?;
+        // Non-blocking hook tap (ADR-003): immediately after the durable append,
+        // map the event to the public vocabulary, resolve the actor, normalize,
+        // and `try_send` to the dispatcher. Gated on a wired sender, so it is
+        // zero-cost when no hooks are configured and never `.await`s here.
+        self.dispatch_hooks_for_event(&event);
         if self.debug_enabled {
             self.history.append_debug_event(&event)?;
         }
         self.chat_projection.apply_history_event(&event);
         self.sync_chat_items();
         self.state.events.push(display.into());
+        Ok(())
+    }
+
+    /// Durably record a graph-keyed event and broadcast (ADR-005). The DAG
+    /// sibling of [`record_event_with_group`]: the scheduler (task_04) emits the
+    /// `execution_graph_*` / `node_*` lifecycle through here so graph events
+    /// carry `graph_id` and are never mis-keyed through the flat-group path.
+    fn record_event_with_graph(
+        &mut self,
+        run_id: Option<String>,
+        graph_id: Option<String>,
+        step_id: Option<String>,
+        kind: &str,
+        payload: serde_json::Value,
+        display: impl Into<String>,
+    ) -> Result<()> {
+        self.append_event_with_graph(run_id, graph_id, step_id, kind, payload, display)?;
         self.publish_state();
         Ok(())
+    }
+
+    /// Durably append a graph-keyed event and fold it into the projection
+    /// **without** broadcasting — the DAG sibling of [`append_event_with_group`].
+    fn append_event_with_graph(
+        &mut self,
+        run_id: Option<String>,
+        graph_id: Option<String>,
+        step_id: Option<String>,
+        kind: &str,
+        payload: serde_json::Value,
+        display: impl Into<String>,
+    ) -> Result<()> {
+        let event = HistoryEvent::new_with_graph(
+            self.history.session_id().to_string(),
+            run_id,
+            graph_id,
+            step_id,
+            kind,
+            payload,
+        );
+        self.history.append_event(&event)?;
+        self.dispatch_hooks_for_event(&event);
+        if self.debug_enabled {
+            self.history.append_debug_event(&event)?;
+        }
+        self.chat_projection.apply_history_event(&event);
+        self.sync_chat_items();
+        self.state.events.push(display.into());
+        Ok(())
+    }
+
+    /// The event tap (ADR-003): resolve actor + normalize + match handlers +
+    /// `try_send` to the off-thread dispatcher. Non-blocking and pure-read of
+    /// `&self`; returns immediately when no sender is wired or the event is
+    /// outside the public vocabulary. `hook_started`/`hook_completed` map to
+    /// `None` here, so recording them never re-triggers a hook (recursion guard).
+    fn dispatch_hooks_for_event(&self, event: &HistoryEvent) {
+        let Some(sender) = self.hook_sender.as_ref() else {
+            return; // No hooks wired ⇒ zero cost.
+        };
+        let Some(public_event) = public_name_for_kind(&event.kind) else {
+            return; // Outside the public vocabulary (incl. hook_* events).
+        };
+        let matched: Vec<MatchedHandler> = self
+            .config
+            .hooks
+            .handlers
+            .iter()
+            .enumerate()
+            .filter(|(_, handler)| handler.matches(public_event))
+            .map(|(index, handler)| MatchedHandler {
+                index,
+                handler: handler.clone(),
+            })
+            .collect();
+        if matched.is_empty() {
+            return;
+        }
+        let actor = self.resolve_actor_ctx(event);
+        // Normalize with the full body so the dispatcher can project per-handler
+        // detail (metadata strips it); redaction happens in the dispatcher.
+        let Some(payload) = normalize(event, actor, PayloadDetail::Full) else {
+            return;
+        };
+        try_dispatch(
+            sender,
+            HookDispatch {
+                payload,
+                handlers: matched,
+            },
+            &self.dropped_hooks,
+        );
+    }
+
+    /// Resolve the uniform cross-runtime actor for an event (ADR-003): the agent
+    /// of the step the event belongs to (matched by `step_id`, falling back to
+    /// the current `active_step`) plus that agent profile's runtime. Both `None`
+    /// for an orchestrator-level event emitted before any agent step is active.
+    fn resolve_actor_ctx(&self, event: &HistoryEvent) -> ActorCtx {
+        let agent = event
+            .step_id
+            .as_ref()
+            .and_then(|step_id| {
+                self.active_steps
+                    .iter()
+                    .chain(self.active_step.iter())
+                    .find(|step| &step.step_id == step_id)
+                    .map(|step| step.agent.clone())
+            })
+            .or_else(|| self.active_step.as_ref().map(|step| step.agent.clone()));
+        let Some(agent) = agent else {
+            return ActorCtx::default();
+        };
+        let runtime = self
+            .agent(&agent)
+            .ok()
+            .map(|profile| profile.runtime.clone());
+        ActorCtx {
+            agent: Some(agent),
+            runtime,
+        }
+    }
+
+    /// Record a `hook_started`/`hook_completed` lifecycle event sent back from the
+    /// dispatcher (ADR-003). This is the only `&mut App` site for hook events;
+    /// the dispatcher never calls `record_event` directly. The event kind is
+    /// outside the public vocabulary, so the tap above ignores it (no re-trigger).
+    pub(crate) fn record_hook_lifecycle(&mut self, record: HookLifecycleRecord) -> Result<()> {
+        let display = hook_lifecycle_display(&record);
+        let payload = serde_json::to_value(&record.payload)?;
+        self.record_event_with_group(
+            record.run_id,
+            None,
+            record.step_id,
+            record.kind.event_kind(),
+            payload,
+            display,
+        )
     }
 
     fn record_parallel_group_rejected_if_present(
@@ -5982,6 +7643,9 @@ fn build_config_status(
         sources,
         preset,
         warnings,
+        approval_mode: config.approval_mode.clone(),
+        execution_graph_enabled: config.features.execution_graph,
+        max_parallel_agent_steps: config.limits.max_parallel_agent_steps,
     }
 }
 
@@ -6002,6 +7666,14 @@ fn config_warning_messages(config: &EffectiveConfig) -> Vec<String> {
     // Keybinding trust-boundary + soft-fail notes (ADR-004): surfaced at startup
     // and via /config alongside the model-fallback warning.
     warnings.extend(config.keybinding_warnings.iter().cloned());
+    // Enabled-but-disabled-by-ceiling: the DAG flag is on but the reused
+    // concurrency ceiling is 0, so no graph can ever run (ADR-005).
+    if config.features.execution_graph && config.limits.max_parallel_agent_steps == 0 {
+        warnings.push(
+            "execution_graph is enabled but limits.max_parallel_agent_steps = 0 disables it"
+                .to_string(),
+        );
+    }
     warnings
 }
 
@@ -6430,6 +8102,41 @@ fn capped_preview(text: &str) -> String {
     format!("{truncated}\n… (truncated)")
 }
 
+/// Whether the newest session OTHER than `current_id` ended non-terminally — the
+/// signal for the dynamic post-crash welcome hint (task_13). Read from
+/// `list_session_summaries` (newest-first), skipping the just-created current
+/// session so a fresh launch never flags itself. `false` when there is no prior
+/// session or it ended cleanly (no false "crash" on a normal quit).
+fn newest_prior_session_recoverable(root: &Path, current_id: &str) -> bool {
+    list_session_summaries(root)
+        .into_iter()
+        .find(|summary| summary.session_id != current_id)
+        .map(|summary| !summary.outcome.is_terminal())
+        .unwrap_or(false)
+}
+
+/// Human-readable drift context for the first-mutation approval prompt and the
+/// `ActionExecutionContext` gate (ADR-004/007). Names the concrete drift modes
+/// (moved cwd, changed HEAD) without surfacing the dirty flag (never a trigger).
+fn drift_ack_message(drift: &git::WorkspaceDrift) -> String {
+    let mut reasons = Vec::new();
+    if drift.cwd_moved {
+        reasons.push("the working directory moved");
+    }
+    if drift.head_changed {
+        reasons.push("the git HEAD changed");
+    }
+    let what = if reasons.is_empty() {
+        "the workspace changed".to_string()
+    } else {
+        reasons.join(" and ")
+    };
+    format!(
+        "Workspace drift since this session paused: {what}. Verify you are on the \
+         intended tree before this first change."
+    )
+}
+
 /// Build the rich `PendingApprovalView` for the modal (ADR-003). Risk fields are
 /// derived from `assess_risk` (the same pure assessment the gate used), with the
 /// command/diff previews capped before they enter `AppState`.
@@ -6459,6 +8166,13 @@ fn build_pending_approval_view(
         Some(TrustTarget::WritePath(path)) => vec![path.display().to_string()],
         _ => Vec::new(),
     };
+    // Fold the drift context into the prompt only for the mutating action the
+    // interlock actually gates (ADR-004); a read-only action under the same armed
+    // gate shows no drift notice.
+    let drift_notice = context
+        .drift_ack
+        .clone()
+        .filter(|_| crate::actions::is_mutating_kind(&request.kind));
     PendingApprovalView {
         run_id,
         group_id,
@@ -6476,6 +8190,7 @@ fn build_pending_approval_view(
         boundary_crossed: None,
         reversible: None,
         trust_target: risk.target,
+        drift_notice,
     }
 }
 
@@ -6660,6 +8375,318 @@ fn synthesize_parallel_group_result(
     }
 }
 
+/// One node's view for the pure DAG admission decision (ADR-004): current
+/// lifecycle state, whether it succeeded (meaningful only when terminal),
+/// command-ness, its write set, and its predecessor node_ids.
+#[derive(Clone, Debug)]
+struct DagNodeSnapshot {
+    node_id: String,
+    run_state: NodeRunState,
+    succeeded: bool,
+    is_command: bool,
+    write_files: BTreeSet<String>,
+    predecessors: Vec<String>,
+}
+
+/// The admission decision over a graph snapshot: which currently-Pending nodes
+/// to spawn now (`admit`) and which to terminalize as Skipped now (`skip`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AdmissionDecision {
+    admit: Vec<String>,
+    skip: Vec<String>,
+}
+
+/// Pure ready-set admission over node states (ADR-004) — no I/O, no spawning;
+/// the scheduler applies the returned decision. This function carries the
+/// feature's hardest invariant (fail-closed forward progress):
+///   * **skip-propagation cascades to a fixpoint**, so every node downstream of
+///     a failed/blocked/cancelled/skipped predecessor is terminalized in a
+///     single call (the join loop can then drain to all-terminal — no deadlock);
+///   * a node is **admitted** only when every predecessor is terminal AND
+///     succeeded, its `write_files` are disjoint from the union of running
+///     nodes' writes, and — if it runs commands — nothing else is running
+///     (command nodes run in isolation).
+///
+/// `Pending` (planned-not-admitted) nodes are never counted as "running", so
+/// their write scopes do not pre-occupy the running set.
+fn compute_admission(nodes: &[DagNodeSnapshot], max_concurrent: usize) -> AdmissionDecision {
+    let index: BTreeMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| (node.node_id.as_str(), i))
+        .collect();
+
+    // Fail-closed skip-propagation to a fixpoint: a Pending node is doomed when
+    // any predecessor is terminal-and-not-succeeded or itself already doomed.
+    let mut doomed: BTreeSet<usize> = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (i, node) in nodes.iter().enumerate() {
+            if node.run_state != NodeRunState::Pending || doomed.contains(&i) {
+                continue;
+            }
+            let blocked = node.predecessors.iter().any(|pred_id| {
+                index.get(pred_id.as_str()).is_some_and(|&pi| {
+                    doomed.contains(&pi)
+                        || (nodes[pi].run_state == NodeRunState::Terminal && !nodes[pi].succeeded)
+                })
+            });
+            if blocked {
+                doomed.insert(i);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Admission over the surviving Pending nodes (deterministic by slice order).
+    let running_count = nodes
+        .iter()
+        .filter(|n| n.run_state == NodeRunState::Running)
+        .count();
+    let initially_running = running_count > 0;
+    let mut command_active = nodes
+        .iter()
+        .any(|n| n.run_state == NodeRunState::Running && n.is_command);
+    let mut admitted_any = false;
+    let mut running_writes: BTreeSet<String> = nodes
+        .iter()
+        .filter(|n| n.run_state == NodeRunState::Running)
+        .flat_map(|n| n.write_files.iter().cloned())
+        .collect();
+    let mut admit = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        if node.run_state != NodeRunState::Pending || doomed.contains(&i) {
+            continue;
+        }
+        // A command node, once running or admitted this pass, monopolizes the
+        // graph: nothing else may be admitted alongside it.
+        if command_active {
+            break;
+        }
+        // Honor the reused concurrency ceiling: never let running + newly-admitted
+        // nodes exceed `max_parallel_agent_steps` (ADR-004 — the DAG reuses the
+        // same bound the flat parallel path enforces).
+        if running_count + admit.len() >= max_concurrent {
+            break;
+        }
+        let ready = node.predecessors.iter().all(|pred_id| {
+            index.get(pred_id.as_str()).is_none_or(|&pi| {
+                nodes[pi].run_state == NodeRunState::Terminal && nodes[pi].succeeded
+            })
+        });
+        if !ready {
+            continue;
+        }
+        if node.is_command {
+            // Command nodes run alone: nothing running, nothing admitted yet.
+            if !initially_running && !admitted_any {
+                admit.push(node.node_id.clone());
+                admitted_any = true;
+                command_active = true;
+            }
+        } else if node.write_files.is_disjoint(&running_writes) {
+            admit.push(node.node_id.clone());
+            running_writes.extend(node.write_files.iter().cloned());
+            admitted_any = true;
+        }
+    }
+
+    let skip = doomed.iter().map(|&i| nodes[i].node_id.clone()).collect();
+    AdmissionDecision { admit, skip }
+}
+
+/// Whether a graph node runs commands, derived from its declared capabilities
+/// (ADR-004) — command nodes are scheduled in isolation since their reads and
+/// side effects can't be fenced.
+fn node_runs_commands(node: &crate::orchestrator::ExecutionNode) -> bool {
+    node.required_capabilities.contains(&Capability::Command)
+}
+
+/// Map a completed node's result status to its lifecycle event kind.
+fn execution_graph_node_kind(status: &AgentResultStatus) -> &'static str {
+    match status {
+        AgentResultStatus::Completed | AgentResultStatus::NoChanges => {
+            crate::history::NODE_SUCCEEDED_KIND
+        }
+        _ => crate::history::NODE_FAILED_KIND,
+    }
+}
+
+/// The Plan-view status label for a node's current runtime state. A node in the
+/// `skipped_nodes` set renders `skipped`; otherwise terminality and the result
+/// status (or the admission state) decide the label.
+fn node_status_label(
+    child: &ParallelChildRuntimeState,
+    skipped_nodes: &BTreeSet<String>,
+) -> &'static str {
+    if skipped_nodes.contains(&child.step_id) {
+        return "skipped";
+    }
+    match &child.terminal_result {
+        Some(result) => match result.status {
+            AgentResultStatus::Completed | AgentResultStatus::NoChanges => "succeeded",
+            AgentResultStatus::Cancelled => "cancelled",
+            _ => "failed",
+        },
+        None => match child.node_run_state {
+            NodeRunState::Running => "running",
+            NodeRunState::Pending | NodeRunState::Terminal => "pending",
+        },
+    }
+}
+
+/// A full graph snapshot (every node's current status + the typed edges) carried
+/// in each graph/node event payload (ADR-005) so the single evolving Plan item
+/// can re-render the whole graph from any one event.
+fn execution_graph_snapshot(
+    graph: &crate::orchestrator::ExecutionGraph,
+    children: &BTreeMap<String, ParallelChildRuntimeState>,
+    skipped_nodes: &BTreeSet<String>,
+) -> serde_json::Value {
+    let nodes: Vec<serde_json::Value> = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            let status = children
+                .get(&node.node_id)
+                .map(|child| node_status_label(child, skipped_nodes))
+                .unwrap_or("pending");
+            json!({
+                "node_id": node.node_id,
+                "step_label": node.step_label,
+                "agent": node.agent,
+                "status": status,
+                "file_scope": node.file_scope,
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = graph
+        .edges
+        .iter()
+        .map(|edge| json!({ "from": edge.from, "to": edge.to, "kind": edge.kind }))
+        .collect();
+    json!({
+        "graph_id": graph.graph_id,
+        "reason": graph.reason,
+        "nodes": nodes,
+        "edges": edges,
+    })
+}
+
+/// The terminal AgentResult for a node skipped by fail-closed propagation. Uses
+/// `Cancelled` status (it never ran); the scheduler tracks skipped node_ids
+/// separately so the result and events can distinguish skip from interrupt.
+fn skipped_agent_result(agent: &str, node_id: &str, diagnostic: &str) -> AgentResult {
+    AgentResult {
+        status: AgentResultStatus::Cancelled,
+        ..failed_agent_result(agent, node_id, diagnostic)
+    }
+}
+
+/// Build the terminal [`ExecutionGraphResult`] from each node's recorded result
+/// plus the set of node_ids that were skipped (ADR-004/005). Status mirrors
+/// [`synthesize_parallel_group_result`].
+fn synthesize_execution_graph_result(
+    run_id: &str,
+    graph_id: &str,
+    started_at: &str,
+    node_results: &[(&ParallelChildRuntimeState, AgentResult)],
+    skipped_nodes: &BTreeSet<String>,
+) -> crate::orchestrator::ExecutionGraphResult {
+    use crate::orchestrator::{ExecutionGraphStatus, NodeResultRef};
+    let mut counts = BTreeMap::new();
+    let mut changed_files = Vec::new();
+    let mut results = Vec::new();
+    let mut failed = Vec::new();
+    let mut successful = 0usize;
+
+    for (index, (child, result)) in node_results.iter().enumerate() {
+        let is_skipped = skipped_nodes.contains(&child.step_id);
+        let label = if is_skipped {
+            "skipped".to_string()
+        } else {
+            agent_status_key(&result.status).to_string()
+        };
+        *counts.entry(label).or_insert(0) += 1;
+        if !is_skipped
+            && matches!(
+                result.status,
+                AgentResultStatus::Completed | AgentResultStatus::NoChanges
+            )
+        {
+            successful += 1;
+        }
+        if !is_skipped
+            && matches!(
+                result.status,
+                AgentResultStatus::Failed
+                    | AgentResultStatus::ParseError
+                    | AgentResultStatus::Blocked
+                    | AgentResultStatus::ApprovalDenied
+            )
+        {
+            failed.push(child.step_id.clone());
+        }
+        changed_files.extend(result.changed_files.iter().cloned());
+        results.push(NodeResultRef {
+            node_id: child.step_id.clone(),
+            step_label: child.step_label.clone(),
+            agent: child.agent_id.clone(),
+            file_scope: child.file_scope.clone(),
+            status: result.status.clone(),
+            result_index: index,
+        });
+    }
+    changed_files.sort();
+    changed_files.dedup();
+
+    let total = node_results.len();
+    let status = if total > 0
+        && node_results.iter().all(|(_, result)| {
+            matches!(
+                result.status,
+                AgentResultStatus::Cancelled | AgentResultStatus::LimitReached
+            )
+        }) {
+        if node_results
+            .iter()
+            .any(|(_, result)| matches!(result.status, AgentResultStatus::LimitReached))
+        {
+            ExecutionGraphStatus::LimitReached
+        } else {
+            ExecutionGraphStatus::Cancelled
+        }
+    } else if total > 0 && successful == total {
+        ExecutionGraphStatus::Completed
+    } else if successful > 0 {
+        ExecutionGraphStatus::CompletedWithIssues
+    } else {
+        ExecutionGraphStatus::Failed
+    };
+    let summary = format!(
+        "Execution graph {graph_id} joined with {successful}/{total} successful node(s), {} skipped.",
+        skipped_nodes.len()
+    );
+
+    crate::orchestrator::ExecutionGraphResult {
+        schema_version: 1,
+        graph_id: graph_id.to_string(),
+        run_id: run_id.to_string(),
+        status,
+        summary,
+        node_results: results,
+        counts,
+        changed_files,
+        skipped: skipped_nodes.iter().cloned().collect(),
+        failed,
+        started_at: started_at.to_string(),
+        completed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    }
+}
+
 fn failed_agent_result(agent: &str, step_id: &str, diagnostic: &str) -> AgentResult {
     AgentResult {
         schema_version: 1,
@@ -6751,16 +8778,50 @@ fn loaded_skills_display(metadata: &[LoadedSkillMetadata]) -> String {
     format!("Skills loaded: {skills}.")
 }
 
+/// Transcript line for a `hook_started`/`hook_completed` lifecycle event.
+fn hook_lifecycle_display(record: &HookLifecycleRecord) -> String {
+    let payload = &record.payload;
+    match record.kind {
+        crate::hooks::HookLifecycleKind::Started => {
+            format!("Hook started: {} on {}.", payload.action, payload.event)
+        }
+        crate::hooks::HookLifecycleKind::Completed => {
+            let status = payload.status.as_deref().unwrap_or("done");
+            format!(
+                "Hook completed: {} on {} ({status}).",
+                payload.action, payload.event
+            )
+        }
+    }
+}
+
 fn config_status_display(status: &ConfigStatusView) -> String {
     let sources = status.sources.join(", ");
     let preset = status.preset.as_deref().unwrap_or("none");
-    if status.warnings.is_empty() {
-        format!("Config: sources: {sources}; preset: {preset}; warnings: none.")
-    } else {
+    let approval = approval_mode_label(&status.approval_mode);
+    let dag = if status.execution_graph_enabled {
         format!(
-            "Config: sources: {sources}; preset: {preset}; warnings: {}.",
-            status.warnings.join("; ")
+            "enabled (max_parallel_agent_steps={})",
+            status.max_parallel_agent_steps
         )
+    } else {
+        "disabled".to_string()
+    };
+    let warnings = if status.warnings.is_empty() {
+        "none".to_string()
+    } else {
+        status.warnings.join("; ")
+    };
+    format!(
+        "Config: sources: {sources}; preset: {preset}; approval: {approval}; dag: {dag}; warnings: {warnings}."
+    )
+}
+
+/// Wire label for an [`ApprovalMode`] in the `/config` display.
+fn approval_mode_label(mode: &ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Yolo => "yolo",
+        ApprovalMode::Normal => "normal",
     }
 }
 
@@ -7250,6 +9311,100 @@ runtime = "fake"
         );
     }
 
+    // ── /config DAG visibility (task_07) ──
+
+    #[test]
+    fn config_display_shows_dag_enabled_with_ceiling() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = 3;
+        let status = build_config_status(&config, &BTreeMap::new());
+        assert!(status.execution_graph_enabled);
+        assert_eq!(status.max_parallel_agent_steps, 3);
+        let display = config_status_display(&status);
+        assert!(
+            display.contains("dag: enabled (max_parallel_agent_steps=3)"),
+            "{display}"
+        );
+    }
+
+    #[test]
+    fn config_display_shows_dag_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let status = build_config_status(&config, &BTreeMap::new());
+        assert!(!status.execution_graph_enabled);
+        assert!(config_status_display(&status).contains("dag: disabled"));
+    }
+
+    #[test]
+    fn config_warns_when_dag_enabled_but_ceiling_zero() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = 0;
+        let status = build_config_status(&config, &BTreeMap::new());
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|w| w.contains("max_parallel_agent_steps = 0 disables it")),
+            "{:?}",
+            status.warnings
+        );
+        assert!(config_status_display(&status).contains("max_parallel_agent_steps = 0 disables it"));
+    }
+
+    #[test]
+    fn config_display_shows_approval_mode() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.approval_mode = ApprovalMode::Normal;
+        let normal = config_status_display(&build_config_status(&config, &BTreeMap::new()));
+        assert!(normal.contains("approval: normal"), "{normal}");
+        config.approval_mode = ApprovalMode::Yolo;
+        let yolo = config_status_display(&build_config_status(&config, &BTreeMap::new()));
+        assert!(yolo.contains("approval: yolo"), "{yolo}");
+    }
+
+    #[test]
+    fn config_status_view_serializes_with_dag_fields() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = 2;
+        let value = serde_json::to_value(build_config_status(&config, &BTreeMap::new())).unwrap();
+        assert_eq!(value["execution_graph_enabled"], json!(true));
+        assert_eq!(value["max_parallel_agent_steps"], json!(2));
+        assert_eq!(value["approval_mode"], json!("yolo"));
+    }
+
+    #[tokio::test]
+    async fn config_command_records_dag_fields() {
+        let dir = tempdir().unwrap();
+        let mut config = fake_config(dir.path());
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = 2;
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("/config").await.unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let viewed = events
+            .iter()
+            .find(|event| event.kind == "config_viewed")
+            .expect("config_viewed recorded");
+        assert_eq!(viewed.payload["execution_graph_enabled"], json!(true));
+        assert_eq!(viewed.payload["max_parallel_agent_steps"], json!(2));
+        let display = app.state.events.join("\n");
+        assert!(
+            display.contains("dag: enabled (max_parallel_agent_steps=2)"),
+            "{display}"
+        );
+        assert!(display.contains("approval: yolo"), "{display}");
+    }
+
     fn write_project_skill(
         project_root: &Path,
         directory_name: &str,
@@ -7295,6 +9450,1094 @@ runtime = "fake"
             text.push_str(&line.text);
         }
         text
+    }
+
+    // ── Session adoption (task_10) ──
+
+    /// The `.atelier` data root for a workspace temp dir (where sessions live).
+    fn atelier_root(dir: &Path) -> std::path::PathBuf {
+        dir.join(".atelier")
+    }
+
+    /// Build a separate, fully-recorded session under the same `.atelier` root as
+    /// `dir` and return its id. The `App` is dropped before returning (there is no
+    /// `Drop` that writes events), leaving only the durable log for
+    /// `LoadedSession::load` to replay — the realistic "adopt a session this
+    /// process did not just write" path.
+    async fn seed_session(dir: &Path, record: impl FnOnce(&mut App) -> Result<()>) -> String {
+        let mut app = App::new_with_debug(fake_config(dir), false).await.unwrap();
+        let id = app.history.session_id().to_string();
+        record(&mut app).unwrap();
+        id
+    }
+
+    fn sentinel_active_step(step_id: &str) -> ActiveStep {
+        ActiveStep {
+            run_id: "stale-run".into(),
+            group_id: None,
+            step_id: step_id.into(),
+            step_label: None,
+            file_scope: None,
+            agent: "explorer".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn adopt_session_swaps_identity_goal_and_transcript() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                None,
+                None,
+                "session_goal_set",
+                json!({ "goal": "Ship the browser" }),
+                "Goal set.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "browse sessions", "submitted_prompt": "browse sessions", "source": "fresh" }),
+                "browse sessions",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "all done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new_with_debug(fake_config(dir.path()), false)
+            .await
+            .unwrap();
+        let original = app.state().session_id.clone();
+        assert_ne!(original, session_b, "the two sessions must be distinct");
+
+        let (sender, receiver) = watch::channel(app.state().clone());
+        app.attach_state_sender(sender);
+
+        let loaded = LoadedSession::load(&atelier_root(dir.path()), &session_b).unwrap();
+        app.adopt_session(loaded).unwrap();
+
+        // Identity + goal + run state reflect the ADOPTED session, not app's own.
+        assert_eq!(app.state().session_id, session_b);
+        assert_eq!(app.history.session_id(), session_b);
+        assert_eq!(
+            app.state().session_goal.as_deref(),
+            Some("Ship the browser")
+        );
+        assert_eq!(app.state().run_state, RunState::Idle);
+        assert_eq!(app.state().active_run_id, None);
+
+        // The transcript is the adopted log's fold; the welcome item stays first.
+        assert!(
+            app.state().chat_items.len() >= 2,
+            "expected welcome + adopted items"
+        );
+        let transcript: String = app
+            .state()
+            .chat_items
+            .iter()
+            .map(chat_item_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("browse sessions"),
+            "adopted transcript missing the prompt: {transcript}"
+        );
+
+        // The swap broadcast carried the adopted state over the watch channel.
+        assert_eq!(receiver.borrow().session_id, session_b);
+
+        // A terminal last run needs no reconciliation event.
+        let interrupted = app
+            .history
+            .read_events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == RUN_INTERRUPTED_KIND)
+            .count();
+        assert_eq!(interrupted, 0);
+    }
+
+    #[tokio::test]
+    async fn adopt_session_reconciles_a_dangling_run_to_idle() {
+        let dir = tempdir().unwrap();
+        // A run that started but never reached a terminal event (crash mid-run).
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "do work", "submitted_prompt": "do work", "source": "fresh" }),
+                "do work",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        let mut app = App::new_with_debug(fake_config(dir.path()), false)
+            .await
+            .unwrap();
+        let loaded = LoadedSession::load(&atelier_root(dir.path()), &session_b).unwrap();
+        app.adopt_session(loaded).unwrap();
+
+        // Resume always opens Idle (ADR-002), even reconciling a dangling run.
+        assert_eq!(app.state().run_state, RunState::Idle);
+        assert_eq!(app.state().active_run_id, None);
+
+        // Exactly one terminal run_interrupted was appended to the ADOPTED log so
+        // a future replay knows the run ended.
+        let events = app.history.read_events().unwrap();
+        let reconciliations: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == RUN_INTERRUPTED_KIND)
+            .collect();
+        assert_eq!(
+            reconciliations.len(),
+            1,
+            "expected exactly one reconciliation event"
+        );
+        let payload: RunInterruptedPayload =
+            serde_json::from_value(reconciliations[0].payload.clone()).unwrap();
+        assert_eq!(payload.run_id, "run-b");
+        assert_eq!(payload.prior_state, RunState::Running);
+    }
+
+    #[tokio::test]
+    async fn adopt_session_does_not_reconcile_a_terminal_run() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "ok" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new_with_debug(fake_config(dir.path()), false)
+            .await
+            .unwrap();
+        let loaded = LoadedSession::load(&atelier_root(dir.path()), &session_b).unwrap();
+        app.adopt_session(loaded).unwrap();
+
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RUN_INTERRUPTED_KIND)
+                .count(),
+            0,
+            "a cleanly-completed run must not be reconciled"
+        );
+        assert_eq!(app.state().run_state, RunState::Idle);
+    }
+
+    /// The exhaustiveness guard (ADR-006): mutate every session-scoped field to a
+    /// sentinel, adopt a different session, and assert each was reset/replaced so
+    /// no prior-session state leaks across the swap. The `AppState` subset is
+    /// ALSO guaranteed at compile time by the full struct literal in
+    /// `adopt_session` (a new field there is a compile error); these runtime
+    /// assertions additionally cover the `App`-level fields the literal can't.
+    #[tokio::test]
+    async fn adopt_session_resets_every_session_scoped_field() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "adopted", "submitted_prompt": "adopted", "source": "fresh" }),
+                "adopted",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "ok" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new_with_debug(fake_config(dir.path()), false)
+            .await
+            .unwrap();
+
+        // ── Sentinel every App-level session-scoped field ──────────────────
+        app.step_timings.insert(
+            "step-x".into(),
+            StepTiming {
+                started_at: Instant::now(),
+                last_activity: Instant::now(),
+            },
+        );
+        app.pending_clarification = Some(PendingClarification {
+            run: RunDriveContext::new("stale", None, "q", "q", None, None, None),
+        });
+        app.pending_governance_decision = Some(PendingGovernanceDecision {
+            run: RunDriveContext::new("stale", None, "g", "g", None, None, None),
+        });
+        app.active_step = Some(sentinel_active_step("s1"));
+        app.active_steps.push(sentinel_active_step("s2"));
+        app.follow_up_queue
+            .push_back(QueuedFollowUp::new("queued work"));
+        app.trust_store
+            .grant(TrustTarget::Command("rm -rf /".into()));
+        app.session_ended = true;
+        app.resume_approval_mode = Some(ApprovalMode::Normal);
+        app.pending_drift_ack = Some(git::WorkspaceDrift {
+            cwd_moved: true,
+            head_changed: true,
+        });
+        // `pending_approval` (App) is omitted: a PendingApproval needs a full
+        // PausedStep + RuntimeRequest + ActionExecutionContext. Its reset is the
+        // explicit `self.pending_approval = None` in adopt_session, asserted below.
+
+        // ── Sentinel the cheap AppState fields (the literal guards them all at
+        //    compile time; these prove the runtime reset for the obvious ones) ──
+        app.state.run_state = RunState::Running;
+        app.state.active_run_id = Some("stale-run".into());
+        app.state.session_goal = Some("stale goal".into());
+        app.state.input = "half-typed".into();
+        app.state.show_first_approval_explainer = true;
+        app.state.pending_approval = Some(PendingApprovalView::default());
+        app.state.pending_clarification = Some(PendingClarificationView {
+            run_id: "stale".into(),
+            question_id: "q".into(),
+            question: "?".into(),
+            options: Vec::new(),
+            recommended_option_id: None,
+            multi_select: false,
+        });
+        app.state.events.push("stale event".into());
+
+        // ── Adopt a different session ──────────────────────────────────────
+        let loaded = LoadedSession::load(&atelier_root(dir.path()), &session_b).unwrap();
+        app.adopt_session(loaded).unwrap();
+
+        // ── App-level fields reset ─────────────────────────────────────────
+        assert!(app.step_timings.is_empty(), "step_timings not cleared");
+        assert!(
+            app.pending_approval.is_none(),
+            "pending_approval (App) not cleared"
+        );
+        assert!(
+            app.pending_clarification.is_none(),
+            "pending_clarification (App) not cleared"
+        );
+        assert!(
+            app.pending_governance_decision.is_none(),
+            "pending_governance_decision (App) not cleared"
+        );
+        assert!(app.active_step.is_none(), "active_step not cleared");
+        assert!(app.active_steps.is_empty(), "active_steps not cleared");
+        assert!(
+            app.follow_up_queue.is_empty(),
+            "follow_up_queue not cleared"
+        );
+        assert!(app.trust_store.is_empty(), "trust_store not cleared");
+        assert!(!app.session_ended, "session_ended not reset");
+        assert!(
+            app.resume_approval_mode.is_none(),
+            "resume_approval_mode not reset"
+        );
+        assert!(
+            app.pending_drift_ack.is_none(),
+            "pending_drift_ack not reset"
+        );
+
+        // ── AppState session subset reset / replaced ───────────────────────
+        assert_eq!(app.state().session_id, session_b);
+        assert_eq!(app.state().run_state, RunState::Idle);
+        assert_eq!(app.state().active_run_id, None);
+        assert_eq!(app.state().session_goal, None, "stale goal leaked");
+        assert!(app.state().input.is_empty(), "input not cleared");
+        assert!(!app.state().show_first_approval_explainer);
+        assert!(app.state().pending_approval.is_none());
+        assert!(app.state().pending_clarification.is_none());
+        assert!(app.state().pending_governance_decision.is_none());
+        assert!(app.state().live_step.is_none());
+        assert!(app.state().live_steps.is_empty());
+        assert!(app.state().queued_follow_ups.is_empty());
+        assert!(
+            !app.state()
+                .events
+                .iter()
+                .any(|event| event == "stale event"),
+            "stale events leaked across the swap"
+        );
+    }
+
+    // ── Resume flow (task_11) ──
+
+    fn session_resumed_payload(app: &App) -> SessionResumedPayload {
+        let events = app.history.read_events().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == SESSION_RESUMED_KIND)
+            .expect("a session_resumed event was appended");
+        serde_json::from_value(event.payload.clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn resume_appends_session_resumed_with_context() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b.clone()))
+            .await
+            .unwrap();
+
+        let resumed = session_resumed_payload(&app);
+        assert!(!resumed.resumed_at.is_empty(), "resumed_at recorded");
+        // The live working directory (canonicalized by config load on macOS, where
+        // tempdirs live under a `/private` symlink).
+        assert_eq!(
+            resumed.cwd, app.config.working_directory,
+            "cwd is the live working directory"
+        );
+        assert!(
+            resumed.head_sha.is_some(),
+            "a git workspace records a HEAD baseline"
+        );
+        assert!(
+            resumed.prior_tail_hash.is_some(),
+            "a non-empty prior log records a tamper-evidence digest (ADR-007)"
+        );
+        // Terminal prior run ⇒ prior_end_state is the folded outcome.
+        assert_eq!(resumed.prior_end_state, RunState::Completed);
+        assert_eq!(app.state().run_state, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn resume_dangling_appends_run_interrupted_then_session_resumed() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "work", "submitted_prompt": "work", "source": "fresh" }),
+                "work",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+            // dangling: no terminal event
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        // Both lifecycle events present, run_interrupted BEFORE session_resumed.
+        let interrupted_at = events
+            .iter()
+            .position(|event| event.kind == RUN_INTERRUPTED_KIND)
+            .expect("run_interrupted appended for the dangling run");
+        let resumed_at = events
+            .iter()
+            .position(|event| event.kind == SESSION_RESUMED_KIND)
+            .expect("session_resumed appended");
+        assert!(
+            interrupted_at < resumed_at,
+            "the dangling run is closed before the resume boundary"
+        );
+        assert_eq!(app.state().run_state, RunState::Idle);
+        // prior_end_state reflects the in-flight (non-terminal) run.
+        assert_eq!(
+            session_resumed_payload(&app).prior_end_state,
+            RunState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_terminal_session_appends_only_session_resumed() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "ok" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RUN_INTERRUPTED_KIND)
+                .count(),
+            0,
+            "a cleanly-terminal session is not reconciled"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == SESSION_RESUMED_KIND)
+                .count(),
+            1,
+            "exactly one resume boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_renders_full_prior_transcript() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "remembered prompt", "submitted_prompt": "remembered prompt", "source": "fresh" }),
+                "remembered prompt",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "finished the work" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        // The live transcript re-renders the prior thread plus a resume divider.
+        let transcript: String = app
+            .state()
+            .chat_items
+            .iter()
+            .map(chat_item_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("remembered prompt"),
+            "prior prompt re-rendered: {transcript}"
+        );
+        assert!(
+            transcript.to_lowercase().contains("resum"),
+            "a resume divider is rendered: {transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_is_rejected_while_a_run_is_active() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        let own_session = app.state().session_id.clone();
+        // Simulate an in-flight run (the one-active-run guard).
+        app.state.active_run_id = Some("live-run".into());
+
+        app.handle_event(AppEvent::ResumeSession(session_b.clone()))
+            .await
+            .unwrap();
+
+        // The guard refused: the session was NOT swapped and no resume boundary
+        // was written.
+        assert_eq!(app.state().session_id, own_session, "session not swapped");
+        assert_ne!(app.history.session_id(), session_b);
+        assert_eq!(
+            app.history
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == SESSION_RESUMED_KIND)
+                .count(),
+            0,
+            "no resume boundary written while a run is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_then_new_prompt_appends_to_the_same_log_and_drives_a_run() {
+        let dir = tempdir().unwrap();
+        // A session left dangling by a crash mid-run.
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "original work", "submitted_prompt": "original work", "source": "fresh" }),
+                "original work",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+
+        // Resume → both lifecycle events land in the SAME events.jsonl.
+        app.handle_event(AppEvent::ResumeSession(session_b.clone()))
+            .await
+            .unwrap();
+        assert_eq!(app.history.session_id(), session_b, "adopted B's store");
+        let after_resume = app.history.read_events().unwrap();
+        assert!(after_resume.iter().any(|e| e.kind == RUN_INTERRUPTED_KIND));
+        assert!(after_resume.iter().any(|e| e.kind == SESSION_RESUMED_KIND));
+        let resume_event_count = after_resume.len();
+
+        // A new prompt drives a fresh fake run that appends to the SAME log.
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(app.state().run_state, RunState::Completed);
+
+        let final_events = app.history.read_events().unwrap();
+        assert!(
+            final_events.len() > resume_event_count,
+            "the new run appended to the same log"
+        );
+        // The new run is distinct from the reconciled dangling one, completed in
+        // B's log.
+        let new_run = final_events
+            .iter()
+            .find(|event| {
+                event.kind == "prompt_submitted" && event.payload["prompt"] == "create a feature"
+            })
+            .and_then(|event| event.run_id.clone())
+            .expect("the new prompt started a run");
+        assert_ne!(new_run, "run-b", "a fresh run id, not the reconciled one");
+        assert!(
+            final_events.iter().any(|event| {
+                event.kind == "run_completed" && event.run_id.as_deref() == Some(new_run.as_str())
+            }),
+            "the new run completed in the adopted log"
+        );
+    }
+
+    // ── Resume safety: cautious approval + drift interlock (task_12) ──
+
+    fn short_head(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("git available");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn write_action(action_id: &str) -> ActionRequest {
+        ActionRequest {
+            schema_version: 1,
+            action_id: action_id.to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::WriteFile,
+            params: json!({ "path": "out.txt", "content": "x" }),
+        }
+    }
+
+    fn read_action(action_id: &str) -> ActionRequest {
+        ActionRequest {
+            schema_version: 1,
+            action_id: action_id.to_string(),
+            step_id: "step".to_string(),
+            kind: ActionKind::ReadFile,
+            params: json!({ "path": "in.txt" }),
+        }
+    }
+
+    /// A `yolo` config so the resumed-session cautious override is observable
+    /// (the global default would not require approval on its own).
+    fn yolo_fake_config(dir: &Path) -> EffectiveConfig {
+        let config = fake_config(dir);
+        assert_eq!(
+            config.approval_mode,
+            ApprovalMode::Yolo,
+            "fake_config must default to Yolo for these tests"
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn resumed_session_forces_normal_approval_mode_over_yolo_config() {
+        let dir = tempdir().unwrap();
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        // Before resume: the global Yolo config governs.
+        assert_eq!(app.effective_approval_mode(), ApprovalMode::Yolo);
+
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        // After resume: cautious Normal, regardless of the Yolo config, and the
+        // resume boundary records it.
+        assert_eq!(app.effective_approval_mode(), ApprovalMode::Normal);
+        assert_eq!(session_resumed_payload(&app).approval_mode, "normal");
+    }
+
+    #[tokio::test]
+    async fn resume_with_head_drift_arms_the_interlock() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        // The session last ran at a HEAD that differs from the live one (branch
+        // switch / rebase since it paused).
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b", "head_sha": "0000000" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        let drift = app
+            .pending_drift_ack
+            .as_ref()
+            .expect("HEAD drift arms the gate");
+        assert!(drift.head_changed);
+        assert!(!drift.cwd_moved, "same directory");
+    }
+
+    #[tokio::test]
+    async fn resume_without_drift_has_no_interlock() {
+        let dir = tempdir().unwrap();
+        // Non-git workspace: no HEAD on either side, same cwd ⇒ no drift.
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        assert!(
+            app.pending_drift_ack.is_none(),
+            "no drift ⇒ only the cautious approval applies, no extra gate"
+        );
+        // Still cautious, though.
+        assert_eq!(app.effective_approval_mode(), ApprovalMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn resume_dirty_tree_but_same_head_is_not_drift() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        let head = short_head(dir.path());
+        // The session last ran at the CURRENT HEAD; the tree is dirty (the
+        // untracked `.atelier/` dir at least), which must NOT count as drift.
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b", "head_sha": head }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+
+        assert!(
+            app.pending_drift_ack.is_none(),
+            "a dirty tree at the same HEAD is not drift (ADR-004)"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledging_first_mutation_records_audit_and_clears_gate() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.pending_drift_ack = Some(git::WorkspaceDrift {
+            cwd_moved: false,
+            head_changed: true,
+        });
+
+        // A read-only action never satisfies the gate (the gate stays armed).
+        app.acknowledge_resume_drift(&read_action("r1")).unwrap();
+        assert!(
+            app.pending_drift_ack.is_some(),
+            "read-only action must not consume the drift gate"
+        );
+
+        // The first mutating action acknowledges: records the audit event + clears.
+        app.acknowledge_resume_drift(&write_action("w1")).unwrap();
+        assert!(app.pending_drift_ack.is_none(), "gate cleared after ack");
+        let events = app.history.read_events().unwrap();
+        let ack = events
+            .iter()
+            .find(|event| event.kind == RESUME_DRIFT_ACK_KIND)
+            .expect("drift acknowledgment recorded in the audit log");
+        assert_eq!(ack.payload["head_changed"], json!(true));
+        assert_eq!(ack.payload["action_id"], json!("w1"));
+
+        // A SECOND mutating action is not re-gated (gate already cleared) and adds
+        // no further ack event.
+        app.acknowledge_resume_drift(&write_action("w2")).unwrap();
+        assert_eq!(
+            app.history
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == RESUME_DRIFT_ACK_KIND)
+                .count(),
+            1,
+            "the interlock fires once, not on every later mutation"
+        );
+    }
+
+    #[test]
+    fn drift_notice_is_folded_into_mutating_approval_prompts_only() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut context = ActionExecutionContext::new(
+            config.working_directory.clone(),
+            config.workspace.clone(),
+            ApprovalMode::Normal,
+        );
+        context.drift_ack = Some("HEAD changed since this session paused".to_string());
+
+        // A mutating action's prompt carries the drift context.
+        let write_view = build_pending_approval_view(
+            "run".to_string(),
+            None,
+            "step".to_string(),
+            "fixer".to_string(),
+            "writes a file".to_string(),
+            None,
+            &write_action("w1"),
+            &context,
+        );
+        assert!(write_view.drift_notice.is_some());
+
+        // A read-only action under the same armed gate shows no drift notice.
+        let read_view = build_pending_approval_view(
+            "run".to_string(),
+            None,
+            "step".to_string(),
+            "explorer".to_string(),
+            "reads a file".to_string(),
+            None,
+            &read_action("r1"),
+            &context,
+        );
+        assert!(read_view.drift_notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_with_drift_requires_acknowledgment_before_first_write() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        // Session last ran at a different HEAD ⇒ drift on resume.
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b", "head_sha": "0000000" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let mut app = App::new(yolo_fake_config(dir.path())).await.unwrap();
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+        assert!(app.pending_drift_ack.is_some(), "resume armed the gate");
+
+        // A new prompt that drives the fixer to a write pauses for approval, and the
+        // prompt carries the drift context — even though the global config is Yolo.
+        app.submit_prompt("approval action create a feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        let pending = app
+            .state
+            .pending_approval
+            .as_ref()
+            .expect("the first mutation paused for approval");
+        assert!(
+            pending.drift_notice.is_some(),
+            "the first write surfaces the drift context"
+        );
+
+        // Acknowledging (approving) records the audit event, clears the gate, and
+        // lets the run proceed.
+        app.handle_event(AppEvent::ApprovalAnswered(ApprovalResolution::ApproveOnce))
+            .await
+            .unwrap();
+        assert!(app.pending_drift_ack.is_none(), "ack cleared the gate");
+        assert!(
+            app.history
+                .read_events()
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == RESUME_DRIFT_ACK_KIND),
+            "the acknowledgment is auditable in the log"
+        );
+    }
+
+    // ── Resume-rate instrumentation + post-crash hint (task_13) ──
+
+    #[tokio::test]
+    async fn post_crash_hint_shown_when_newest_prior_session_is_non_terminal() {
+        let dir = tempdir().unwrap();
+        // A prior session left mid-flight (dangling ⇒ non-terminal outcome).
+        let prior = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        let app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(
+            app.state().recoverable_session,
+            "a fresh launch nudges recovery of the interrupted prior session"
+        );
+        // The outcome comes from list_session_summaries, not an ad-hoc scan.
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        let prior_outcome = summaries
+            .iter()
+            .find(|summary| summary.session_id == prior)
+            .map(|summary| summary.outcome.clone())
+            .unwrap();
+        assert!(!prior_outcome.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn post_crash_hint_suppressed_when_newest_prior_session_completed() {
+        let dir = tempdir().unwrap();
+        // A prior session that ended cleanly: a normal quit must not look like a crash.
+        seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_completed",
+                json!({ "summary": "done" }),
+                "Run completed.",
+            )
+        })
+        .await;
+
+        let app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(
+            !app.state().recoverable_session,
+            "a cleanly-completed prior session shows no post-crash hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_ever_session_shows_no_post_crash_hint() {
+        let dir = tempdir().unwrap();
+        // No prior session at all ⇒ nothing to recover.
+        let app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(!app.state().recoverable_session);
+    }
+
+    #[tokio::test]
+    async fn resume_metrics_and_hint_reflect_a_crash_then_recovery() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+        // A session left mid-flight (dangling crash).
+        let session_b = seed_session(dir.path(), |app| {
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "prompt_submitted",
+                json!({ "prompt": "work", "submitted_prompt": "work", "source": "fresh" }),
+                "work",
+            )?;
+            app.record_event(
+                Some("run-b".into()),
+                None,
+                "run_started",
+                json!({ "run_id": "run-b" }),
+                "Run started.",
+            )
+        })
+        .await;
+
+        // A fresh launch shows the post-crash hint…
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        assert!(app.state().recoverable_session, "hint shown until resumed");
+
+        // …then the user resumes and completes it.
+        app.handle_event(AppEvent::ResumeSession(session_b))
+            .await
+            .unwrap();
+        app.handle_event(AppEvent::PromptSubmitted(
+            "create a feature".to_string(),
+            PromptSource::Fresh,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(app.state().run_state, RunState::Completed);
+
+        // The derived metrics reflect exactly one recovered + completed resume.
+        let metrics = crate::history::resume_metrics(&root);
+        assert_eq!(metrics.recovered, 1);
+        assert_eq!(metrics.resumed_completed, 1);
+        assert_eq!(metrics.crash_recovery_rate(), Some(1.0));
+        assert_eq!(metrics.resumed_completion_rate(), Some(1.0));
     }
 
     fn runtime_skill_context(display_name: &str, content: &str) -> SkillPromptContext {
@@ -7605,6 +10848,7 @@ runtime = "fake"
             floor: app.config.approval.floor,
             trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
             pre_approved: false,
+            drift_ack: None,
         };
         let rendered_context = ActionExecutionContext {
             user_prompt: Some(request.prompt.clone()),
@@ -8325,6 +11569,548 @@ runtime = "fake"
         .unwrap()
     }
 
+    fn fake_dag_config(dir: &std::path::Path) -> EffectiveConfig {
+        let config_path = dir.join("atelier.toml");
+        fs::write(
+            &config_path,
+            r#"
+[features]
+execution_graph = true
+
+[limits]
+max_parallel_agent_steps = 2
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    // ── DAG ready-set admission (task_04) ──
+
+    fn dag_snapshot(
+        node_id: &str,
+        run_state: NodeRunState,
+        succeeded: bool,
+        is_command: bool,
+        writes: &[&str],
+        preds: &[&str],
+    ) -> DagNodeSnapshot {
+        DagNodeSnapshot {
+            node_id: node_id.to_string(),
+            run_state,
+            succeeded,
+            is_command,
+            write_files: writes.iter().map(|w| w.to_string()).collect(),
+            predecessors: preds.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn admission_promotes_disjoint_dependents_in_one_pass() {
+        // A done-succeeded; B and C depend on A with disjoint writes → both ready.
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Terminal, true, false, &["a.rs"], &[]),
+            dag_snapshot("b", NodeRunState::Pending, false, false, &["b.rs"], &["a"]),
+            dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &["a"]),
+        ];
+        let decision = compute_admission(&nodes, 8);
+        assert_eq!(decision.admit, vec!["b".to_string(), "c".to_string()]);
+        assert!(decision.skip.is_empty());
+    }
+
+    #[test]
+    fn admission_write_overlap_holds_second_node() {
+        // B and C share a write file; only one is admitted, the other waits.
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Terminal, true, false, &["a.rs"], &[]),
+            dag_snapshot(
+                "b",
+                NodeRunState::Pending,
+                false,
+                false,
+                &["shared.rs"],
+                &["a"],
+            ),
+            dag_snapshot(
+                "c",
+                NodeRunState::Pending,
+                false,
+                false,
+                &["shared.rs"],
+                &["a"],
+            ),
+        ];
+        let decision = compute_admission(&nodes, 8);
+        assert_eq!(decision.admit, vec!["b".to_string()]);
+        assert!(decision.skip.is_empty());
+    }
+
+    #[test]
+    fn admission_command_node_waits_while_others_run() {
+        // A command-capable ready node cannot be admitted while anything runs.
+        let nodes = vec![
+            dag_snapshot("x", NodeRunState::Running, false, false, &["x.rs"], &[]),
+            dag_snapshot("y", NodeRunState::Pending, false, true, &[], &[]),
+        ];
+        let decision = compute_admission(&nodes, 8);
+        assert!(decision.admit.is_empty());
+    }
+
+    #[test]
+    fn admission_command_node_runs_in_isolation() {
+        // Nothing running; a command node and a non-command node are both ready.
+        // The command node monopolizes: exactly one node is admitted.
+        let nodes = vec![
+            dag_snapshot("y", NodeRunState::Pending, false, true, &[], &[]),
+            dag_snapshot("z", NodeRunState::Pending, false, false, &["z.rs"], &[]),
+        ];
+        let decision = compute_admission(&nodes, 8);
+        assert_eq!(decision.admit, vec!["y".to_string()]);
+    }
+
+    #[test]
+    fn admission_fail_closed_skips_dependent_of_failed_node() {
+        // A failed → its dependent D is skipped, never admitted.
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Terminal, false, false, &["a.rs"], &[]),
+            dag_snapshot("d", NodeRunState::Pending, false, false, &["d.rs"], &["a"]),
+        ];
+        let decision = compute_admission(&nodes, 8);
+        assert!(decision.admit.is_empty());
+        assert_eq!(decision.skip, vec!["d".to_string()]);
+    }
+
+    #[test]
+    fn admission_forward_progress_cascades_skip_through_tail() {
+        // A failed; B→C→D are all downstream. One admission call skips the whole
+        // tail so the join loop drains to all-terminal (no deadlock).
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Terminal, false, false, &["a.rs"], &[]),
+            dag_snapshot("b", NodeRunState::Pending, false, false, &["b.rs"], &["a"]),
+            dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &["b"]),
+            dag_snapshot("d", NodeRunState::Pending, false, false, &["d.rs"], &["c"]),
+        ];
+        let decision = compute_admission(&nodes, 8);
+        assert!(decision.admit.is_empty());
+        assert_eq!(
+            decision.skip,
+            vec!["b".to_string(), "c".to_string(), "d".to_string()]
+        );
+    }
+
+    #[test]
+    fn admission_pending_writes_do_not_pre_occupy_running_set() {
+        // Two ready nodes share a write file, nothing running. If a Pending node's
+        // writes were wrongly counted as "running", neither would admit
+        // (deadlock); the correct behavior admits the first and holds the second.
+        let nodes = vec![
+            dag_snapshot(
+                "a",
+                NodeRunState::Pending,
+                false,
+                false,
+                &["shared.rs"],
+                &[],
+            ),
+            dag_snapshot(
+                "b",
+                NodeRunState::Pending,
+                false,
+                false,
+                &["shared.rs"],
+                &[],
+            ),
+        ];
+        let decision = compute_admission(&nodes, 8);
+        assert_eq!(decision.admit, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn admission_respects_the_max_concurrent_ceiling() {
+        // Four independent, write-disjoint, ready nodes but a ceiling of 2: only
+        // two are admitted in one pass (the reused max_parallel_agent_steps bound).
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Pending, false, false, &["a.rs"], &[]),
+            dag_snapshot("b", NodeRunState::Pending, false, false, &["b.rs"], &[]),
+            dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &[]),
+            dag_snapshot("d", NodeRunState::Pending, false, false, &["d.rs"], &[]),
+        ];
+        let decision = compute_admission(&nodes, 2);
+        assert_eq!(decision.admit, vec!["a".to_string(), "b".to_string()]);
+
+        // With one node already running, only one more slot remains.
+        let nodes = vec![
+            dag_snapshot("a", NodeRunState::Running, false, false, &["a.rs"], &[]),
+            dag_snapshot("b", NodeRunState::Pending, false, false, &["b.rs"], &[]),
+            dag_snapshot("c", NodeRunState::Pending, false, false, &["c.rs"], &[]),
+        ];
+        let decision = compute_admission(&nodes, 2);
+        assert_eq!(decision.admit, vec!["b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dag_decision_routes_through_scheduler_and_completes() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "graph work",
+            "graph work",
+            None,
+            None,
+            None,
+        );
+        let node = |id: &str, label: &str| crate::orchestrator::ExecutionNode {
+            node_id: id.to_string(),
+            step_label: label.to_string(),
+            agent: "explorer".to_string(),
+            instruction: format!("inspect {label}"),
+            required_capabilities: vec![Capability::Read],
+            file_scope: ParallelFileScope {
+                write_files: Vec::new(),
+                read_roots: vec!["src".to_string()],
+            },
+        };
+        let graph = crate::orchestrator::ExecutionGraph {
+            graph_id: "graph-1".to_string(),
+            reason: "two read-only nodes in sequence".to_string(),
+            nodes: vec![node("a", "alpha"), node("b", "beta")],
+            edges: vec![crate::orchestrator::ExecutionEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                kind: crate::orchestrator::ExecutionEdgeKind::DataDependency,
+            }],
+        };
+        let decision = crate::orchestrator::OrchestratorDecision {
+            schema_version: 3,
+            decision_id: "decision-dag".to_string(),
+            run_id: "run-dag".to_string(),
+            status: DecisionStatus::Continue,
+            plan: vec!["Run the graph.".to_string()],
+            next_agent: None,
+            next_step: Some(DecisionNextStep::Dag(graph)),
+            reason: "The work forms a dependency graph.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Graph completes.".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            multi_select: false,
+            final_summary: None,
+        };
+
+        let routed = app
+            .handle_orchestrator_decision(&mut run, decision)
+            .await
+            .unwrap();
+
+        assert!(routed, "a completed graph routes as a successful step");
+        // Routed to the scheduler (not the single-agent or parallel-group path).
+        assert!(run
+            .previous_results
+            .iter()
+            .any(|result| matches!(result, RunStepResult::Dag { .. })));
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "node_succeeded"
+                    && event.graph_id.as_deref() == Some("graph-1"))
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == "execution_graph_completed"
+                && event.graph_id.as_deref() == Some("graph-1")
+        }));
+        // The DAG path must not leak flat parallel-group vocabulary.
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "parallel_group_started"));
+    }
+
+    // ── whole-plan approval gate (task_05) ──
+
+    fn fake_dag_normal_config(dir: &std::path::Path) -> EffectiveConfig {
+        let config_path = dir.join("atelier.toml");
+        fs::write(
+            &config_path,
+            r#"
+approval_mode = "normal"
+
+[features]
+execution_graph = true
+
+[limits]
+max_parallel_agent_steps = 2
+
+[runtimes.fake]
+type = "fake"
+
+[agents.orchestrator]
+runtime = "fake"
+
+[agents.explorer]
+runtime = "fake"
+
+[agents.fixer]
+runtime = "fake"
+
+[agents.reviewer]
+runtime = "fake"
+
+[agents.oracle]
+runtime = "fake"
+"#,
+        )
+        .unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn simple_dag_graph(graph_id: &str) -> crate::orchestrator::ExecutionGraph {
+        let node = |id: &str, label: &str| crate::orchestrator::ExecutionNode {
+            node_id: id.to_string(),
+            step_label: label.to_string(),
+            agent: "explorer".to_string(),
+            instruction: format!("inspect {label}"),
+            required_capabilities: vec![Capability::Read],
+            file_scope: ParallelFileScope {
+                write_files: Vec::new(),
+                read_roots: vec!["src".to_string()],
+            },
+        };
+        crate::orchestrator::ExecutionGraph {
+            graph_id: graph_id.to_string(),
+            reason: "two read-only nodes in sequence".to_string(),
+            nodes: vec![node("a", "alpha"), node("b", "beta")],
+            edges: vec![crate::orchestrator::ExecutionEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                kind: crate::orchestrator::ExecutionEdgeKind::DataDependency,
+            }],
+        }
+    }
+
+    fn dag_continue_decision_for(
+        graph: crate::orchestrator::ExecutionGraph,
+    ) -> crate::orchestrator::OrchestratorDecision {
+        crate::orchestrator::OrchestratorDecision {
+            schema_version: 3,
+            decision_id: "decision-dag".to_string(),
+            run_id: "run-dag".to_string(),
+            status: DecisionStatus::Continue,
+            plan: vec!["Run the graph.".to_string()],
+            next_agent: None,
+            next_step: Some(DecisionNextStep::Dag(graph)),
+            reason: "The work forms a dependency graph.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Graph completes.".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            multi_select: false,
+            final_summary: None,
+        }
+    }
+
+    #[test]
+    fn plan_question_id_is_deterministic_from_graph_id() {
+        assert_eq!(plan_question_id("graph-1"), plan_question_id("graph-1"));
+        assert_ne!(plan_question_id("graph-1"), plan_question_id("graph-2"));
+        assert!(plan_question_id("graph-1").contains("graph-1"));
+    }
+
+    #[tokio::test]
+    async fn dag_normal_mode_pauses_for_plan_approval_without_spawning() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_normal_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "graph work",
+            "graph work",
+            None,
+            None,
+            None,
+        );
+
+        let cont = app
+            .handle_orchestrator_decision(
+                &mut run,
+                dag_continue_decision_for(simple_dag_graph("graph-1")),
+            )
+            .await
+            .unwrap();
+
+        assert!(!cont, "normal mode pauses until the plan is accepted");
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        let plan = app
+            .state
+            .pending_plan_approval
+            .as_ref()
+            .expect("plan gate pending");
+        assert_eq!(plan.graph_id, "graph-1");
+        assert_eq!(plan.question_id, plan_question_id("graph-1"));
+        // The plan gate uses a distinct slot; the per-action slot is untouched.
+        assert!(app.state.pending_approval.is_none());
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "execution_graph_proposed" && event.graph_id.as_deref() == Some("graph-1")
+        }));
+        // No node spawned, no approval yet.
+        assert!(!events.iter().any(|event| event.kind == "node_running"));
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == "execution_graph_approved"));
+    }
+
+    #[tokio::test]
+    async fn dag_yolo_mode_auto_accepts_and_runs() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "graph work",
+            "graph work",
+            None,
+            None,
+            None,
+        );
+
+        let cont = app
+            .handle_orchestrator_decision(
+                &mut run,
+                dag_continue_decision_for(simple_dag_graph("graph-1")),
+            )
+            .await
+            .unwrap();
+
+        assert!(cont);
+        assert!(
+            app.state.pending_plan_approval.is_none(),
+            "yolo never gates"
+        );
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "execution_graph_approved"
+                && event.payload["auto_accepted"] == json!(true)
+        }));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "execution_graph_completed"));
+        assert!(run
+            .previous_results
+            .iter()
+            .any(|result| matches!(result, RunStepResult::Dag { .. })));
+    }
+
+    #[tokio::test]
+    async fn dag_plan_reject_emits_rejected_with_reason_and_spawns_nothing() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_normal_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "what is the status?",
+            "what is the status?",
+            None,
+            None,
+            None,
+        );
+        app.handle_orchestrator_decision(
+            &mut run,
+            dag_continue_decision_for(simple_dag_graph("graph-1")),
+        )
+        .await
+        .unwrap();
+        assert!(app.state.pending_plan_approval.is_some());
+
+        app.resolve_pending_plan_approval(
+            &plan_question_id("graph-1"),
+            PlanApprovalAnswer::Reject {
+                reason: Some("too risky".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        let rejected = events
+            .iter()
+            .find(|event| event.kind == "execution_graph_rejected")
+            .expect("rejected event recorded");
+        assert_eq!(rejected.payload["reason"], json!("too risky"));
+        // Rejection returns the plan to the orchestrator; no graph node ran.
+        assert!(!events.iter().any(|event| event.kind == "node_running"));
+        assert!(app.state.pending_plan_approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn dag_plan_accept_runs_the_graph() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_dag_normal_config(dir.path())).await.unwrap();
+        let mut run = RunDriveContext::new(
+            "run-dag",
+            None,
+            "graph work",
+            "graph work",
+            None,
+            None,
+            None,
+        );
+        app.handle_orchestrator_decision(
+            &mut run,
+            dag_continue_decision_for(simple_dag_graph("graph-1")),
+        )
+        .await
+        .unwrap();
+        assert!(app.state.pending_plan_approval.is_some());
+
+        app.resolve_pending_plan_approval(&plan_question_id("graph-1"), PlanApprovalAnswer::Accept)
+            .await
+            .unwrap();
+
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "execution_graph_approved"
+                && event.payload["auto_accepted"] == json!(false)
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "node_succeeded"
+                    && event.graph_id.as_deref() == Some("graph-1"))
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "execution_graph_completed"));
+        assert!(app.state.pending_plan_approval.is_none());
+    }
+
     fn assert_no_workflow_run_start_events(events: &[HistoryEvent]) {
         assert!(events.iter().all(|event| {
             event.kind != "run_started"
@@ -8582,6 +12368,293 @@ prompt = "{reviewer_prompt}"
             .iter()
             .any(|event| event.kind == "runtime_stream_delta"));
         assert!(dir.path().join(".atelier/runs").exists());
+    }
+
+    // ── lifecycle hooks: event tap + dispatcher wiring (task_05) ──
+
+    /// A fake-runtime config whose agents all use `runtime_id` (type `fake`),
+    /// with `hooks_toml` appended as a user-scope `[hooks]` section (honored, not
+    /// dropped, because it is loaded as the explicit `--config` layer).
+    fn fake_config_with_hooks(dir: &Path, runtime_id: &str, hooks_toml: &str) -> EffectiveConfig {
+        let config_path = dir.join("atelier.toml");
+        let toml = format!(
+            "[runtimes.{rid}]\ntype = \"fake\"\n\
+             [agents.orchestrator]\nruntime = \"{rid}\"\n\
+             [agents.explorer]\nruntime = \"{rid}\"\n\
+             [agents.fixer]\nruntime = \"{rid}\"\n\
+             [agents.reviewer]\nruntime = \"{rid}\"\n\
+             [agents.oracle]\nruntime = \"{rid}\"\n\
+             [agents.consul]\nruntime = \"{rid}\"\n\
+             [council.presets.default.architect]\nruntime = \"{rid}\"\n\
+             [council.presets.default.security]\nruntime = \"{rid}\"\n\
+             [council.presets.default.reviewer]\nruntime = \"{rid}\"\n\
+             {hooks}",
+            rid = runtime_id,
+            hooks = hooks_toml,
+        );
+        fs::write(&config_path, toml).unwrap();
+        load_effective_config(ConfigLoadOptions {
+            working_directory: dir.to_path_buf(),
+            config_path: Some(config_path),
+        })
+        .unwrap()
+    }
+
+    fn command_hook_handler(public_event: &str, command: &str) -> crate::hooks::HookHandler {
+        crate::hooks::HookHandler {
+            on: vec![public_event.to_string()],
+            action: crate::hooks::HookAction::Command(command.to_string()),
+            payload: PayloadDetail::Metadata,
+        }
+    }
+
+    struct NoopNotifier;
+    impl crate::hooks::Notifier for NoopNotifier {
+        fn notify(&self, _title: &str, _body: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Wire `app`'s tap to a freshly-spawned dispatcher and return the lifecycle
+    /// back-channel receiver (the records `run_tui` would forward to the worker).
+    fn wire_hook_dispatcher(
+        app: &mut App,
+        notifier: Arc<dyn crate::hooks::Notifier>,
+    ) -> mpsc::Receiver<HookLifecycleRecord> {
+        let (hook_tx, hook_rx) = crate::hooks::hook_channel();
+        let (life_tx, life_rx) = mpsc::channel(256);
+        app.attach_hook_sender(hook_tx, DroppedHookCounter::new());
+        tokio::spawn(crate::hooks::run_hook_dispatcher(
+            hook_rx,
+            life_tx,
+            notifier,
+            crate::hooks::DEFAULT_HOOK_TIMEOUT,
+        ));
+        life_rx
+    }
+
+    #[tokio::test]
+    async fn tap_does_no_dispatch_when_no_hooks_configured() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        // A sender is wired, but no handlers are configured.
+        let (tx, mut rx) = crate::hooks::hook_channel();
+        app.attach_hook_sender(tx, DroppedHookCounter::new());
+        app.record_event(
+            Some("run-1".into()),
+            None,
+            "run_completed",
+            json!({}),
+            "done",
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err(), "no item should be dispatched");
+        assert_eq!(app.dropped_hook_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn tap_resolves_actor_runtime_from_active_step_agent() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.config
+            .hooks
+            .handlers
+            .push(command_hook_handler("step_started", "true"));
+        let (tx, mut rx) = crate::hooks::hook_channel();
+        app.attach_hook_sender(tx, DroppedHookCounter::new());
+        app.active_step = Some(ActiveStep {
+            run_id: "run-1".into(),
+            group_id: None,
+            step_id: "step-1".into(),
+            step_label: None,
+            file_scope: None,
+            agent: "explorer".into(),
+        });
+        app.record_event_with_group(
+            Some("run-1".into()),
+            None,
+            Some("step-1".into()),
+            "agent_step_started",
+            json!({ "agent": "explorer" }),
+            "started",
+        )
+        .unwrap();
+        let item = rx.try_recv().expect("a dispatch item");
+        assert_eq!(item.payload.event, "step_started");
+        assert_eq!(item.payload.actor.agent.as_deref(), Some("explorer"));
+        // fake_config's explorer agent uses runtime "fake".
+        assert_eq!(item.payload.actor.runtime.as_deref(), Some("fake"));
+    }
+
+    #[tokio::test]
+    async fn tap_increments_dropped_counter_on_full_channel_without_blocking() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.config
+            .hooks
+            .handlers
+            .push(command_hook_handler("run_completed", "true"));
+        // Capacity 1, never drained: the first fits, the second is dropped.
+        let (tx, _rx) = mpsc::channel(1);
+        let dropped = DroppedHookCounter::new();
+        app.attach_hook_sender(tx, dropped.clone());
+        app.record_event(Some("run-1".into()), None, "run_completed", json!({}), "a")
+            .unwrap();
+        app.record_event(Some("run-1".into()), None, "run_completed", json!({}), "b")
+            .unwrap();
+        assert_eq!(dropped.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn tap_ignores_kinds_outside_public_vocabulary() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.config
+            .hooks
+            .handlers
+            .push(command_hook_handler("run_completed", "true"));
+        let (tx, mut rx) = crate::hooks::hook_channel();
+        app.attach_hook_sender(tx, DroppedHookCounter::new());
+        // `runtime_stream_delta` is not in the public vocabulary → no dispatch.
+        app.record_event(
+            Some("run-1".into()),
+            None,
+            "runtime_stream_delta",
+            json!({ "agent": "explorer", "content": "x" }),
+            "delta",
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn end_to_end_command_hook_writes_normalized_payload() {
+        let dir = tempdir().unwrap();
+        let sentinel = dir.path().join("hook.json");
+        let hooks = format!(
+            "[[hooks.handler]]\non = \"run_completed\"\ncommand = \"cat > '{}'\"\n",
+            sentinel.display()
+        );
+        let config = fake_config_with_hooks(dir.path(), "fake", &hooks);
+        let mut app = App::new(config).await.unwrap();
+        let mut life_rx = wire_hook_dispatcher(&mut app, Arc::new(NoopNotifier));
+
+        app.submit_prompt("create a feature").await.unwrap();
+        assert_eq!(app.state.run_state, RunState::Completed);
+
+        // hook_started arrives, then hook_completed once the command has run.
+        let _started = tokio::time::timeout(Duration::from_secs(5), life_rx.recv())
+            .await
+            .expect("hook_started within timeout")
+            .expect("hook_started present");
+        let _completed = tokio::time::timeout(Duration::from_secs(5), life_rx.recv())
+            .await
+            .expect("hook_completed within timeout")
+            .expect("hook_completed present");
+
+        let written = std::fs::read_to_string(&sentinel).expect("hook wrote the sentinel");
+        assert!(
+            written.contains("\"event\":\"run_completed\""),
+            "payload: {written}"
+        );
+        assert!(
+            written.contains("\"outcome\":\"success\""),
+            "payload: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_runtime_run_completed_payload_shape_is_uniform() {
+        async fn captured_run_completed(dir: &Path, runtime_id: &str) -> crate::hooks::HookPayload {
+            let config = fake_config_with_hooks(
+                dir,
+                runtime_id,
+                "[[hooks.handler]]\non = \"run_completed\"\nnotify = true\n",
+            );
+            let mut app = App::new(config).await.unwrap();
+            let (tx, mut rx) = crate::hooks::hook_channel();
+            app.attach_hook_sender(tx, DroppedHookCounter::new());
+            app.submit_prompt("create a feature").await.unwrap();
+            let mut found = None;
+            while let Ok(item) = rx.try_recv() {
+                if item.payload.event == "run_completed" {
+                    found = Some(item.payload);
+                }
+            }
+            found.expect("run_completed dispatched")
+        }
+
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let a = captured_run_completed(dir_a.path(), "fake").await;
+        // A distinct runtime id (also of type `fake`): the actor.runtime value
+        // differs, but the payload SHAPE must be identical — the PRD's
+        // cross-runtime conformance proceed-criterion.
+        let b = captured_run_completed(dir_b.path(), "alt").await;
+
+        let key_set = |payload: &crate::hooks::HookPayload| {
+            let value = serde_json::to_value(payload).unwrap();
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            key_set(&a),
+            key_set(&b),
+            "run_completed payload shape differs across runtimes"
+        );
+        assert_eq!(a.event, b.event);
+        assert_eq!(a.outcome, b.outcome);
+        assert_eq!(a.schema_version, b.schema_version);
+        // The actor field is present and structurally uniform in both.
+        assert!(serde_json::to_value(&a).unwrap().get("actor").is_some());
+        assert!(serde_json::to_value(&b).unwrap().get("actor").is_some());
+    }
+
+    #[tokio::test]
+    async fn hook_lifecycle_events_are_recorded_into_history() {
+        let dir = tempdir().unwrap();
+        let sentinel = dir.path().join("hook.json");
+        let hooks = format!(
+            "[[hooks.handler]]\non = \"run_completed\"\ncommand = \"cat > '{}'\"\n",
+            sentinel.display()
+        );
+        let config = fake_config_with_hooks(dir.path(), "fake", &hooks);
+        let mut app = App::new(config).await.unwrap();
+        let mut life_rx = wire_hook_dispatcher(&mut app, Arc::new(NoopNotifier));
+
+        app.submit_prompt("create a feature").await.unwrap();
+        let started = tokio::time::timeout(Duration::from_secs(5), life_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(5), life_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Record them as the worker would (the only &mut App site).
+        app.record_hook_lifecycle(started).unwrap();
+        app.record_hook_lifecycle(completed).unwrap();
+
+        let events = app.history.read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "hook_started"));
+        let completed_event = events
+            .iter()
+            .find(|event| event.kind == "hook_completed")
+            .expect("hook_completed recorded");
+        assert_eq!(
+            completed_event
+                .payload
+                .get("exit_code")
+                .and_then(Value::as_i64),
+            Some(0)
+        );
+        // Recording hook_* events must NOT re-trigger hooks: exactly one
+        // hook_completed exists (no recursive cascade).
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "hook_completed").count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -9766,6 +13839,48 @@ prompt = "{reviewer_prompt}"
     }
 
     #[tokio::test]
+    async fn run_records_head_baseline_and_detects_external_commit_drift() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path(), "feat/resume");
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.refresh_git_context().await;
+        let stored_head = app
+            .state
+            .git_context
+            .as_ref()
+            .and_then(|context| context.head_sha.clone());
+        assert!(stored_head.is_some(), "a git repo yields a head_sha");
+
+        // Recording a run captures the HEAD baseline into the log (ADR-007).
+        app.submit_prompt("create a feature").await.unwrap();
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            crate::history::last_recorded_head_sha(&events),
+            stored_head,
+            "run_started records the head baseline, recoverable by folding"
+        );
+
+        // An external commit moves HEAD.
+        std::fs::write(dir.path().join("new.txt"), "x").unwrap();
+        run_git(dir.path(), &["add", "new.txt"]);
+        run_git(dir.path(), &["commit", "-m", "external"]);
+        let live_head = fetch_git_context(dir.path())
+            .await
+            .and_then(|context| context.head_sha);
+        assert_ne!(stored_head, live_head, "external commit moved HEAD");
+
+        // Drift: HEAD changed, same cwd.
+        let drift = git::detect_drift(
+            dir.path(),
+            stored_head.as_deref(),
+            dir.path(),
+            live_head.as_deref(),
+        );
+        assert!(drift.head_changed);
+        assert!(!drift.cwd_moved);
+    }
+
+    #[tokio::test]
     async fn set_git_context_publishes_only_on_change() {
         let dir = tempdir().unwrap();
         let mut app = App::new(fake_config(dir.path())).await.unwrap();
@@ -9776,6 +13891,8 @@ prompt = "{reviewer_prompt}"
         let context = GitContext {
             repo_name: "atelier".to_string(),
             branch: "main".to_string(),
+            head_sha: None,
+            dirty: false,
         };
         assert!(app.set_git_context(Some(context.clone())));
         assert!(receiver.has_changed().unwrap(), "change published");

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "DAG decision schema, types, validation, and prompt guidance"
 type: backend
 complexity: high
@@ -31,12 +31,19 @@ Introduce the `ExecutionGraph` plan types and a new `DecisionNextStep::Dag` vari
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Define `ExecutionGraph`/`ExecutionNode`/`ExecutionEdge`/`ExecutionEdgeKind` and add the `Dag` variant.
-- [ ] 2.2 Add the `schema_version 3` arm to `normalized_next_step`; keep v1/v2 frozen.
-- [ ] 2.3 Implement `validate_execution_graph` (per-node reuse + acyclicity + edge-endpoint + node-id uniqueness + concurrency-aware disjointness) and wire the `Dag` dispatch arm.
-- [ ] 2.4 Add flag-gated `kind="dag"` guidance to `build_orchestrator_prompt`.
-- [ ] 2.5 Add the result-side `RunStepResult` consideration note for task_03 (the `Dag` result variant is added there).
-- [ ] 2.6 Add unit tests for round-trip, schema gating, and every validation accept/reject case.
+- [x] 2.1 Define `ExecutionGraph`/`ExecutionNode`/`ExecutionEdge`/`ExecutionEdgeKind` and add the `Dag` variant.
+- [x] 2.2 Add the `schema_version 3` arm to `normalized_next_step`; keep v1/v2 frozen (existing strings byte-identical; new distinct `Dag`-reject strings for v1/v2).
+- [x] 2.3 Implement `validate_execution_graph` (per-node reuse + acyclicity (Kahn) + edge-endpoint + node-id uniqueness + concurrency-aware disjointness via descendant reachability) and wire the `Dag` dispatch arm.
+- [x] 2.4 Add flag-gated `kind="dag"` guidance to `build_orchestrator_prompt`.
+- [x] 2.5 Add the result-side `RunStepResult` consideration note for task_03 (the `Dag` result variant is added there).
+- [x] 2.6 Add unit tests for round-trip, schema gating, and every validation accept/reject case.
+
+> Compilation note: adding the `Dag` variant compiler-forced one exhaustive
+> match in `src/app/mod.rs` (`handle_orchestrator_decision`). A minimal
+> fail-closed stub (`bail!("execution graph scheduling is not yet implemented")`)
+> was added there; **task_04 replaces it** with `run_execution_graph`. The
+> `let-else` casts (`app/mod.rs:5293`, `fake.rs:756`) take the else branch for
+> `Dag` and need no change for compilation (task_04/08 audit them for behavior).
 
 ## Implementation Details
 All changes are in `src/orchestrator/mod.rs`. The `Dag` arm slots into the existing `#[serde(tag="kind")]` enum at the `DecisionNextStep` definition; the dispatch and normalization sites are compiler-forced (exhaustive matches). Reuse `ParallelFileScope` (already `Ord`, so write-set intersection is cheap). See TechSpec "Core Interfaces" and "Orchestrator Decision & Event Contract"; do not duplicate the type bodies here.
@@ -62,17 +69,18 @@ All changes are in `src/orchestrator/mod.rs`. The `Dag` arm slots into the exist
 
 ## Tests
 - Unit tests:
-  - [ ] A `kind="dag"` decision at `schema_version 3` round-trips through serde; a `single_agent`/`parallel_group` decision still deserializes unchanged.
-  - [ ] `kind="dag"` under `schema_version 2` is rejected; the existing v2 error string is unchanged.
-  - [ ] `validate_execution_graph` rejects a graph with a cycle (A→B→A).
-  - [ ] It rejects an edge whose `from`/`to` references a non-existent `node_id`.
-  - [ ] It rejects duplicate `node_id`s.
-  - [ ] It rejects two nodes with NO path between them that share a `write_files` entry (concurrent-write conflict).
-  - [ ] It ACCEPTS two nodes on a dependency chain (A→B) that share a `write_files` entry (sequential reuse is legal).
-  - [ ] It rejects an edit-capable node with empty `write_files` (per-node rule reused).
-  - [ ] `build_orchestrator_prompt` emits DAG guidance only when `execution_graph && max_parallel_agent_steps > 0`.
+  - [x] A `kind="dag"` decision at `schema_version 3` round-trips through serde; a `single_agent`/`parallel_group` decision still deserializes unchanged. (`dag_decision_round_trips_through_serde`, `existing_next_step_variants_still_deserialize_unchanged`, `dag_normalizes_at_schema_version_3`)
+  - [x] `kind="dag"` under `schema_version 2` is rejected; the existing v2 error string is unchanged. (`dag_under_schema_version_2_is_rejected`, `schema_version_2_error_string_is_unchanged_for_next_agent`; plus `dag_under_schema_version_1_is_rejected`)
+  - [x] `validate_execution_graph` rejects a graph with a cycle (A→B→A). (`validate_execution_graph_rejects_cycle`)
+  - [x] It rejects an edge whose `from`/`to` references a non-existent `node_id`. (`validate_execution_graph_rejects_unknown_edge_endpoint`)
+  - [x] It rejects duplicate `node_id`s. (`validate_execution_graph_rejects_duplicate_node_id`)
+  - [x] It rejects two nodes with NO path between them that share a `write_files` entry (concurrent-write conflict). (`validate_execution_graph_rejects_concurrent_write_overlap`)
+  - [x] It ACCEPTS two nodes on a dependency chain (A→B) that share a `write_files` entry (sequential reuse is legal). (`validate_execution_graph_accepts_sequential_shared_write_file`)
+  - [x] It rejects an edit-capable node with empty `write_files` (per-node rule reused). (`validate_execution_graph_rejects_edit_node_missing_write_files`)
+  - [x] `build_orchestrator_prompt` emits DAG guidance only when `execution_graph && max_parallel_agent_steps > 0`. (`build_orchestrator_prompt_emits_dag_guidance_only_when_enabled`)
+  - [x] Bonus: valid diamond accepted (graph larger than ceiling) (`validate_execution_graph_accepts_valid_diamond`); feature-flag-off rejects (`validate_execution_graph_rejects_when_feature_disabled`).
 - Integration tests:
-  - [ ] A full `OrchestratorDecision` JSON carrying a `Dag` next_step parses and validates end-to-end via the existing `parse_contract` path.
+  - [x] A full `OrchestratorDecision` JSON carrying a `Dag` next_step parses and validates end-to-end via the existing `parse_contract` path. (`full_dag_decision_parses_and_validates_end_to_end`)
 - Test coverage target: >=80%
 - All tests must pass
 

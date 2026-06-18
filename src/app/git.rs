@@ -28,6 +28,14 @@ pub struct GitContext {
     pub repo_name: String,
     /// `git rev-parse --abbrev-ref HEAD`, or the short SHA when detached.
     pub branch: String,
+    /// Short HEAD SHA (`git rev-parse --short HEAD`), the resume drift baseline
+    /// (ADR-007). `None` on a non-git/unborn-branch repo or on timeout.
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    /// Whether the working tree has uncommitted changes (`git status
+    /// --porcelain`). Display-only — never a drift trigger (ADR-007).
+    #[serde(default)]
+    pub dirty: bool,
 }
 
 /// Fetch the git context for `dir`, or `None` on any failure (never errors).
@@ -59,7 +67,61 @@ async fn fetch_with_git(git_bin: &str, dir: &Path) -> Option<GitContext> {
     if branch.is_empty() || repo_name.is_empty() {
         return None;
     }
-    Some(GitContext { repo_name, branch })
+
+    // Drift inputs (ADR-007), each within the same per-call timeout and each
+    // degrading independently — a missing HEAD (unborn branch) or a slow
+    // `status` never blocks or fails the context.
+    let head_sha = run_git(git_bin, dir, &["rev-parse", "--short", "HEAD"])
+        .await
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty());
+    let dirty = run_git(git_bin, dir, &["status", "--porcelain"])
+        .await
+        .map(|status| !status.trim().is_empty())
+        .unwrap_or(false);
+
+    Some(GitContext {
+        repo_name,
+        branch,
+        head_sha,
+        dirty,
+    })
+}
+
+/// Workspace movement since a session paused (ADR-007). `dirty` is deliberately
+/// absent — it is display-only and never a drift trigger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceDrift {
+    pub cwd_moved: bool,
+    pub head_changed: bool,
+}
+
+impl WorkspaceDrift {
+    /// Whether any drift was detected (drives the first-mutation interlock,
+    /// task_12).
+    pub fn any(&self) -> bool {
+        self.cwd_moved || self.head_changed
+    }
+}
+
+/// Pure drift detection (ADR-007): compare the stored session baseline against
+/// the live workspace. `cwd_moved` when the working directory differs;
+/// `head_changed` only when *both* heads are known and differ — a missing HEAD
+/// on either side (non-git) never reports head drift. Dirtiness is not an input.
+pub fn detect_drift(
+    stored_cwd: &Path,
+    stored_head: Option<&str>,
+    live_cwd: &Path,
+    live_head: Option<&str>,
+) -> WorkspaceDrift {
+    let head_changed = match (stored_head, live_head) {
+        (Some(stored), Some(live)) => stored != live,
+        _ => false,
+    };
+    WorkspaceDrift {
+        cwd_moved: stored_cwd != live_cwd,
+        head_changed,
+    }
 }
 
 /// Run `git <args>` in `dir` with a timeout, returning trimmed-of-nothing stdout
@@ -135,8 +197,48 @@ mod tests {
 
     #[tokio::test]
     async fn returns_none_outside_a_repo() {
+        // Non-git dir ⇒ no context at all (so head_sha is absent), and it does
+        // not block (this returns promptly).
         let dir = tempdir().unwrap();
         assert!(fetch_git_context(dir.path()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetches_short_head_and_dirty_flag() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path(), "feat/resume");
+        let clean = fetch_git_context(dir.path()).await.expect("Some in a repo");
+        let head = clean.head_sha.clone().expect("head_sha present in a repo");
+        assert!(!head.is_empty());
+        assert!(!clean.dirty, "a freshly-committed tree is clean");
+
+        // An uncommitted change flips `dirty` but not the HEAD.
+        std::fs::write(dir.path().join("README.md"), "changed").unwrap();
+        let dirty = fetch_git_context(dir.path()).await.expect("Some in a repo");
+        assert!(dirty.dirty, "an uncommitted change is dirty");
+        assert_eq!(dirty.head_sha, Some(head));
+    }
+
+    #[test]
+    fn detect_drift_matrix() {
+        let a = Path::new("/work/a");
+        let b = Path::new("/work/b");
+
+        // Same cwd + same head ⇒ no drift.
+        let none = detect_drift(a, Some("h1"), a, Some("h1"));
+        assert!(!none.cwd_moved && !none.head_changed && !none.any());
+        // Different head ⇒ head_changed only.
+        let head = detect_drift(a, Some("h1"), a, Some("h2"));
+        assert!(head.head_changed && !head.cwd_moved && head.any());
+        // Moved/missing cwd ⇒ cwd_moved only.
+        let cwd = detect_drift(a, Some("h1"), b, Some("h1"));
+        assert!(cwd.cwd_moved && !cwd.head_changed && cwd.any());
+        // A missing head on either side (non-git) ⇒ never head drift.
+        assert!(!detect_drift(a, None, a, Some("h1")).head_changed);
+        assert!(!detect_drift(a, Some("h1"), a, None).head_changed);
+        assert!(!detect_drift(a, None, a, None).head_changed);
+        // `dirty` is not an input — same cwd/head is no-drift regardless of it.
+        assert!(!detect_drift(a, Some("h1"), a, Some("h1")).any());
     }
 
     #[tokio::test]

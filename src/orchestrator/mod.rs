@@ -1,7 +1,7 @@
 use crate::config::{AgentProfile, Capability, EffectiveConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 pub const JSON_START: &str = "<<<MULTIAGENT_JSON_START>>>";
@@ -20,6 +20,22 @@ pub enum RunState {
     Completed,
     Failed,
     LimitReached,
+}
+
+impl RunState {
+    /// Whether the run has reached a terminal state — finished, not in flight.
+    /// True for exactly `Completed`, `Failed`, `Interrupted`, and `LimitReached`;
+    /// false for `Idle`, `Planning`, `Running`, and `WaitingForUser`.
+    ///
+    /// The single expression of "is this run finished", consumed by session
+    /// outcome derivation (task_03) and dangling-run detection on resume
+    /// (task_10) (ADR-008). It does not change which states are terminal.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            RunState::Completed | RunState::Failed | RunState::Interrupted | RunState::LimitReached
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +103,10 @@ pub struct ClarificationOption {
 pub enum DecisionNextStep {
     SingleAgent(SingleAgentStepPlan),
     ParallelGroup(ParallelGroupPlan),
+    /// A dependency graph of nodes the scheduler admits lazily by predecessor
+    /// success + write-disjointness (`kind="dag"`, decision `schema_version 3`,
+    /// ADR-004). Only emitted when `features.execution_graph` is on.
+    Dag(ExecutionGraph),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +139,48 @@ pub struct ParallelChildStepPlan {
 pub struct ParallelFileScope {
     pub write_files: Vec<String>,
     pub read_roots: Vec<String>,
+}
+
+/// A static dependency graph the orchestrator can propose as a single decision
+/// (`kind="dag"`, ADR-004). Nodes mirror `ParallelChildStepPlan` plus a durable
+/// `node_id`; edges declare ordering. The scheduler (task_04) lowers this onto
+/// the reused parallel executor with concurrency-aware admission.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionGraph {
+    pub graph_id: String,
+    pub reason: String,
+    pub nodes: Vec<ExecutionNode>,
+    pub edges: Vec<ExecutionEdge>,
+}
+
+/// One graph node. `file_scope` is reused verbatim by the runtime write-fence;
+/// command-capability is derived from `required_capabilities` (no new field).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionNode {
+    pub node_id: String,
+    pub step_label: String,
+    pub agent: String,
+    pub instruction: String,
+    #[serde(default)]
+    pub required_capabilities: Vec<Capability>,
+    pub file_scope: ParallelFileScope,
+}
+
+/// A directed ordering edge: `to` becomes admittable only after `from` succeeds.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: ExecutionEdgeKind,
+}
+
+/// Both edge kinds gate readiness identically; the distinction is intent
+/// (a data handoff vs. a pure ordering constraint), surfaced for legibility.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEdgeKind {
+    DataDependency,
+    SemanticGate,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +226,7 @@ pub struct AgentResult {
 pub enum RunStepResult {
     Agent { result: AgentResult },
     ParallelGroup { result: ParallelGroupResult },
+    Dag { result: ExecutionGraphResult },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,6 +284,50 @@ pub struct ParallelFailedScope {
     pub diagnostic: String,
 }
 
+/// The terminal aggregate of an execution-graph (DAG) run (ADR-004/005),
+/// modeled on [`ParallelGroupResult`] and serialized into the
+/// `execution_graph_completed` event. The scheduler (task_04) populates it; the
+/// projection (task_06) renders it. `skipped`/`failed` carry the `node_id`s the
+/// fail-closed admission terminalized without (or after a failed) run.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionGraphResult {
+    pub schema_version: u32,
+    pub graph_id: String,
+    pub run_id: String,
+    pub status: ExecutionGraphStatus,
+    pub summary: String,
+    pub node_results: Vec<NodeResultRef>,
+    pub counts: BTreeMap<String, u32>,
+    pub changed_files: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<String>,
+    pub started_at: String,
+    pub completed_at: String,
+}
+
+/// Terminal status of an execution graph, mirroring [`ParallelGroupStatus`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionGraphStatus {
+    Completed,
+    CompletedWithIssues,
+    Failed,
+    Cancelled,
+    LimitReached,
+}
+
+/// One graph node's result reference, mirroring [`ParallelChildResultRef`] with
+/// a durable `node_id` instead of a `step_id`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeResultRef {
+    pub node_id: String,
+    pub step_label: String,
+    pub agent: String,
+    pub file_scope: ParallelFileScope,
+    pub status: AgentResultStatus,
+    pub result_index: usize,
+}
+
 impl AgentResult {
     pub fn completed(
         agent: impl Into<String>,
@@ -257,6 +364,9 @@ impl OrchestratorDecision {
                         DecisionNextStep::ParallelGroup(_) => {
                             bail!("schema_version 1 cannot select a parallel_group next_step")
                         }
+                        DecisionNextStep::Dag(_) => {
+                            bail!("schema_version 1 cannot select a dag next_step")
+                        }
                     }
                 } else {
                     Ok(self.next_agent.as_ref().map(|agent| {
@@ -272,6 +382,15 @@ impl OrchestratorDecision {
                 if self.next_agent.is_some() {
                     bail!("schema_version 2 must use next_step instead of next_agent");
                 }
+                if matches!(self.next_step, Some(DecisionNextStep::Dag(_))) {
+                    bail!("schema_version 2 cannot select a dag next_step");
+                }
+                Ok(self.next_step.clone())
+            }
+            3 => {
+                if self.next_agent.is_some() {
+                    bail!("schema_version 3 must use next_step instead of next_agent");
+                }
                 Ok(self.next_step.clone())
             }
             version => bail!("unsupported orchestrator decision schema_version {version}"),
@@ -282,7 +401,9 @@ impl OrchestratorDecision {
 pub fn agent_results(results: &[RunStepResult]) -> impl Iterator<Item = &AgentResult> {
     results.iter().flat_map(|result| match result {
         RunStepResult::Agent { result } => std::slice::from_ref(result),
-        RunStepResult::ParallelGroup { .. } => &[],
+        // Parallel groups and DAGs aggregate their own per-child/per-node
+        // results; neither contributes a top-level AgentResult here.
+        RunStepResult::ParallelGroup { .. } | RunStepResult::Dag { .. } => &[],
     })
 }
 
@@ -490,6 +611,7 @@ fn validate_decision_next_step(
     match next_step {
         DecisionNextStep::SingleAgent(plan) => validate_single_agent_step_plan(plan, config),
         DecisionNextStep::ParallelGroup(group) => validate_parallel_group_plan(group, config),
+        DecisionNextStep::Dag(graph) => validate_execution_graph(graph, config),
     }
 }
 
@@ -534,6 +656,142 @@ pub fn validate_parallel_group_plan(
                 bail!(
                     "parallel write file {write_file} is assigned to both {existing} and {}",
                     child.step_label
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate an `ExecutionGraph` decision (ADR-004). Reuses the per-node plan
+/// checks (`validate_parallel_child_step_plan`) and scope-path normalization
+/// (`validate_parallel_scope_path`), then adds the graph-level invariants:
+/// unique node ids, edges referencing real nodes, acyclicity, and
+/// **concurrency-aware** write-file disjointness — two nodes may share a write
+/// file only when a dependency path orders them (sequential reuse is legal);
+/// nodes that could run concurrently must write disjoint files.
+pub fn validate_execution_graph(graph: &ExecutionGraph, config: &EffectiveConfig) -> Result<()> {
+    if !config.features.execution_graph {
+        bail!("execution graph is disabled by features.execution_graph");
+    }
+    if config.limits.max_parallel_agent_steps == 0 {
+        bail!("execution graph is disabled by limits.max_parallel_agent_steps = 0");
+    }
+    if graph.graph_id.trim().is_empty() {
+        bail!("execution graph is missing graph_id");
+    }
+    if graph.nodes.is_empty() {
+        bail!("execution graph must contain at least one node");
+    }
+
+    // Node-id uniqueness + per-node plan validation (reused verbatim).
+    let mut index_of = BTreeMap::<String, usize>::new();
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        if node.node_id.trim().is_empty() {
+            bail!("execution graph node is missing node_id");
+        }
+        if index_of.insert(node.node_id.clone(), idx).is_some() {
+            bail!("execution graph has duplicate node_id {}", node.node_id);
+        }
+        let child = ParallelChildStepPlan {
+            step_label: node.step_label.clone(),
+            agent: node.agent.clone(),
+            instruction: node.instruction.clone(),
+            required_capabilities: node.required_capabilities.clone(),
+            file_scope: node.file_scope.clone(),
+        };
+        validate_parallel_child_step_plan(&child, config)?;
+    }
+
+    // Edges must reference declared nodes; build the adjacency list (from -> to).
+    let node_count = graph.nodes.len();
+    let mut adjacency = vec![Vec::<usize>::new(); node_count];
+    for edge in &graph.edges {
+        let from = *index_of.get(&edge.from).ok_or_else(|| {
+            anyhow!(
+                "execution graph edge references unknown from node_id {}",
+                edge.from
+            )
+        })?;
+        let to = *index_of.get(&edge.to).ok_or_else(|| {
+            anyhow!(
+                "execution graph edge references unknown to node_id {}",
+                edge.to
+            )
+        })?;
+        adjacency[from].push(to);
+    }
+
+    // Acyclicity via Kahn's algorithm: if any node never reaches in-degree 0,
+    // there is a cycle (a self-loop A->A is caught the same way).
+    let mut indegree = vec![0usize; node_count];
+    for targets in &adjacency {
+        for &to in targets {
+            indegree[to] += 1;
+        }
+    }
+    let mut queue: VecDeque<usize> = (0..node_count).filter(|&i| indegree[i] == 0).collect();
+    let mut settled = 0usize;
+    while let Some(node) = queue.pop_front() {
+        settled += 1;
+        for &next in &adjacency[node] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                queue.push_back(next);
+            }
+        }
+    }
+    if settled != node_count {
+        bail!("execution graph contains a cycle");
+    }
+
+    // Descendant reachability (the graph is acyclic here): descendants[i] is the
+    // set of nodes reachable from i. Two nodes with no path either way could run
+    // concurrently and must therefore write disjoint files.
+    //
+    // This is O(V^2) space (a full boolean reachability matrix). That is fine at
+    // the practical graph sizes here — total node count is bounded by the
+    // `max_agent_steps` step budget (validation rejects graphs that can't fit).
+    // If that ceiling is ever raised by orders of magnitude, switch to on-demand
+    // reachability (BFS per disjointness check) or a bitset transitive closure.
+    let mut descendants = vec![vec![false; node_count]; node_count];
+    for (start, reachable) in descendants.iter_mut().enumerate() {
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            for &next in &adjacency[node] {
+                if !reachable[next] {
+                    reachable[next] = true;
+                    stack.push(next);
+                }
+            }
+        }
+    }
+
+    // Normalize each node's write set once, then enforce disjointness only
+    // between nodes that may run concurrently (no path between them).
+    let mut write_sets: Vec<BTreeSet<PathBuf>> = Vec::with_capacity(node_count);
+    for node in &graph.nodes {
+        let mut set = BTreeSet::new();
+        for write_file in &node.file_scope.write_files {
+            let normalized =
+                validate_parallel_scope_path(write_file, &config.workspace.extra_write_roots)?;
+            set.insert(normalized);
+        }
+        write_sets.push(set);
+    }
+    for i in 0..node_count {
+        for j in (i + 1)..node_count {
+            let may_run_concurrently = !descendants[i][j] && !descendants[j][i];
+            if !may_run_concurrently {
+                continue;
+            }
+            if let Some(shared) = write_sets[i].intersection(&write_sets[j]).next() {
+                bail!(
+                    "execution graph nodes {} and {} may run concurrently but both write {}",
+                    graph.nodes[i].node_id,
+                    graph.nodes[j].node_id,
+                    shared.display()
                 );
             }
         }
@@ -738,6 +996,19 @@ pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
                 .to_string(),
         );
     }
+    if config.features.execution_graph && config.limits.max_parallel_agent_steps > 0 {
+        lines.extend([
+            "- You may return schema_version 3 with next_step.kind = \"dag\" when the work forms a dependency graph: independent nodes run concurrently while dependent nodes wait on their predecessors.".to_string(),
+            "- Every dag node needs a node_id, step_label, agent, instruction, required_capabilities, and file_scope with exact write_files plus read_roots.".to_string(),
+            "- Declare an edge { from, to, kind } for each dependency; use kind \"data_dependency\" when the consumer reads the producer's output, or \"semantic_gate\" when ordering is required without a data handoff.".to_string(),
+            "- Nodes that can run concurrently (no edge path between them) must have disjoint write_files; nodes on a dependency chain may reuse the same write file sequentially.".to_string(),
+            format!(
+                "- At most {} dag nodes run concurrently; the graph itself may contain more nodes than that.",
+                config.limits.max_parallel_agent_steps
+            ),
+            "- Command-capable nodes run in isolation; keep project-wide mutations, formatters, dependency installs, code generation, migrations, whole-suite tests, and VCS actions in their own dag node.".to_string(),
+        ]);
+    }
 
     lines.join("\n")
 }
@@ -785,6 +1056,28 @@ mod tests {
     use super::*;
     use crate::config::{load_effective_config, ConfigLoadOptions};
     use tempfile::tempdir;
+
+    #[test]
+    fn run_state_is_terminal_truth_table() {
+        // Terminal: the run has finished.
+        for state in [
+            RunState::Completed,
+            RunState::Failed,
+            RunState::Interrupted,
+            RunState::LimitReached,
+        ] {
+            assert!(state.is_terminal(), "{state:?} should be terminal");
+        }
+        // In-flight: the run is not finished.
+        for state in [
+            RunState::Idle,
+            RunState::Planning,
+            RunState::Running,
+            RunState::WaitingForUser,
+        ] {
+            assert!(!state.is_terminal(), "{state:?} should not be terminal");
+        }
+    }
 
     fn parallel_enabled_config(max_parallel_agent_steps: u32) -> crate::config::EffectiveConfig {
         let dir = tempdir().unwrap();
@@ -1466,6 +1759,326 @@ mod tests {
         let error = validate_parallel_group_plan(&group, &config).unwrap_err();
 
         assert!(error.to_string().contains("current-directory components"));
+    }
+
+    // ── execution graph (DAG) decision schema + validation (task_02) ──
+
+    fn dag_enabled_config(max_parallel_agent_steps: u32) -> crate::config::EffectiveConfig {
+        let dir = tempdir().unwrap();
+        let mut config = load_effective_config(ConfigLoadOptions {
+            working_directory: dir.path().to_path_buf(),
+            config_path: None,
+        })
+        .unwrap();
+        config.features.execution_graph = true;
+        config.limits.max_parallel_agent_steps = max_parallel_agent_steps;
+        config
+    }
+
+    fn dag_node(node_id: &str, write_file: &str) -> ExecutionNode {
+        ExecutionNode {
+            node_id: node_id.to_string(),
+            step_label: format!("step {node_id}"),
+            agent: "fixer".to_string(),
+            instruction: format!("Fix {write_file}."),
+            required_capabilities: vec![Capability::Read, Capability::Edit],
+            file_scope: ParallelFileScope {
+                write_files: vec![write_file.to_string()],
+                read_roots: vec!["src".to_string()],
+            },
+        }
+    }
+
+    fn dag_edge(from: &str, to: &str) -> ExecutionEdge {
+        ExecutionEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: ExecutionEdgeKind::DataDependency,
+        }
+    }
+
+    fn dag_continue_decision(schema_version: u32) -> OrchestratorDecision {
+        OrchestratorDecision {
+            schema_version,
+            decision_id: "decision".to_string(),
+            run_id: "run".to_string(),
+            status: DecisionStatus::Continue,
+            plan: vec!["Run the graph.".to_string()],
+            next_agent: None,
+            next_step: Some(DecisionNextStep::Dag(ExecutionGraph {
+                graph_id: "graph".to_string(),
+                reason: "Two independent then joined.".to_string(),
+                nodes: vec![dag_node("a", "src/a.rs"), dag_node("b", "src/b.rs")],
+                edges: vec![dag_edge("a", "b")],
+            })),
+            reason: "The work forms a dependency graph.".to_string(),
+            required_capabilities: Vec::new(),
+            stop_condition: "Graph completes.".to_string(),
+            clarifying_question: None,
+            clarifying_options: Vec::new(),
+            recommended_option_id: None,
+            multi_select: false,
+            final_summary: None,
+        }
+    }
+
+    #[test]
+    fn dag_decision_round_trips_through_serde() {
+        let next_step = DecisionNextStep::Dag(ExecutionGraph {
+            graph_id: "graph".to_string(),
+            reason: "Diamond.".to_string(),
+            nodes: vec![dag_node("a", "src/a.rs"), dag_node("b", "src/b.rs")],
+            edges: vec![dag_edge("a", "b")],
+        });
+        let value = serde_json::to_value(&next_step).unwrap();
+        assert_eq!(value["kind"], "dag");
+        let parsed: DecisionNextStep = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, next_step);
+    }
+
+    #[test]
+    fn existing_next_step_variants_still_deserialize_unchanged() {
+        let single: DecisionNextStep =
+            serde_json::from_str(r#"{"kind":"single_agent","agent":"explorer"}"#).unwrap();
+        assert!(matches!(single, DecisionNextStep::SingleAgent(_)));
+        let parallel: DecisionNextStep = serde_json::from_str(
+            r#"{"kind":"parallel_group","group_id":"g","reason":"r","steps":[]}"#,
+        )
+        .unwrap();
+        assert!(matches!(parallel, DecisionNextStep::ParallelGroup(_)));
+    }
+
+    #[test]
+    fn dag_normalizes_at_schema_version_3() {
+        let decision = dag_continue_decision(3);
+        let next_step = decision.normalized_next_step().unwrap().unwrap();
+        assert!(matches!(next_step, DecisionNextStep::Dag(_)));
+    }
+
+    #[test]
+    fn dag_under_schema_version_2_is_rejected() {
+        let decision = dag_continue_decision(2);
+        let error = decision.normalized_next_step().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("schema_version 2 cannot select a dag next_step"));
+    }
+
+    #[test]
+    fn dag_under_schema_version_1_is_rejected() {
+        let decision = dag_continue_decision(1);
+        let error = decision.normalized_next_step().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("schema_version 1 cannot select a dag next_step"));
+    }
+
+    #[test]
+    fn schema_version_2_error_string_is_unchanged_for_next_agent() {
+        // The existing v2 message must stay byte-identical (replay/test contract).
+        let mut decision = dag_continue_decision(2);
+        decision.next_step = None;
+        decision.next_agent = Some("explorer".to_string());
+        let error = decision.normalized_next_step().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("schema_version 2 must use next_step instead of next_agent"));
+    }
+
+    #[test]
+    fn validate_execution_graph_accepts_valid_diamond() {
+        // a -> {b, c} -> d; b and c are concurrent but write disjoint files. The
+        // graph (4 nodes) is larger than the concurrency ceiling (2), which is
+        // legal — the ceiling bounds simultaneity, not total node count.
+        let config = dag_enabled_config(2);
+        let graph = ExecutionGraph {
+            graph_id: "graph".to_string(),
+            reason: "Diamond.".to_string(),
+            nodes: vec![
+                dag_node("a", "src/a.rs"),
+                dag_node("b", "src/b.rs"),
+                dag_node("c", "src/c.rs"),
+                dag_node("d", "src/d.rs"),
+            ],
+            edges: vec![
+                dag_edge("a", "b"),
+                dag_edge("a", "c"),
+                dag_edge("b", "d"),
+                dag_edge("c", "d"),
+            ],
+        };
+        validate_execution_graph(&graph, &config).unwrap();
+    }
+
+    #[test]
+    fn validate_execution_graph_rejects_cycle() {
+        let config = dag_enabled_config(2);
+        let graph = ExecutionGraph {
+            graph_id: "graph".to_string(),
+            reason: "Cyclic.".to_string(),
+            nodes: vec![dag_node("a", "src/a.rs"), dag_node("b", "src/b.rs")],
+            edges: vec![dag_edge("a", "b"), dag_edge("b", "a")],
+        };
+        let error = validate_execution_graph(&graph, &config).unwrap_err();
+        assert!(error.to_string().contains("contains a cycle"));
+    }
+
+    #[test]
+    fn validate_execution_graph_rejects_unknown_edge_endpoint() {
+        let config = dag_enabled_config(2);
+        let graph = ExecutionGraph {
+            graph_id: "graph".to_string(),
+            reason: "Dangling edge.".to_string(),
+            nodes: vec![dag_node("a", "src/a.rs")],
+            edges: vec![dag_edge("a", "ghost")],
+        };
+        let error = validate_execution_graph(&graph, &config).unwrap_err();
+        assert!(error.to_string().contains("unknown to node_id ghost"));
+    }
+
+    #[test]
+    fn validate_execution_graph_rejects_duplicate_node_id() {
+        let config = dag_enabled_config(2);
+        let graph = ExecutionGraph {
+            graph_id: "graph".to_string(),
+            reason: "Duplicate ids.".to_string(),
+            nodes: vec![dag_node("a", "src/a.rs"), dag_node("a", "src/b.rs")],
+            edges: Vec::new(),
+        };
+        let error = validate_execution_graph(&graph, &config).unwrap_err();
+        assert!(error.to_string().contains("duplicate node_id a"));
+    }
+
+    #[test]
+    fn validate_execution_graph_rejects_concurrent_write_overlap() {
+        // a and b have no path between them, so they could run concurrently and
+        // must not write the same file.
+        let config = dag_enabled_config(2);
+        let graph = ExecutionGraph {
+            graph_id: "graph".to_string(),
+            reason: "Concurrent overlap.".to_string(),
+            nodes: vec![
+                dag_node("a", "src/shared.rs"),
+                dag_node("b", "src/shared.rs"),
+            ],
+            edges: Vec::new(),
+        };
+        let error = validate_execution_graph(&graph, &config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("may run concurrently but both write"));
+    }
+
+    #[test]
+    fn validate_execution_graph_accepts_sequential_shared_write_file() {
+        // a -> b orders the two nodes, so reusing the same write file is legal.
+        let config = dag_enabled_config(2);
+        let graph = ExecutionGraph {
+            graph_id: "graph".to_string(),
+            reason: "Sequential reuse.".to_string(),
+            nodes: vec![
+                dag_node("a", "src/shared.rs"),
+                dag_node("b", "src/shared.rs"),
+            ],
+            edges: vec![dag_edge("a", "b")],
+        };
+        validate_execution_graph(&graph, &config).unwrap();
+    }
+
+    #[test]
+    fn validate_execution_graph_rejects_edit_node_missing_write_files() {
+        let config = dag_enabled_config(2);
+        let mut node = dag_node("a", "src/a.rs");
+        node.file_scope.write_files = Vec::new();
+        node.file_scope.read_roots = vec!["src".to_string()];
+        let graph = ExecutionGraph {
+            graph_id: "graph".to_string(),
+            reason: "Edit without writes.".to_string(),
+            nodes: vec![node],
+            edges: Vec::new(),
+        };
+        let error = validate_execution_graph(&graph, &config).unwrap_err();
+        assert!(error.to_string().contains("missing write_files"));
+    }
+
+    #[test]
+    fn validate_execution_graph_rejects_when_feature_disabled() {
+        let mut config = dag_enabled_config(2);
+        config.features.execution_graph = false;
+        let graph = ExecutionGraph {
+            graph_id: "graph".to_string(),
+            reason: "Disabled.".to_string(),
+            nodes: vec![dag_node("a", "src/a.rs")],
+            edges: Vec::new(),
+        };
+        let error = validate_execution_graph(&graph, &config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("disabled by features.execution_graph"));
+    }
+
+    #[test]
+    fn build_orchestrator_prompt_emits_dag_guidance_only_when_enabled() {
+        let mut config = validation_config();
+        config.limits.max_parallel_agent_steps = 2;
+
+        config.features.execution_graph = false;
+        assert!(!build_orchestrator_prompt(&config).contains("kind = \"dag\""));
+
+        config.features.execution_graph = true;
+        assert!(build_orchestrator_prompt(&config).contains("kind = \"dag\""));
+
+        // A zero concurrency ceiling disables the DAG even when the flag is on.
+        config.limits.max_parallel_agent_steps = 0;
+        assert!(!build_orchestrator_prompt(&config).contains("kind = \"dag\""));
+    }
+
+    #[test]
+    fn full_dag_decision_parses_and_validates_end_to_end() {
+        let config = dag_enabled_config(2);
+        let decision = dag_continue_decision(3);
+        let wrapped = wrap_json_contract(&decision).unwrap();
+        let parsed = parse_orchestrator_decision(&wrapped).unwrap();
+        assert_eq!(parsed, decision);
+        validate_orchestrator_decision(&parsed, &config).unwrap();
+    }
+
+    #[test]
+    fn execution_graph_result_round_trips_via_run_step_result() {
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("completed".to_string(), 1u32);
+        counts.insert("skipped".to_string(), 1u32);
+        counts.insert("failed".to_string(), 1u32);
+        let result = RunStepResult::Dag {
+            result: ExecutionGraphResult {
+                schema_version: 1,
+                graph_id: "graph".to_string(),
+                run_id: "run".to_string(),
+                status: ExecutionGraphStatus::CompletedWithIssues,
+                summary: "one succeeded, one failed, one skipped".to_string(),
+                node_results: vec![NodeResultRef {
+                    node_id: "a".to_string(),
+                    step_label: "step a".to_string(),
+                    agent: "fixer".to_string(),
+                    file_scope: ParallelFileScope {
+                        write_files: vec!["src/a.rs".to_string()],
+                        read_roots: vec!["src".to_string()],
+                    },
+                    status: AgentResultStatus::Completed,
+                    result_index: 0,
+                }],
+                counts,
+                changed_files: vec!["src/a.rs".to_string()],
+                skipped: vec!["c".to_string()],
+                failed: vec!["b".to_string()],
+                started_at: "2026-06-17T00:00:00.000Z".to_string(),
+                completed_at: "2026-06-17T00:01:00.000Z".to_string(),
+            },
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["kind"], "dag");
+        let parsed: RunStepResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, result);
     }
 
     #[test]

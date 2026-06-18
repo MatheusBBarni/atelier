@@ -1,15 +1,18 @@
 use crate::app::chat::{
     ChatDetailRef, ChatItemKind, ChatItemView, ChatLineStyle, ChatLineView, ChatSeverity,
+    SessionPreview,
 };
 use crate::app::git::GitContext;
 use crate::app::{
     ActivityState, AgentView, App, AppEvent, AppState, ApprovalHandle, ApprovalResolution,
-    InterruptHandle, PendingApprovalView, PendingClarificationView, PromptSource,
-    QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
+    InterruptHandle, PendingApprovalView, PendingClarificationView, PendingPlanApprovalView,
+    PlanApprovalAnswer, PromptSource, QueuedFollowUpStatus, QueuedFollowUpView, RosterRow,
 };
 use crate::config::EffectiveConfig;
 use crate::file_index::{FileEntry, FileIndex, FileSuggestion};
 use crate::governance::{GovernanceAnswer, GovernanceDecisionView};
+use crate::history::SessionSummary;
+use crate::hooks::{self, HookLifecycleRecord};
 use crate::keybindings::{self, KeyAction, Keymap};
 use crate::orchestrator::RunState;
 use crate::skills::{
@@ -92,6 +95,8 @@ const CLARIFICATION_HINT_MULTI: &str =
     "↑/↓ or 1-9 move · Space toggle · type for custom · Enter confirm · Ctrl-C interrupt";
 const GOVERNANCE_DECISION_HINT: &str =
     "Ctrl-Y accept · Esc reject · type a redirect then Enter to reject with guidance · Ctrl-C interrupt";
+const PLAN_APPROVAL_HINT: &str =
+    "Ctrl-Y accept plan · Esc reject · type a reason then Enter to reject with guidance · Ctrl-C interrupt";
 const QUEUE_VISIBLE_MAX: usize = 6;
 const QUEUE_SELECTED_MARKER: &str = "> ";
 const QUEUE_UNSELECTED_MARKER: &str = "  ";
@@ -190,6 +195,7 @@ enum TuiCommand {
     ClarificationInputCharacter(char),
     ClarificationInputBackspace,
     QueueSelection(QueueSelectionCommand),
+    SessionBrowser(SessionBrowserCommand),
     ReloadSkills,
     InputCharacter(char),
     InputBackspace,
@@ -290,7 +296,101 @@ enum QueueSelectionCommand {
 #[derive(Debug)]
 enum AppWorkerCommand {
     Event(AppEvent),
+    /// A `hook_started`/`hook_completed` record from the off-thread dispatcher,
+    /// forwarded here so the worker (the only `&mut App`) records it (ADR-003).
+    RecordHookLifecycle(HookLifecycleRecord),
     Shutdown,
+}
+
+/// Which view the session browser is showing: the list, or a selected session's
+/// read-only transcript preview (task_08).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BrowserMode {
+    #[default]
+    List,
+    Preview,
+}
+
+/// One browser action, routed while the modal is visible (task_07/08). The
+/// resume action arrives in task_11.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionBrowserCommand {
+    Open,
+    Close,
+    Up,
+    Down,
+    FilterChar(char),
+    FilterBackspace,
+    /// `→` on a list row → load that session's preview and switch to it.
+    OpenPreview,
+    /// `Esc` in preview → return to the list.
+    Back,
+    /// Scroll the preview transcript (reuses the chat scroll vocabulary).
+    ScrollPreview(EventScrollCommand),
+    /// `Enter` (list or preview) → resume this session: dispatch
+    /// `AppEvent::ResumeSession` to the worker and close the modal (task_11). The
+    /// id is resolved at keypress so the worker need not see browser state.
+    Resume(String),
+}
+
+/// Ephemeral session-browser modal state, held in `TuiUiState` like `help_*`
+/// (ADR-001). Summaries arrive off-thread over a watch channel; the filter is a
+/// case-insensitive substring narrow (fuzzy deferred, ADR-001).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SessionBrowserState {
+    visible: bool,
+    mode: BrowserMode,
+    summaries: Vec<SessionSummary>,
+    selection_index: usize,
+    filter: String,
+    /// The selected session's loaded preview (task_08); `None` while loading or
+    /// in list mode. Arrives off-thread over a watch channel.
+    preview: Option<SessionPreview>,
+    /// Which session the current preview is for, so `run_loop` knows when to
+    /// spawn a fresh off-thread load.
+    preview_session_id: Option<String>,
+    /// Scroll offset (in transcript lines) for the preview pane.
+    preview_scroll: usize,
+}
+
+impl SessionBrowserState {
+    /// Indices of `summaries` matching the case-insensitive substring filter, in
+    /// list (newest-first) order. An empty filter matches everything.
+    fn filtered_indices(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.summaries.len()).collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.summaries
+            .iter()
+            .enumerate()
+            .filter(|(_, summary)| summary.label.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Keep `selection_index` within the current filtered range.
+    fn clamp_selection(&mut self) {
+        let len = self.filtered_indices().len();
+        if len == 0 {
+            self.selection_index = 0;
+        } else if self.selection_index >= len {
+            self.selection_index = len - 1;
+        }
+    }
+
+    /// The session id the Resume action targets: the previewed session in preview
+    /// mode, else the highlighted list row. `None` when the (filtered) list is
+    /// empty, so Resume is a no-op rather than resuming nothing.
+    fn selected_session_id(&self) -> Option<String> {
+        match self.mode {
+            BrowserMode::Preview => self.preview_session_id.clone(),
+            BrowserMode::List => self
+                .filtered_indices()
+                .get(self.selection_index)
+                .map(|&index| self.summaries[index].session_id.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -367,6 +467,9 @@ struct TuiUiState {
     /// task_08 swaps in the config-resolved map. No overrides ⇒ byte-identical
     /// default routing.
     keymap: Keymap,
+    /// Session-browser modal state (task_07): visibility, off-thread-loaded
+    /// summaries, selection, and filter. Default = closed/empty.
+    browser: SessionBrowserState,
 }
 
 impl Default for TuiUiState {
@@ -415,6 +518,7 @@ impl Default for TuiUiState {
             }),
             hide_banner: false,
             keymap: default_keymap(),
+            browser: SessionBrowserState::default(),
         }
     }
 }
@@ -536,6 +640,9 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     let hide_banner = config.ui.hide_banner;
     let prompt_history_enabled = config.ui.prompt_history_enabled;
     let prompt_history_max = config.ui.prompt_history_max;
+    // Captured before `config` is moved into the app; drives whether the hook
+    // dispatcher is spawned (zero cost when no handlers) and which notifier backend.
+    let hooks_config = config.hooks.clone();
     // Resolve the active keymap from defaults + validated config overrides (task_08).
     // Captured before `config` is moved into the app; no overrides ⇒ default keymap.
     let keymap = Keymap::resolve(&keybindings::DEFAULTS, &config.keybindings);
@@ -554,6 +661,42 @@ pub async fn run_tui(config: EffectiveConfig, debug_enabled: bool) -> Result<()>
     // gated on the toggle) projects `prompt_submitted` history off-thread and
     // publishes the ring once; the render loop syncs it into `TuiUiState`.
     let (prompt_history_sender, prompt_history_receiver) = watch::channel(Vec::<String>::new());
+
+    // Lifecycle hooks (ADR-003): only when handlers are configured, create the
+    // bounded dispatch channel + drop counter, wire the event tap
+    // (`App.hook_sender`), spawn the off-thread dispatcher, and forward its
+    // `hook_started`/`hook_completed` records back into the worker (the only
+    // `&mut App`) to be recorded. Skipped entirely otherwise, so the write path
+    // stays zero-cost when no hooks are present.
+    if !hooks_config.handlers.is_empty() {
+        let (hook_sender, hook_receiver) = hooks::hook_channel();
+        let (lifecycle_sender, mut lifecycle_receiver) =
+            mpsc::channel::<HookLifecycleRecord>(hooks::HOOK_CHANNEL_CAPACITY);
+        app.attach_hook_sender(hook_sender, hooks::DroppedHookCounter::new());
+        let notifier: Arc<dyn hooks::Notifier> = match hooks_config.notify_fallback_command.clone()
+        {
+            Some(command) => Arc::new(hooks::CommandNotifier::new(command)),
+            None => Arc::new(hooks::OscNotifier::to_terminal()),
+        };
+        tokio::spawn(hooks::run_hook_dispatcher(
+            hook_receiver,
+            lifecycle_sender,
+            notifier,
+            hooks::DEFAULT_HOOK_TIMEOUT,
+        ));
+        let lifecycle_command_sender = command_sender.clone();
+        tokio::spawn(async move {
+            while let Some(record) = lifecycle_receiver.recv().await {
+                if lifecycle_command_sender
+                    .send(AppWorkerCommand::RecordHookLifecycle(record))
+                    .await
+                    .is_err()
+                {
+                    break; // Worker is gone; stop forwarding.
+                }
+            }
+        });
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -630,6 +773,15 @@ async fn run_loop(
     mut ui_state: TuiUiState,
 ) -> Result<()> {
     let mut state = state_receiver.borrow_and_update().clone();
+    // Session-browser list channel (task_07): the loader runs off-thread on
+    // browser-open and publishes summaries here; the render loop syncs them in,
+    // so opening the browser never blocks the render loop.
+    let (session_summaries_sender, mut session_summaries_receiver) =
+        watch::channel(Vec::<SessionSummary>::new());
+    // Session-preview channel (task_08): on selecting a row, the sanitized
+    // history-only fold is built off-thread and published here.
+    let (session_preview_sender, mut session_preview_receiver) =
+        watch::channel(None::<SessionPreview>);
     // Render the first frame (welcome visible) before the blocking skill scan,
     // then load suggestions behind it so the /skill dropdown is ready by the
     // next interaction.
@@ -641,6 +793,8 @@ async fn run_loop(
         sync_worker_state(&mut state, &mut state_receiver);
         sync_file_index(&mut ui_state, &mut file_index_receiver);
         sync_prompt_history(&mut ui_state, &mut prompt_history_receiver);
+        sync_session_summaries(&mut ui_state, &mut session_summaries_receiver);
+        sync_session_preview(&mut ui_state, &mut session_preview_receiver);
         clamp_input_cursor(&mut ui_state, &state.input);
         terminal.draw(|frame| render(frame, &state, &mut ui_state))?;
 
@@ -651,6 +805,8 @@ async fn run_loop(
                 _ => None,
             };
             if let Some(command) = command {
+                let browser_was_visible = ui_state.browser.visible;
+                let preview_target_before = ui_state.browser.preview_session_id.clone();
                 // Skill reload reports via the status line (set in `reload_skills`)
                 // rather than a full-screen takeover.
                 if !execute_tui_command_with_interrupt(
@@ -664,6 +820,23 @@ async fn run_loop(
                 .await?
                 {
                     break;
+                }
+                // The browser just opened → load its session list off-thread.
+                if ui_state.browser.visible && !browser_was_visible {
+                    spawn_session_summaries_load(
+                        ui_state.working_directory.clone(),
+                        session_summaries_sender.clone(),
+                    );
+                }
+                // A new session was selected for preview → fold it off-thread.
+                if let Some(session_id) = ui_state.browser.preview_session_id.clone() {
+                    if Some(&session_id) != preview_target_before.as_ref() {
+                        spawn_session_preview_load(
+                            ui_state.working_directory.clone(),
+                            session_id,
+                            session_preview_sender.clone(),
+                        );
+                    }
                 }
             }
         }
@@ -773,6 +946,26 @@ async fn execute_tui_command_with_interrupt(
             apply_queue_selection_command(state, ui_state, command);
             Ok(true)
         }
+        TuiCommand::SessionBrowser(command) => {
+            match command {
+                // Resume dispatches to the worker (off-thread read → adopt_session
+                // → lifecycle events), then closes the modal + clears the composer
+                // so the re-rendered transcript shows unobstructed (task_11).
+                SessionBrowserCommand::Resume(session_id) => {
+                    queue_app_event(command_sender, AppEvent::ResumeSession(session_id)).await?;
+                    apply_session_browser_command(ui_state, SessionBrowserCommand::Close);
+                    clear_input(state, ui_state);
+                }
+                // Opening clears the composer so a `/sessions` trigger doesn't
+                // linger (a Ctrl-R open has an empty composer, so it's a no-op there).
+                SessionBrowserCommand::Open => {
+                    apply_session_browser_command(ui_state, SessionBrowserCommand::Open);
+                    clear_input(state, ui_state);
+                }
+                other => apply_session_browser_command(ui_state, other),
+            }
+            Ok(true)
+        }
         TuiCommand::ReloadSkills => {
             reload_skills(state, ui_state);
             Ok(true)
@@ -816,6 +1009,7 @@ async fn execute_tui_command_with_interrupt(
                 AppEvent::PromptSubmitted(_, _)
                     | AppEvent::ApprovalAnswered(_)
                     | AppEvent::GovernanceDecisionResolved(_, _)
+                    | AppEvent::PlanApprovalResolved(_, _)
             );
             if let AppEvent::ApprovalAnswered(resolution) = &event {
                 if let (Some(approval_handle), Some(pending)) =
@@ -885,6 +1079,87 @@ fn sync_file_index(
     if file_index_receiver.has_changed().unwrap_or(false) {
         ui_state.file_mention_entries = file_index_receiver.borrow_and_update().clone();
     }
+}
+
+/// Adopt the latest off-thread session-list snapshot into the browser state
+/// (task_07), keeping the selection within range after the list lands.
+fn sync_session_summaries(
+    ui_state: &mut TuiUiState,
+    receiver: &mut watch::Receiver<Vec<SessionSummary>>,
+) {
+    if receiver.has_changed().unwrap_or(false) {
+        ui_state.browser.summaries = receiver.borrow_and_update().clone();
+        ui_state.browser.clamp_selection();
+    }
+}
+
+/// Load the session summaries off the render thread and publish them to the
+/// browser (task_07), mirroring `spawn_file_index_refresh`.
+/// `list_session_summaries` is synchronous file I/O, so it runs inside
+/// `spawn_blocking`; a join error (panic) or a closed receiver leaves the list
+/// unchanged. No-op without a working directory.
+fn spawn_session_summaries_load(
+    working_directory: Option<PathBuf>,
+    sender: watch::Sender<Vec<SessionSummary>>,
+) {
+    tokio::spawn(async move {
+        let Some(working_directory) = working_directory else {
+            return;
+        };
+        let data_root = working_directory.join(".atelier");
+        if let Ok(summaries) =
+            tokio::task::spawn_blocking(move || crate::history::list_session_summaries(&data_root))
+                .await
+        {
+            let _ = sender.send(summaries);
+        }
+    });
+}
+
+/// Adopt the latest off-thread preview into the browser (task_08). The build is
+/// pure and read-only; this only updates `ui_state`.
+fn sync_session_preview(
+    ui_state: &mut TuiUiState,
+    receiver: &mut watch::Receiver<Option<SessionPreview>>,
+) {
+    if receiver.has_changed().unwrap_or(false) {
+        let incoming = receiver.borrow_and_update().clone();
+        // Drop a stale preview from a previously-selected session: a slow load
+        // that resolves after the user moved on must not overwrite the preview
+        // for the session now selected. A `None` (loading/cleared) always applies.
+        let applies = match (&incoming, &ui_state.browser.preview_session_id) {
+            (Some(preview), Some(current)) => &preview.session_id == current,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if applies {
+            ui_state.browser.preview = incoming;
+        }
+    }
+}
+
+/// Build the read-only session preview off the render thread and publish it
+/// (task_08), reusing the task_06 builder. `build_session_preview` is synchronous
+/// file I/O, so it runs inside `spawn_blocking`; a build error or join failure
+/// leaves the loading placeholder in place. Strictly read-only — no `App` touch.
+fn spawn_session_preview_load(
+    working_directory: Option<PathBuf>,
+    session_id: String,
+    sender: watch::Sender<Option<SessionPreview>>,
+) {
+    tokio::spawn(async move {
+        let Some(working_directory) = working_directory else {
+            return;
+        };
+        let data_root = working_directory.join(".atelier");
+        let built = tokio::task::spawn_blocking(move || {
+            crate::app::chat::build_session_preview(&data_root, &session_id)
+        })
+        .await;
+        if let Ok(Ok(preview)) = built {
+            let _ = sender.send(Some(preview));
+        }
+    });
 }
 
 /// Project this project's recall list off the render thread and publish it to
@@ -1073,6 +1348,11 @@ async fn run_app_worker(
                         app.record_diagnostic(error.to_string())?;
                     }
                 }
+                Some(AppWorkerCommand::RecordHookLifecycle(record)) => {
+                    if let Err(error) = app.record_hook_lifecycle(record) {
+                        app.record_diagnostic(error.to_string())?;
+                    }
+                }
                 Some(AppWorkerCommand::Shutdown) => {
                     walk_cancel.store(true, Ordering::Relaxed);
                     app.end_session()?;
@@ -1197,12 +1477,21 @@ fn key_event_to_tui_command_with_ui(
             }
             _ => None,
         }
+    } else if ui_state.browser.visible {
+        // Full modal (task_07/08): below help, above every other context. While
+        // visible it consumes keys (nav / filter / preview-scroll / close);
+        // unmatched keys are swallowed so nothing leaks to the composer. Help
+        // still wins above. Routing is mode-aware (list vs preview).
+        session_browser_key_command(&ui_state.browser, key)
     } else if state.pending_clarification.is_some() {
         // Ctrl-C is handled by the reserved-key guard above.
         clarification_key_command(state, ui_state, key)
     } else if state.pending_governance_decision.is_some() {
         // Ctrl-C is handled by the reserved-key guard above.
         governance_decision_key_command(state, key)
+    } else if state.pending_plan_approval.is_some() {
+        // The whole-plan DAG approval gate (ADR-005); Ctrl-C handled above.
+        plan_approval_key_command(state, key)
     } else if state.pending_approval.is_some() {
         // Modal contexts keep default chat-scroll (PageUp/PageDown/Home/End) as a
         // fallback so keyboard users can still scroll while the modal is open, but the
@@ -1243,6 +1532,92 @@ fn key_event_to_tui_command_with_ui(
     }
 }
 
+/// Map a key to a [`SessionBrowserCommand`] while the browser modal is visible
+/// (task_07). `Esc` closes; `↑/↓` navigate; `Backspace` and printable characters
+/// narrow the filter. Every other key returns `None` and is swallowed by the
+/// modal (Ctrl-C is intercepted earlier by the reserved-key guard).
+/// Build the Resume command for the browser's current selection, or `None` when
+/// the (filtered) list is empty so `Enter` is a no-op rather than resuming
+/// nothing. The session id is resolved here so the worker never reads UI state.
+fn resume_command(browser: &SessionBrowserState) -> Option<TuiCommand> {
+    browser
+        .selected_session_id()
+        .map(|id| TuiCommand::SessionBrowser(SessionBrowserCommand::Resume(id)))
+}
+
+fn session_browser_key_command(browser: &SessionBrowserState, key: KeyEvent) -> Option<TuiCommand> {
+    use SessionBrowserCommand as Cmd;
+    let command = match browser.mode {
+        // List: Enter resumes the selection, → previews it, ↑/↓ navigate, typing
+        // filters, Esc closes.
+        BrowserMode::List => match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => Cmd::Close,
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => return resume_command(browser),
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => Cmd::OpenPreview,
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => Cmd::Up,
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => Cmd::Down,
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => Cmd::FilterBackspace,
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => Cmd::FilterChar(ch),
+            _ => return None,
+        },
+        // Preview: Enter resumes, Esc returns to the list, chat-scroll keys move
+        // the transcript.
+        BrowserMode::Preview => match key {
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => return resume_command(browser),
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => Cmd::Back,
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            } => Cmd::ScrollPreview(EventScrollCommand::PageUp),
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            } => Cmd::ScrollPreview(EventScrollCommand::PageDown),
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => Cmd::ScrollPreview(EventScrollCommand::LinesUp(1)),
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => Cmd::ScrollPreview(EventScrollCommand::LinesDown(1)),
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } => Cmd::ScrollPreview(EventScrollCommand::Top),
+            KeyEvent {
+                code: KeyCode::End, ..
+            } => Cmd::ScrollPreview(EventScrollCommand::Bottom),
+            _ => return None,
+        },
+    };
+    Some(TuiCommand::SessionBrowser(command))
+}
+
 /// Queue focus is active when the input composer is empty and there are queued
 /// follow-ups, with no higher-priority mode (help / clarification / approval)
 /// open. The `/agent:` and `/skill:` dropdowns require non-empty input, so they
@@ -1253,6 +1628,7 @@ fn queue_control_active(state: &AppState, ui_state: &TuiUiState) -> bool {
         && !ui_state.help_visible
         && state.pending_clarification.is_none()
         && state.pending_governance_decision.is_none()
+        && state.pending_plan_approval.is_none()
         && state.pending_approval.is_none()
 }
 
@@ -1339,6 +1715,101 @@ fn apply_queue_selection_command(
             }
         }
         QueueSelectionCommand::Next => (current + 1) % count,
+    };
+}
+
+/// Apply a [`SessionBrowserCommand`] to the modal state (task_07). The summaries
+/// refresh on `Open` is triggered by `run_loop` (it owns the watch channel), so
+/// this only mutates visibility / selection / filter.
+fn apply_session_browser_command(ui_state: &mut TuiUiState, command: SessionBrowserCommand) {
+    let browser = &mut ui_state.browser;
+    match command {
+        SessionBrowserCommand::Open => {
+            browser.visible = true;
+            browser.mode = BrowserMode::List;
+            browser.filter.clear();
+            browser.selection_index = 0;
+            browser.preview = None;
+            browser.preview_session_id = None;
+            browser.preview_scroll = 0;
+        }
+        SessionBrowserCommand::Close => {
+            // Full reset so the next open starts clean (no stale summaries/filter).
+            *browser = SessionBrowserState::default();
+        }
+        SessionBrowserCommand::Up => {
+            browser.selection_index = browser.selection_index.saturating_sub(1);
+        }
+        SessionBrowserCommand::Down => {
+            let len = browser.filtered_indices().len();
+            if len > 0 && browser.selection_index + 1 < len {
+                browser.selection_index += 1;
+            }
+        }
+        SessionBrowserCommand::FilterChar(ch) => {
+            browser.filter.push(ch);
+            browser.selection_index = 0;
+        }
+        SessionBrowserCommand::FilterBackspace => {
+            browser.filter.pop();
+            browser.selection_index = 0;
+        }
+        SessionBrowserCommand::OpenPreview => {
+            // Enter on the selected list row: switch to preview mode and mark which
+            // session to load. `run_loop` spawns the off-thread fold; the preview
+            // stays `None` (loading placeholder) until it lands.
+            if let Some(&index) = browser.filtered_indices().get(browser.selection_index) {
+                let session_id = browser.summaries[index].session_id.clone();
+                browser.mode = BrowserMode::Preview;
+                browser.preview = None;
+                browser.preview_session_id = Some(session_id);
+                browser.preview_scroll = 0;
+            }
+        }
+        SessionBrowserCommand::Back => {
+            // Return to the list, discarding the loaded preview.
+            browser.mode = BrowserMode::List;
+            browser.preview = None;
+            browser.preview_session_id = None;
+            browser.preview_scroll = 0;
+        }
+        SessionBrowserCommand::ScrollPreview(scroll) => {
+            apply_preview_scroll(browser, scroll);
+        }
+        SessionBrowserCommand::Resume(_) => {
+            // Resume is intercepted in `execute_tui_command_with_interrupt` (it
+            // dispatches `AppEvent::ResumeSession` to the worker and then closes
+            // the modal); it never reaches this UI-only mutator.
+        }
+    }
+}
+
+/// Number of transcript lines `render_session_browser` produces for a preview —
+/// one title + optional summary + body lines + a blank separator per item. Kept
+/// in sync with the preview line builder so scroll clamping matches the render.
+fn preview_total_lines(preview: &SessionPreview) -> usize {
+    preview
+        .items
+        .iter()
+        .map(|item| 1 + usize::from(item.summary.is_some()) + item.body.len() + 1)
+        .sum()
+}
+
+/// Apply a chat-style scroll command to the preview offset, clamped to the
+/// transcript length. A no-op while the preview is still loading.
+fn apply_preview_scroll(browser: &mut SessionBrowserState, scroll: EventScrollCommand) {
+    let Some(preview) = browser.preview.as_ref() else {
+        return;
+    };
+    const PAGE: usize = 10;
+    let max = preview_total_lines(preview).saturating_sub(1);
+    browser.preview_scroll = match scroll {
+        EventScrollCommand::Top => 0,
+        EventScrollCommand::Bottom => max,
+        EventScrollCommand::PageUp => browser.preview_scroll.saturating_sub(PAGE),
+        EventScrollCommand::PageDown => (browser.preview_scroll + PAGE).min(max),
+        EventScrollCommand::LinesUp(n) => browser.preview_scroll.saturating_sub(n),
+        EventScrollCommand::LinesDown(n) => (browser.preview_scroll + n).min(max),
     };
 }
 
@@ -1547,6 +2018,56 @@ fn governance_decision_key_command(state: &AppState, key: KeyEvent) -> Option<Tu
     }
 }
 
+/// Key routing for the whole-plan DAG approval gate (ADR-005), mirroring
+/// `governance_decision_key_command`: Ctrl-Y accepts; Esc rejects; Enter rejects
+/// with the composed reason (empty line = no-op so the default key never
+/// accepts); other keys compose the optional reason.
+fn plan_approval_key_command(state: &AppState, key: KeyEvent) -> Option<TuiCommand> {
+    let question_id = state.pending_plan_approval.as_ref()?.question_id.clone();
+    match key {
+        KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+            question_id,
+            PlanApprovalAnswer::Accept,
+        ))),
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        } => Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+            question_id,
+            PlanApprovalAnswer::Reject { reason: None },
+        ))),
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        } => {
+            let reason = state.input.trim();
+            (!reason.is_empty()).then(|| {
+                TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+                    question_id,
+                    PlanApprovalAnswer::Reject {
+                        reason: Some(reason.to_string()),
+                    },
+                ))
+            })
+        }
+        KeyEvent {
+            code: KeyCode::Backspace,
+            ..
+        } => Some(TuiCommand::InputBackspace),
+        KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            ..
+        } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+            Some(TuiCommand::InputCharacter(ch))
+        }
+        _ => None,
+    }
+}
+
 /// The reserved interrupt/quit chord: `Ctrl-C`. Matched at the single chokepoint in
 /// `key_event_to_tui_command_with_ui` so it can never be shadowed by a modal context
 /// or a user keymap. Structurally non-bindable (excluded from `keybindings::is_portable`).
@@ -1587,6 +2108,21 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
         // `Keymap`, consulted in the normal-input branch of the wrapper (task_04/08).
         // Keeping them here would shadow a user rebind/unbind of their default key,
         // and would also leak them into modal fallbacks (the keymap is normal-only).
+        //
+        // Ctrl-R opens the session browser (task_07; hardcoded — no keybinding
+        // config yet). Guarded off while a blocking modal (approval / clarification
+        // / governance) is pending so it can't shadow those answer paths.
+        KeyEvent {
+            code: KeyCode::Char('r'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } if state.pending_approval.is_none()
+            && state.pending_clarification.is_none()
+            && state.pending_governance_decision.is_none()
+            && state.pending_plan_approval.is_none() =>
+        {
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
+        }
         KeyEvent {
             code: KeyCode::Up, ..
         } => Some(TuiCommand::MoveInputCursor(InputCursorCommand::Up)),
@@ -1606,6 +2142,13 @@ fn key_event_to_tui_command(state: &AppState, key: KeyEvent) -> Option<TuiComman
             code: KeyCode::Enter,
             ..
         } if state.input.trim() == "/help" => Some(TuiCommand::ToggleHelp),
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        } if state.input.trim() == "/sessions" => {
+            // /sessions opens the same browser as Ctrl-R (task_09 discoverability).
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
+        }
         KeyEvent {
             code: KeyCode::Enter,
             ..
@@ -1797,6 +2340,17 @@ fn approval_modal_lines(
         lines.push(Line::styled(
             format!("Reversible: {}", if reversible { "yes" } else { "no" }),
             Style::default().fg(theme.text_muted),
+        ));
+    }
+    // Drift interlock context for the first mutation after a drifted resume
+    // (ADR-004): surface it prominently so a reflexive approve cannot silently
+    // write to a moved tree.
+    if let Some(drift) = pending.drift_notice.as_deref() {
+        lines.push(Line::styled(
+            format!("⚠ {drift}"),
+            Style::default()
+                .fg(theme.status_warn)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -2910,6 +3464,13 @@ fn agent_suggestion_detail(agent: &crate::app::AgentView) -> String {
 
 fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
     let theme = ui_state.theme;
+    // The session browser is a full-screen modal (task_07): when visible it takes
+    // over the frame, so it renders correctly regardless of any composer /
+    // clarification / approval context that may exist underneath.
+    if ui_state.browser.visible {
+        render_session_browser(frame, &ui_state.browser, &theme);
+        return;
+    }
     // Reset / default the clarification selection before sizing the composer so
     // the measured height matches what we render this frame.
     sync_clarification_state(state, ui_state);
@@ -2986,6 +3547,16 @@ fn render(frame: &mut Frame, state: &AppState, ui_state: &mut TuiUiState) {
             ui_state,
         );
         render_governance_decision_status(frame, areas.status, &theme);
+        if ui_state.help_visible {
+            render_help_modal(frame, state, ui_state, &theme);
+        }
+        return;
+    }
+
+    if let Some(pending) = &state.pending_plan_approval {
+        let areas = clarification_input_areas(composer_area);
+        render_plan_approval_composer(frame, areas.input, pending, &state.input, ui_state);
+        render_plan_approval_status(frame, areas.status, &theme);
         if ui_state.help_visible {
             render_help_modal(frame, state, ui_state, &theme);
         }
@@ -3157,6 +3728,7 @@ fn render_chat(frame: &mut Frame, event_area: Rect, state: &AppState, ui_state: 
             .git_context
             .as_ref()
             .map(|git| (git.repo_name.as_str(), git.branch.as_str())),
+        recoverable_session: state.recoverable_session,
     };
     let event_lines = if !state.chat_items.is_empty() {
         chat_item_lines(
@@ -4030,7 +4602,9 @@ fn chat_kind_label(kind: &ChatItemKind) -> &'static str {
         ChatItemKind::SkillContext => "skills",
         ChatItemKind::AgentResult => "agent",
         ChatItemKind::RunSummary => "run",
+        ChatItemKind::HookInvocation => "hook",
         ChatItemKind::Welcome => "welcome",
+        ChatItemKind::Plan => "plan",
     }
 }
 
@@ -4065,6 +4639,168 @@ fn wrapped_event_line_count(lines: &[Line<'_>], width: u16) -> usize {
 /// dispatches on `ui_state.help_active_tab` to the matching per-tab builder. The
 /// default tab (`GettingStarted`) renders on open. Tab navigation is handled in the
 /// key-routing layer (task 07); this render just reflects `help_active_tab`.
+/// Render the session-browser modal (task_07): a centered, newest-first list of
+/// `label · timestamp · outcome` rows with the selection highlighted and a filter
+/// line. All color flows through theme tokens; transcript-derived text is
+/// sanitized (ADR-004) before display.
+fn render_session_browser(frame: &mut Frame, browser: &SessionBrowserState, theme: &Theme) {
+    let area = centered_rect(78, 80, frame.area());
+    if browser.mode == BrowserMode::Preview {
+        render_session_preview(frame, area, browser, theme);
+        return;
+    }
+    let filtered = browser.filtered_indices();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(if browser.filter.is_empty() {
+        Span::styled(
+            "type to filter".to_string(),
+            Style::default().fg(theme.text_dim),
+        )
+    } else {
+        Span::styled(
+            format!(
+                "filter: {}",
+                crate::app::chat::sanitize_transcript_text(&browser.filter)
+            ),
+            Style::default().fg(theme.text_muted),
+        )
+    }));
+    lines.push(Line::from(""));
+
+    if filtered.is_empty() {
+        let message = if browser.summaries.is_empty() {
+            "No sessions yet."
+        } else {
+            "No sessions match the filter."
+        };
+        lines.push(Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(theme.text_dim),
+        )));
+    }
+
+    for (row, &index) in filtered.iter().enumerate() {
+        let summary = &browser.summaries[index];
+        let selected = row == browser.selection_index;
+        let label_style = if selected {
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_muted)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if selected { "▶ " } else { "  " }.to_string(), label_style),
+            Span::styled(
+                crate::app::chat::sanitize_transcript_text(&summary.label),
+                label_style,
+            ),
+            Span::raw("  "),
+            Span::styled(
+                crate::app::chat::sanitize_transcript_text(&summary.started_at),
+                Style::default().fg(theme.text_dim),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                run_state_label(&summary.outcome).to_string(),
+                run_state_style(theme, &summary.outcome),
+            ),
+        ]));
+    }
+
+    let widget = Paragraph::new(lines)
+        .style(Style::default().fg(theme.text).bg(theme.ink))
+        .block(
+            Block::default()
+                .title(" Sessions ")
+                .title(
+                    Line::from(" ↑↓ select · Enter resume · → preview · Esc close ")
+                        .right_aligned(),
+                )
+                .title_style(
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .border_style(Style::default().fg(theme.accent))
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
+/// Render the read-only transcript preview pane (task_08): a loading placeholder
+/// until the off-thread fold lands, then the sanitized, scrollable transcript.
+fn render_session_preview(
+    frame: &mut Frame,
+    area: Rect,
+    browser: &SessionBrowserState,
+    theme: &Theme,
+) {
+    let (lines, scroll) = match &browser.preview {
+        None => (
+            vec![Line::from(Span::styled(
+                "Loading transcript…".to_string(),
+                Style::default().fg(theme.text_dim),
+            ))],
+            0u16,
+        ),
+        Some(preview) if preview.items.is_empty() => (
+            vec![Line::from(Span::styled(
+                "This session has no transcript.".to_string(),
+                Style::default().fg(theme.text_dim),
+            ))],
+            0,
+        ),
+        Some(preview) => (
+            build_preview_lines(preview, theme),
+            browser.preview_scroll.min(u16::MAX as usize) as u16,
+        ),
+    };
+    let widget = Paragraph::new(lines)
+        .style(Style::default().fg(theme.text).bg(theme.ink))
+        .scroll((scroll, 0))
+        .block(
+            Block::default()
+                .title(" Session preview ")
+                .title(Line::from(" Enter resume · Esc back · PgUp/PgDn scroll ").right_aligned())
+                .title_style(
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .border_style(Style::default().fg(theme.accent))
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
+/// Build the styled transcript lines for a preview (already sanitized by the
+/// task_06 builder): a title + optional summary + body lines + a separator per
+/// item. The line count matches `preview_total_lines` so scroll clamping is exact.
+fn build_preview_lines(preview: &SessionPreview, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(preview_total_lines(preview));
+    for item in &preview.items {
+        lines.push(Line::from(Span::styled(
+            item.title.clone(),
+            severity_title_style(theme, &item.severity).add_modifier(Modifier::BOLD),
+        )));
+        if let Some(summary) = &item.summary {
+            lines.push(Line::from(Span::styled(
+                summary.clone(),
+                Style::default().fg(theme.text_muted),
+            )));
+        }
+        for line in &item.body {
+            lines.push(chat_body_line(theme, line));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
 fn render_help_modal(frame: &mut Frame, state: &AppState, ui_state: &TuiUiState, theme: &Theme) {
     let area = centered_rect(78, 100, frame.area());
     let active = ui_state.help_active_tab;
@@ -5031,6 +5767,16 @@ fn composer_height(state: &AppState, ui_state: &TuiUiState, area: Rect, reserved
         lines.push(Line::from(String::new()));
         lines.push(Line::from(format!("Redirect (optional): {}", state.input)));
         wrapped_event_line_count(&lines, inner_width)
+    } else if let Some(pending) = &state.pending_plan_approval {
+        // Mirror render_plan_approval_composer's lines so the composer is tall
+        // enough to show the plan summary + the reject-reason line.
+        let lines = vec![
+            Line::from(pending.summary.clone()),
+            Line::from("Accept to run the plan, or reject to send it back to the orchestrator."),
+            Line::from(String::new()),
+            Line::from(format!("Reject reason (optional): {}", state.input)),
+        ];
+        wrapped_event_line_count(&lines, inner_width)
     } else {
         return INPUT_COMPOSER_HEIGHT;
     };
@@ -5439,6 +6185,79 @@ fn render_governance_decision_status(frame: &mut Frame, status_area: Rect, theme
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             GOVERNANCE_DECISION_HINT,
+            Style::default().fg(theme.text_muted),
+        ))),
+        line_area,
+    );
+}
+
+fn render_plan_approval_composer(
+    frame: &mut Frame,
+    area: Rect,
+    view: &PendingPlanApprovalView,
+    input: &str,
+    ui_state: &TuiUiState,
+) {
+    let theme = ui_state.theme;
+    // The full graph is already rendered in the durable Plan chat item; the
+    // composer just restates the decision and echoes the reject reason being typed.
+    let lines = vec![
+        Line::from(Span::styled(
+            view.summary.clone(),
+            Style::default().fg(theme.text),
+        )),
+        Line::from(Span::styled(
+            "Accept to run the plan, or reject to send it back to the orchestrator.",
+            Style::default().fg(theme.text_muted),
+        )),
+        Line::from(String::new()),
+        Line::from(vec![
+            Span::styled(
+                "Reject reason (optional): ",
+                Style::default().fg(theme.text_muted),
+            ),
+            Span::styled(input.to_string(), Style::default().fg(theme.text)),
+        ]),
+    ];
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let focus_line = if input.is_empty() {
+        0
+    } else {
+        lines.len().saturating_sub(1)
+    };
+    let scroll = clarification_scroll_offset(
+        &lines,
+        focus_line,
+        clarification_inner_width(area),
+        inner_height,
+    );
+    let composer = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll.min(usize::from(u16::MAX)) as u16, 0))
+        .block(
+            Block::default()
+                .title(" Review plan · approval ")
+                .title_style(Style::default().fg(theme.accent))
+                .border_style(Style::default().fg(theme.accent))
+                .borders(Borders::ALL),
+        );
+    frame.render_widget(composer, area);
+}
+
+fn render_plan_approval_status(frame: &mut Frame, status_area: Rect, theme: &Theme) {
+    if status_area.width == 0 || status_area.height == 0 {
+        return;
+    }
+    let line_area = Rect {
+        x: status_area.x + 1,
+        y: status_area.y,
+        width: status_area.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(Clear, status_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            PLAN_APPROVAL_HINT,
             Style::default().fg(theme.text_muted),
         ))),
         line_area,
@@ -5857,6 +6676,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: vec![
                 AgentView {
                     runtime: "codex".to_string(),
@@ -5873,6 +6693,7 @@ mod tests {
             events: Vec::new(),
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
         populate_roster_rows(&mut state);
         let ui_state = TuiUiState {
@@ -5902,6 +6723,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -5909,6 +6731,7 @@ mod tests {
             events: Vec::new(),
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Agent Roster"));
@@ -5932,6 +6755,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
                 name: "Fixer".to_string(),
@@ -5957,6 +6781,7 @@ mod tests {
             ],
             input: "follow up".to_string(),
             git_context: None,
+            recoverable_session: false,
         };
         populate_roster_rows(&mut state);
         let text = render_to_text(&state, 100, 24);
@@ -6133,6 +6958,9 @@ mod tests {
             ],
             preset: Some("research".to_string()),
             warnings: vec!["enabled agents without model_fallbacks: explorer".to_string()],
+            approval_mode: crate::config::ApprovalMode::Yolo,
+            execution_graph_enabled: false,
+            max_parallel_agent_steps: 2,
         };
 
         let small = render_to_text(&state, 80, 24);
@@ -6158,6 +6986,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -6165,6 +6994,7 @@ mod tests {
             events: vec!["You: build a feature".to_string()],
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
 
         let text = render_to_text(&state, 100, 24);
@@ -6183,6 +7013,7 @@ mod tests {
             session_id: "session".to_string(),
             run_id: Some("run".to_string()),
             group_id: None,
+            graph_id: None,
             step_id: None,
             timestamp: "2026-06-05T00:00:00.000Z".to_string(),
             kind: "prompt_submitted".to_string(),
@@ -6263,6 +7094,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -6270,6 +7102,7 @@ mod tests {
             events: vec!["Action approval required.".to_string()],
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
         let text = render_to_text(&state, 100, 24);
         assert!(text.contains("Approval required for fixer"));
@@ -6300,6 +7133,7 @@ mod tests {
             show_first_approval_explainer,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             // Empty so the pending-approval fallback render path is exercised.
@@ -6308,6 +7142,7 @@ mod tests {
             events: vec!["Action approval required.".to_string()],
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         }
     }
 
@@ -9081,6 +9916,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: vec![AgentView {
                 id: "fixer".to_string(),
                 name: "Fixer".to_string(),
@@ -9098,6 +9934,7 @@ mod tests {
             events: vec!["Run started.".to_string()],
             input: String::new(),
             git_context: None,
+            recoverable_session: false,
         };
         let ui_state = TuiUiState {
             roster_visible: false,
@@ -9203,6 +10040,7 @@ mod tests {
             show_first_approval_explainer: false,
             pending_clarification: None,
             pending_governance_decision: None,
+            pending_plan_approval: None,
             agents: Vec::new(),
             roster_rows: Vec::new(),
             chat_items: Vec::new(),
@@ -9210,6 +10048,7 @@ mod tests {
             events: Vec::new(),
             input: input.to_string(),
             git_context: None,
+            recoverable_session: false,
         }
     }
 
@@ -9346,6 +10185,102 @@ mod tests {
         }];
         // A pending governance decision suppresses queue keys even with an empty
         // composer and queued items present.
+        assert!(!queue_control_active(&state, &TuiUiState::default()));
+    }
+
+    // ── whole-plan DAG approval gate key routing (review fix) ──
+
+    fn state_with_plan_approval(input: &str) -> AppState {
+        let mut state = state_with_input(input, false);
+        state.run_state = RunState::WaitingForUser;
+        state.active_run_id = Some("run".to_string());
+        state.pending_plan_approval = Some(PendingPlanApprovalView {
+            run_id: "run".to_string(),
+            graph_id: "graph-1".to_string(),
+            question_id: "plan-approval:graph-1".to_string(),
+            summary: "Review the proposed plan: 4 node(s), 4 edge(s).".to_string(),
+        });
+        state
+    }
+
+    #[test]
+    fn plan_approval_accept_key_routes_to_resolve_accept() {
+        let state = state_with_plan_approval("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+                "plan-approval:graph-1".to_string(),
+                PlanApprovalAnswer::Accept
+            )))
+        );
+    }
+
+    #[test]
+    fn plan_approval_esc_rejects_without_reason() {
+        let state = state_with_plan_approval("");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+                "plan-approval:graph-1".to_string(),
+                PlanApprovalAnswer::Reject { reason: None }
+            )))
+        );
+    }
+
+    #[test]
+    fn plan_approval_enter_rejects_with_typed_reason() {
+        let state = state_with_plan_approval("too risky");
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::Dispatch(AppEvent::PlanApprovalResolved(
+                "plan-approval:graph-1".to_string(),
+                PlanApprovalAnswer::Reject {
+                    reason: Some("too risky".to_string())
+                }
+            )))
+        );
+    }
+
+    #[test]
+    fn plan_approval_enter_on_empty_line_never_accepts() {
+        let state = state_with_plan_approval("");
+        let ui = TuiUiState::default();
+        // The safe default must never land on Accept; an empty line is a no-op.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn queue_control_inactive_during_pending_plan_approval() {
+        let mut state = state_with_plan_approval("");
+        state.queued_follow_ups = vec![QueuedFollowUpView {
+            id: "q1".to_string(),
+            prompt: "later".to_string(),
+            created_at: "t".to_string(),
+            status: QueuedFollowUpStatus::Pending,
+            pause_reason: None,
+        }];
         assert!(!queue_control_active(&state, &TuiUiState::default()));
     }
 
@@ -9546,6 +10481,9 @@ mod tests {
             sources: vec!["built-in defaults".to_string()],
             preset: None,
             warnings: Vec::new(),
+            approval_mode: crate::config::ApprovalMode::Yolo,
+            execution_graph_enabled: false,
+            max_parallel_agent_steps: 2,
         }
     }
 
@@ -10583,14 +11521,17 @@ runtime = "fake"
         )]);
         let ui_state = TuiUiState::default();
 
-        // Ctrl-R only resumes paused items; on a pending item it falls through.
+        // Ctrl-R resumes only PAUSED items; on a pending item it does NOT resume —
+        // it falls through to opening the session browser (task_07). The key point
+        // is that no FollowUpResumeRequested is produced for a pending item.
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui_state,
+            key_with_modifiers(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
         assert_eq!(
-            key_event_to_tui_command_with_ui(
-                &state,
-                &ui_state,
-                key_with_modifiers(KeyCode::Char('r'), KeyModifiers::CONTROL)
-            ),
-            None
+            command,
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
         );
     }
 
@@ -12357,6 +13298,8 @@ runtime = "fake"
         let theme = TuiUiState::default().theme;
         let git = GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "main".to_string(),
         };
         let with = footer_text(&footer_line(&theme, Some(&git), &RunState::Idle, &[], 80));
@@ -12387,6 +13330,402 @@ runtime = "fake"
         assert_eq!(agent_summary(&idle), "3 agents");
     }
 
+    // ── session browser modal (task_07) ──
+
+    fn browser_summary(label: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: format!("id-{label}"),
+            label: label.to_string(),
+            started_at: "2026-06-17T00:00:00.000Z".to_string(),
+            outcome: RunState::Completed,
+            working_directory: std::path::PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn session_browser_keys_route_to_filter_nav_and_close() {
+        use SessionBrowserCommand as Cmd;
+        // Default browser is in List mode.
+        let browser = SessionBrowserState::default();
+        let cmd =
+            |code| session_browser_key_command(&browser, KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(
+            cmd(KeyCode::Char('a')),
+            Some(TuiCommand::SessionBrowser(Cmd::FilterChar('a')))
+        );
+        assert_eq!(cmd(KeyCode::Up), Some(TuiCommand::SessionBrowser(Cmd::Up)));
+        assert_eq!(
+            cmd(KeyCode::Down),
+            Some(TuiCommand::SessionBrowser(Cmd::Down))
+        );
+        assert_eq!(
+            cmd(KeyCode::Backspace),
+            Some(TuiCommand::SessionBrowser(Cmd::FilterBackspace))
+        );
+        assert_eq!(
+            cmd(KeyCode::Esc),
+            Some(TuiCommand::SessionBrowser(Cmd::Close))
+        );
+    }
+
+    #[test]
+    fn browser_takes_precedence_over_normal_but_help_wins() {
+        let state = state_with_input("hello", false);
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        // A printable key narrows the browser filter, not the composer.
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(
+                SessionBrowserCommand::FilterChar('x')
+            ))
+        );
+        // Help still wins if both are somehow set.
+        ui.help_visible = true;
+        assert!(!matches!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(_))
+        ));
+    }
+
+    #[test]
+    fn ctrl_r_opens_browser_from_normal_context() {
+        let state = state_with_input("", false);
+        let ui = TuiUiState::default();
+        assert_eq!(
+            key_event_to_tui_command_with_ui(
+                &state,
+                &ui,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
+        );
+    }
+
+    #[test]
+    fn browser_filter_narrows_rows_case_insensitively() {
+        let mut ui = TuiUiState::default();
+        ui.browser.summaries = vec![
+            browser_summary("Fix the parser"),
+            browser_summary("Add hooks"),
+            browser_summary("PARSER cleanup"),
+        ];
+        ui.browser.filter = "parser".to_string();
+        assert_eq!(ui.browser.filtered_indices(), vec![0, 2]);
+
+        // Down moves within the filtered set and clamps at its end; Up returns.
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::Down);
+        assert_eq!(ui.browser.selection_index, 1);
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::Down);
+        assert_eq!(
+            ui.browser.selection_index, 1,
+            "clamped at the last filtered row"
+        );
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::Up);
+        assert_eq!(ui.browser.selection_index, 0);
+    }
+
+    #[test]
+    fn sync_session_summaries_adopts_published_snapshot() {
+        let (sender, mut receiver) = watch::channel(Vec::<SessionSummary>::new());
+        let mut ui = TuiUiState::default();
+        sender
+            .send(vec![browser_summary("loaded off-thread")])
+            .unwrap();
+        sync_session_summaries(&mut ui, &mut receiver);
+        assert_eq!(ui.browser.summaries.len(), 1);
+        assert_eq!(ui.browser.summaries[0].label, "loaded off-thread");
+    }
+
+    #[test]
+    fn browser_renders_summaries_newest_first() {
+        let state = state_with_input("", false);
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        ui.browser.summaries = vec![
+            browser_summary("newest session"),
+            browser_summary("older session"),
+        ];
+        let text = render_to_text_with_ui_mut(&state, &mut ui, 100, 30);
+        let newest = text.find("newest session").expect("newest rendered");
+        let older = text.find("older session").expect("older rendered");
+        assert!(newest < older, "newest-first order in the rendered list");
+    }
+
+    // ── session preview pane (task_08) ──
+
+    fn preview_with_items(n: usize) -> SessionPreview {
+        SessionPreview {
+            session_id: "s".to_string(),
+            items: (0..n)
+                .map(|i| chat_item(&format!("item {i}"), ChatItemKind::RunSummary))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn sync_session_preview_drops_a_stale_session_preview() {
+        let (sender, mut receiver) = watch::channel(None::<SessionPreview>);
+        let mut ui = TuiUiState::default();
+        ui.browser.preview_session_id = Some("current".to_string());
+
+        // A slow preview for a previously-selected session must not overwrite.
+        sender
+            .send(Some(SessionPreview {
+                session_id: "stale".to_string(),
+                items: Vec::new(),
+            }))
+            .unwrap();
+        sync_session_preview(&mut ui, &mut receiver);
+        assert!(
+            ui.browser.preview.is_none(),
+            "stale preview must be dropped"
+        );
+
+        // The preview for the currently-selected session applies.
+        sender
+            .send(Some(SessionPreview {
+                session_id: "current".to_string(),
+                items: Vec::new(),
+            }))
+            .unwrap();
+        sync_session_preview(&mut ui, &mut receiver);
+        assert_eq!(
+            ui.browser.preview.as_ref().map(|p| p.session_id.as_str()),
+            Some("current")
+        );
+    }
+
+    #[test]
+    fn right_opens_preview_and_esc_returns_to_list() {
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        ui.browser.summaries = vec![browser_summary("a session")];
+
+        // List-mode → (Right) routes to OpenPreview (Enter is reserved for Resume).
+        assert_eq!(
+            session_browser_key_command(
+                &ui.browser,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(
+                SessionBrowserCommand::OpenPreview
+            ))
+        );
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::OpenPreview);
+        assert_eq!(ui.browser.mode, BrowserMode::Preview);
+        assert_eq!(
+            ui.browser.preview_session_id.as_deref(),
+            Some("id-a session")
+        );
+
+        // Preview-mode Esc routes to Back, returning to the list.
+        assert_eq!(
+            session_browser_key_command(
+                &ui.browser,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Back))
+        );
+        apply_session_browser_command(&mut ui, SessionBrowserCommand::Back);
+        assert_eq!(ui.browser.mode, BrowserMode::List);
+        assert_eq!(ui.browser.preview_session_id, None);
+    }
+
+    #[test]
+    fn enter_resumes_selected_session_from_list_and_preview() {
+        let mut browser = SessionBrowserState {
+            visible: true,
+            summaries: vec![browser_summary("first"), browser_summary("second")],
+            selection_index: 1,
+            ..SessionBrowserState::default()
+        };
+
+        // List mode: Enter resumes the highlighted row.
+        assert_eq!(
+            session_browser_key_command(
+                &browser,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Resume(
+                "id-second".to_string()
+            )))
+        );
+
+        // Preview mode: Enter resumes the previewed session.
+        browser.mode = BrowserMode::Preview;
+        browser.preview_session_id = Some("id-first".to_string());
+        assert_eq!(
+            session_browser_key_command(
+                &browser,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Resume(
+                "id-first".to_string()
+            )))
+        );
+
+        // Empty (filtered-out) list: Enter is a no-op, not a resume of nothing.
+        let empty = SessionBrowserState {
+            visible: true,
+            ..SessionBrowserState::default()
+        };
+        assert_eq!(
+            session_browser_key_command(&empty, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn preview_shows_loading_placeholder_then_transcript() {
+        let state = state_with_input("", false);
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        ui.browser.mode = BrowserMode::Preview;
+
+        // No preview yet → loading placeholder.
+        let loading = render_to_text_with_ui_mut(&state, &mut ui, 100, 30);
+        assert!(
+            loading.contains("Loading"),
+            "expected loading state: {loading}"
+        );
+
+        // The off-thread fold lands → the transcript renders.
+        ui.browser.preview = Some(SessionPreview {
+            session_id: "s".to_string(),
+            items: vec![chat_item("a remembered step", ChatItemKind::RunSummary)],
+        });
+        let rendered = render_to_text_with_ui_mut(&state, &mut ui, 100, 30);
+        assert!(
+            rendered.contains("a remembered step"),
+            "expected transcript: {rendered}"
+        );
+    }
+
+    #[test]
+    fn preview_scroll_stays_within_bounds() {
+        let mut ui = TuiUiState::default();
+        ui.browser.mode = BrowserMode::Preview;
+        // 5 items × (title + separator) = 10 lines ⇒ max scroll 9.
+        ui.browser.preview = Some(preview_with_items(5));
+
+        let scroll = |ui: &mut TuiUiState, cmd| {
+            apply_session_browser_command(ui, SessionBrowserCommand::ScrollPreview(cmd))
+        };
+        scroll(&mut ui, EventScrollCommand::Bottom);
+        assert_eq!(ui.browser.preview_scroll, 9);
+        scroll(&mut ui, EventScrollCommand::PageDown);
+        assert_eq!(ui.browser.preview_scroll, 9, "clamped at the end");
+        scroll(&mut ui, EventScrollCommand::Top);
+        assert_eq!(ui.browser.preview_scroll, 0);
+        scroll(&mut ui, EventScrollCommand::LinesUp(3));
+        assert_eq!(ui.browser.preview_scroll, 0, "clamped at the top");
+        scroll(&mut ui, EventScrollCommand::LinesDown(2));
+        assert_eq!(ui.browser.preview_scroll, 2);
+    }
+
+    #[tokio::test]
+    async fn entering_preview_does_not_mutate_app_state() {
+        let mut state = state_with_input("", false);
+        state.chat_items = vec![chat_item("live transcript", ChatItemKind::UserPrompt)];
+        let mut ui = TuiUiState::default();
+        ui.browser.visible = true;
+        ui.browser.summaries = vec![browser_summary("x")];
+
+        let chat_before = state.chat_items.clone();
+        let run_before = state.run_state.clone();
+        let (sender, _receiver) = mpsc::channel(1);
+        execute_tui_command(
+            &mut state,
+            &mut ui,
+            &sender,
+            TuiCommand::SessionBrowser(SessionBrowserCommand::OpenPreview),
+        )
+        .await
+        .unwrap();
+        // The UI switched to preview, but live app state is untouched (read-only).
+        assert_eq!(ui.browser.mode, BrowserMode::Preview);
+        assert_eq!(state.chat_items, chat_before);
+        assert_eq!(state.run_state, run_before);
+    }
+
+    #[test]
+    fn preview_matches_the_on_disk_fold() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let store = crate::history::HistoryStore::create(dir.path()).unwrap();
+        let id = store.session_id().to_string();
+        for (kind, payload) in [
+            ("prompt_submitted", serde_json::json!({ "prompt": "do it" })),
+            ("run_completed", serde_json::json!({ "summary": "done" })),
+        ] {
+            store
+                .append_event(&crate::history::HistoryEvent::new(
+                    id.clone(),
+                    Some("r".to_string()),
+                    None,
+                    kind,
+                    payload,
+                ))
+                .unwrap();
+        }
+        let root = dir.path().join(".atelier");
+        let preview = crate::app::chat::build_session_preview(&root, &id).unwrap();
+        assert!(!preview.items.is_empty());
+        // What the off-thread loader publishes equals a fresh on-disk fold.
+        assert_eq!(
+            preview.items,
+            crate::app::chat::build_session_preview(&root, &id)
+                .unwrap()
+                .items
+        );
+    }
+
+    // ── /sessions discoverability (task_09) ──
+
+    #[test]
+    fn slash_sessions_routes_to_browser_open() {
+        // The base routing layer owns the /sessions → browser-open binding (just
+        // like /help → ToggleHelp); the command dropdown handles completion first,
+        // then this fires on submit.
+        let state = state_with_input("/sessions", false);
+        assert_eq!(
+            key_event_to_tui_command(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TuiCommand::SessionBrowser(SessionBrowserCommand::Open))
+        );
+    }
+
+    #[tokio::test]
+    async fn submitting_slash_sessions_opens_browser_and_clears_input() {
+        let mut state = state_with_input("/sessions", false);
+        // Once the command dropdown has been dismissed (after completion), the
+        // submit routes to the browser-open binding — the same end state as Ctrl-R.
+        let mut ui = TuiUiState {
+            command_dropdown_dismissed: Some("/sessions".to_string()),
+            ..TuiUiState::default()
+        };
+        let command = key_event_to_tui_command_with_ui(
+            &state,
+            &ui,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .expect("a command for /sessions + Enter");
+        let (sender, _receiver) = mpsc::channel(1);
+        execute_tui_command(&mut state, &mut ui, &sender, command)
+            .await
+            .unwrap();
+        assert!(ui.browser.visible, "/sessions opens the browser");
+        assert!(state.input.is_empty(), "the /sessions trigger is cleared");
+    }
+
     #[test]
     fn run_state_labels_render_for_every_variant() {
         for run_state in [
@@ -12412,6 +13751,8 @@ runtime = "fake"
         let theme = TuiUiState::default().theme;
         let git = GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "feature/a-very-long-branch-name-that-will-not-fit".to_string(),
         };
         // At 40 cols the branch is shortened first while the run state stays.
@@ -12432,6 +13773,8 @@ runtime = "fake"
         let mut state = state_with_agent_roster("");
         state.git_context = Some(GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "main".to_string(),
         });
 
@@ -12457,6 +13800,8 @@ runtime = "fake"
         let mut state = state_with_input("", false);
         state.git_context = Some(GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "feat/one".to_string(),
         });
         let before = render_to_text(&state, 80, 24);
@@ -12464,6 +13809,8 @@ runtime = "fake"
 
         state.git_context = Some(GitContext {
             repo_name: "atelier".to_string(),
+            head_sha: None,
+            dirty: false,
             branch: "feat/two".to_string(),
         });
         let after = render_to_text(&state, 80, 24);
@@ -12580,6 +13927,25 @@ runtime = "fake"
         assert_eq!(explorer_fg, theme.accent_for(0));
         assert_eq!(fixer_fg, theme.accent_for(1));
         assert_ne!(explorer_fg, fixer_fg);
+    }
+
+    #[test]
+    fn hook_invocation_item_renders_without_panicking() {
+        // The new exhaustive arm resolves...
+        assert_eq!(chat_kind_label(&ChatItemKind::HookInvocation), "hook");
+        // ...and a HookInvocation item renders through the transcript path without
+        // panicking (the render path is a pure function of chat items).
+        let mut state = state_with_input("", false);
+        state.chat_items = vec![chat_item(
+            "Hook running: command on run_completed",
+            ChatItemKind::HookInvocation,
+        )];
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut ui_state = TuiUiState::default();
+        terminal
+            .draw(|frame| render(frame, &state, &mut ui_state))
+            .unwrap();
     }
 
     #[test]
@@ -12855,6 +14221,7 @@ runtime = "fake"
             preset: None,
             warnings: 0,
             git: None,
+            recoverable_session: false,
         };
         let line_text = |line: &Line<'static>| -> String {
             line.spans.iter().map(|s| s.content.as_ref()).collect()

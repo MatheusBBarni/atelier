@@ -3,6 +3,7 @@ use crate::config::{init_config, load_effective_config, to_redacted_toml, Config
 use crate::docgen::{emit_docs, render_summary as render_docgen_summary};
 use crate::doctor::{render_human, render_json, run_doctor};
 use crate::history::clean_sessions;
+use crate::hooks::{follow_events, EventsCommand};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::env;
@@ -49,6 +50,11 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub codemap: Option<CodemapCommand>,
 
+    /// Stream normalized lifecycle-hook payloads from the active session
+    /// (`--events follow`) — a dry-run preview of what a hook receives on stdin.
+    #[arg(long, value_enum)]
+    pub events: Option<EventsCommand>,
+
     #[arg(long, value_name = "DIR")]
     pub emit_docs: Option<PathBuf>,
 
@@ -84,11 +90,24 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
             || cli.init_config
             || cli.clean_sessions
             || cli.codemap.is_some()
+            || cli.events.is_some()
             || cli.emit_docs.is_some()
             || cli.yes
             || cli.debug)
     {
         bail!("--update cannot be combined with other flags");
+    }
+    if cli.events.is_some()
+        && (cli.doctor
+            || cli.print_config
+            || cli.init_config
+            || cli.clean_sessions
+            || cli.codemap.is_some()
+            || cli.emit_docs.is_some())
+    {
+        bail!(
+            "--events cannot be combined with --doctor, --print-config, --init-config, --clean-sessions, --codemap, or --emit-docs"
+        );
     }
     if cli.codemap.is_some()
         && (cli.doctor
@@ -151,6 +170,13 @@ pub async fn run_cli_with(cli: Cli) -> Result<()> {
         working_directory,
         config_path: cli.config.clone(),
     })?;
+
+    if let Some(events_command) = cli.events {
+        match events_command {
+            EventsCommand::Follow => follow_events(&config).await?,
+        }
+        return Ok(());
+    }
 
     if cli.print_config {
         print!("{}", to_redacted_toml(&config)?);
@@ -242,6 +268,7 @@ mod tests {
             clean_sessions: false,
             update: false,
             codemap: None,
+            events: None,
             emit_docs: None,
             yes: false,
             debug: false,
@@ -264,6 +291,7 @@ mod tests {
             clean_sessions: false,
             update: false,
             codemap: Some(CodemapCommand::Init),
+            events: None,
             emit_docs: None,
             yes: false,
             debug: false,
@@ -287,6 +315,7 @@ mod tests {
             clean_sessions: false,
             update: false,
             codemap: None,
+            events: None,
             emit_docs: Some(out_dir),
             yes: false,
             debug: false,
@@ -339,6 +368,7 @@ mod tests {
             clean_sessions: false,
             update: false,
             codemap: None,
+            events: None,
             emit_docs: None,
             yes: false,
             debug: false,
@@ -347,5 +377,28 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--strict is only valid with --doctor"));
+    }
+
+    #[tokio::test]
+    async fn events_conflicts_with_doctor() {
+        let dir = tempdir().unwrap();
+        let cli = Cli {
+            cwd: Some(dir.path().to_path_buf()),
+            config: None,
+            doctor: true,
+            json: false,
+            strict: false,
+            print_config: false,
+            init_config: false,
+            clean_sessions: false,
+            update: false,
+            codemap: None,
+            events: Some(EventsCommand::Follow),
+            emit_docs: None,
+            yes: false,
+            debug: false,
+        };
+        let error = run_cli_with(cli).await.unwrap_err();
+        assert!(error.to_string().contains("--events cannot be combined"));
     }
 }

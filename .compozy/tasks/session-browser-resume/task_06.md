@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Read-only preview fold + transcript sanitization"
 type: backend
 complexity: medium
@@ -29,10 +29,10 @@ Build the read-only transcript a user previews before resuming: fold a chosen se
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Add a preview builder that opens a session and returns its history-only projected items.
-- [ ] 6.2 Ensure live/transient overlays and the welcome item are excluded from the preview.
-- [ ] 6.3 Add transcript sanitization for control/ANSI sequences.
-- [ ] 6.4 Add unit tests for isolation, fidelity, and sanitization.
+- [x] 6.1 Add a preview builder that opens a session and returns its history-only projected items. — `build_session_preview(root, session_id) -> SessionPreview` in the chat module.
+- [x] 6.2 Ensure live/transient overlays and the welcome item are excluded from the preview. — `rebuild().items()` is inherently history-only (welcome/live/approval are added by `App::sync_chat_items`, never by `rebuild`); verified by test.
+- [x] 6.3 Add transcript sanitization for control/ANSI sequences. — `sanitize_transcript_text` (CSI/OSC + C0/C1 controls stripped, tabs kept), applied to every rendered field via `sanitize_chat_item`.
+- [x] 6.4 Add unit tests for isolation, fidelity, and sanitization.
 
 ## Implementation Details
 Add a preview builder (e.g. in the chat module) that calls `HistoryStore::open()` (task_02) → `read_events()` → `ChatProjection::rebuild` (`src/app/chat/projection.rs:50`) → `items()`. Contrast with the live path `sync_chat_items` (`src/app/mod.rs:4267`), which prepends welcome and overlays transients — those must be skipped. Sanitization applies to `ChatLineView` text before render. See TechSpec "System Architecture" (preview = throwaway rebuild) and ADR-004 (untrusted transcript).
@@ -58,12 +58,12 @@ Add a preview builder (e.g. in the chat module) that calls `HistoryStore::open()
 
 ## Tests
 - Unit tests:
-  - [ ] Preview of a session equals `ChatProjection::rebuild(events).items()` (fidelity, zero desync).
-  - [ ] Preview excludes the welcome item and any live-step/pending-approval overlay items.
-  - [ ] A transcript line containing an ANSI escape / control sequence is rendered with that sequence stripped or escaped.
-  - [ ] Building a preview does not alter the live `App`/projection state.
+  - [x] Preview of a session equals `ChatProjection::rebuild(events).items()` (fidelity, zero desync). — `preview_equals_a_direct_rebuild_of_the_log`
+  - [x] Preview excludes the welcome item and any live-step/pending-approval overlay items. — `preview_excludes_welcome_and_live_overlays`
+  - [x] A transcript line containing an ANSI escape / control sequence is rendered with that sequence stripped or escaped. — `sanitize_strips_ansi_and_control_sequences`
+  - [x] Building a preview does not alter the live `App`/projection state. — `building_a_preview_does_not_mutate_a_live_projection`
 - Integration tests:
-  - [ ] Record a multi-run session to a `tempdir`, build its preview, and assert the item sequence matches a direct fold of the on-disk log.
+  - [x] Record a multi-run session to a `tempdir`, build its preview, and assert the item sequence matches a direct fold of the on-disk log. — `preview_over_multi_run_session_matches_on_disk_fold` (incl. run_interrupted + session_resumed)
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -71,3 +71,8 @@ Add a preview builder (e.g. in the chat module) that calls `HistoryStore::open()
 - All tests passing
 - Test coverage >=80%
 - The preview is a faithful, sanitized, read-only render of a stored session, free of live-state artifacts.
+
+## As-built notes
+- `SessionPreview { session_id, items: Vec<ChatItemView> }` + `build_session_preview(root, session_id)` live in `src/app/chat/mod.rs`. The builder opens the session (`HistoryStore::open`, task_02), reads events, `ChatProjection::rebuild`s, and sanitizes — never touching live `App`/projection state (it owns a throwaway projection).
+- History-only is **free**: `rebuild().items()` is the pure fold; the welcome item and live-step/pending-approval overlays are only ever added by `App::sync_chat_items`, so simply not calling that path yields the history-only preview.
+- `sanitize_transcript_text` strips full CSI (`ESC [ … final`) and OSC (`ESC ] … BEL|ST`) sequences plus C0/C1 control chars (keeping `\t`); `sanitize_chat_item` applies it to title, summary, body lines, and detail labels. Both `pub` for reuse by task_08's render path.

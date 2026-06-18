@@ -180,6 +180,23 @@ pub struct ActionExecutionContext {
     /// catastrophic or `floor=Enforce` action actually runs instead of re-prompting;
     /// the hard checks (capability/path/scope/command-policy) still apply.
     pub pre_approved: bool,
+    /// `Some(message)` while a drifted resume's first-mutation interlock is armed
+    /// (ADR-004/007). When set, the **first** state-mutating action
+    /// ([`is_mutating_kind`]) is forced to `RequiresApproval` regardless of its own
+    /// tier, and the message is folded into the approval prompt as the drift
+    /// context. The App clears the gate once the user acknowledges. Read-only
+    /// actions are never affected. Empty for a normal (non-resumed) context.
+    pub drift_ack: Option<String>,
+}
+
+/// Whether an action kind modifies the workspace — the set the drift interlock
+/// (ADR-004) gates on. `RunCommand` is included conservatively (its effect is
+/// unknown), while reads/notes never count.
+pub fn is_mutating_kind(kind: &ActionKind) -> bool {
+    matches!(
+        kind,
+        ActionKind::WriteFile | ActionKind::ApplyPatch | ActionKind::RunCommand
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +221,7 @@ impl ActionExecutionContext {
             floor: FloorPolicy::default(),
             trusted_targets: Arc::new(HashSet::new()),
             pre_approved: false,
+            drift_ack: None,
         }
     }
 }
@@ -336,6 +354,15 @@ fn apply_floor_and_trust(
     // Catastrophic always prompts and is never trustable — checked first so trust
     // can never win over it.
     if risk.catastrophic {
+        return ActionDecision::RequiresApproval(risk);
+    }
+
+    // Drifted-resume first-mutation interlock (ADR-004/007): while the gate is
+    // armed, the first state-mutating action must prompt for a positive
+    // acknowledgment regardless of its own tier or any (cleared-on-resume) trust.
+    // Read-only actions are never gated. Checked before trust so it can't be
+    // bypassed; after catastrophic so the stronger gate wins.
+    if context.drift_ack.is_some() && is_mutating_kind(&request.kind) {
         return ActionDecision::RequiresApproval(risk);
     }
 
@@ -1945,6 +1972,7 @@ mod tests {
             floor: config.approval.floor,
             trusted_targets: Arc::new(HashSet::new()),
             pre_approved: false,
+            drift_ack: None,
         }
     }
 
@@ -2066,6 +2094,47 @@ mod tests {
             matches!(allowed, ActionDecision::Allowed),
             "got {allowed:?}"
         );
+    }
+
+    #[test]
+    fn drift_ack_gate_forces_approval_on_mutating_kinds_even_when_otherwise_allowed() {
+        let dir = tempdir().unwrap();
+        let (config, fixer) = fixture_agent("fixer");
+        let mut context = action_context(dir.path(), &config);
+        // A provably-safe command is normally Allowed (Low tier).
+        let safe_command = ActionRequest {
+            schema_version: 1,
+            action_id: "c".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::RunCommand,
+            params: json!({ "command": "git status" }),
+        };
+        assert!(
+            matches!(
+                validate_action_request_with_scope(&fixer, &context, &safe_command),
+                ActionDecision::Allowed | ActionDecision::AllowedWithWarning(_)
+            ),
+            "a safe command is allowed without the gate"
+        );
+
+        // With the drift gate armed, the first mutating-kind action is forced to
+        // prompt regardless of its own (Low) tier or trust (ADR-004/007).
+        context.drift_ack = Some("HEAD changed".to_string());
+        assert!(
+            matches!(
+                validate_action_request_with_scope(&fixer, &context, &safe_command),
+                ActionDecision::RequiresApproval(_)
+            ),
+            "the drift gate forces approval on the first mutation"
+        );
+
+        // A re-run the user already approved at the modal still proceeds (the gate
+        // must not double-prompt the acknowledged action).
+        context.pre_approved = true;
+        assert!(matches!(
+            validate_action_request_with_scope(&fixer, &context, &safe_command),
+            ActionDecision::Allowed
+        ));
     }
 
     #[test]

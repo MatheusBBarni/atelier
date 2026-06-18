@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Discoverability - /sessions command + welcome cue"
 type: frontend
 complexity: low
@@ -28,10 +28,10 @@ Make the browser discoverable beyond the keybinding: register a `/sessions` slas
 </requirements>
 
 ## Subtasks
-- [ ] 9.1 Add the `/sessions` entry to the slash-command catalog with description.
-- [ ] 9.2 Wire `/sessions` execution to open the browser.
-- [ ] 9.3 Add a static browser cue to the welcome facts box.
-- [ ] 9.4 Add tests for catalog presence and the welcome cue.
+- [x] 9.1 Add the `/sessions` entry to the slash-command catalog with description.
+- [x] 9.2 Wire `/sessions` execution to open the browser.
+- [x] 9.3 Add a static browser cue to the welcome facts box.
+- [x] 9.4 Add tests for catalog presence and the welcome cue.
 
 ## Implementation Details
 Add the command to `src/slash_commands.rs` (catalog is the single source for dropdown/help/guidance; `/goal` at `:57` is a model entry). Route its execution to the browser-open command (TUI-local, like `/help`/`/reload:skills`). Add the cue line in `src/tui/welcome.rs` facts (`:312`+), styled with a muted theme token. See TechSpec "API Endpoints" and the PRD "User Experience" (discoverability).
@@ -56,11 +56,11 @@ Add the command to `src/slash_commands.rs` (catalog is the single source for dro
 
 ## Tests
 - Unit tests:
-  - [ ] The slash-command catalog contains `/sessions` with a description (and the slash-command catalog test suite still passes).
-  - [ ] The welcome facts box includes the browser cue line.
-  - [ ] Executing `/sessions` produces the browser-open command.
+  - [x] The slash-command catalog contains `/sessions` with a description (and the slash-command catalog test suite still passes). — `slash_commands` unit tests (`catalog_labels_are_exactly_the_fixed_v1_set`, `tui_local_and_app_command_entries_are_categorized_distinctly`) + `tests/slash_command_catalog.rs` (`len()==13` + `/sessions` TuiLocal) updated.
+  - [x] The welcome facts box includes the browser cue line. — `welcome::tests::facts_box_includes_session_browser_cue`
+  - [x] Executing `/sessions` produces the browser-open command. — `slash_sessions_routes_to_browser_open`
 - Integration tests:
-  - [ ] Submitting `/sessions` in the TUI opens the session browser (same end state as `Ctrl-R`).
+  - [x] Submitting `/sessions` in the TUI opens the session browser (same end state as `Ctrl-R`). — `submitting_slash_sessions_opens_browser_and_clears_input`
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -68,3 +68,8 @@ Add the command to `src/slash_commands.rs` (catalog is the single source for dro
 - All tests passing
 - Test coverage >=80%
 - Users can find the browser via the command dropdown, help overlay, and welcome cue — not just the keybinding.
+
+## As-built notes
+- `/sessions` added to the metadata-only catalog (`TuiLocal`, "browse and preview past sessions"), so it surfaces in the dropdown, help overlay, and unknown-command guidance. Updated the catalog amendment comment + the `FIXED_V1_LABELS` (12→13) / categorization / `tests/slash_command_catalog.rs` (`len()==13`) assertions.
+- Execution mirrors `/help`: a base-handler Enter arm (`input == "/sessions"` → `SessionBrowser(Open)`); the command dropdown completes the text first, then this fires on submit. The `Open` handler now `clear_input`s so the `/sessions` trigger doesn't linger (a Ctrl-R open is empty, so it's a no-op there).
+- Welcome facts gain a static muted cue ("Ctrl-R or /sessions to browse and resume past sessions") beside the `/help` cue. The dynamic post-crash variant is task_13.

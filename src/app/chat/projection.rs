@@ -5,7 +5,13 @@ use super::{
     ChatLineView, ChatSeverity, ChatSourceRef,
 };
 use crate::app::{LiveStepStatus, LiveStepView, PendingApprovalView};
-use crate::history::HistoryEvent;
+use crate::history::{
+    HistoryEvent, EXECUTION_GRAPH_APPROVED_KIND, EXECUTION_GRAPH_COMPLETED_KIND,
+    EXECUTION_GRAPH_PROPOSED_KIND, EXECUTION_GRAPH_REJECTED_KIND, NODE_CANCELLED_KIND,
+    NODE_FAILED_KIND, NODE_PENDING_KIND, NODE_READY_KIND, NODE_RUNNING_KIND, NODE_SKIPPED_KIND,
+    NODE_SUCCEEDED_KIND,
+};
+use crate::hooks::HookLifecyclePayload;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,6 +25,9 @@ pub(crate) const FIRST_APPROVAL_EXPLAINER: &str =
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_SUMMARY_CHARS: usize = 240;
 const MAX_BODY_LINES: usize = 12;
+/// Per-node Plan body lines beyond this collapse to a single per-state counts
+/// line (ADR-005), keeping the rendered body under [`MAX_BODY_LINES`].
+const PLAN_NODE_LINE_BUDGET: usize = 10;
 const MAX_WORKFLOW_UNFINISHED_TARGET_LINES: usize = 3;
 const MAX_WORKFLOW_EVIDENCE_LINES: usize = 1;
 
@@ -29,6 +38,10 @@ pub struct ChatProjection {
     action_context: BTreeMap<String, ActionContext>,
     live_keys: BTreeSet<ChatLifecycleKey>,
     pending_key: Option<ChatLifecycleKey>,
+    /// `graph_id`s seen in DAG events (ADR-005). Used to suppress the per-node
+    /// live `AgentProgress` items for graph nodes — their detail lives in the
+    /// Plan item and the Agent Roster, not as separate chat items.
+    graph_ids: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -87,10 +100,22 @@ impl ChatProjection {
                 self.apply_agent_result(event)
             }
             "parallel_group_joined" => self.apply_parallel_group_joined(event),
+            EXECUTION_GRAPH_PROPOSED_KIND
+            | EXECUTION_GRAPH_APPROVED_KIND
+            | EXECUTION_GRAPH_REJECTED_KIND
+            | EXECUTION_GRAPH_COMPLETED_KIND
+            | NODE_PENDING_KIND
+            | NODE_READY_KIND
+            | NODE_RUNNING_KIND
+            | NODE_SUCCEEDED_KIND
+            | NODE_FAILED_KIND
+            | NODE_SKIPPED_KIND
+            | NODE_CANCELLED_KIND => self.apply_execution_graph(event),
             "workflow_started" => self.apply_workflow_started(event),
             "workflow_completed" => self.apply_workflow_completed(event),
             "run_completed" | "run_failed" | "run_limit_reached" | "run_interrupted"
             | "subtask_completed" => self.apply_run_summary(event),
+            "session_resumed" => self.apply_session_resumed(event),
             "diagnostic" => self.apply_diagnostic(event),
             "follow_up_queued"
             | "follow_up_replay_started"
@@ -98,6 +123,8 @@ impl ChatProjection {
             | "follow_up_replay_resumed"
             | "follow_up_cancelled" => self.apply_follow_up_lifecycle(event),
             "blocker_reported" => self.apply_blocker(event),
+            "hook_started" => self.apply_hook_started(event),
+            "hook_completed" => self.apply_hook_completed(event),
             "config_viewed"
             | "session_goal_viewed"
             | "session_goal_set"
@@ -129,6 +156,16 @@ impl ChatProjection {
     pub fn apply_live_steps(&mut self, live_steps: &[LiveStepView]) {
         let mut next_keys = BTreeSet::new();
         for live_step in live_steps {
+            // Suppress the per-node live item for a graph node (ADR-005): the
+            // node is rendered in the single Plan item, and its streaming detail
+            // belongs to the Agent Roster, not a separate chat item.
+            if live_step
+                .group_id
+                .as_ref()
+                .is_some_and(|group_id| self.graph_ids.contains(group_id))
+            {
+                continue;
+            }
             let key = live_step_key(live_step);
             next_keys.insert(key.clone());
             self.upsert_live_step(live_step, key);
@@ -385,7 +422,28 @@ impl ChatProjection {
         });
     }
 
+    /// Whether an event belongs to a known execution graph (its `group_id` is a
+    /// tracked `graph_id`). Per-node live items for graph nodes are suppressed in
+    /// favor of the single Plan item (ADR-005); detail stays in the Agent Roster.
+    fn belongs_to_graph(&self, event: &HistoryEvent) -> bool {
+        // Graph identity arrives in either column depending on the emit path:
+        // node lifecycle / agent_result events carry `graph_id` (group_id None);
+        // the reused streaming / active-step events overload `group_id` with the
+        // graph_id. Check both so every per-node event for a known graph is caught.
+        event
+            .group_id
+            .as_ref()
+            .is_some_and(|id| self.graph_ids.contains(id))
+            || event
+                .graph_id
+                .as_ref()
+                .is_some_and(|id| self.graph_ids.contains(id))
+    }
+
     fn apply_agent_step_started(&mut self, event: &HistoryEvent) {
+        if self.belongs_to_graph(event) {
+            return;
+        }
         let Some(agent) = string_field(&event.payload, "agent") else {
             return;
         };
@@ -407,7 +465,90 @@ impl ChatProjection {
         });
     }
 
+    fn apply_hook_started(&mut self, event: &HistoryEvent) {
+        self.apply_hook_lifecycle(event, false);
+    }
+
+    fn apply_hook_completed(&mut self, event: &HistoryEvent) {
+        self.apply_hook_lifecycle(event, true);
+    }
+
+    /// Project a hook-lifecycle event (ADR-003) into one `HookInvocation` item
+    /// that evolves `hook_started` → `hook_completed`. Keyed by run + handler
+    /// index + public event so the started/completed pair collapses into a
+    /// single transcript item carrying action, status, duration, and exit code.
+    fn apply_hook_lifecycle(&mut self, event: &HistoryEvent, completed: bool) {
+        let Ok(payload) = serde_json::from_value::<HookLifecyclePayload>(event.payload.clone())
+        else {
+            return;
+        };
+        let Some(run_id) = event.run_id.clone() else {
+            return; // Hooks fire only on run-scoped events.
+        };
+        let key = ChatLifecycleKey::Hook {
+            run_id,
+            handler_index: payload.handler_index,
+            event: payload.event.clone(),
+        };
+        let mut body = vec![ChatLineView::muted(format!(
+            "handler #{}",
+            payload.handler_index
+        ))];
+        let (status, severity, title) = if completed {
+            let status_label = payload.status.as_deref().unwrap_or("done");
+            let failed = status_label != "ok";
+            if let Some(duration) = payload.duration_ms {
+                body.push(ChatLineView::muted(format!("duration: {duration} ms")));
+            }
+            if let Some(code) = payload.exit_code {
+                body.push(ChatLineView::muted(format!("exit code: {code}")));
+            }
+            if let Some(excerpt) = payload.stderr_excerpt.as_deref().filter(|e| !e.is_empty()) {
+                body.push(ChatLineView::error(excerpt.to_string()));
+            }
+            (
+                if failed {
+                    ChatItemStatus::Failed
+                } else {
+                    ChatItemStatus::Completed
+                },
+                if failed {
+                    ChatSeverity::Error
+                } else {
+                    ChatSeverity::Success
+                },
+                format!(
+                    "Hook {status_label}: {} on {}",
+                    payload.action, payload.event
+                ),
+            )
+        } else {
+            body.push(ChatLineView::muted("dispatching…"));
+            (
+                ChatItemStatus::Running,
+                ChatSeverity::Info,
+                format!("Hook running: {} on {}", payload.action, payload.event),
+            )
+        };
+        self.upsert(ItemInput {
+            lifecycle_key: Some(key),
+            kind: ChatItemKind::HookInvocation,
+            status,
+            severity,
+            title,
+            summary: Some(format!("{} · {}", payload.action, payload.event)),
+            body,
+            details: history_detail(event, "hook"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
     fn apply_runtime_stream_delta(&mut self, event: &HistoryEvent) {
+        if self.belongs_to_graph(event) {
+            return;
+        }
         let Some(agent) = string_field(&event.payload, "agent") else {
             return;
         };
@@ -1020,6 +1161,11 @@ impl ChatProjection {
     }
 
     fn apply_agent_result(&mut self, event: &HistoryEvent) {
+        // A graph node's terminal result is rendered in the single Plan item, not
+        // as a standalone per-node AgentResult chat item (ADR-005).
+        if self.belongs_to_graph(event) {
+            return;
+        }
         let agent = string_field(&event.payload, "agent")
             .or_else(|| string_field(&event.payload, "member_id"))
             .unwrap_or_else(|| "agent".to_string());
@@ -1109,6 +1255,78 @@ impl ChatProjection {
             summary,
             body,
             details: history_detail(event, "group result"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    /// The single durable Plan handler (ADR-005): every graph/node event carries
+    /// the full graph snapshot, which this re-renders wholesale into one Plan
+    /// item keyed by `graph_id` (the `upsert` path replaces the body each time).
+    /// Never touches `live_keys`/`pending_key`, so it survives every sync.
+    fn apply_execution_graph(&mut self, event: &HistoryEvent) {
+        let Some(graph_id) = event
+            .graph_id
+            .clone()
+            .or_else(|| string_field(&event.payload, "graph_id"))
+        else {
+            return;
+        };
+        // Remember the graph so its per-node live items are suppressed.
+        self.graph_ids.insert(graph_id.clone());
+
+        let snapshot = event.payload.get("graph");
+        let nodes = snapshot
+            .and_then(|graph| graph.get("nodes"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let reason = snapshot
+            .and_then(|graph| string_field(graph, "reason"))
+            .or_else(|| string_field(&event.payload, "reason"));
+
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for node in &nodes {
+            let status = string_field(node, "status").unwrap_or_else(|| "pending".to_string());
+            *counts.entry(status).or_insert(0) += 1;
+        }
+
+        let (status, severity, title) = execution_graph_item_view(event, &counts);
+
+        let mut body = Vec::new();
+        if event.kind == EXECUTION_GRAPH_REJECTED_KIND {
+            if let Some(rejected_reason) = string_field(&event.payload, "reason") {
+                body.push(ChatLineView::warning(format!(
+                    "rejected: {rejected_reason}"
+                )));
+            }
+        }
+        // Per-node lines, or a single per-state counts line for large graphs so
+        // the body never silently overflows the 12-line cap.
+        if nodes.len() <= PLAN_NODE_LINE_BUDGET {
+            for node in &nodes {
+                body.push(ChatLineView::muted(execution_graph_node_line(node)));
+            }
+        } else {
+            body.push(ChatLineView::plain(format!(
+                "{} nodes — {}",
+                nodes.len(),
+                execution_graph_counts_summary(&counts)
+            )));
+        }
+
+        self.upsert(ItemInput {
+            lifecycle_key: Some(ChatLifecycleKey::Plan {
+                graph_id: graph_id.clone(),
+            }),
+            kind: ChatItemKind::Plan,
+            status,
+            severity,
+            title,
+            summary: reason,
+            body,
+            details: history_detail(event, "plan"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
             fallback_event_id: event.event_id.clone(),
@@ -1215,6 +1433,39 @@ impl ChatProjection {
             severity,
             title: title.to_string(),
             summary: summary.map(|summary| message_summary(&summary)),
+            body,
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    /// Fold a `session_resumed` event (ADR-002/008) into a visible "Resumed"
+    /// divider marking the resume boundary. Each resume is its own standalone
+    /// item (no lifecycle key → keyed by the event id), so multiple resumes each
+    /// render a divider and none collapse. Reuses the `RunSummary` item kind +
+    /// neutral `Info` styling rather than introducing a new chat kind.
+    fn apply_session_resumed(&mut self, event: &HistoryEvent) {
+        let mut body = Vec::new();
+        if let Some(prior) = string_field(&event.payload, "prior_end_state") {
+            body.push(ChatLineView::muted(format!("previous run: {prior}")));
+        }
+        if let Some(cwd) = string_field(&event.payload, "cwd") {
+            body.push(ChatLineView::muted(format!("cwd: {cwd}")));
+        }
+        if event.payload.get("dirty").and_then(Value::as_bool) == Some(true) {
+            body.push(ChatLineView::warning(
+                "workspace had uncommitted changes at resume",
+            ));
+        }
+        self.upsert(ItemInput {
+            lifecycle_key: None,
+            kind: ChatItemKind::RunSummary,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: "Session resumed".to_string(),
+            summary: Some("resumed from a previous session".to_string()),
             body,
             details: history_detail(event, "history"),
             source: source_from_event(event, None),
@@ -2048,6 +2299,90 @@ fn live_step_key(live_step: &LiveStepView) -> ChatLifecycleKey {
         step_id: live_step.step_id.clone(),
         item_kind: ChatItemKind::AgentProgress,
     }
+}
+
+/// Map a DAG event + per-state node counts to the Plan item's overall status,
+/// severity, and title (ADR-005).
+fn execution_graph_item_view(
+    event: &HistoryEvent,
+    counts: &BTreeMap<String, usize>,
+) -> (ChatItemStatus, ChatSeverity, String) {
+    let count = |status: &str| counts.get(status).copied().unwrap_or(0);
+    match event.kind.as_str() {
+        EXECUTION_GRAPH_PROPOSED_KIND => (
+            ChatItemStatus::WaitingApproval,
+            ChatSeverity::Info,
+            "Plan proposed".to_string(),
+        ),
+        EXECUTION_GRAPH_REJECTED_KIND => (
+            ChatItemStatus::Denied,
+            ChatSeverity::Warning,
+            "Plan rejected".to_string(),
+        ),
+        EXECUTION_GRAPH_COMPLETED_KIND => {
+            let result_status =
+                string_field(&event.payload, "status").unwrap_or_else(|| "completed".to_string());
+            let (status, severity) = match result_status.as_str() {
+                "completed" => (ChatItemStatus::Completed, ChatSeverity::Success),
+                "completed_with_issues" => (ChatItemStatus::Completed, ChatSeverity::Warning),
+                "failed" => (ChatItemStatus::Failed, ChatSeverity::Error),
+                "cancelled" => (ChatItemStatus::Interrupted, ChatSeverity::Warning),
+                "limit_reached" => (ChatItemStatus::Failed, ChatSeverity::Warning),
+                _ => (ChatItemStatus::Completed, ChatSeverity::Info),
+            };
+            (
+                status,
+                severity,
+                format!("Plan {}", result_status.replace('_', " ")),
+            )
+        }
+        // approved + every node_* event: roll up from the snapshot node states.
+        _ => {
+            let (status, severity) = if count("running") > 0 {
+                (ChatItemStatus::Running, ChatSeverity::Info)
+            } else if count("pending") + count("ready") > 0 {
+                (ChatItemStatus::Pending, ChatSeverity::Info)
+            } else if count("failed") > 0 {
+                (ChatItemStatus::Failed, ChatSeverity::Error)
+            } else if count("cancelled") > 0 {
+                (ChatItemStatus::Interrupted, ChatSeverity::Warning)
+            } else if count("succeeded") > 0 {
+                (ChatItemStatus::Completed, ChatSeverity::Success)
+            } else if count("skipped") > 0 {
+                (ChatItemStatus::Skipped, ChatSeverity::Warning)
+            } else {
+                (ChatItemStatus::Pending, ChatSeverity::Info)
+            };
+            (status.clone(), severity, format!("Plan {}", status.label()))
+        }
+    }
+}
+
+/// One per-node Plan body line: `[status] step_label — scope` (ADR-005).
+fn execution_graph_node_line(node: &Value) -> String {
+    let status = string_field(node, "status").unwrap_or_else(|| "pending".to_string());
+    let label = string_field(node, "step_label")
+        .or_else(|| string_field(node, "node_id"))
+        .unwrap_or_else(|| "node".to_string());
+    let scope = node
+        .get("file_scope")
+        .and_then(|scope| {
+            serde_json::from_value::<crate::orchestrator::ParallelFileScope>(scope.clone()).ok()
+        })
+        .map(|scope| live_scope_summary(&scope));
+    match scope {
+        Some(scope) => format!("[{status}] {label} — {scope}"),
+        None => format!("[{status}] {label}"),
+    }
+}
+
+/// A compact per-state counts line for a large graph: `3 running, 2 succeeded`.
+fn execution_graph_counts_summary(counts: &BTreeMap<String, usize>) -> String {
+    counts
+        .iter()
+        .map(|(status, count)| format!("{count} {status}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn live_scope_summary(scope: &crate::orchestrator::ParallelFileScope) -> String {
@@ -2921,11 +3256,282 @@ mod tests {
             session_id: "session".to_string(),
             run_id: run_id.map(str::to_string),
             group_id: None,
+            graph_id: None,
             step_id: step_id.map(str::to_string),
             timestamp: "2026-06-05T00:00:00.000Z".to_string(),
             kind: kind.to_string(),
             payload,
             payload_truncated: false,
+        }
+    }
+
+    // ── single evolving Plan projection (task_06) ──
+
+    /// Build a DAG event carrying the full graph snapshot the emitters produce:
+    /// `nodes` is `(node_id, status)` pairs. `extra` merges into the payload root
+    /// (e.g. the completed event's `status`).
+    fn graph_event(
+        kind: &str,
+        graph_id: &str,
+        nodes: &[(&str, &str)],
+        extra: Value,
+    ) -> HistoryEvent {
+        let node_values: Vec<Value> = nodes
+            .iter()
+            .map(|(id, status)| {
+                json!({
+                    "node_id": id,
+                    "step_label": format!("step {id}"),
+                    "agent": "fixer",
+                    "status": status,
+                    "file_scope": { "write_files": [format!("src/{id}.rs")], "read_roots": ["src"] },
+                })
+            })
+            .collect();
+        let mut payload = json!({
+            "graph_id": graph_id,
+            "graph": {
+                "graph_id": graph_id,
+                "reason": "diamond",
+                "nodes": node_values,
+                "edges": [],
+            },
+        });
+        if let (Some(map), Value::Object(extra)) = (payload.as_object_mut(), extra) {
+            for (key, value) in extra {
+                map.insert(key, value);
+            }
+        }
+        HistoryEvent::new_with_graph(
+            "session",
+            Some("run".to_string()),
+            Some(graph_id.to_string()),
+            None,
+            kind,
+            payload,
+        )
+    }
+
+    fn plan_items(projection: &ChatProjection) -> Vec<ChatItemView> {
+        projection
+            .items()
+            .iter()
+            .filter(|item| item.kind == ChatItemKind::Plan)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn proposed_creates_one_plan_item_and_later_events_update_it_in_place() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&graph_event(
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            "g1",
+            &[("a", "pending"), ("b", "pending")],
+            json!({}),
+        ));
+        let items = plan_items(&projection);
+        assert_eq!(items.len(), 1, "one Plan item per graph");
+        assert_eq!(items[0].status, ChatItemStatus::WaitingApproval);
+        assert_eq!(
+            items[0].lifecycle_key,
+            Some(ChatLifecycleKey::Plan {
+                graph_id: "g1".to_string()
+            })
+        );
+
+        projection.apply_history_event(&graph_event(
+            NODE_RUNNING_KIND,
+            "g1",
+            &[("a", "running"), ("b", "pending")],
+            json!({}),
+        ));
+        let items = plan_items(&projection);
+        assert_eq!(items.len(), 1, "the same item is updated, not duplicated");
+        assert_eq!(items[0].status, ChatItemStatus::Running);
+    }
+
+    #[test]
+    fn node_state_transitions_re_render_the_plan_item() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&graph_event(
+            NODE_RUNNING_KIND,
+            "g1",
+            &[("a", "running"), ("b", "pending")],
+            json!({}),
+        ));
+        projection.apply_history_event(&graph_event(
+            NODE_SUCCEEDED_KIND,
+            "g1",
+            &[("a", "succeeded"), ("b", "running")],
+            json!({}),
+        ));
+        let items = plan_items(&projection);
+        assert_eq!(items[0].status, ChatItemStatus::Running, "b still running");
+        let body: String = items[0]
+            .body
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("[succeeded] step a"), "body: {body}");
+        assert!(body.contains("[running] step b"), "body: {body}");
+    }
+
+    #[test]
+    fn failed_node_renders_plan_failed_with_skipped_dependents() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&graph_event(
+            NODE_FAILED_KIND,
+            "g1",
+            &[("a", "failed"), ("b", "skipped")],
+            json!({}),
+        ));
+        let items = plan_items(&projection);
+        assert_eq!(items[0].status, ChatItemStatus::Failed);
+        let body: String = items[0]
+            .body
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("[skipped] step b"), "body: {body}");
+    }
+
+    #[test]
+    fn plan_item_survives_a_live_step_sync() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&graph_event(
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            "g1",
+            &[("a", "pending")],
+            json!({}),
+        ));
+        assert_eq!(plan_items(&projection).len(), 1);
+        // A sync with no live steps removes stale transient items; the durable
+        // Plan item must remain.
+        projection.apply_live_steps(&[]);
+        assert_eq!(plan_items(&projection).len(), 1, "Plan item is durable");
+    }
+
+    #[test]
+    fn large_graph_collapses_to_a_counts_line() {
+        let nodes: Vec<(String, &str)> = (0..15).map(|i| (format!("n{i}"), "running")).collect();
+        let node_refs: Vec<(&str, &str)> = nodes
+            .iter()
+            .map(|(id, status)| (id.as_str(), *status))
+            .collect();
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&graph_event(
+            NODE_RUNNING_KIND,
+            "g1",
+            &node_refs,
+            json!({}),
+        ));
+        let items = plan_items(&projection);
+        assert!(
+            items[0].body.len() <= MAX_BODY_LINES,
+            "body must respect the cap"
+        );
+        let body: String = items[0]
+            .body
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("15 nodes"), "body: {body}");
+        assert!(body.contains("15 running"), "body: {body}");
+    }
+
+    #[test]
+    fn per_node_live_items_are_suppressed_for_graph_nodes() {
+        let mut projection = ChatProjection::new();
+        // The graph must be known first (its proposed event registers the id).
+        projection.apply_history_event(&graph_event(
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            "g1",
+            &[("a", "pending")],
+            json!({}),
+        ));
+        let graph_step = LiveStepView {
+            run_id: "run".to_string(),
+            group_id: Some("g1".to_string()),
+            step_id: "a".to_string(),
+            step_label: Some("step a".to_string()),
+            file_scope: None,
+            agent: "fixer".to_string(),
+            status: LiveStepStatus::Running,
+            streams: Vec::new(),
+        };
+        projection.apply_live_steps(&[graph_step]);
+        // No AgentProgress item for the graph node; only the Plan item exists.
+        assert!(!projection
+            .items()
+            .iter()
+            .any(|item| item.kind == ChatItemKind::AgentProgress));
+        assert_eq!(plan_items(&projection).len(), 1);
+
+        // A non-graph live step is NOT suppressed.
+        let flat_step = LiveStepView {
+            group_id: Some("flat-group".to_string()),
+            step_id: "x".to_string(),
+            ..LiveStepView {
+                run_id: "run".to_string(),
+                group_id: None,
+                step_id: String::new(),
+                step_label: None,
+                file_scope: None,
+                agent: "fixer".to_string(),
+                status: LiveStepStatus::Running,
+                streams: Vec::new(),
+            }
+        };
+        projection.apply_live_steps(&[flat_step]);
+        assert!(projection
+            .items()
+            .iter()
+            .any(|item| item.kind == ChatItemKind::AgentProgress));
+    }
+
+    #[test]
+    fn unknown_dag_like_kind_produces_no_plan_item() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&graph_event(
+            "node_bogus_unknown",
+            "g1",
+            &[("a", "running")],
+            json!({}),
+        ));
+        assert!(plan_items(&projection).is_empty());
+    }
+
+    #[test]
+    fn every_dag_kind_is_registered_and_renders_a_plan_item() {
+        for kind in [
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            EXECUTION_GRAPH_APPROVED_KIND,
+            EXECUTION_GRAPH_REJECTED_KIND,
+            NODE_PENDING_KIND,
+            NODE_READY_KIND,
+            NODE_RUNNING_KIND,
+            NODE_SUCCEEDED_KIND,
+            NODE_FAILED_KIND,
+            NODE_SKIPPED_KIND,
+            NODE_CANCELLED_KIND,
+            EXECUTION_GRAPH_COMPLETED_KIND,
+        ] {
+            let mut projection = ChatProjection::new();
+            let extra = if kind == EXECUTION_GRAPH_COMPLETED_KIND {
+                json!({ "status": "completed" })
+            } else {
+                json!({})
+            };
+            projection.apply_history_event(&graph_event(kind, "g1", &[("a", "succeeded")], extra));
+            assert_eq!(
+                plan_items(&projection).len(),
+                1,
+                "kind {kind} must render a Plan item"
+            );
         }
     }
 
@@ -2956,6 +3562,239 @@ mod tests {
             text.push_str(&line.text);
         }
         text
+    }
+
+    // ── hook transcript projection (task_06) ──
+
+    fn hook_lifecycle_payload(
+        handler_index: usize,
+        action: &str,
+        public_event: &str,
+        status: Option<&str>,
+        duration_ms: Option<u64>,
+        exit_code: Option<i32>,
+    ) -> Value {
+        serde_json::to_value(crate::hooks::HookLifecyclePayload {
+            handler_index,
+            action: action.to_string(),
+            event: public_event.to_string(),
+            status: status.map(str::to_string),
+            duration_ms,
+            exit_code,
+            stderr_excerpt: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn hook_started_creates_running_hook_invocation_item() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(0, "command", "run_completed", None, None, None),
+        ));
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::HookInvocation);
+        assert_eq!(item.status, ChatItemStatus::Running);
+        // Handler/action/event labels surface in the item.
+        let text = item_text(item);
+        assert!(text.contains("command"), "text: {text}");
+        assert!(text.contains("run_completed"), "text: {text}");
+        assert!(text.contains("handler #0"), "text: {text}");
+    }
+
+    #[test]
+    fn hook_completed_collapses_into_one_item_with_duration_and_exit_code() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(0, "command", "run_completed", None, None, None),
+        ));
+        projection.apply_history_event(&event(
+            "hook_completed",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(0, "command", "run_completed", Some("ok"), Some(12), Some(0)),
+        ));
+        // The two events collapse into a single, now-completed item.
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.kind, ChatItemKind::HookInvocation);
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.severity, ChatSeverity::Success);
+        let text = item_text(item);
+        assert!(text.contains("12 ms"), "text: {text}");
+        assert!(text.contains("exit code: 0"), "text: {text}");
+    }
+
+    #[test]
+    fn hook_completed_with_nonzero_exit_renders_failed() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(1, "command", "run_failed", None, None, None),
+        ));
+        projection.apply_history_event(&event(
+            "hook_completed",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(1, "command", "run_failed", Some("error"), Some(5), Some(2)),
+        ));
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Failed);
+        assert_eq!(item.severity, ChatSeverity::Error);
+        assert!(item_text(item).contains("exit code: 2"));
+    }
+
+    #[test]
+    fn distinct_hook_handlers_do_not_collapse() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(0, "notify", "run_completed", None, None, None),
+        ));
+        projection.apply_history_event(&event(
+            "hook_started",
+            Some("run-1"),
+            None,
+            hook_lifecycle_payload(1, "command", "run_completed", None, None, None),
+        ));
+        // Different handler indices ⇒ different lifecycle keys ⇒ two items.
+        assert_eq!(projection.items().len(), 2);
+    }
+
+    // ── resume lifecycle fold: run_interrupted + session_resumed (task_04) ──
+
+    #[test]
+    fn dangling_run_then_run_interrupted_renders_interrupted() {
+        // A run with no terminal event, then a run_interrupted closing it.
+        let events = vec![
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "run_interrupted",
+                Some("run-1"),
+                None,
+                json!({ "run_id": "run-1", "prior_state": "running" }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        // run_started + run_interrupted collapse into one Run item, now interrupted.
+        assert_eq!(projection.items().len(), 1);
+        assert_eq!(projection.items()[0].status, ChatItemStatus::Interrupted);
+        assert_eq!(projection.items()[0].title, "Run interrupted");
+    }
+
+    #[test]
+    fn session_resumed_inserts_exactly_one_resume_divider() {
+        let events = vec![event(
+            "session_resumed",
+            Some("run-1"),
+            None,
+            json!({
+                "resumed_at": "2026-06-17T00:00:00.000Z",
+                "cwd": "/tmp/project",
+                "dirty": false,
+                "prior_end_state": "interrupted",
+                "approval_mode": "normal"
+            }),
+        )];
+        let projection = ChatProjection::rebuild(&events);
+        assert_eq!(projection.items().len(), 1);
+        assert_eq!(projection.items()[0].title, "Session resumed");
+    }
+
+    #[test]
+    fn log_without_new_kinds_folds_unchanged() {
+        // Backward compatibility: a log of pre-existing kinds folds with no
+        // resume divider and the expected run summary.
+        let events = vec![
+            event(
+                "prompt_submitted",
+                Some("run-1"),
+                None,
+                json!({ "prompt": "go" }),
+            ),
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "run_completed",
+                Some("run-1"),
+                None,
+                json!({ "summary": "done" }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        assert!(projection
+            .items()
+            .iter()
+            .all(|item| item.title != "Session resumed"));
+        assert!(projection
+            .items()
+            .iter()
+            .any(|item| item.title == "Run completed"));
+    }
+
+    #[test]
+    fn unrecognized_future_kind_folds_to_no_item() {
+        let projection = ChatProjection::rebuild(&[event(
+            "some_future_kind_v9",
+            Some("run-1"),
+            None,
+            json!({ "whatever": true }),
+        )]);
+        assert!(projection.items().is_empty());
+    }
+
+    #[test]
+    fn rebuild_over_mixed_log_with_resume_kinds_is_ordered() {
+        let events = vec![
+            event(
+                "prompt_submitted",
+                Some("run-1"),
+                None,
+                json!({ "prompt": "do it" }),
+            ),
+            event("run_started", Some("run-1"), None, json!({})),
+            event(
+                "run_interrupted",
+                Some("run-1"),
+                None,
+                json!({ "run_id": "run-1", "prior_state": "running" }),
+            ),
+            event(
+                "session_resumed",
+                Some("run-1"),
+                None,
+                json!({
+                    "resumed_at": "2026-06-17T00:00:00.000Z",
+                    "cwd": "/tmp/project",
+                    "dirty": true,
+                    "prior_end_state": "interrupted",
+                    "approval_mode": "normal"
+                }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        let items = projection.items();
+        // UserPrompt, the (interrupted) Run, then the resume divider — in order.
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].kind, ChatItemKind::UserPrompt);
+        assert_eq!(items[1].status, ChatItemStatus::Interrupted);
+        assert_eq!(items[2].title, "Session resumed");
+        // The dirty-workspace note is surfaced in the divider body.
+        assert!(items[2]
+            .body
+            .iter()
+            .any(|line| line.text.contains("uncommitted changes")));
     }
 
     #[test]

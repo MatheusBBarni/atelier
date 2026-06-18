@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Hook transcript projection
 type: backend
 complexity: low
@@ -29,11 +29,11 @@ Project `hook_started`/`hook_completed` events into the chat transcript so hook 
 </requirements>
 
 ## Subtasks
-- [ ] 6.1 Add the `ChatItemKind::HookInvocation` variant.
-- [ ] 6.2 Add `apply_hook_started`/`apply_hook_completed` and route them in `apply_history_event`.
-- [ ] 6.3 Collapse start→complete into one evolving chat item.
-- [ ] 6.4 Update the TUI render match for the new variant.
-- [ ] 6.5 Add unit tests for the projection and the render arm.
+- [x] 6.1 Add the `ChatItemKind::HookInvocation` variant.
+- [x] 6.2 Add `apply_hook_started`/`apply_hook_completed` and route them in `apply_history_event`.
+- [x] 6.3 Collapse start→complete into one evolving chat item.
+- [x] 6.4 Update the TUI render match for the new variant.
+- [x] 6.5 Add unit tests for the projection and the render arm.
 
 ## Implementation Details
 Edit `src/app/chat/projection.rs` (`apply_history_event`, `:58`) to add the two handlers, mirroring an existing pair (e.g. command_started/command_completed). Add the variant in `src/app/chat/mod.rs` (`ChatItemKind`, `:27`). Locate and update the `ChatItemKind` render match in `src/tui/` (the render path is a pure function of chat items) — confirm the exact site during implementation. Use the lifecycle payload type from task_01. See TechSpec "System Architecture → Projection".
@@ -58,12 +58,12 @@ Edit `src/app/chat/projection.rs` (`apply_history_event`, `:58`) to add the two 
 
 ## Tests
 - Unit tests:
-  - [ ] A `hook_started` event creates a `HookInvocation` item in a running state with the handler/action labels.
-  - [ ] A subsequent `hook_completed` for the same hook updates the SAME item to a completed state with duration + exit code (no duplicate item).
-  - [ ] A `hook_completed` with a non-zero exit code renders a failed/error status.
-  - [ ] The TUI render arm handles `ChatItemKind::HookInvocation` without panicking.
+  - [x] A `hook_started` event creates a `HookInvocation` item in a running state with the handler/action labels. — `hook_started_creates_running_hook_invocation_item`
+  - [x] A subsequent `hook_completed` for the same hook updates the SAME item to a completed state with duration + exit code (no duplicate item). — `hook_completed_collapses_into_one_item_with_duration_and_exit_code`
+  - [x] A `hook_completed` with a non-zero exit code renders a failed/error status. — `hook_completed_with_nonzero_exit_renders_failed`
+  - [x] The TUI render arm handles `ChatItemKind::HookInvocation` without panicking. — `tui::tests::hook_invocation_item_renders_without_panicking`
 - Integration tests:
-  - [ ] Feeding a `hook_started`+`hook_completed` pair through `apply_history_event` yields one collapsed transcript item.
+  - [x] Feeding a `hook_started`+`hook_completed` pair through `apply_history_event` yields one collapsed transcript item. — `hook_completed_collapses_into_one_item_with_duration_and_exit_code` (+ `distinct_hook_handlers_do_not_collapse`)
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -72,3 +72,9 @@ Edit `src/app/chat/projection.rs` (`apply_history_event`, `:58`) to add the two 
 - Test coverage >=80%
 - Hook executions appear as a single evolving transcript item with status, duration, and exit code
 - The render path compiles with the new exhaustive variant handled
+
+## As-built notes
+- New `ChatItemKind::HookInvocation` + a new `ChatLifecycleKey::Hook { run_id, handler_index, event }` whose `item_id` (`chat:hook:{run_id}:{handler_index}:{event}`) collapses the `hook_started`→`hook_completed` pair for one matched handler into a single evolving item.
+- `apply_hook_started`/`apply_hook_completed` (routed in `apply_history_event`) deserialize the task_01 `HookLifecyclePayload`: started → Running/Info; completed `ok` → Completed/Success; completed non-`ok` → Failed/Error. Body surfaces `handler #N`, duration ms, exit code, and (on failure) the redacted excerpt.
+- Two exhaustive `ChatItemKind` matches updated: `ChatItemKind::slug()` (`hook_invocation`) and the TUI `chat_kind_label()` (`hook`). `cargo check` passing confirms no other exhaustive match was missed.
+- Recursion is structural (task_01): `hook_*` kinds are outside the public vocabulary, so projecting them never re-enters dispatch — task_05's `hook_lifecycle_events_are_recorded_into_history` test asserts exactly one `hook_completed`.

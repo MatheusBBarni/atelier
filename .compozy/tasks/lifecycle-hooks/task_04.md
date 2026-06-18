@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Off-thread hook dispatcher (channel + subprocess + hook events)
 type: backend
 complexity: high
@@ -31,12 +31,12 @@ Build the long-lived dispatcher task that drains the bounded hook channel and ex
 </requirements>
 
 ## Subtasks
-- [ ] 4.1 Define the dispatch item type, bounded channel, capacity constant, and the shared dropped-event counter.
-- [ ] 4.2 Implement the dispatcher task loop draining the channel.
-- [ ] 4.3 Execute `command` handlers as timed subprocesses with payload on stdin and redacted output.
-- [ ] 4.4 Invoke the `Notifier` for `notify` handlers.
-- [ ] 4.5 Emit `hook_started`/`hook_completed` lifecycle records over the worker back-channel.
-- [ ] 4.6 Add unit/async tests for execution, timeout, drop counter, and notify dispatch.
+- [x] 4.1 Define the dispatch item type, bounded channel, capacity constant, and the shared dropped-event counter.
+- [x] 4.2 Implement the dispatcher task loop draining the channel.
+- [x] 4.3 Execute `command` handlers as timed subprocesses with payload on stdin and redacted output.
+- [x] 4.4 Invoke the `Notifier` for `notify` handlers.
+- [x] 4.5 Emit `hook_started`/`hook_completed` lifecycle records over the worker back-channel.
+- [x] 4.6 Add unit/async tests for execution, timeout, drop counter, and notify dispatch.
 
 ## Implementation Details
 Create `src/hooks/dispatch.rs`. Model the subprocess on `run_git` (`src/app/git.rs:72`) and the stdin write on `src/runtime/claude.rs:174`. Model the spawned task and back-channel on `spawn_parallel_runtime_task` (`src/app/mod.rs:5803`), which already routes off-thread results back to the worker via an `mpsc` sender. The dispatcher receives dispatch items (from the tap, task_05) and sends lifecycle records out; task_05 owns creating both channels and wiring the worker handler. See TechSpec "System Architecture → Dispatcher task" and "Known Risks → best-effort delivery".
@@ -67,13 +67,13 @@ Create `src/hooks/dispatch.rs`. Model the subprocess on `run_git` (`src/app/git.
 
 ## Tests
 - Unit tests:
-  - [ ] A `command` handler runs and receives the exact normalized JSON on stdin (asserted via a script that echoes stdin to a sentinel file).
-  - [ ] A hook exceeding the timeout is killed and reported as `hook_completed` with a timeout status (no hang).
-  - [ ] `try_send` on a full bounded channel increments the dropped-event counter.
-  - [ ] A `notify` handler invokes the injected `Notifier` exactly once.
-  - [ ] Hook stdout/stderr containing a `Bearer …` token is redacted before being recorded.
+  - [x] A `command` handler runs and receives the exact normalized JSON on stdin (asserted via a script that echoes stdin to a sentinel file). — `command_hook_receives_exact_normalized_json_on_stdin`
+  - [x] A hook exceeding the timeout is killed and reported as `hook_completed` with a timeout status (no hang). — `command_hook_exceeding_timeout_is_killed_and_reported`
+  - [x] `try_send` on a full bounded channel increments the dropped-event counter. — `try_send_on_full_channel_increments_dropped_counter`
+  - [x] A `notify` handler invokes the injected `Notifier` exactly once. — `notify_handler_invokes_injected_notifier_once`
+  - [x] Hook stdout/stderr containing a `Bearer …` token is redacted before being recorded. — `failed_hook_output_with_bearer_token_is_redacted`
 - Integration tests:
-  - [ ] End-to-end: a dispatch item with a `command` handler produces `hook_started` then `hook_completed` lifecycle records on the back-channel with the exit code.
+  - [x] End-to-end: a dispatch item with a `command` handler produces `hook_started` then `hook_completed` lifecycle records on the back-channel with the exit code. — `command_hook_emits_started_then_completed_with_exit_code`
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -83,3 +83,11 @@ Create `src/hooks/dispatch.rs`. Model the subprocess on `run_git` (`src/app/git.
 - The dispatcher never blocks the worker thread and bounds every hook with a timeout
 - Best-effort delivery is enforced (drop-on-full increments the counter)
 - `hook_started`/`hook_completed` are emitted via the back-channel, not `record_event` directly
+
+## As-built notes
+- **`src/hooks/dispatch.rs`**: `HookDispatch { payload, handlers: Vec<MatchedHandler> }` over a bounded `mpsc` channel (`HOOK_CHANNEL_CAPACITY = 256`, `hook_channel()`); `try_dispatch()` is the tap's non-blocking enqueue that increments `DroppedHookCounter` on a full channel. `run_hook_dispatcher(items, lifecycle_tx, notifier, timeout)` drains the channel; holds no `&App`.
+- **Command hooks** run as `sh -c <command>` (the command is user-scope config, ADR-001) with the per-handler-projected, redacted payload on **stdin only**. The whole stdin-write + `wait_with_output` lives inside one `async move` future owning the child, raced against `tokio::time::sleep(timeout)`; on timeout the future drops → `kill_on_drop` reaps the child, so even a child that never drains stdin cannot block. stdout+stderr are `redact_sensitive_text`-redacted and a capped excerpt is kept only on failure.
+- **Per-handler payload detail** is applied here, not at the tap: the item carries the full-body payload and `payload_stdin()` strips `body` for `metadata` handlers, then redacts the serialized JSON before stdin. (task_05's tap will normalize with `Full`.)
+- **Notify hooks** call the task_03 `Notifier` on a `spawn_blocking` thread raced against the same timeout (the trait is sync and may spawn a fallback process).
+- **Lifecycle**: `HookLifecycleRecord { kind: Started|Completed, session_id, run_id, step_id, payload: HookLifecyclePayload }` sent over a back-channel; `HookLifecycleKind::event_kind()` returns `hook_started`/`hook_completed` (outside the public vocabulary → no re-trigger). task_05 records these on the worker.
+- **Test-flakiness note (not a regression):** under full-suite parallel load, the timing-sensitive `runtime::{claude,cursor,codex}` process/availability tests (CLAUDE.md-designated environment-sensitive) can flake; they pass 119/119 in isolation and the failure set is non-deterministic across runs. Unrelated to this task's code.

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Transcript preview pane (off-thread fold load)"
 type: frontend
 complexity: high
@@ -29,10 +29,10 @@ Add the read-only transcript preview to the browser: selecting a session loads i
 </requirements>
 
 ## Subtasks
-- [ ] 8.1 Add the list→preview transition (`Enter` selects, back returns) and preview state (scroll offset).
-- [ ] 8.2 Add the off-thread preview loader + watch side-channel, with a loading placeholder.
-- [ ] 8.3 Render the sanitized preview transcript with scroll support.
-- [ ] 8.4 Add unit/integration tests for the transition, off-thread load, and read-only guarantee.
+- [x] 8.1 Add the list→preview transition (`Enter` selects, back returns) and preview state (scroll offset).
+- [x] 8.2 Add the off-thread preview loader + watch side-channel, with a loading placeholder.
+- [x] 8.3 Render the sanitized preview transcript with scroll support.
+- [x] 8.4 Add unit/integration tests for the transition, off-thread load, and read-only guarantee.
 
 ## Implementation Details
 Extend the browser state/commands from task_07 in `src/tui/mod.rs` with a `Preview` mode and scroll offset; mirror the `spawn_file_index_refresh`/watch pattern for a `watch::Sender<Option<SessionPreview>>` carrying the task_06 output. Reuse the chat scroll commands (`ScrollEvents`/`EventScrollCommand`, around `:1708`) for the preview pane. Render near the existing modal renderers. See TechSpec "System Architecture" (data flow) and ADR-001/004.
@@ -55,12 +55,12 @@ Extend the browser state/commands from task_07 in `src/tui/mod.rs` with a `Previ
 
 ## Tests
 - Unit tests:
-  - [ ] `Enter` on a selected row switches the browser to preview mode and requests a load; `Esc` returns to the list.
-  - [ ] Before the preview arrives, a loading placeholder renders; after the watch channel updates, the transcript renders.
-  - [ ] PageUp/PageDown/Home/End adjust the preview scroll offset within bounds.
-  - [ ] Entering preview does not change live `AppState.chat_items` or run state.
+  - [x] `Enter` on a selected row switches the browser to preview mode and requests a load; `Esc` returns to the list. — `enter_opens_preview_and_esc_returns_to_list`
+  - [x] Before the preview arrives, a loading placeholder renders; after the watch channel updates, the transcript renders. — `preview_shows_loading_placeholder_then_transcript`
+  - [x] PageUp/PageDown/Home/End adjust the preview scroll offset within bounds. — `preview_scroll_stays_within_bounds`
+  - [x] Entering preview does not change live `AppState.chat_items` or run state. — `entering_preview_does_not_mutate_app_state`
 - Integration tests:
-  - [ ] Open browser → select a recorded session → preview loads off-thread and matches the on-disk fold → scroll → back to list.
+  - [x] Open browser → select a recorded session → preview loads off-thread and matches the on-disk fold → scroll → back to list. — `preview_matches_the_on_disk_fold` (+ the transition/scroll/back tests above; off-thread plumbing via `sync_session_preview`/`spawn_session_preview_load`).
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -68,3 +68,9 @@ Extend the browser state/commands from task_07 in `src/tui/mod.rs` with a `Previ
 - All tests passing
 - Test coverage >=80%
 - Phase 1 MVP complete: a user can browse and read any past session's full transcript without resuming, without UI stalls.
+
+## As-built notes
+- `BrowserMode::Preview` + `SessionBrowserState { preview: Option<SessionPreview>, preview_session_id, preview_scroll }`. `SessionBrowserCommand` gains `OpenPreview` (Enter), `Back` (Esc), `ScrollPreview(EventScrollCommand)`. `session_browser_key_command` is now mode-aware (List: Enter/nav/filter/close; Preview: Esc-back + chat-scroll keys PageUp/PageDown/Up/Down/Home/End).
+- Off-thread load mirrors task_07: `run_loop` owns a `watch<Option<SessionPreview>>`, spawns `spawn_session_preview_load` (→ `spawn_blocking(build_session_preview)`, task_06) when `preview_session_id` changes, and `sync_session_preview` adopts it. Until it lands, `preview` is `None` → a "Loading transcript…" placeholder renders.
+- `render_session_preview` draws the sanitized transcript (titles via `severity_title_style`, body via the existing `chat_body_line` — all theme tokens, colors guard still green) with `Paragraph::scroll`. `preview_total_lines` keeps `apply_preview_scroll`'s clamping in lockstep with the render.
+- **Read-only:** `apply_session_browser_command` takes only `ui_state`; the preview builder owns a throwaway projection. A test confirms `OpenPreview` leaves `AppState.chat_items`/`run_state` untouched.

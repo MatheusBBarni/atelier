@@ -1,5 +1,5 @@
 use crate::ids::new_id;
-use crate::orchestrator::ArtifactReference;
+use crate::orchestrator::{ArtifactReference, RunState};
 use anyhow::{anyhow, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,11 @@ pub struct HistoryEvent {
     pub run_id: Option<String>,
     #[serde(default)]
     pub group_id: Option<String>,
+    /// Groups every event of one execution-graph (DAG) run, mirroring `group_id`
+    /// for flat parallel groups (ADR-005). `#[serde(default)]` so legacy logs
+    /// without it still deserialize at `schema_version 1` (the DAG is additive).
+    #[serde(default)]
+    pub graph_id: Option<String>,
     pub step_id: Option<String>,
     pub timestamp: String,
     pub kind: String,
@@ -50,6 +55,34 @@ impl HistoryEvent {
             session_id: session_id.into(),
             run_id,
             group_id,
+            graph_id: None,
+            step_id,
+            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            kind: kind.into(),
+            payload,
+            payload_truncated: false,
+        }
+    }
+
+    /// Construct a graph-keyed event (ADR-005). The DAG sibling of
+    /// [`new_with_group`]: it sets `graph_id` and leaves `group_id` `None` so
+    /// orchestrator-altitude graph/node events are never mis-keyed through the
+    /// flat-group path. Node events carry their `node_id` inside `payload`.
+    pub fn new_with_graph(
+        session_id: impl Into<String>,
+        run_id: Option<String>,
+        graph_id: Option<String>,
+        step_id: Option<String>,
+        kind: impl Into<String>,
+        payload: Value,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            event_id: new_id(),
+            session_id: session_id.into(),
+            run_id,
+            group_id: None,
+            graph_id,
             step_id,
             timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             kind: kind.into(),
@@ -78,6 +111,75 @@ pub struct SessionMetadata {
     pub session_id: String,
     pub working_directory: PathBuf,
     pub started_at: String,
+    /// Derived, self-healing cache (ADR-008): the session goal label, or `None`.
+    /// The event log is authoritative; this is recomputed by folding the log when
+    /// stale, never the source of truth. `#[serde(default)]` so pre-cache
+    /// `metadata.json` files still deserialize.
+    #[serde(default)]
+    pub goal: Option<String>,
+    /// Derived cache: terminal run outcome (e.g. `completed` / `failed`), or
+    /// `None` while the session has no terminal run yet.
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// Derived cache: the `HEAD` sha recorded at the last write, the baseline for
+    /// resume drift detection (ADR-007).
+    #[serde(default)]
+    pub last_head_sha: Option<String>,
+}
+
+/// Kind string for the lifecycle event that closes a dangling run on resume
+/// (ADR-002/008). Additive — no schema bump.
+pub const RUN_INTERRUPTED_KIND: &str = "run_interrupted";
+/// Kind string for the tamper-evident resume-boundary lifecycle event
+/// (ADR-002/007/008). Additive — no schema bump.
+pub const SESSION_RESUMED_KIND: &str = "session_resumed";
+/// Kind string for the audit event recording acknowledgment of workspace drift
+/// at the first state-mutating action after a drifted resume (ADR-004/007).
+/// Additive — no schema bump.
+pub const RESUME_DRIFT_ACK_KIND: &str = "resume_drift_acknowledged";
+
+/// Execution-graph (DAG) lifecycle event kinds (ADR-005). All additive at
+/// history `schema_version 1`: the scheduler (task_04) emits them through the
+/// `graph_id`-keyed recorder path and the projection (task_06) registers each
+/// one explicitly. The `node_*` kinds carry their `node_id` inside `payload`.
+pub const EXECUTION_GRAPH_PROPOSED_KIND: &str = "execution_graph_proposed";
+pub const EXECUTION_GRAPH_APPROVED_KIND: &str = "execution_graph_approved";
+pub const EXECUTION_GRAPH_REJECTED_KIND: &str = "execution_graph_rejected";
+pub const EXECUTION_GRAPH_COMPLETED_KIND: &str = "execution_graph_completed";
+pub const NODE_PENDING_KIND: &str = "node_pending";
+pub const NODE_READY_KIND: &str = "node_ready";
+pub const NODE_RUNNING_KIND: &str = "node_running";
+pub const NODE_SUCCEEDED_KIND: &str = "node_succeeded";
+pub const NODE_FAILED_KIND: &str = "node_failed";
+pub const NODE_SKIPPED_KIND: &str = "node_skipped";
+pub const NODE_CANCELLED_KIND: &str = "node_cancelled";
+
+/// Payload for a `run_interrupted` event — closes a dangling run found on resume
+/// (ADR-008). Emitted by task_11; folded by the existing run-summary projection
+/// arm, which marks the run Interrupted.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunInterruptedPayload {
+    pub run_id: String,
+    pub prior_state: RunState,
+}
+
+/// Payload for a `session_resumed` event — the tamper-evident resume boundary
+/// (ADR-002/007/008). Emitted by task_11; folded into a visible "Resumed"
+/// divider in the transcript.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionResumedPayload {
+    pub resumed_at: String,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    pub dirty: bool,
+    pub prior_end_state: RunState,
+    /// The approval mode the resumed session runs under (serialized form, e.g.
+    /// `normal` — task_12 defaults resume to cautious).
+    pub approval_mode: String,
+    /// Hash of the prior log tail at resume time, for tamper-evidence (ADR-007).
+    #[serde(default)]
+    pub prior_tail_hash: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +207,9 @@ impl HistoryStore {
             session_id: session_id.clone(),
             working_directory: working_directory.to_path_buf(),
             started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            goal: None,
+            outcome: None,
+            last_head_sha: None,
         };
         let metadata_path = session_dir.join("metadata.json");
         write_private_file(
@@ -127,6 +232,57 @@ impl HistoryStore {
             events_path,
             artifacts_dir,
         })
+    }
+
+    /// Bind a store to an *existing* session under `root` (the `.atelier` data
+    /// root) by id, without creating anything — the sibling of [`create`]. Reads
+    /// and schema-validates `metadata.json`, failing loud on a missing file or
+    /// `schema_version != 1` (the same validation boundary as the event reader,
+    /// ADR-003). Used by the session browser (task_03/06) and resume
+    /// (task_10/11).
+    pub fn open(root: &Path, session_id: &str) -> Result<Self> {
+        let session_dir = root.join("sessions").join(session_id);
+        let metadata = read_metadata(&session_dir)?;
+        if metadata.schema_version != 1 {
+            return Err(anyhow!(
+                "unsupported session metadata schema_version {} in {}",
+                metadata.schema_version,
+                session_dir.join("metadata.json").display()
+            ));
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            session_id: session_id.to_string(),
+            events_path: session_dir.join("events.jsonl"),
+            artifacts_dir: session_dir.join("artifacts"),
+            session_dir,
+        })
+    }
+
+    /// Read this session's `metadata.json` (including the derived cache fields).
+    pub fn read_metadata(&self) -> Result<SessionMetadata> {
+        read_metadata(&self.session_dir)
+    }
+
+    /// Self-healing cache write (ADR-008): rewrite the derived metadata fields
+    /// (`goal`, `outcome`, `last_head_sha`) while preserving the authoritative
+    /// fields and the file's private `0600` permissions. The event log stays the
+    /// source of truth; callers recompute these by folding the log and persist
+    /// the result here.
+    pub fn update_metadata_cache(
+        &self,
+        goal: Option<String>,
+        outcome: Option<String>,
+        last_head_sha: Option<String>,
+    ) -> Result<()> {
+        let mut metadata = read_metadata(&self.session_dir)?;
+        metadata.goal = goal;
+        metadata.outcome = outcome;
+        metadata.last_head_sha = last_head_sha;
+        write_private_file(
+            &self.session_dir.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata)?.as_bytes(),
+        )
     }
 
     pub fn session_id(&self) -> &str {
@@ -167,6 +323,7 @@ impl HistoryStore {
             "session_id": event.session_id,
             "run_id": event.run_id,
             "group_id": event.group_id,
+            "graph_id": event.graph_id,
             "step_id": event.step_id,
             "kind": event.kind,
             "payload": event.payload,
@@ -379,6 +536,350 @@ pub fn project_prompt_history(root: &Path, max: usize) -> Vec<String> {
     history
 }
 
+/// A newest-first browse row for the session picker (task_07). All fields are
+/// derived from the session's event log (the source of truth, ADR-008); the
+/// `metadata.json` cache is a self-healing accelerator, never authoritative.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub session_id: String,
+    /// Human-scannable label: the goal if set, else the first user prompt
+    /// (truncated), else `started_at · outcome`.
+    pub label: String,
+    pub started_at: String,
+    /// Terminal run outcome folded from the log (`Idle` when no run finished).
+    pub outcome: RunState,
+    pub working_directory: PathBuf,
+}
+
+/// Longest label rendered in the picker before truncation.
+const SESSION_LABEL_MAX_CHARS: usize = 72;
+
+/// Build newest-first [`SessionSummary`] rows for every session under `root`
+/// (the `.atelier` data root). Tolerant: a session that fails to open, parse, or
+/// read is skipped rather than failing the whole list. Self-healing: each
+/// session's `goal`/`outcome` cache is recomputed from its log and rewritten when
+/// missing or disagreeing (the log wins, ADR-008).
+///
+/// Newest-first ordering leverages the ULID-like session ids (lexicographically
+/// sortable = chronological): the directory names are sorted and reversed.
+pub fn list_session_summaries(root: &Path) -> Vec<SessionSummary> {
+    let sessions_dir = root.join("sessions");
+    let Ok(entries) = fs::read_dir(&sessions_dir) else {
+        return Vec::new(); // No sessions/ yet → empty, not an error.
+    };
+    let mut session_ids: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    // ULID-like ids: lexicographic order is chronological; reverse → newest first.
+    session_ids.sort();
+    session_ids.reverse();
+
+    session_ids
+        .iter()
+        .filter_map(|session_id| summarize_session(root, session_id))
+        .collect()
+}
+
+/// Summarize one session, self-healing its metadata cache from the log. Returns
+/// `None` (skip) when the session can't be opened/read.
+fn summarize_session(root: &Path, session_id: &str) -> Option<SessionSummary> {
+    let store = HistoryStore::open(root, session_id).ok()?;
+    let metadata = store.read_metadata().ok()?;
+    // The log is authoritative; an unreadable log degrades to "no events".
+    let events = store.read_events().unwrap_or_default();
+
+    let goal = derive_goal(&events);
+    let outcome = derive_outcome(&events);
+    let outcome_label = run_state_label(&outcome);
+
+    // Self-heal the derived cache when missing or disagreeing with the log.
+    if metadata.goal != goal || metadata.outcome.as_deref() != Some(outcome_label.as_str()) {
+        let _ = store.update_metadata_cache(
+            goal.clone(),
+            Some(outcome_label.clone()),
+            metadata.last_head_sha.clone(),
+        );
+    }
+
+    let label = goal
+        .clone()
+        .or_else(|| first_prompt_label(&events))
+        .unwrap_or_else(|| format!("{} · {}", metadata.started_at, outcome_label));
+
+    Some(SessionSummary {
+        session_id: session_id.to_string(),
+        label,
+        started_at: metadata.started_at,
+        outcome,
+        working_directory: metadata.working_directory,
+    })
+}
+
+/// The PRD resume success metrics, derived **entirely by folding the durable log**
+/// — no external telemetry (ADR-002/005). Counts across every session under a
+/// data root; the rates are the headline KPIs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResumeMetrics {
+    /// Sessions that ended non-terminally (a run was interrupted or left dangling).
+    pub crashed: usize,
+    /// Crashed sessions later recovered (their log carries a `session_resumed`).
+    pub recovered: usize,
+    /// Sessions that were resumed at least once.
+    pub resumed: usize,
+    /// Resumed sessions that reached a terminal `Completed` outcome.
+    pub resumed_completed: usize,
+}
+
+impl ResumeMetrics {
+    /// Crash-recovery adoption: `recovered / crashed`. `None` when nothing crashed
+    /// (the ratio is undefined, not zero).
+    pub fn crash_recovery_rate(&self) -> Option<f64> {
+        (self.crashed > 0).then(|| self.recovered as f64 / self.crashed as f64)
+    }
+
+    /// Resumed-session completion: `resumed_completed / resumed`. `None` when
+    /// nothing was resumed.
+    pub fn resumed_completion_rate(&self) -> Option<f64> {
+        (self.resumed > 0).then(|| self.resumed_completed as f64 / self.resumed as f64)
+    }
+}
+
+/// Fold every session under `root` into [`ResumeMetrics`]. Tolerant: a session
+/// whose log can't be read is skipped (mirrors [`list_session_summaries`]).
+pub fn resume_metrics(root: &Path) -> ResumeMetrics {
+    let mut metrics = ResumeMetrics::default();
+    let Ok(entries) = fs::read_dir(root.join("sessions")) else {
+        return metrics;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(events) = read_events_from_path(&entry.path().join("events.jsonl")) else {
+            continue;
+        };
+        if events.is_empty() {
+            continue;
+        }
+        let resumed = events
+            .iter()
+            .any(|event| event.kind == SESSION_RESUMED_KIND);
+        if session_ended_non_terminal(&events) {
+            metrics.crashed += 1;
+            if resumed {
+                metrics.recovered += 1;
+            }
+        }
+        if resumed {
+            metrics.resumed += 1;
+            if derive_outcome(&events) == RunState::Completed {
+                metrics.resumed_completed += 1;
+            }
+        }
+    }
+    metrics
+}
+
+/// Whether a session ended non-terminally — a run was interrupted
+/// (`run_interrupted`, including the resume reconciliation) or left dangling. The
+/// durable "crashed" signal behind the crash-recovery metric.
+fn session_ended_non_terminal(events: &[HistoryEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| event.kind == RUN_INTERRUPTED_KIND)
+        || dangling_run_from_events(events).is_some()
+}
+
+/// Time-to-continue: the delay from a session's `session_resumed` boundary to the
+/// next `prompt_submitted` (the user actually continuing in the resumed session).
+/// `None` when the session was never resumed, no prompt followed the resume, or a
+/// timestamp won't parse. Derived from the RFC3339 event timestamps.
+pub fn time_to_continue(events: &[HistoryEvent]) -> Option<chrono::Duration> {
+    let resumed_index = events
+        .iter()
+        .position(|event| event.kind == SESSION_RESUMED_KIND)?;
+    let resumed_at = chrono::DateTime::parse_from_rfc3339(&events[resumed_index].timestamp).ok()?;
+    let prompt = events[resumed_index + 1..]
+        .iter()
+        .find(|event| event.kind == "prompt_submitted")?;
+    let prompt_at = chrono::DateTime::parse_from_rfc3339(&prompt.timestamp).ok()?;
+    Some(prompt_at - resumed_at)
+}
+
+/// The active session goal folded from the log: the last `session_goal_set`
+/// value, cleared by a later `session_goal_cleared`.
+pub(crate) fn derive_goal(events: &[HistoryEvent]) -> Option<String> {
+    let mut goal = None;
+    for event in events {
+        match event.kind.as_str() {
+            "session_goal_set" => {
+                goal = event
+                    .payload
+                    .get("goal")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            "session_goal_cleared" => goal = None,
+            _ => {}
+        }
+    }
+    goal
+}
+
+/// The session outcome folded from the log: the last *terminal* run state
+/// (`is_terminal()`, task_01), or the terminal `run_state` in a `session_ended`
+/// payload. `Idle` when no run reached a terminal state.
+pub(crate) fn derive_outcome(events: &[HistoryEvent]) -> RunState {
+    let mut outcome = RunState::Idle;
+    for event in events {
+        let candidate = match event.kind.as_str() {
+            "run_completed" => Some(RunState::Completed),
+            "run_failed" => Some(RunState::Failed),
+            "run_limit_reached" => Some(RunState::LimitReached),
+            "run_interrupted" => Some(RunState::Interrupted),
+            "session_ended" => event
+                .payload
+                .get("run_state")
+                .and_then(|value| serde_json::from_value::<RunState>(value.clone()).ok()),
+            _ => None,
+        };
+        if let Some(candidate) = candidate {
+            if candidate.is_terminal() {
+                outcome = candidate;
+            }
+        }
+    }
+    outcome
+}
+
+/// A SHA-256 digest of the pre-resume event log, recorded in the `session_resumed`
+/// boundary as tamper-evidence for the prior tail (ADR-002/007). Hashing the
+/// serialized parsed events (which atelier solely reads and writes) detects added,
+/// removed, reordered, or payload-edited prior events. `None` for an empty log.
+pub(crate) fn hash_events_digest(events: &[HistoryEvent]) -> Option<String> {
+    if events.is_empty() {
+        return None;
+    }
+    let bytes = serde_json::to_vec(events).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// The most-recently-started run together with the state it was last seen in,
+/// **only when that run never reached a terminal state** — i.e. a run left
+/// dangling by a crash or a quit mid-run (ADR-002/008). `None` when the last run
+/// closed terminally or no run ever started.
+///
+/// Resume folds this to decide whether to append a reconciling `run_interrupted`
+/// event; the `!is_terminal()` filter (task_01) is the "detect dangling" gate.
+/// A `run_started` marks a run at least `Running`; a later terminal run event
+/// (or a `session_ended` whose own `run_state` is terminal) closes it. A
+/// graceful quit *mid-run* records the in-flight `active_run_id` + `run_state`
+/// in `session_ended`, which is trusted; a clean between-runs quit carries
+/// `active_run_id: null` and must not resurrect the just-closed run.
+pub(crate) fn dangling_run_from_events(events: &[HistoryEvent]) -> Option<(String, RunState)> {
+    let mut current: Option<(String, RunState)> = None;
+    for event in events {
+        match event.kind.as_str() {
+            "run_started" => {
+                if let Some(run_id) = event.run_id.clone() {
+                    current = Some((run_id, RunState::Running));
+                }
+            }
+            "run_completed" => close_current_run(&mut current, event, RunState::Completed),
+            "run_failed" => close_current_run(&mut current, event, RunState::Failed),
+            "run_limit_reached" => close_current_run(&mut current, event, RunState::LimitReached),
+            "run_interrupted" => close_current_run(&mut current, event, RunState::Interrupted),
+            "session_ended" => {
+                if let Some(run_id) = event.payload.get("active_run_id").and_then(Value::as_str) {
+                    let state = event
+                        .payload
+                        .get("run_state")
+                        .and_then(|value| serde_json::from_value::<RunState>(value.clone()).ok())
+                        .unwrap_or(RunState::Running);
+                    current = Some((run_id.to_string(), state));
+                }
+            }
+            _ => {}
+        }
+    }
+    current.filter(|(_, state)| !state.is_terminal())
+}
+
+/// Mark the run currently being folded by [`dangling_run_from_events`] as closed
+/// in `state`. Runs are sequential (the one-active-run guard), so a terminal
+/// event closes the open run; the `run_id` is matched when the event carries one
+/// to stay robust against any out-of-order tail.
+fn close_current_run(
+    current: &mut Option<(String, RunState)>,
+    event: &HistoryEvent,
+    state: RunState,
+) {
+    if let Some((run_id, slot)) = current.as_mut() {
+        if event
+            .run_id
+            .as_deref()
+            .map(|id| id == run_id)
+            .unwrap_or(true)
+        {
+            *slot = state;
+        }
+    }
+}
+
+/// The first non-secret user prompt as a truncated label, or `None`. Mirrors
+/// [`project_prompt_history`]'s extraction, including the leading-space secrets
+/// escape hatch (such prompts never surface).
+fn first_prompt_label(events: &[HistoryEvent]) -> Option<String> {
+    events
+        .iter()
+        .filter(|event| event.kind == "prompt_submitted")
+        .find_map(|event| {
+            let prompt = event.payload.get("prompt").and_then(Value::as_str)?;
+            if prompt.starts_with(' ') {
+                return None; // Secrets escape hatch — skip, try the next prompt.
+            }
+            Some(truncate_label(prompt))
+        })
+}
+
+fn truncate_label(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() <= SESSION_LABEL_MAX_CHARS {
+        return text.to_string();
+    }
+    format!(
+        "{}…",
+        text.chars()
+            .take(SESSION_LABEL_MAX_CHARS.saturating_sub(1))
+            .collect::<String>()
+    )
+}
+
+/// The snake_case label for a [`RunState`] (e.g. `completed`, `limit_reached`),
+/// matching its serde representation and the cached `outcome` string.
+fn run_state_label(state: &RunState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The most recent short HEAD recorded in the log — the resume drift baseline
+/// (ADR-007). Folds for the last event carrying a non-empty `head_sha` payload
+/// field (recorded on `run_started` at run boundaries). `None` when no run
+/// recorded a HEAD (e.g. a non-git workspace).
+pub fn last_recorded_head_sha(events: &[HistoryEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        event
+            .payload
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string)
+    })
+}
+
 pub fn clean_sessions(working_directory: &Path) -> Result<Vec<PathBuf>> {
     let root = working_directory.join(".atelier");
     let targets = [root.join("sessions"), root.join("runs")];
@@ -391,6 +892,15 @@ pub fn clean_sessions(working_directory: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(deleted)
+}
+
+/// Read and parse a session's `metadata.json` from its session directory.
+fn read_metadata(session_dir: &Path) -> Result<SessionMetadata> {
+    let metadata_path = session_dir.join("metadata.json");
+    let raw = fs::read_to_string(&metadata_path)
+        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", metadata_path.display()))
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
@@ -453,6 +963,551 @@ mod tests {
         assert_eq!(events, vec![event]);
     }
 
+    // ── HistoryStore::open + self-healing metadata cache (task_02) ──
+
+    #[test]
+    fn open_loads_existing_session_and_reads_same_events_in_order() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let session_id = store.session_id().to_string();
+        let first = HistoryEvent::new(
+            session_id.clone(),
+            Some("run".to_string()),
+            None,
+            "run_started",
+            json!({ "prompt": "hi" }),
+        );
+        let second = HistoryEvent::new(
+            session_id.clone(),
+            Some("run".to_string()),
+            None,
+            "run_completed",
+            json!({ "summary": "done" }),
+        );
+        store.append_event(&first).unwrap();
+        store.append_event(&second).unwrap();
+
+        // Re-open the same session by id without going through create().
+        let opened = HistoryStore::open(&dir.path().join(".atelier"), &session_id).unwrap();
+        assert_eq!(opened.session_id(), session_id);
+        assert_eq!(opened.read_events().unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn open_rejects_unsupported_metadata_schema_version() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let session_id = store.session_id().to_string();
+        let root = dir.path().join(".atelier");
+        let metadata_path = root
+            .join("sessions")
+            .join(&session_id)
+            .join("metadata.json");
+        fs::write(
+            &metadata_path,
+            r#"{"schema_version":2,"session_id":"x","working_directory":".","started_at":"t"}"#,
+        )
+        .unwrap();
+        let err = HistoryStore::open(&root, &session_id).unwrap_err();
+        assert!(
+            err.to_string().contains("schema_version 2"),
+            "expected a loud schema error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_without_cache_fields_defaults_to_none() {
+        // A pre-cache metadata.json (no goal/outcome/last_head_sha) still loads.
+        let legacy = r#"{"schema_version":1,"session_id":"s","working_directory":"/tmp","started_at":"2026-06-17T00:00:00.000Z"}"#;
+        let metadata: SessionMetadata = serde_json::from_str(legacy).unwrap();
+        assert_eq!(metadata.goal, None);
+        assert_eq!(metadata.outcome, None);
+        assert_eq!(metadata.last_head_sha, None);
+    }
+
+    #[test]
+    fn update_metadata_cache_persists_fields_and_preserves_permissions() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        store
+            .update_metadata_cache(
+                Some("ship it".to_string()),
+                Some("completed".to_string()),
+                None,
+            )
+            .unwrap();
+
+        let metadata = store.read_metadata().unwrap();
+        assert_eq!(metadata.goal.as_deref(), Some("ship it"));
+        assert_eq!(metadata.outcome.as_deref(), Some("completed"));
+        assert_eq!(metadata.last_head_sha, None);
+        // Authoritative fields untouched; still schema v1 (additive, no bump).
+        assert_eq!(metadata.schema_version, 1);
+        assert_eq!(metadata.session_id, store.session_id());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir
+                .path()
+                .join(".atelier")
+                .join("sessions")
+                .join(store.session_id())
+                .join("metadata.json");
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "metadata.json should stay private 0600");
+        }
+    }
+
+    #[test]
+    fn update_metadata_cache_round_trips_last_head_sha() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        store
+            .update_metadata_cache(None, None, Some("abc123".to_string()))
+            .unwrap();
+        assert_eq!(
+            store.read_metadata().unwrap().last_head_sha.as_deref(),
+            Some("abc123")
+        );
+    }
+
+    // ── session summaries (task_03) ──
+
+    fn append(store: &HistoryStore, kind: &str, payload: Value) {
+        let event = HistoryEvent::new(
+            store.session_id().to_string(),
+            Some("run".to_string()),
+            None,
+            kind,
+            payload,
+        );
+        store.append_event(&event).unwrap();
+    }
+
+    #[test]
+    fn list_session_summaries_orders_newest_first_by_id() {
+        let dir = tempdir().unwrap();
+        let ids: Vec<String> = (0..3)
+            .map(|_| {
+                HistoryStore::create(dir.path())
+                    .unwrap()
+                    .session_id()
+                    .to_string()
+            })
+            .collect();
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        let got: Vec<String> = summaries.iter().map(|s| s.session_id.clone()).collect();
+        // The contract is reverse-lexicographic by id; for ULID ids that is
+        // newest-created first.
+        let mut expected = ids.clone();
+        expected.sort();
+        expected.reverse();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn summary_label_uses_goal_when_set() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        append(
+            &store,
+            "prompt_submitted",
+            json!({ "prompt": "do something" }),
+        );
+        append(
+            &store,
+            "session_goal_set",
+            json!({ "goal": "ship the feature" }),
+        );
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        assert_eq!(summaries[0].label, "ship the feature");
+    }
+
+    #[test]
+    fn summary_label_falls_back_to_first_prompt() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        // A leading-space (secret) prompt is skipped; the first real prompt wins.
+        append(
+            &store,
+            "prompt_submitted",
+            json!({ "prompt": " secret token" }),
+        );
+        append(
+            &store,
+            "prompt_submitted",
+            json!({ "prompt": "fix the parser" }),
+        );
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        assert_eq!(summaries[0].label, "fix the parser");
+    }
+
+    #[test]
+    fn summary_label_falls_back_to_timestamp_and_outcome() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        // No goal, no prompt — only a terminal run.
+        append(&store, "run_completed", json!({ "summary": "done" }));
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        let summary = &summaries[0];
+        assert_eq!(summary.outcome, RunState::Completed);
+        assert!(
+            summary.label.contains("completed"),
+            "label: {}",
+            summary.label
+        );
+        assert!(
+            summary.label.contains(&summary.started_at),
+            "label: {}",
+            summary.label
+        );
+    }
+
+    #[test]
+    fn summary_self_heals_missing_outcome_cache_from_log() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        append(&store, "run_failed", json!({ "reason": "boom" }));
+        // Fresh metadata has no cached outcome.
+        assert_eq!(store.read_metadata().unwrap().outcome, None);
+
+        let summaries = list_session_summaries(&dir.path().join(".atelier"));
+        assert_eq!(summaries[0].outcome, RunState::Failed);
+        // The browse pass rewrote the cache from the log (log wins, ADR-008).
+        assert_eq!(
+            store.read_metadata().unwrap().outcome.as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn corrupt_session_is_skipped_without_failing_the_list() {
+        let dir = tempdir().unwrap();
+        let good = HistoryStore::create(dir.path()).unwrap();
+        append(
+            &good,
+            "prompt_submitted",
+            json!({ "prompt": "valid session" }),
+        );
+        let good_id = good.session_id().to_string();
+
+        // A corrupt session: unparseable metadata.json.
+        let root = dir.path().join(".atelier");
+        let corrupt_dir = root.join("sessions").join("corrupt");
+        fs::create_dir_all(&corrupt_dir).unwrap();
+        fs::write(corrupt_dir.join("metadata.json"), "not json").unwrap();
+
+        let summaries = list_session_summaries(&root);
+        let ids: Vec<&str> = summaries.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(ids.contains(&good_id.as_str()));
+        assert!(
+            !ids.contains(&"corrupt"),
+            "corrupt session should be skipped"
+        );
+    }
+
+    #[test]
+    fn list_session_summaries_over_multi_session_fixture() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".atelier");
+
+        let a = HistoryStore::create(dir.path()).unwrap();
+        append(&a, "prompt_submitted", json!({ "prompt": "first session" }));
+        append(&a, "run_completed", json!({ "summary": "ok" }));
+
+        let b = HistoryStore::create(dir.path()).unwrap();
+        append(
+            &b,
+            "session_goal_set",
+            json!({ "goal": "second session goal" }),
+        );
+        append(&b, "run_failed", json!({ "reason": "nope" }));
+
+        let summaries = list_session_summaries(&root);
+        assert_eq!(summaries.len(), 2);
+        // Order is reverse-lexicographic by id (deterministic; back-to-back ULIDs
+        // can share a millisecond, so don't assume creation order == id order).
+        let mut expected_order = vec![a.session_id().to_string(), b.session_id().to_string()];
+        expected_order.sort();
+        expected_order.reverse();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|s| s.session_id.clone())
+                .collect::<Vec<_>>(),
+            expected_order
+        );
+        // Content by id.
+        let by_id = |id: &str| summaries.iter().find(|s| s.session_id == id).unwrap();
+        assert_eq!(by_id(a.session_id()).label, "first session");
+        assert_eq!(by_id(a.session_id()).outcome, RunState::Completed);
+        assert_eq!(by_id(b.session_id()).label, "second session goal");
+        assert_eq!(by_id(b.session_id()).outcome, RunState::Failed);
+    }
+
+    // ── HEAD baseline fold (task_05) ──
+
+    #[test]
+    fn last_recorded_head_sha_returns_the_most_recent_non_empty() {
+        let head_a = HistoryEvent::new(
+            "s",
+            Some("r1".to_string()),
+            None,
+            "run_started",
+            json!({ "run_id": "r1", "head_sha": "aaa1111" }),
+        );
+        let head_b = HistoryEvent::new(
+            "s",
+            Some("r2".to_string()),
+            None,
+            "run_started",
+            json!({ "run_id": "r2", "head_sha": "bbb2222" }),
+        );
+        let no_head = HistoryEvent::new(
+            "s",
+            Some("r2".to_string()),
+            None,
+            "run_completed",
+            json!({ "summary": "done" }),
+        );
+        // Empty log → no baseline.
+        assert_eq!(last_recorded_head_sha(&[]), None);
+        // Most recent recorded HEAD wins; events without a head_sha are ignored.
+        assert_eq!(
+            last_recorded_head_sha(&[head_a.clone(), head_b, no_head]),
+            Some("bbb2222".to_string())
+        );
+        // A null head_sha (non-git run) is skipped, falling back to an earlier one.
+        let null_head = HistoryEvent::new(
+            "s",
+            Some("r3".to_string()),
+            None,
+            "run_started",
+            json!({ "run_id": "r3", "head_sha": null }),
+        );
+        assert_eq!(
+            last_recorded_head_sha(&[head_a, null_head]),
+            Some("aaa1111".to_string())
+        );
+    }
+
+    // ── Dangling-run detection (task_10) ──
+
+    fn run_event(run_id: &str, kind: &str, payload: Value) -> HistoryEvent {
+        HistoryEvent::new("s", Some(run_id.to_string()), None, kind, payload)
+    }
+
+    #[test]
+    fn dangling_run_is_none_for_an_empty_or_runless_log() {
+        assert_eq!(dangling_run_from_events(&[]), None);
+        let goal_only = HistoryEvent::new(
+            "s",
+            None,
+            None,
+            "session_goal_set",
+            json!({ "goal": "ship it" }),
+        );
+        assert_eq!(dangling_run_from_events(&[goal_only]), None);
+    }
+
+    #[test]
+    fn dangling_run_is_none_when_the_last_run_closed_terminally() {
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            run_event("r1", "run_completed", json!({ "summary": "done" })),
+        ];
+        assert_eq!(dangling_run_from_events(&events), None);
+    }
+
+    #[test]
+    fn dangling_run_reports_a_crash_mid_run_as_running() {
+        // A started run with no terminal event after it (the process died).
+        let events = [run_event("r1", "run_started", json!({ "run_id": "r1" }))];
+        assert_eq!(
+            dangling_run_from_events(&events),
+            Some(("r1".to_string(), RunState::Running))
+        );
+    }
+
+    #[test]
+    fn dangling_run_trusts_a_graceful_quit_mid_run() {
+        // end_session records the in-flight run via active_run_id + run_state.
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            HistoryEvent::new(
+                "s",
+                None,
+                None,
+                "session_ended",
+                json!({ "run_state": RunState::Running, "active_run_id": "r1" }),
+            ),
+        ];
+        assert_eq!(
+            dangling_run_from_events(&events),
+            Some(("r1".to_string(), RunState::Running))
+        );
+    }
+
+    #[test]
+    fn dangling_run_is_none_for_a_clean_between_runs_quit() {
+        // A run completed, then the user quit while Idle: session_ended carries a
+        // null active_run_id and must not resurrect the just-closed run.
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            run_event("r1", "run_completed", json!({ "summary": "done" })),
+            HistoryEvent::new(
+                "s",
+                None,
+                None,
+                "session_ended",
+                json!({ "run_state": RunState::Idle, "active_run_id": null }),
+            ),
+        ];
+        assert_eq!(dangling_run_from_events(&events), None);
+    }
+
+    #[test]
+    fn dangling_run_tracks_only_the_most_recent_run() {
+        // First run completed; a second started and never closed → the second is
+        // the dangling one.
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            run_event("r1", "run_completed", json!({ "summary": "done" })),
+            run_event("r2", "run_started", json!({ "run_id": "r2" })),
+        ];
+        assert_eq!(
+            dangling_run_from_events(&events),
+            Some(("r2".to_string(), RunState::Running))
+        );
+    }
+
+    #[test]
+    fn dangling_run_is_none_when_session_ended_recorded_a_terminal_state() {
+        // Quit captured a terminal run_state (e.g. right after failure): the
+        // is_terminal() filter rejects it, so there is nothing to reconcile.
+        let events = [
+            run_event("r1", "run_started", json!({ "run_id": "r1" })),
+            HistoryEvent::new(
+                "s",
+                None,
+                None,
+                "session_ended",
+                json!({ "run_state": RunState::Failed, "active_run_id": "r1" }),
+            ),
+        ];
+        assert_eq!(dangling_run_from_events(&events), None);
+    }
+
+    // ── Resume metrics (task_13) ──
+
+    fn seed_metrics_session(working_dir: &Path, kinds: &[(&str, Value)]) {
+        let store = HistoryStore::create(working_dir).unwrap();
+        for (kind, payload) in kinds {
+            let event = HistoryEvent::new(
+                store.session_id(),
+                Some("r".to_string()),
+                None,
+                *kind,
+                payload.clone(),
+            );
+            store.append_event(&event).unwrap();
+        }
+    }
+
+    fn event_at(kind: &str, timestamp: &str) -> HistoryEvent {
+        HistoryEvent {
+            schema_version: 1,
+            event_id: "e".to_string(),
+            session_id: "s".to_string(),
+            run_id: None,
+            group_id: None,
+            graph_id: None,
+            step_id: None,
+            timestamp: timestamp.to_string(),
+            kind: kind.to_string(),
+            payload: json!({}),
+            payload_truncated: false,
+        }
+    }
+
+    #[test]
+    fn resume_metrics_fold_crash_recovery_and_completion() {
+        let dir = tempdir().unwrap();
+        // 1: crashed (interrupted), never resumed.
+        seed_metrics_session(
+            dir.path(),
+            &[
+                ("run_started", json!({ "run_id": "r" })),
+                ("run_interrupted", json!({ "run_id": "r" })),
+            ],
+        );
+        // 2: crashed + resumed, not completed.
+        seed_metrics_session(
+            dir.path(),
+            &[
+                ("run_interrupted", json!({})),
+                ("session_resumed", json!({})),
+            ],
+        );
+        // 3: crashed + resumed + completed.
+        seed_metrics_session(
+            dir.path(),
+            &[
+                ("run_interrupted", json!({})),
+                ("session_resumed", json!({})),
+                ("run_completed", json!({})),
+            ],
+        );
+        // 4: clean run, never crashed/resumed → counts in nothing.
+        seed_metrics_session(
+            dir.path(),
+            &[
+                ("run_started", json!({ "run_id": "r" })),
+                ("run_completed", json!({})),
+            ],
+        );
+
+        let metrics = resume_metrics(&dir.path().join(".atelier"));
+        assert_eq!(metrics.crashed, 3, "sessions 1–3 ended non-terminally");
+        assert_eq!(metrics.recovered, 2, "sessions 2 and 3 were resumed");
+        assert_eq!(metrics.resumed, 2);
+        assert_eq!(metrics.resumed_completed, 1, "only session 3 completed");
+        assert_eq!(metrics.crash_recovery_rate(), Some(2.0 / 3.0));
+        assert_eq!(metrics.resumed_completion_rate(), Some(0.5));
+    }
+
+    #[test]
+    fn resume_metrics_on_empty_root_are_zero_with_undefined_rates() {
+        let dir = tempdir().unwrap();
+        let metrics = resume_metrics(&dir.path().join(".atelier"));
+        assert_eq!(metrics, ResumeMetrics::default());
+        assert_eq!(metrics.crash_recovery_rate(), None);
+        assert_eq!(metrics.resumed_completion_rate(), None);
+    }
+
+    #[test]
+    fn time_to_continue_is_resume_to_next_prompt_delta() {
+        let events = [
+            event_at("run_interrupted", "2026-06-17T10:00:00.000Z"),
+            event_at("session_resumed", "2026-06-17T10:00:02.000Z"),
+            event_at("prompt_submitted", "2026-06-17T10:00:07.000Z"),
+        ];
+        // 10:00:02 → 10:00:07 = 5s.
+        assert_eq!(
+            time_to_continue(&events).map(|delta| delta.num_seconds()),
+            Some(5)
+        );
+
+        // A session never resumed has no time-to-continue.
+        let unresumed = [event_at("prompt_submitted", "2026-06-17T10:00:00.000Z")];
+        assert_eq!(time_to_continue(&unresumed), None);
+
+        // Resumed but no following prompt yet (still idle after reopening).
+        let no_prompt = [event_at("session_resumed", "2026-06-17T10:00:00.000Z")];
+        assert_eq!(time_to_continue(&no_prompt), None);
+    }
+
     #[test]
     fn reads_legacy_jsonl_events_without_group_id() {
         let dir = tempdir().unwrap();
@@ -468,6 +1523,159 @@ mod tests {
 
         assert_eq!(events[0].group_id, None);
         assert!(!events[0].payload_truncated);
+    }
+
+    // ── execution-graph (DAG) events + graph_id (task_03) ──
+
+    #[test]
+    fn reads_legacy_jsonl_events_without_graph_id() {
+        // A pre-DAG line (no graph_id column) deserializes with graph_id == None
+        // at schema_version 1 — the DAG is additive, no schema bump.
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let path = store.session_dir().join("events.jsonl");
+        fs::write(
+            &path,
+            r#"{"schema_version":1,"event_id":"event","session_id":"session","run_id":"run","group_id":null,"step_id":"step","timestamp":"2026-06-06T00:00:00.000Z","kind":"agent_result","payload":{}}"#,
+        )
+        .unwrap();
+
+        let events = read_events_from_path(&path).unwrap();
+        assert_eq!(events[0].graph_id, None);
+    }
+
+    #[test]
+    fn graph_id_round_trips_through_append_and_read() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let event = HistoryEvent::new_with_graph(
+            store.session_id().to_string(),
+            Some("run".to_string()),
+            Some("graph-1".to_string()),
+            None,
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            json!({ "graph_id": "graph-1", "nodes": [] }),
+        );
+        store.append_event(&event).unwrap();
+        let events = store.read_events().unwrap();
+        assert_eq!(events, vec![event]);
+        assert_eq!(events[0].graph_id.as_deref(), Some("graph-1"));
+        // new_with_graph keeps the group path clear (graph events aren't mis-keyed).
+        assert_eq!(events[0].group_id, None);
+    }
+
+    #[test]
+    fn append_debug_event_includes_graph_id_in_lockstep() {
+        // append_debug_event hand-builds its JSON; it must carry graph_id or the
+        // debug log silently drops it (the lockstep risk called out in the spec).
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let event = HistoryEvent::new_with_graph(
+            store.session_id().to_string(),
+            Some("run".to_string()),
+            Some("graph-7".to_string()),
+            None,
+            NODE_RUNNING_KIND,
+            json!({ "graph_id": "graph-7", "node_id": "a" }),
+        );
+        store.append_debug_event(&event).unwrap();
+
+        let debug = fs::read_to_string(store.root.join("debug.log")).unwrap();
+        let record: Value = serde_json::from_str(debug.trim()).unwrap();
+        assert_eq!(record["graph_id"], json!("graph-7"));
+        assert_eq!(record["kind"], json!(NODE_RUNNING_KIND));
+    }
+
+    #[test]
+    fn mixed_legacy_parallel_and_dag_events_all_parse() {
+        // Old parallel_* events and new node_*/execution_graph_* events coexist in
+        // one events.jsonl at schema_version 1.
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let session = store.session_id().to_string();
+        let legacy = HistoryEvent::new_with_group(
+            session.clone(),
+            Some("run".to_string()),
+            Some("group-1".to_string()),
+            None,
+            "parallel_group_started",
+            json!({ "group_id": "group-1" }),
+        );
+        let proposed = HistoryEvent::new_with_graph(
+            session.clone(),
+            Some("run".to_string()),
+            Some("graph-1".to_string()),
+            None,
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            json!({ "graph_id": "graph-1" }),
+        );
+        let node = HistoryEvent::new_with_graph(
+            session.clone(),
+            Some("run".to_string()),
+            Some("graph-1".to_string()),
+            None,
+            NODE_SUCCEEDED_KIND,
+            json!({ "graph_id": "graph-1", "node_id": "a" }),
+        );
+        store.append_event(&legacy).unwrap();
+        store.append_event(&proposed).unwrap();
+        store.append_event(&node).unwrap();
+
+        let events = store.read_events().unwrap();
+        assert_eq!(events, vec![legacy, proposed, node]);
+    }
+
+    #[test]
+    fn read_events_still_rejects_non_v1_schema() {
+        // The schema gate is unchanged by the DAG additions.
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let path = store.session_dir().join("events.jsonl");
+        fs::write(
+            &path,
+            r#"{"schema_version":2,"event_id":"e","session_id":"s","run_id":null,"step_id":null,"timestamp":"2026-06-06T00:00:00.000Z","kind":"node_running","payload":{}}"#,
+        )
+        .unwrap();
+        let err = read_events_from_path(&path).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported history schema_version 2"));
+    }
+
+    #[test]
+    fn dag_event_sequence_replays_through_read_back() {
+        // A full proposed → node_* → completed sequence replays cleanly, all
+        // grouped under one graph_id.
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::create(dir.path()).unwrap();
+        let session = store.session_id().to_string();
+        let kinds = [
+            EXECUTION_GRAPH_PROPOSED_KIND,
+            EXECUTION_GRAPH_APPROVED_KIND,
+            NODE_PENDING_KIND,
+            NODE_READY_KIND,
+            NODE_RUNNING_KIND,
+            NODE_SUCCEEDED_KIND,
+            EXECUTION_GRAPH_COMPLETED_KIND,
+        ];
+        for kind in kinds {
+            let event = HistoryEvent::new_with_graph(
+                session.clone(),
+                Some("run".to_string()),
+                Some("graph-9".to_string()),
+                None,
+                kind,
+                json!({ "graph_id": "graph-9" }),
+            );
+            store.append_event(&event).unwrap();
+        }
+
+        let events = store.read_events().unwrap();
+        let replayed: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(replayed, kinds);
+        assert!(events
+            .iter()
+            .all(|e| e.graph_id.as_deref() == Some("graph-9")));
     }
 
     #[test]

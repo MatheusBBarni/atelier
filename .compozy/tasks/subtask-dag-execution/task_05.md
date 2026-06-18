@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Whole-plan approval gate (normal mode)"
 type: backend
 complexity: high
@@ -32,11 +32,13 @@ Add a single, binary accept/reject gate that pauses a proposed DAG before any no
 </requirements>
 
 ## Subtasks
-- [ ] 5.1 Add the `pending_plan_approval` state field and its publish path (distinct from per-action approval).
-- [ ] 5.2 Insert the gate in `run_execution_graph` before admission; branch on `approval_mode`.
-- [ ] 5.3 Wire accept/reject resolution through the clarification/approval channel with `question_id` from `graph_id`.
-- [ ] 5.4 Implement reject-with-reason → orchestrator re-propose; emit approved/rejected events.
-- [ ] 5.5 Add unit + integration tests for accept, reject-re-propose, and yolo auto-accept.
+- [x] 5.1 Add the `pending_plan_approval` state field (`AppState` view + internal `App` holder) and its publish path, distinct from per-action `pending_approval`.
+- [x] 5.2 Gate before admission, branching on `approval_mode`. **Design note:** implemented as return-and-resume via the clarification channel in `handle_execution_graph_decision` (before `run_execution_graph`), mirroring the governance-decision pattern — required to satisfy ADR-005 (clarification channel + free-text reject reason) and tests 5.67/5.69, which the binary approval channel cannot. The gate is after validation (upstream) and before any node is admitted; preparation is deferred to accept so rejected plans waste no work.
+- [x] 5.3 Accept/reject resolution via the clarification answer channel (`AppEvent::PlanApprovalResolved` → `resolve_pending_plan_approval`); `question_id` derived deterministically from `graph_id` via `plan_question_id`.
+- [x] 5.4 Reject-with-reason appends the reason to the prompt and re-drives the orchestrator (re-propose, not a hard failure); emits `execution_graph_proposed`/`approved`/`rejected` events.
+- [x] 5.5 Unit/integration tests for normal-pause, accept, reject-with-reason, yolo auto-accept, distinct-field, and question_id determinism.
+
+> The TUI wiring that sends `AppEvent::PlanApprovalResolved` and renders the Plan item's WaitingApproval/accept-reject affordance is task_06 (projection + TUI); this task owns the app-side decision flow + events.
 
 ## Implementation Details
 Changes are in `src/app/mod.rs`. Reuse `ApprovalHandle::answer`/`wait_for_approval` (already a binary accept/reject primitive) or the clarification-answer path; mint a `question_id` from `graph_id`. The gate must not spawn any node before resolution. See TechSpec "Component Overview → Plan approval" and ADR-005 (approval on the Plan item via the clarification channel). The Plan item's WaitingApproval rendering is implemented in task_06; this task owns the decision flow and events.
@@ -62,13 +64,13 @@ Changes are in `src/app/mod.rs`. Reuse `ApprovalHandle::answer`/`wait_for_approv
 
 ## Tests
 - Unit tests:
-  - [ ] In `normal` mode, no node is spawned until an accept signal is received.
-  - [ ] In `yolo` mode, the plan is auto-accepted and admission begins with no gate.
-  - [ ] A reject with a reason emits `execution_graph_rejected` carrying the reason and does not spawn nodes.
-  - [ ] The plan gate uses `pending_plan_approval`, leaving `state.pending_approval` (per-action) untouched (no collision).
-  - [ ] The clarification `question_id` is derived deterministically from `graph_id` (accept event re-keys identically).
+  - [x] In `normal` mode, no node is spawned until accept. (`dag_normal_mode_pauses_for_plan_approval_without_spawning`)
+  - [x] In `yolo` mode, the plan is auto-accepted and runs with no gate. (`dag_yolo_mode_auto_accepts_and_runs`)
+  - [x] A reject with a reason emits `execution_graph_rejected` carrying the reason and spawns no nodes. (`dag_plan_reject_emits_rejected_with_reason_and_spawns_nothing`)
+  - [x] The plan gate uses `pending_plan_approval`, leaving `state.pending_approval` (per-action) untouched. (`dag_normal_mode_pauses_for_plan_approval_without_spawning`)
+  - [x] The `question_id` is derived deterministically from `graph_id`. (`plan_question_id_is_deterministic_from_graph_id` + `dag_normal_mode_pauses...`)
 - Integration tests:
-  - [ ] (with task_08 harness) normal-mode accept runs the graph; reject-with-reason triggers an orchestrator re-proposal; yolo runs without a prompt.
+  - [x] (task_05) normal-mode accept runs the graph end-to-end via the fake runtime (`dag_plan_accept_runs_the_graph`); reject re-drives the orchestrator; yolo runs without a prompt (`dag_yolo_mode_auto_accepts_and_runs`). task_08 adds the full fake-runtime DAG-emission harness.
 - Test coverage target: >=80%
 - All tests must pass
 

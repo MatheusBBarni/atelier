@@ -5,11 +5,15 @@ use multiagent::slash_commands::{
 #[test]
 fn catalog_accessor_is_usable_from_an_external_module() {
     let specs = catalog();
-    assert_eq!(specs.len(), 12);
+    assert_eq!(specs.len(), 13);
     assert_eq!(specs[0].label, "/help");
     assert!(specs
         .iter()
         .any(|spec| spec.label == "/reload:skills" && spec.kind == SlashCommandKind::TuiLocal));
+    // /sessions opens the session browser, a TUI-local command (task_09).
+    assert!(specs
+        .iter()
+        .any(|spec| spec.label == "/sessions" && spec.kind == SlashCommandKind::TuiLocal));
 }
 
 #[test]

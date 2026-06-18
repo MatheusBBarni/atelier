@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add RunState::is_terminal() helper"
 type: refactor
 complexity: low
@@ -26,9 +26,9 @@ Add a `RunState::is_terminal()` helper and replace the inline `matches!(.., Comp
 </requirements>
 
 ## Subtasks
-- [ ] 1.1 Add the `is_terminal()` method on `RunState`.
-- [ ] 1.2 Find and replace the inline `matches!` terminal checks that express run-finished semantics.
-- [ ] 1.3 Add a unit test covering the truth table for all eight variants.
+- [x] 1.1 Add the `is_terminal()` method on `RunState`.
+- [x] 1.2 Find and replace the inline `matches!` terminal checks that express run-finished semantics. — **Find done; no replacements applicable.** An exhaustive scan (every `matches!` in `src/`) found **zero** `matches!(.., Completed | Failed | Interrupted | LimitReached)` (the exact terminal set). The nearby run-state checks are deliberately *narrower* and do **not** express "is finished": `can_replay_now` matches `Completed` only (clean-completion semantics), and the queue-pause check matches `Failed | Interrupted | LimitReached | WaitingForUser` (ended-badly-or-waiting — includes a non-terminal state, excludes `Completed`). Substituting `is_terminal()` into either would change behavior, which this task forbids. See As-built notes.
+- [x] 1.3 Add a unit test covering the truth table for all eight variants. — `run_state_is_terminal_truth_table`
 
 ## Implementation Details
 Add the method to the `RunState` enum in `src/orchestrator/mod.rs` (enum at `:14`). See TechSpec "Core Interfaces" for the helper shape. Replace duplicated checks in `src/app/mod.rs` (e.g. around the queue `can_replay_now` / run-end paths). Do not introduce a new file.
@@ -51,10 +51,10 @@ Add the method to the `RunState` enum in `src/orchestrator/mod.rs` (enum at `:14
 
 ## Tests
 - Unit tests:
-  - [ ] `is_terminal()` returns true for `Completed`, `Failed`, `Interrupted`, `LimitReached`.
-  - [ ] `is_terminal()` returns false for `Idle`, `Planning`, `Running`, `WaitingForUser`.
+  - [x] `is_terminal()` returns true for `Completed`, `Failed`, `Interrupted`, `LimitReached`. — `run_state_is_terminal_truth_table`
+  - [x] `is_terminal()` returns false for `Idle`, `Planning`, `Running`, `WaitingForUser`. — same test (all 8 variants)
 - Integration tests:
-  - [ ] Existing run-lifecycle tests (FakeRuntime completed/failed/interrupted runs) pass after the call-site refactor.
+  - [x] Existing run-lifecycle tests (FakeRuntime completed/failed/interrupted runs) pass after the call-site refactor. — orchestrator suite 34/0; the app FakeRuntime completed/failed/limit lifecycle tests pass unchanged (no behavior change — pure additive method).
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -63,3 +63,7 @@ Add the method to the `RunState` enum in `src/orchestrator/mod.rs` (enum at `:14
 - Test coverage >=80%
 - `is_terminal()` is the single expression of run-finished semantics at the refactored call sites.
 - No change to which states are terminal or to run-state transitions.
+
+## As-built notes
+- Added `RunState::is_terminal()` (pure, `&self`) returning true for exactly `Completed | Failed | Interrupted | LimitReached`. No behavior change of any kind.
+- **No call sites refactored — by design, verified.** A scripted scan of every `matches!` in `src/` found no expression containing all four terminal states; ADR-008's premise of "scattered `matches!(.., Completed|Failed|Interrupted|LimitReached)`" does not match the current code. The two closest checks are intentionally narrower (`can_replay_now` → `Completed` only; `react_to_run_end_for_queue` → `Failed|Interrupted|LimitReached|WaitingForUser`), and swapping `is_terminal()` into either would alter the matched state set — a behavior change the task explicitly prohibits, and (for the queue site) would also reduce readability. The helper is therefore added for its stated downstream consumers — task_03 (session-outcome derivation) and task_10 (dangling-run detection on open), per ADR-008 §4 — which is where the first true "is this run finished" call sites appear.

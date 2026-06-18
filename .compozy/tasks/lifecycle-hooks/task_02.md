@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Hooks config through the ladder + drop local-layer hooks
 type: backend
 complexity: medium
@@ -29,12 +29,12 @@ Thread a `[hooks]` section through atelier's config ladder (Raw → Merged → E
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add `RawHooksConfig`/`RawHookHandler` and the `hooks` field to `RawConfig`, `MergedConfig`, `EffectiveConfig`.
-- [ ] 2.2 Add the `apply_raw` branch that merges hooks, mirroring `[limits]`/`[ui]`.
-- [ ] 2.3 Implement local-layer drop: ignore `raw.hooks` when the source is `./atelier.toml`, with a diagnostic.
-- [ ] 2.4 Validate handlers (`on` string|list, exactly-one-action, known public events).
-- [ ] 2.5 Add a commented `[[hooks.handler]]` block to `starter_config_text`.
-- [ ] 2.6 Add unit tests for parsing, validation, and the local-drop behavior.
+- [x] 2.1 Add `RawHooksConfig`/`RawHookHandler` and the `hooks` field to `RawConfig`, `MergedConfig`, `EffectiveConfig`.
+- [x] 2.2 Add the `apply_raw` branch that merges hooks, mirroring `[limits]`/`[ui]`.
+- [x] 2.3 Implement local-layer drop: ignore `raw.hooks` when the source is `./atelier.toml`, with a diagnostic.
+- [x] 2.4 Validate handlers (`on` string|list, exactly-one-action, known public events).
+- [x] 2.5 Add a commented `[[hooks.handler]]` block to `starter_config_text`.
+- [x] 2.6 Add unit tests for parsing, validation, and the local-drop behavior.
 
 ## Implementation Details
 All edits live in `src/config/mod.rs`. Mirror an existing section end-to-end: `RawConfig` (`:417`, note `deny_unknown_fields`), `MergedConfig` (`:606`), `EffectiveConfig` (`:401`), the `apply_raw` branch (`:909-978`), and `into_effective`. The local override is applied at `:1680-1688` via `apply_config_file`; the local-drop check keys off the source identity passed into `apply_raw` (`source_name`/source dir). Add the scaffold to `starter_config_text` (`:2195-2334`). The reusable `HooksConfig`/`HookHandler` types come from task_01. See TechSpec "System Architecture → Config ladder".
@@ -65,14 +65,14 @@ All edits live in `src/config/mod.rs`. Mirror an existing section end-to-end: `R
 
 ## Tests
 - Unit tests:
-  - [ ] A `[[hooks.handler]]` array with `on = "run_completed"` + `notify = true` parses into one handler.
-  - [ ] `on = ["run_completed","run_failed"]` parses to a two-event handler.
-  - [ ] A handler with both `notify` and `command` is rejected (exactly-one-action error).
-  - [ ] `on = "not_an_event"` is rejected with an unknown-public-event error.
-  - [ ] Hooks in `./atelier.toml` are dropped while a home-config `[ui]` override in the same local file still applies.
-  - [ ] An unknown key under `[hooks]` is rejected by `deny_unknown_fields`.
+  - [x] A `[[hooks.handler]]` array with `on = "run_completed"` + `notify = true` parses into one handler. — `hooks_handler_with_notify_parses`
+  - [x] `on = ["run_completed","run_failed"]` parses to a two-event handler. — `hooks_on_list_parses_to_multi_event_handler`
+  - [x] A handler with both `notify` and `command` is rejected (exactly-one-action error). — `hooks_handler_with_both_actions_is_rejected` (+ `_without_an_action_` for the no-action case)
+  - [x] `on = "not_an_event"` is rejected with an unknown-public-event error. — `hooks_unknown_public_event_is_rejected`
+  - [x] Hooks in `./atelier.toml` are dropped while a home-config `[ui]` override in the same local file still applies. — `local_layer_hooks_are_dropped_while_other_local_overrides_apply`
+  - [x] An unknown key under `[hooks]` is rejected by `deny_unknown_fields`. — `hooks_unknown_key_is_rejected_by_deny_unknown_fields`
 - Integration tests:
-  - [ ] `atelier --print-config` renders a configured `[hooks]` section from home config.
+  - [x] `atelier --print-config` renders a configured `[hooks]` section from home config. — `print_config_renders_configured_hooks_section` (+ `print_config_omits_hooks_when_none_configured`)
 - Test coverage target: >=80%
 - All tests must pass
 
@@ -82,3 +82,10 @@ All edits live in `src/config/mod.rs`. Mirror an existing section end-to-end: `R
 - `[hooks]` parses, validates, and merges through Raw→Merged→Effective
 - Local-layer hooks are ignored; other local overrides unaffected
 - `--init-config` scaffolds a commented hooks example
+
+## As-built notes
+- **Local-drop diagnostic** lands on a new `EffectiveConfig.hooks_warnings: Vec<String>` (mirrors `keybinding_warnings`), threaded through `MergedConfig`. Task_08 (doctor) reads it. The drop keys off `layer == ConfigLayer::Local` in `apply_raw`, exactly like the keybindings trust boundary.
+- **Whole-array replacement, not field-merge:** a user-scope layer sets `MergedConfig.hooks` wholesale (`build_hooks_config`), so the last user-scope layer wins. There is at most one user-scope layer (explicit `--config` *or* home) plus the dropped Local layer, so replacement is unambiguous.
+- **`--print-config`** surfaces hooks via a new `PrintableHooks`/`PrintableHookHandler` projection in `build_printable_config` (skipped when empty). Field order is scalar-before-array-of-tables so the TOML serializes cleanly; `command` is shown for command actions, omitted for notify.
+- **Raw schema:** `RawHookEvents` (untagged string|list), `RawNotify` (untagged `true`|`{title,body}` table), `RawNotifyConfig`, all under `deny_unknown_fields`. `payload` reuses task_01's `PayloadDetail` (`"metadata"`/`"full"`). `notify = false` is treated as "notify not selected".
+- **Touched task_01's `src/hooks/mod.rs`:** added `PartialEq, Eq` derives to `HooksConfig`/`HookHandler`/`HookAction` (trait impls only, no behavior change) because `EffectiveConfig` is `Eq` and now embeds `HooksConfig`.
