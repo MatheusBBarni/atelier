@@ -30,6 +30,13 @@ pub enum ApprovalMode {
     Normal,
 }
 
+impl ApprovalMode {
+    /// Every variant in declaration order (drift test, ADR-005).
+    pub fn all() -> Vec<Self> {
+        vec![Self::Yolo, Self::Normal]
+    }
+}
+
 /// Posture for the gray-area floor (ADR-002's phased-rollout lever). `Warn`
 /// surfaces the risk and records an audit annotation but still runs under `Yolo`;
 /// `Enforce` re-prompts instead. This controls ONLY the gray-area tier — the
@@ -79,6 +86,24 @@ pub enum ToolName {
     CallMcpTool,
     ReadMcpResource,
     ListMcpResources,
+}
+
+impl Capability {
+    /// Every variant in declaration order (drift test, ADR-005). Must include
+    /// `McpTool`.
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Plan,
+            Self::Read,
+            Self::Answer,
+            Self::Challenge,
+            Self::Edit,
+            Self::Command,
+            Self::Verify,
+            Self::Review,
+            Self::McpTool,
+        ]
+    }
 }
 
 impl ToolName {
@@ -312,6 +337,19 @@ pub enum RuntimeKind {
     Fake,
 }
 
+impl RuntimeKind {
+    /// Every variant in declaration order (drift test, ADR-005).
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Codex,
+            Self::Claude,
+            Self::Cursor,
+            Self::Zai,
+            Self::Fake,
+        ]
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptMode {
@@ -329,6 +367,19 @@ pub enum AgentEffort {
     High,
     #[serde(rename = "xhigh")]
     XHigh,
+}
+
+impl AgentEffort {
+    /// Every variant in declaration order (drift test, ADR-005).
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Minimal,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+            Self::XHigh,
+        ]
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -3200,6 +3251,60 @@ fn write_private_file_if_missing(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn enum_all_helpers_are_exhaustive() {
+        // Length checks for the enum-coverage drift test (ADR-005). The
+        // exhaustive `match` over each `all()` result makes adding a variant a
+        // compile error here, so `all()` cannot silently drift from the enum.
+        assert_eq!(RuntimeKind::all().len(), 5);
+        for v in RuntimeKind::all() {
+            match v {
+                RuntimeKind::Codex
+                | RuntimeKind::Claude
+                | RuntimeKind::Cursor
+                | RuntimeKind::Zai
+                | RuntimeKind::Fake => {}
+            }
+        }
+
+        assert_eq!(ApprovalMode::all().len(), 2);
+        for v in ApprovalMode::all() {
+            match v {
+                ApprovalMode::Yolo | ApprovalMode::Normal => {}
+            }
+        }
+
+        assert_eq!(AgentEffort::all().len(), 5);
+        for v in AgentEffort::all() {
+            match v {
+                AgentEffort::Minimal
+                | AgentEffort::Low
+                | AgentEffort::Medium
+                | AgentEffort::High
+                | AgentEffort::XHigh => {}
+            }
+        }
+
+        assert_eq!(Capability::all().len(), 9);
+        assert!(Capability::all().contains(&Capability::McpTool));
+        for v in Capability::all() {
+            match v {
+                Capability::Plan
+                | Capability::Read
+                | Capability::Answer
+                | Capability::Challenge
+                | Capability::Edit
+                | Capability::Command
+                | Capability::Verify
+                | Capability::Review
+                | Capability::McpTool => {}
+            }
+        }
+
+        // `ToolName::all()` predates this task; assert it stays in sync too.
+        assert_eq!(ToolName::all().len(), 10);
+    }
 
     fn load_from_temp(contents: &str) -> Result<EffectiveConfig> {
         let dir = tempdir()?;
