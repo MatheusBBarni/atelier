@@ -273,6 +273,27 @@ pub struct PendingApprovalView {
     /// clean common path. Surfaced in the approval modal.
     #[serde(default)]
     pub drift_notice: Option<String>,
+    /// MCP trust-legibility fields (task_09), populated for a `CallMcpTool`
+    /// awaiting approval: the origin server id, the tool name, the tool's FULL
+    /// untruncated description, and the server's current trust tier. `mcp_server`
+    /// being `Some` also offers the approve-and-trust action (promote the server).
+    #[serde(default)]
+    pub mcp_server: Option<String>,
+    #[serde(default)]
+    pub mcp_tool: Option<String>,
+    #[serde(default)]
+    pub mcp_description: Option<String>,
+    #[serde(default)]
+    pub mcp_trusted: bool,
+}
+
+impl PendingApprovalView {
+    /// Whether the approve-and-trust action is offered: either a session trust
+    /// target (commands/writes) or an MCP origin server to promote (task_09).
+    /// Catastrophic actions are never trustable and are handled before this.
+    pub fn offers_trust(&self) -> bool {
+        self.trust_target.is_some() || self.mcp_server.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2523,6 +2544,21 @@ impl App {
                         json!({ "target": trust_target_payload(&target) }),
                         format!("Trusted for this session: {}", trust_target_label(&target)),
                     )?;
+                }
+            }
+            // For an MCP tool call, approve-and-trust promotes the ORIGIN SERVER
+            // in the durable trust store (ADR-006/007) — not the session list —
+            // so future calls from it auto-allow until revoked. `promote_mcp_server`
+            // persists the file and records `mcp_server_trusted`.
+            if pending.action_request.kind == ActionKind::CallMcpTool {
+                if let Some(server) = pending
+                    .action_request
+                    .params
+                    .get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                {
+                    self.promote_mcp_server(&server)?;
                 }
             }
         }
@@ -8300,6 +8336,39 @@ fn build_pending_approval_view(
         .drift_ack
         .clone()
         .filter(|_| crate::actions::is_mutating_kind(&request.kind));
+    // MCP trust-legibility (task_09): for a tool call, surface the origin server,
+    // the tool name, its full untruncated description (from the catalog snapshot),
+    // and whether the server is already trusted.
+    let (mcp_server, mcp_tool, mcp_description, mcp_trusted) =
+        if request.kind == ActionKind::CallMcpTool {
+            let server = request
+                .params
+                .get("server")
+                .and_then(serde_json::Value::as_str);
+            let tool = request
+                .params
+                .get("tool")
+                .and_then(serde_json::Value::as_str);
+            let description = match (context.mcp.as_ref(), server, tool) {
+                (Some(mcp), Some(server), Some(tool)) => mcp
+                    .catalog
+                    .tool(server, tool)
+                    .and_then(|tool| tool.description.clone()),
+                _ => None,
+            };
+            let trusted = match (context.mcp.as_ref(), server) {
+                (Some(mcp), Some(server)) => mcp.trust.is_trusted(server),
+                _ => false,
+            };
+            (
+                server.map(str::to_string),
+                tool.map(str::to_string),
+                description,
+                trusted,
+            )
+        } else {
+            (None, None, None, false)
+        };
     PendingApprovalView {
         run_id,
         group_id,
@@ -8318,6 +8387,10 @@ fn build_pending_approval_view(
         reversible: None,
         trust_target: risk.target,
         drift_notice,
+        mcp_server,
+        mcp_tool,
+        mcp_description,
+        mcp_trusted,
     }
 }
 

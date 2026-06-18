@@ -2240,7 +2240,7 @@ fn parse_approval_resolution(input: &str, view: &PendingApprovalView) -> Approva
         };
     }
 
-    if view.trust_target.is_some() && matches!(lower.as_str(), "t" | "trust") {
+    if view.offers_trust() && matches!(lower.as_str(), "t" | "trust") {
         return ApprovalResolution::ApproveAndTrust;
     }
 
@@ -2354,8 +2354,9 @@ fn approval_modal_lines(
         ));
     }
 
-    // Key hint, adapted to the tier and trust availability.
-    let trust_hint = if pending.trust_target.is_some() {
+    // Key hint, adapted to the tier and trust availability. For an MCP call,
+    // "approve & trust" promotes the origin server (task_09).
+    let trust_hint = if pending.offers_trust() {
         " · t = approve & trust"
     } else {
         ""
@@ -7307,6 +7308,36 @@ mod tests {
             parse_approval_resolution("n", &view),
             ApprovalResolution::Deny
         );
+    }
+
+    #[test]
+    fn mcp_approval_offers_promote_and_keeps_approve_deny() {
+        // An untrusted MCP call has no session `trust_target`, but its `mcp_server`
+        // still offers approve-and-trust (promote the server, task_09).
+        let view = crate::app::PendingApprovalView {
+            agent: "fixer".to_string(),
+            tier: Some(crate::actions::RiskTier::Medium),
+            reason: Some("untrusted MCP server".to_string()),
+            mcp_server: Some("filesystem".to_string()),
+            mcp_tool: Some("read_file".to_string()),
+            ..Default::default()
+        };
+        // `t` promotes even though `trust_target` is None.
+        assert_eq!(
+            parse_approval_resolution("t", &view),
+            ApprovalResolution::ApproveAndTrust
+        );
+        // A plain approve does NOT promote (it stays a one-shot approval).
+        assert_eq!(
+            parse_approval_resolution("y", &view),
+            ApprovalResolution::ApproveOnce
+        );
+        assert_eq!(
+            parse_approval_resolution("n", &view),
+            ApprovalResolution::Deny
+        );
+        // The modal advertises the promote action.
+        assert!(modal_text(&view, true).contains("approve & trust"));
     }
 
     #[test]

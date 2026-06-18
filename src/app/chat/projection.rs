@@ -103,6 +103,7 @@ impl ChatProjection {
             "trust_granted" | "trust_revoked" | "trust_cleared" | "trust_listed" => {
                 self.apply_trust_event(event)
             }
+            "mcp_server_trusted" | "mcp_server_revoked" => self.apply_mcp_trust_event(event),
             "action_denied" => self.apply_action_denied(event),
             "action_completed" => self.apply_action_completed(event),
             "artifact_written" => self.apply_artifact_written(event),
@@ -285,6 +286,24 @@ impl ChatProjection {
                 diagnostic,
                 MAX_SUMMARY_CHARS,
             )));
+        }
+        // MCP trust legibility (task_09): show the origin server + trust tier and
+        // the tool's FULL untruncated description, so the user can see exactly what
+        // the tool claims to do before trusting the server.
+        if let Some(server) = approval.mcp_server.as_deref() {
+            let tier = if approval.mcp_trusted {
+                "trusted"
+            } else {
+                "untrusted"
+            };
+            let origin = match approval.mcp_tool.as_deref() {
+                Some(tool) => format!("MCP tool {server}/{tool} ({tier} server)"),
+                None => format!("MCP server {server} ({tier})"),
+            };
+            body.push(ChatLineView::muted(origin));
+            if let Some(description) = approval.mcp_description.as_deref() {
+                body.push(ChatLineView::plain(format!("description: {description}")));
+            }
         }
         self.upsert(ItemInput {
             lifecycle_key: Some(key),
@@ -958,6 +977,37 @@ impl ChatProjection {
             title: title.to_string(),
             summary: Some(message_summary(&message)),
             body,
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
+    /// Project an MCP trust promote/revoke into the transcript (task_09): a small
+    /// info item so trust decisions are visible and auditable in chat.
+    fn apply_mcp_trust_event(&mut self, event: &HistoryEvent) {
+        let server =
+            string_field(&event.payload, "server").unwrap_or_else(|| "<server>".to_string());
+        let (title, message) = if event.kind == "mcp_server_trusted" {
+            (
+                "MCP server trusted",
+                format!("Trusted MCP server {server}."),
+            )
+        } else {
+            (
+                "MCP server trust revoked",
+                format!("Revoked trust for MCP server {server}."),
+            )
+        };
+        self.upsert(ItemInput {
+            lifecycle_key: None,
+            kind: ChatItemKind::Diagnostic,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: title.to_string(),
+            summary: Some(message.clone()),
+            body: vec![ChatLineView::muted(message)],
             details: history_detail(event, "history"),
             source: source_from_event(event, None),
             updated_at: event.timestamp.clone(),
@@ -5290,6 +5340,58 @@ mod tests {
             .all(|line| line.text != FIRST_APPROVAL_EXPLAINER));
         // The approval summary remains the first body line (unchanged semantics).
         assert_eq!(item.body[0].text, approval.summary);
+    }
+
+    #[test]
+    fn mcp_approval_card_shows_full_description_and_origin() {
+        let mut projection = ChatProjection::rebuild(&[]);
+        let mut approval = pending_approval_view();
+        approval.mcp_server = Some("filesystem".to_string());
+        approval.mcp_tool = Some("read_file".to_string());
+        approval.mcp_description = Some("Reads any file the user names.".to_string());
+        approval.mcp_trusted = false;
+        projection.apply_pending_approval(Some(&approval), false);
+
+        let item = &projection.items()[0];
+        let body: String = item
+            .body
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("filesystem/read_file"), "origin: {body}");
+        assert!(body.contains("untrusted"), "tier: {body}");
+        // The full untruncated description is surfaced.
+        assert!(
+            body.contains("Reads any file the user names."),
+            "desc: {body}"
+        );
+    }
+
+    #[test]
+    fn mcp_trust_events_project_into_transcript() {
+        let events = vec![
+            event(
+                "mcp_server_trusted",
+                Some("run"),
+                None,
+                json!({ "server": "filesystem" }),
+            ),
+            event(
+                "mcp_server_revoked",
+                Some("run"),
+                None,
+                json!({ "server": "filesystem" }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        assert_eq!(projection.items().len(), 2);
+        assert!(projection.items()[0].title.contains("trusted"));
+        assert!(projection.items()[1].title.contains("revoked"));
+        assert!(projection.items()[1]
+            .body
+            .iter()
+            .any(|line| line.text.contains("filesystem")));
     }
 
     #[test]

@@ -145,3 +145,59 @@ async fn call_mcp_tool_on_untrusted_server_requires_approval_before_execute() {
 
     handle.shutdown().await.ok();
 }
+
+#[tokio::test]
+async fn first_contact_prompts_then_promote_allows_then_revoke_prompts() {
+    // The first-contact → approve+promote → revoke trust lifecycle (task_09),
+    // observed through the validation gate. Promote/revoke are exactly what the
+    // approval card's approve-and-trust and `/trust` revoke drive.
+    let agent = mcp_caller_agent();
+    let handle = McpSupervisor::spawn(vec![fake_server_config("fake")], Duration::from_secs(5));
+    let catalog = handle.snapshot_catalog().await.expect("catalog");
+    let trust_dir = tempdir().unwrap();
+    let mut trust = McpTrustStore::load(trust_dir.path());
+
+    let request = ActionRequest {
+        schema_version: 1,
+        action_id: "a".to_string(),
+        step_id: "s".to_string(),
+        kind: ActionKind::CallMcpTool,
+        params: json!({ "server": "fake", "tool": "effect_tool", "args": {} }),
+    };
+
+    let context = |trust: &McpTrustStore| {
+        let mut context = ActionExecutionContext::new(
+            PathBuf::from("."),
+            WorkspacePolicy::default(),
+            ApprovalMode::Yolo,
+        );
+        context.mcp = Some(McpActionContext {
+            handle: handle.clone(),
+            trust: trust.clone(),
+            catalog: Arc::new(catalog.clone()),
+        });
+        context
+    };
+
+    // First contact: untrusted ⇒ prompt.
+    assert!(matches!(
+        validate_action_request_with_scope(&agent, &context(&trust), &request),
+        ActionDecision::RequiresApproval(_)
+    ));
+
+    // Promote (approve-and-trust) ⇒ auto-allowed, no prompt.
+    trust.promote("fake").unwrap();
+    assert!(matches!(
+        validate_action_request_with_scope(&agent, &context(&trust), &request),
+        ActionDecision::Allowed
+    ));
+
+    // Revoke ⇒ prompts again.
+    trust.revoke("fake").unwrap();
+    assert!(matches!(
+        validate_action_request_with_scope(&agent, &context(&trust), &request),
+        ActionDecision::RequiresApproval(_)
+    ));
+
+    handle.shutdown().await.ok();
+}

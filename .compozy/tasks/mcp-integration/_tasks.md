@@ -12,7 +12,7 @@
 | 06 | Apply record-time redaction at event write | completed | medium | task_05 |
 | 07 | Advertise an MCP tool-catalog snapshot to the orchestrator | completed | medium | task_03 |
 | 08 | Project MCP tool calls and events into the chat transcript | completed | medium | task_05 |
-| 09 | Extend the approval card with MCP description and trust controls | pending | high | task_04, task_05 |
+| 09 | Extend the approval card with MCP description and trust controls | completed | high | task_04, task_05 |
 | 10 | Add doctor MCP checks, parity matrix, and local metric | pending | medium | task_03, task_05 |
 | 11 | Add the emission repair loop, degrade flag, and spike harness | pending | high | task_01, task_05 |
 
