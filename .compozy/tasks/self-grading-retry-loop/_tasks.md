@@ -10,4 +10,4 @@
 | 04 | Grade-round events and collapsing chat projection | completed | medium | task_03 |
 | 05 | Grading executor and FakeRuntime grading phrases | completed | high | task_01, task_03, task_04 |
 | 06 | Grading trigger gate at run_agent_step | completed | medium | task_05 |
-| 07 | Cycle-exhaustion escalation (accept/retry/abort) | pending | medium | task_05, task_06 |
+| 07 | Cycle-exhaustion escalation (accept/retry/abort) | completed | medium | task_05, task_06 |

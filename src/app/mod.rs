@@ -627,6 +627,19 @@ struct PendingParallelApproval {
 #[derive(Clone, Debug)]
 struct PendingClarification {
     run: RunDriveContext,
+    /// Present only when this pause is a grade-loop cycle-exhaustion escalation
+    /// (self-grading retry loop, task 07). Carries the context needed to retry so
+    /// `resolve_pending_clarification` can route accept/retry/abort instead of the
+    /// ordinary append-and-re-drive path; `None` for ordinary clarifications.
+    grade_escalation: Option<GradeEscalation>,
+}
+
+/// Context captured when the grade loop exhausts `max_attempts` on FAIL, so a
+/// `retry` can re-run the loop against the same producing agent and changes.
+#[derive(Clone, Debug)]
+struct GradeEscalation {
+    producing_agent_id: String,
+    changed_files: Vec<String>,
 }
 
 /// The captured run context behind a pending governance decision, mirroring
@@ -2708,6 +2721,17 @@ impl App {
         )?;
 
         let mut run = pending.run;
+
+        // Grade-cycle escalation (task 07): route accept/retry/abort by option id
+        // BEFORE the ordinary prompt-append, but only when the escalation marker is
+        // present — so an ordinary clarification whose option id happens to be
+        // "retry" is never hijacked.
+        if let Some(escalation) = pending.grade_escalation {
+            return self
+                .resolve_grade_escalation(run, escalation, &answer)
+                .await;
+        }
+
         run.prompt = format!("{}\n\nUser clarification: {}", run.prompt, answer.answer);
 
         self.state.pending_clarification = None;
@@ -2716,6 +2740,69 @@ impl App {
 
         self.drive_and_replay(run, None).await?;
         Ok(())
+    }
+
+    /// Route a resolved grade-cycle escalation (task 07) by the selected option id:
+    /// `abort` fails the run with the last failing check; `retry` re-runs the grade
+    /// loop with a fresh attempt budget (re-escalating if it still fails); anything
+    /// else (`accept`) keeps the work as unverified and continues the run.
+    async fn resolve_grade_escalation(
+        &mut self,
+        mut run: RunDriveContext,
+        escalation: GradeEscalation,
+        answer: &ClarificationAnswer,
+    ) -> Result<()> {
+        self.state.pending_clarification = None;
+        let run_id = run.run_id.clone();
+
+        match answer.selected_option_id.as_deref() {
+            Some("abort") => {
+                self.state.run_state = RunState::Failed;
+                self.record_event(
+                    Some(run_id),
+                    None,
+                    "run_failed",
+                    json!({ "reason": "verification failed; aborted by user at grade escalation" }),
+                    "Run aborted after verification failed.",
+                )?;
+                self.publish_state();
+                Ok(())
+            }
+            Some("retry") => {
+                self.state.run_state = RunState::Running;
+                self.publish_state();
+                match self
+                    .run_grading_workflow(
+                        &mut run,
+                        &escalation.producing_agent_id,
+                        escalation.changed_files,
+                    )
+                    .await?
+                {
+                    // Re-escalated: `run_grading_workflow` already set up a fresh
+                    // accept/retry/abort pause.
+                    GradingOutcome::Escalated => Ok(()),
+                    GradingOutcome::Concluded => {
+                        self.state.run_state = RunState::Planning;
+                        self.publish_state();
+                        self.drive_and_replay(run, None).await
+                    }
+                }
+            }
+            // "accept" (or any other id): keep the unverified work and continue.
+            _ => {
+                self.record_event(
+                    Some(run_id),
+                    None,
+                    "grade_escalation_resolved",
+                    json!({ "outcome": "accept_unverified" }),
+                    "User accepted unverified work; run continues.",
+                )?;
+                self.state.run_state = RunState::Planning;
+                self.publish_state();
+                self.drive_and_replay(run, None).await
+            }
+        }
     }
 
     /// Resolve the pending governance decision, mirroring
@@ -3084,7 +3171,10 @@ impl App {
             }
             DecisionStatus::WaitingForUser => {
                 self.state.run_state = RunState::WaitingForUser;
-                self.pending_clarification = Some(PendingClarification { run: run.clone() });
+                self.pending_clarification = Some(PendingClarification {
+                    run: run.clone(),
+                    grade_escalation: None,
+                });
                 let question = decision
                     .clarifying_question
                     .clone()
@@ -5571,6 +5661,12 @@ impl App {
                 crate::orchestrator::GradeOutcome::Fail => {
                     self.record_grade_round(run, round, max_attempts, "fail", Some(&verdict))?;
                     if round >= max_attempts {
+                        self.pause_for_grade_escalation(
+                            run,
+                            producing_agent_id,
+                            &changed_files,
+                            &verdict,
+                        )?;
                         return Ok(GradingOutcome::Escalated);
                     }
                     // Re-dispatch the SAME producing agent with the critique.
@@ -5752,6 +5848,83 @@ impl App {
             format!("grading: {}", result.summary),
         )?;
         run.previous_results.push(RunStepResult::Agent { result });
+        Ok(())
+    }
+
+    /// Pause the run as `WaitingForUser` on grade-cycle exhaustion (task 07),
+    /// reusing the clarification transport with three options — `accept` /
+    /// `retry` / `abort` — and a `grade_escalation` marker so
+    /// `resolve_pending_clarification` routes them instead of appending the
+    /// answer to the prompt. The question surfaces the last failing check.
+    fn pause_for_grade_escalation(
+        &mut self,
+        run: &RunDriveContext,
+        producing_agent_id: &str,
+        changed_files: &[String],
+        verdict: &crate::orchestrator::GraderVerdict,
+    ) -> Result<()> {
+        self.state.run_state = RunState::WaitingForUser;
+        self.pending_clarification = Some(PendingClarification {
+            run: run.clone(),
+            grade_escalation: Some(GradeEscalation {
+                producing_agent_id: producing_agent_id.to_string(),
+                changed_files: changed_files.to_vec(),
+            }),
+        });
+
+        let failing = verdict
+            .critique
+            .clone()
+            .or_else(|| verdict.command.clone())
+            .unwrap_or_else(|| "the verification command".to_string());
+        let question = format!(
+            "Verification still fails after {} attempt(s):\n{failing}\n\nAccept the work as-is, \
+             retry the checks, or abort the run?",
+            self.config.grading.max_attempts.max(1)
+        );
+        let options = vec![
+            crate::orchestrator::ClarificationOption {
+                id: "accept".to_string(),
+                label: "Accept the work as unverified".to_string(),
+                description: Some("Keep the changes and continue the run.".to_string()),
+            },
+            crate::orchestrator::ClarificationOption {
+                id: "retry".to_string(),
+                label: "Retry verification".to_string(),
+                description: Some(
+                    "Run the grade loop again with a fresh attempt budget.".to_string(),
+                ),
+            },
+            crate::orchestrator::ClarificationOption {
+                id: "abort".to_string(),
+                label: "Abort the run".to_string(),
+                description: Some("Fail the run; do not keep going.".to_string()),
+            },
+        ];
+        let view = PendingClarificationView {
+            run_id: run.run_id.clone(),
+            question_id: new_id(),
+            question,
+            options,
+            recommended_option_id: Some("retry".to_string()),
+            multi_select: false,
+        };
+        self.state.pending_clarification = Some(view.clone());
+        self.set_agent_status("orchestrator", "waiting_for_user");
+        self.record_event(
+            Some(run.run_id.clone()),
+            None,
+            "clarification_requested",
+            json!({
+                "question_id": view.question_id,
+                "question": view.question,
+                "options": view.options,
+                "recommended_option_id": view.recommended_option_id,
+                "multi_select": view.multi_select,
+                "grade_escalation": true,
+            }),
+            "Verification exhausted retries; awaiting accept/retry/abort.",
+        )?;
         Ok(())
     }
 
@@ -10302,6 +10475,7 @@ runtime = "fake"
         );
         app.pending_clarification = Some(PendingClarification {
             run: RunDriveContext::new("stale", None, "q", "q", None, None, None),
+            grade_escalation: None,
         });
         app.pending_governance_decision = Some(PendingGovernanceDecision {
             run: RunDriveContext::new("stale", None, "g", "g", None, None, None),
@@ -18228,6 +18402,137 @@ runtime = "fake"
             .count();
         assert_eq!(working, 2, "exactly max_attempts rounds — no recursion");
         assert!(grade_round_outcomes(&app).contains(&"pass".to_string()));
+    }
+
+    // ── cycle-exhaustion escalation: accept / retry / abort (task_07) ──
+
+    async fn resolve_escalation(app: &mut App, option_id: &str) -> Result<()> {
+        let view = app
+            .state
+            .pending_clarification
+            .clone()
+            .expect("a clarification is pending");
+        app.resolve_pending_clarification(ClarificationAnswer {
+            question_id: view.question_id,
+            answer: option_id.to_string(),
+            selected_option_id: Some(option_id.to_string()),
+            selected_option_label: None,
+            answer_source: "recommended".to_string(),
+        })
+        .await
+    }
+
+    fn fail_round_count(app: &App) -> usize {
+        grade_round_outcomes(app)
+            .iter()
+            .filter(|outcome| *outcome == "fail")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn grade_exhaustion_pauses_with_accept_retry_abort() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        app.submit_prompt("write action create a feature grade fail")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        let view = app
+            .state
+            .pending_clarification
+            .clone()
+            .expect("escalation pending");
+        let ids: Vec<&str> = view.options.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, vec!["accept", "retry", "abort"]);
+        assert!(view.options.iter().all(|o| !o.label.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn grade_escalation_abort_fails_the_run() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        app.submit_prompt("write action create a feature grade fail")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        resolve_escalation(&mut app, "abort").await.unwrap();
+        assert_eq!(app.state.run_state, RunState::Failed);
+    }
+
+    #[tokio::test]
+    async fn grade_escalation_accept_continues_the_run() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        app.submit_prompt("write action create a feature grade fail")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        resolve_escalation(&mut app, "accept").await.unwrap();
+        assert_ne!(
+            app.state.run_state,
+            RunState::Failed,
+            "accept keeps the work and continues the run"
+        );
+        assert_ne!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.history.read_events().unwrap().iter().any(|event| {
+            event.kind == "grade_escalation_resolved"
+                && event
+                    .payload
+                    .get("outcome")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("accept_unverified")
+        }));
+    }
+
+    #[tokio::test]
+    async fn grade_escalation_retry_reruns_the_loop_with_a_fresh_budget() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        app.submit_prompt("write action create a feature grade fail")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert_eq!(fail_round_count(&app), 2, "first loop exhausted 2 attempts");
+
+        resolve_escalation(&mut app, "retry").await.unwrap();
+        // Retry re-runs the grade loop with a fresh budget; it still never passes,
+        // so it exhausts again and re-escalates.
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert_eq!(
+            fail_round_count(&app),
+            4,
+            "retry ran a fresh 2-attempt loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_clarification_with_retry_option_is_not_hijacked() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        // A normal clarification (no grade_escalation marker).
+        app.submit_prompt("needs clarification about the feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        // Resolving with option id "retry" must follow the ordinary
+        // append-and-re-drive path, NOT the grade-escalation router.
+        resolve_escalation(&mut app, "retry").await.unwrap();
+        assert_ne!(app.state.run_state, RunState::Failed);
+        assert!(
+            !app.history.read_events().unwrap().iter().any(|event| {
+                event.kind == "clarification_requested"
+                    && event
+                        .payload
+                        .get("grade_escalation")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            }),
+            "a normal clarification never raises a grade escalation"
+        );
     }
 
     #[tokio::test]
