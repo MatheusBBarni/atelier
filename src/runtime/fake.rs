@@ -69,6 +69,25 @@ impl Runtime for FakeRuntime {
             RuntimeOutput::OrchestratorDecision {
                 decision: fake_decision(&request),
             }
+        } else if is_fake_grade_request(&request) {
+            // Grader sub-step (self-grading loop): first call runs a canonical
+            // (or, for SKIP, a non-canonical) command with a deterministic exit
+            // code; once the command result is fed back, return the contract.
+            if request.action_results.is_empty() {
+                RuntimeOutput::ActionRequest {
+                    request: ActionRequest {
+                        schema_version: 1,
+                        action_id: new_id(),
+                        step_id: request.step_id.clone(),
+                        kind: ActionKind::RunCommand,
+                        params: serde_json::json!({ "command": fake_grade_command(&request) }),
+                    },
+                }
+            } else {
+                RuntimeOutput::AgentResult {
+                    result: fake_agent_result(&request),
+                }
+            }
         } else if should_emit_fake_command_action_request(&request) {
             RuntimeOutput::ActionRequest {
                 request: ActionRequest {
@@ -652,6 +671,51 @@ fn should_emit_fake_command_action_request(request: &RuntimeRequest) -> bool {
         && request.agent_profile.id == "fixer"
         && request.agent_profile.has_capability(&Capability::Command)
         && fake_control_text(request).contains("command action")
+}
+
+/// Whether this is a grader sub-step of the self-grading loop. The grading
+/// executor stamps `(grade round N)` into the grader prompt, so the marker is
+/// unique to that path and never collides with ordinary reviewer routing.
+fn is_fake_grade_request(request: &RuntimeRequest) -> bool {
+    request.agent_profile.id == "reviewer" && fake_control_text(request).contains("grade round")
+}
+
+/// The canonical (or, for SKIP, non-canonical) command the fake grader runs,
+/// scripted by a marker in the original task. Each exits deterministically and
+/// without building or searching for a manifest:
+/// - `grade pass`  → `cargo test --help` (exit 0) ⇒ PASS
+/// - `grade flaky` → fail round 1, pass thereafter (exercises the fix→regrade)
+/// - `grade skip`  → a non-canonical command ⇒ SKIP (no canonical check ran)
+/// - otherwise (`grade fail`) → always non-zero ⇒ exhaust → escalate
+fn fake_grade_command(request: &RuntimeRequest) -> &'static str {
+    let text = fake_control_text(request);
+    if text.contains("grade skip") {
+        // Non-canonical but auto-approved (read-only allowlist) ⇒ SKIP.
+        "pwd"
+    } else if text.contains("grade pass") {
+        "cargo test --help"
+    } else if text.contains("grade flaky") {
+        if fake_grade_round(&text) <= 1 {
+            "cargo test --frobnicate-please"
+        } else {
+            "cargo test --help"
+        }
+    } else {
+        "cargo test --frobnicate-please"
+    }
+}
+
+/// Parse the `grade round N` counter the executor stamps into the grader prompt.
+fn fake_grade_round(text: &str) -> u32 {
+    text.rsplit("grade round ")
+        .next()
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .filter(|digits| !digits.is_empty())
+        })
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(1)
 }
 
 fn should_emit_fake_trusted_command_action_request(request: &RuntimeRequest) -> bool {

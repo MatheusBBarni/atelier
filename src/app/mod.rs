@@ -1048,6 +1048,33 @@ enum AgentStepOutcome {
     Stop,
 }
 
+/// Result of the externally-grounded auto-verification loop (ADR-003). `Concluded`
+/// lets the caller return `Completed`; `Escalated` (attempts exhausted on FAIL)
+/// is handled by the cycle-exhaustion escalation (task 07).
+// `dead_code` allow removed in task 06, which wires this into `run_agent_step`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GradingOutcome {
+    Concluded,
+    Escalated,
+}
+
+/// Outcome of a single grade/fix sub-step run through the action-executing path.
+#[allow(dead_code)] // wired in task 06
+#[derive(Debug)]
+enum GradingSubstep {
+    Completed(Box<AgentResult>),
+    /// The sub-step paused (approval) or stopped (limit/interrupt/error); the
+    /// grading loop cannot conclude and yields control to the caller.
+    Halted,
+}
+
+/// The built-in agent that runs the project's checks during grading. It already
+/// ships with `read`/`command`/`verify` capabilities, so its canonical
+/// verification commands auto-approve under the read-only allowlist.
+#[allow(dead_code)] // wired in task 06
+const GRADING_GRADER_AGENT_ID: &str = "reviewer";
+
 #[derive(Debug)]
 enum ParallelRuntimeMessage {
     RuntimeEvent {
@@ -5464,6 +5491,254 @@ impl App {
         Ok(true)
     }
 
+    /// The externally-grounded auto-verification loop (ADR-003/004): run the
+    /// grader to execute the project's checks, derive a verdict from the recorded
+    /// command exit codes, and on FAIL re-dispatch the SAME `producing_agent_id`
+    /// with the critique — bounded by `grading.max_attempts` and exempt from
+    /// `max_agent_steps` (grade/fix sub-steps never touch `run.step_count`). The
+    /// wall-clock guard and per-command timeout still apply. Returns `Escalated`
+    /// when attempts exhaust on FAIL (handled in task 07), `Concluded` otherwise.
+    #[allow(dead_code)] // wired into run_agent_step in task 06
+    async fn run_grading_workflow(
+        &mut self,
+        run: &mut RunDriveContext,
+        producing_agent_id: &str,
+        changed_files: Vec<String>,
+    ) -> Result<GradingOutcome> {
+        let max_attempts = self.config.grading.max_attempts.max(1);
+
+        for round in 1..=max_attempts {
+            if self.wall_clock_limit_reached(run) {
+                self.stop_for_wall_clock_limit(run)?;
+                return Ok(GradingOutcome::Concluded);
+            }
+            self.record_grade_round(run, round, max_attempts, "working", None)?;
+
+            // Grader sub-step: run the project's checks through the action path.
+            let grader_step_id = new_id();
+            let grade_prompt = grading_grader_prompt(&run.prompt, &changed_files, round);
+            let grader = self.agent(GRADING_GRADER_AGENT_ID)?.clone();
+            if matches!(
+                self.run_grading_substep(run, grader, &grader_step_id, &grade_prompt)
+                    .await?,
+                GradingSubstep::Halted
+            ) {
+                return Ok(GradingOutcome::Concluded);
+            }
+
+            // Verdict from the structured command exit codes — never agent text.
+            let commands = self.collect_grade_command_outcomes(&grader_step_id)?;
+            let verdict = crate::orchestrator::derive_grade_verdict(&commands);
+            self.record_event(
+                Some(run.run_id.clone()),
+                Some(grader_step_id.clone()),
+                crate::history::GRADER_VERDICT_KIND,
+                serde_json::to_value(&verdict)?,
+                format!("Grader verdict: {:?}.", verdict.outcome),
+            )?;
+
+            match verdict.outcome {
+                crate::orchestrator::GradeOutcome::Pass => {
+                    self.record_grade_round(run, round, max_attempts, "pass", Some(&verdict))?;
+                    self.push_grade_conclusion(run, &verdict, round)?;
+                    return Ok(GradingOutcome::Concluded);
+                }
+                crate::orchestrator::GradeOutcome::Skip => {
+                    self.record_grade_round(run, round, max_attempts, "skip", Some(&verdict))?;
+                    self.push_grade_conclusion(run, &verdict, round)?;
+                    return Ok(GradingOutcome::Concluded);
+                }
+                crate::orchestrator::GradeOutcome::Fail => {
+                    self.record_grade_round(run, round, max_attempts, "fail", Some(&verdict))?;
+                    if round >= max_attempts {
+                        return Ok(GradingOutcome::Escalated);
+                    }
+                    // Re-dispatch the SAME producing agent with the critique.
+                    let fix_step_id = new_id();
+                    let fix_prompt = grading_fix_prompt(&run.prompt, verdict.critique.as_deref());
+                    let producing = self.agent(producing_agent_id)?.clone();
+                    match self
+                        .run_grading_substep(run, producing, &fix_step_id, &fix_prompt)
+                        .await?
+                    {
+                        GradingSubstep::Completed(result) => {
+                            run.previous_results
+                                .push(RunStepResult::Agent { result: *result });
+                        }
+                        GradingSubstep::Halted => return Ok(GradingOutcome::Concluded),
+                    }
+                }
+            }
+        }
+        Ok(GradingOutcome::Escalated)
+    }
+
+    /// Run one grade/fix sub-step through the action-executing runtime path
+    /// WITHOUT incrementing `run.step_count` (grading is step-budget-exempt,
+    /// ADR-003). Records `agent_step_started` + the terminal `agent_result`; the
+    /// in-loop command execution records `command_completed` events the verdict
+    /// reads back. Returns `Halted` on pause/limit/interrupt/error.
+    #[allow(dead_code)] // wired in task 06
+    async fn run_grading_substep(
+        &mut self,
+        run: &mut RunDriveContext,
+        agent: AgentProfile,
+        step_id: &str,
+        prompt: &str,
+    ) -> Result<GradingSubstep> {
+        let agent_id = agent.id.clone();
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(step_id.to_string()),
+            "agent_step_started",
+            json!({ "agent": agent_id }),
+            format!("{agent_id} grade step started."),
+        )?;
+        let request = self.runtime_request(
+            &run.run_id,
+            step_id,
+            RuntimePrompt::new(prompt, run.skill_context.as_ref()),
+            agent,
+            run.previous_results.clone(),
+            "agent_result",
+        )?;
+        let step = PausedStep::Agent {
+            step_id: step_id.to_string(),
+            agent_id: agent_id.clone(),
+        };
+        self.set_active_step(&run.run_id, step_id, &agent_id);
+        let started_at = Instant::now();
+        let outcome = self
+            .execute_runtime_step_with_actions(request, run, step, started_at)
+            .await;
+        match outcome {
+            Ok(StepOutcome::Output(output)) => match *output {
+                RuntimeOutput::AgentResult { result } => {
+                    self.record_event(
+                        Some(run.run_id.clone()),
+                        Some(result.step_id.clone()),
+                        "agent_result",
+                        serde_json::to_value(&result)?,
+                        format!("{}: {}", result.agent, result.summary),
+                    )?;
+                    self.clear_active_step(step_id);
+                    Ok(GradingSubstep::Completed(Box::new(result)))
+                }
+                _ => {
+                    self.clear_active_step(step_id);
+                    Ok(GradingSubstep::Halted)
+                }
+            },
+            Ok(StepOutcome::Paused) => Ok(GradingSubstep::Halted),
+            Ok(StepOutcome::LimitReached) | Ok(StepOutcome::Interrupted) | Err(_) => {
+                self.clear_active_step(step_id);
+                Ok(GradingSubstep::Halted)
+            }
+        }
+    }
+
+    /// Collect the grade sub-step's executed commands from the recorded
+    /// `command_completed` events (the structured ground truth — never
+    /// model-authored text), scoped to `step_id`.
+    #[allow(dead_code)] // wired in task 06
+    fn collect_grade_command_outcomes(
+        &self,
+        step_id: &str,
+    ) -> Result<Vec<crate::orchestrator::CommandOutcome>> {
+        let events = self.history.read_events()?;
+        Ok(events
+            .iter()
+            .filter(|event| {
+                event.kind == "command_completed" && event.step_id.as_deref() == Some(step_id)
+            })
+            .map(|event| crate::orchestrator::CommandOutcome {
+                command: event
+                    .payload
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                exit_code: event
+                    .payload
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64),
+                excerpt: event
+                    .payload
+                    .get("diagnostic")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            })
+            .collect())
+    }
+
+    /// Record a `grade_round` event (task 04 projects it into the one evolving
+    /// grade item). `verdict` supplies the command/exit/critique for resolved
+    /// rounds; pass `None` for the in-progress `working` round.
+    #[allow(dead_code)] // wired in task 06
+    fn record_grade_round(
+        &mut self,
+        run: &RunDriveContext,
+        round: u32,
+        max_rounds: u32,
+        outcome: &str,
+        verdict: Option<&crate::orchestrator::GraderVerdict>,
+    ) -> Result<()> {
+        let mut payload = json!({
+            "round": round,
+            "max_rounds": max_rounds,
+            "outcome": outcome,
+        });
+        if let Some(verdict) = verdict {
+            if let Some(command) = &verdict.command {
+                payload["command"] = json!(command);
+            }
+            if let Some(exit_code) = verdict.exit_code {
+                payload["exit_code"] = json!(exit_code);
+            }
+            if let Some(critique) = &verdict.critique {
+                payload["critique"] = json!(critique);
+            }
+        }
+        self.record_event(
+            Some(run.run_id.clone()),
+            None,
+            crate::history::GRADE_ROUND_KIND,
+            payload,
+            format!("Grade round {round}/{max_rounds}: {outcome}."),
+        )
+    }
+
+    /// Push the concluding grade result into `run.previous_results` so the run
+    /// record reflects the verification outcome.
+    #[allow(dead_code)] // wired in task 06
+    fn push_grade_conclusion(
+        &mut self,
+        run: &mut RunDriveContext,
+        verdict: &crate::orchestrator::GraderVerdict,
+        round: u32,
+    ) -> Result<()> {
+        let summary = match verdict.outcome {
+            crate::orchestrator::GradeOutcome::Pass => format!(
+                "Verified after {round} round(s): {} passed",
+                verdict.command.as_deref().unwrap_or("checks")
+            ),
+            crate::orchestrator::GradeOutcome::Skip => {
+                "Unverified — no canonical verification command ran".to_string()
+            }
+            crate::orchestrator::GradeOutcome::Fail => "Verification failed".to_string(),
+        };
+        let result = AgentResult::completed("grading", new_id(), summary);
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(result.step_id.clone()),
+            "agent_result",
+            serde_json::to_value(&result)?,
+            format!("grading: {}", result.summary),
+        )?;
+        run.previous_results.push(RunStepResult::Agent { result });
+        Ok(())
+    }
+
     fn council_report_from_runtime_output(
         &mut self,
         run: &RunDriveContext,
@@ -8005,6 +8280,34 @@ fn council_member_prompt(
         "Council review request:\n\nOriginal user prompt:\n{user_prompt}\n\nOrchestrator reason:\n{reason}\n\nCouncil stop condition:\n{stop_condition}\n\nReturn focused risks, dissent, and a recommended next action from your council role.",
         reason = decision.reason,
         stop_condition = decision.stop_condition
+    )
+}
+
+/// Prompt for the grader sub-step: ask the grader to run the project's checks on
+/// the changed files. The round number is embedded so a replay/runtime can vary
+/// behavior per round (the fake runtime keys its scripted outcomes off it).
+#[allow(dead_code)] // wired in task 06
+fn grading_grader_prompt(user_prompt: &str, changed_files: &[String], round: u32) -> String {
+    let files = if changed_files.is_empty() {
+        "the working tree".to_string()
+    } else {
+        changed_files.join(", ")
+    };
+    format!(
+        "Verify the changes to {files} by running the project's canonical checks \
+         (e.g. `cargo test`, `cargo clippy`) and report the results. (grade round {round})\n\n\
+         Original task:\n{user_prompt}"
+    )
+}
+
+/// Prompt for the fix sub-step: re-dispatch the producing agent with the
+/// grader's concrete critique so it can address the verification failure.
+#[allow(dead_code)] // wired in task 06
+fn grading_fix_prompt(user_prompt: &str, critique: Option<&str>) -> String {
+    let critique = critique.unwrap_or("Verification failed; address the reported issues.");
+    format!(
+        "Verification failed. Fix the following, then stop:\n{critique}\n\n\
+         Original task:\n{user_prompt}"
     )
 }
 
@@ -17715,6 +18018,129 @@ runtime = "fake"
         let mut config = fake_config(dir);
         config.features.governance_early_abort = true;
         App::new(config).await.unwrap()
+    }
+
+    // ── self-grading auto-verification loop (task_05) ──
+
+    async fn grading_app(dir: &std::path::Path, max_attempts: u32) -> App {
+        let mut config = fake_config(dir);
+        config.grading.enabled = true;
+        config.grading.max_attempts = max_attempts;
+        App::new(config).await.unwrap()
+    }
+
+    fn grading_run(prompt: &str) -> RunDriveContext {
+        RunDriveContext::new("run", None, prompt, prompt, None, None, None)
+    }
+
+    fn grade_round_outcomes(app: &App) -> Vec<String> {
+        app.history
+            .read_events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == crate::history::GRADE_ROUND_KIND)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("outcome")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn dispatched_agent(app: &App, agent: &str) -> bool {
+        app.history.read_events().unwrap().iter().any(|event| {
+            event.kind == "agent_step_started"
+                && event
+                    .payload
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(agent)
+        })
+    }
+
+    #[tokio::test]
+    async fn grading_pass_on_first_grade_concludes_without_fix() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        let mut run = grading_run("apply the edit grade pass");
+
+        let outcome = app
+            .run_grading_workflow(&mut run, "fixer", vec!["src/x.rs".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GradingOutcome::Concluded);
+        assert!(grade_round_outcomes(&app).contains(&"pass".to_string()));
+        assert!(!dispatched_agent(&app, "fixer"), "no fix dispatch on PASS");
+        assert_eq!(run.step_count, 0, "grading is step-budget exempt");
+    }
+
+    #[tokio::test]
+    async fn grading_skip_concludes_unverified() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        let mut run = grading_run("apply the edit grade skip");
+
+        let outcome = app
+            .run_grading_workflow(&mut run, "fixer", vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GradingOutcome::Concluded);
+        assert!(grade_round_outcomes(&app).contains(&"skip".to_string()));
+        assert!(!dispatched_agent(&app, "fixer"), "no fix dispatch on SKIP");
+    }
+
+    #[tokio::test]
+    async fn grading_fail_exhausts_attempts_and_escalates() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        let mut run = grading_run("apply the edit grade fail");
+
+        let outcome = app
+            .run_grading_workflow(&mut run, "fixer", vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GradingOutcome::Escalated);
+        let outcomes = grade_round_outcomes(&app);
+        assert_eq!(
+            outcomes.iter().filter(|o| *o == "fail").count(),
+            2,
+            "both attempts failed before escalation: {outcomes:?}"
+        );
+        assert_eq!(run.step_count, 0, "grading is step-budget exempt");
+    }
+
+    #[tokio::test]
+    async fn grading_flaky_redispatches_same_agent_then_passes() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        let mut run = grading_run("apply the edit grade flaky");
+
+        let outcome = app
+            .run_grading_workflow(&mut run, "fixer", vec!["src/x.rs".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GradingOutcome::Concluded);
+        let outcomes = grade_round_outcomes(&app);
+        assert!(
+            outcomes.contains(&"fail".to_string()),
+            "round 1 failed: {outcomes:?}"
+        );
+        assert!(
+            outcomes.contains(&"pass".to_string()),
+            "round 2 passed: {outcomes:?}"
+        );
+        assert!(
+            dispatched_agent(&app, "fixer"),
+            "the SAME producing agent was re-dispatched to fix"
+        );
+        // A 2-round grade loop must not consume the max_agent_steps budget.
+        assert_eq!(run.step_count, 0, "grading is step-budget exempt");
     }
 
     #[tokio::test]
