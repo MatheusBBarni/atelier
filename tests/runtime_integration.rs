@@ -32,6 +32,8 @@ async fn codex_runtime_executes_real_agent_step() -> Result<()> {
         prompt_mode: PromptMode::Stdin,
         base_url: None,
         api_key_env: None,
+        auth_header_name: None,
+        auth_header_prefix: None,
         degrade_not_abandon: false,
     });
 
@@ -72,6 +74,8 @@ async fn zai_runtime_executes_real_agent_step() -> Result<()> {
                 .unwrap_or_else(|_| "https://api.z.ai/api/paas/v4".to_string()),
         ),
         api_key_env: Some(api_key_env),
+        auth_header_name: None,
+        auth_header_prefix: None,
         degrade_not_abandon: false,
     });
     let model = std::env::var("MULTIAGENT_ZAI_MODEL").unwrap_or_else(|_| "glm-5.1".to_string());
@@ -107,6 +111,8 @@ async fn claude_runtime_executes_real_agent_step() -> Result<()> {
         prompt_mode: PromptMode::Stdin,
         base_url: None,
         api_key_env: None,
+        auth_header_name: None,
+        auth_header_prefix: None,
         degrade_not_abandon: false,
     });
     let model = std::env::var("MULTIAGENT_CLAUDE_MODEL").unwrap_or_else(|_| "default".to_string());
@@ -142,6 +148,8 @@ async fn cursor_runtime_executes_real_agent_step() -> Result<()> {
         prompt_mode: PromptMode::Stdin,
         base_url: None,
         api_key_env: None,
+        auth_header_name: None,
+        auth_header_prefix: None,
         degrade_not_abandon: false,
     });
     let model = std::env::var("MULTIAGENT_CURSOR_MODEL").unwrap_or_else(|_| "default".to_string());

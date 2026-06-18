@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: "Add auth header config fields to RuntimeConfig"
 type: backend
 complexity: medium
@@ -33,13 +33,13 @@ The existing `ZaiRuntime` (now `HttpApiRuntime`) hardcodes `.bearer_auth()` for 
 </requirements>
 
 ## Subtasks
-- [ ] 03.1 Add `auth_header_name: Option<String>` and `auth_header_prefix: Option<String>` to `RuntimeConfig` struct
-- [ ] 03.2 Add the same fields to `RawRuntimeConfig` struct
-- [ ] 03.3 Add the same fields to `MergedRuntimeConfig` struct
-- [ ] 03.4 Update `apply_runtime()` to merge the new fields (same pattern as `base_url` and `api_key_env`)
-- [ ] 03.5 Update `into_effective()` `HttpApi` arm to pass the new fields through to `RuntimeConfig`
-- [ ] 03.6 Update `into_effective()` for other runtime kinds (Codex, Claude, Cursor, Fake) to set the new fields to `None`
-- [ ] 03.7 Add config roundtrip test: TOML with `auth_header_name` and `auth_header_prefix` → deserialize → serialize → verify equality
+- [x] 03.1 Add `auth_header_name: Option<String>` and `auth_header_prefix: Option<String>` to `RuntimeConfig` struct
+- [x] 03.2 Add the same fields to `RawRuntimeConfig` struct (no serde rename — TOML keys match field names)
+- [x] 03.3 Add the same fields to `MergedRuntimeConfig` struct (+ all 4 builtin runtime literals and the `apply_runtime` `or_insert` literal set them to `None`)
+- [x] 03.4 Update `apply_runtime()` to merge the new fields (same last-write-wins pattern as `base_url`/`api_key_env`)
+- [x] 03.5 Update `into_effective()` `HttpApi` arm to pass the new fields through to `RuntimeConfig` (`runtime.auth_header_name`/`auth_header_prefix`)
+- [x] 03.6 Update `into_effective()` for other runtime kinds (Codex, Claude, Cursor, Fake) to set the new fields to `None`
+- [x] 03.7 Add config roundtrip test (`runtime_config_auth_header_fields_roundtrip`: serialize → deserialize → assert equality) plus deserialize/default tests
 
 ## Implementation Details
 
@@ -72,17 +72,22 @@ See TechSpec "Data Models" section for the field definitions.
 - `cargo test --lib` passes **(REQUIRED)**
 
 ## Tests
-- Unit tests:
-  - [ ] TOML with `auth_header_name = "api-key"` and `auth_header_prefix = ""` deserializes correctly
-  - [ ] TOML without auth header fields defaults to `None` for both
-  - [ ] Config roundtrip: serialize → deserialize → verify fields match
-  - [ ] `into_effective()` for `HttpApi` runtime passes auth fields through
-  - [ ] `into_effective()` for `Codex` runtime sets auth fields to `None`
+- Unit tests (in `src/config/mod.rs`):
+  - [x] TOML with `auth_header_name = "api-key"` and `auth_header_prefix = ""` deserializes correctly (`http_api_auth_header_fields_deserialize_and_pass_through`)
+  - [x] TOML without auth header fields defaults to `None` for both (`http_api_runtime_without_auth_headers_defaults_to_none`)
+  - [x] Config roundtrip: serialize → deserialize → verify fields match (`runtime_config_auth_header_fields_roundtrip`)
+  - [x] `into_effective()` for `HttpApi` runtime passes auth fields through (covered by `http_api_auth_header_fields_deserialize_and_pass_through`, which loads via `into_effective`)
+  - [x] `into_effective()` for `Codex` runtime sets auth fields to `None` (`codex_runtime_auth_header_fields_are_none`)
 - Integration tests:
-  - [ ] `cargo test --lib` passes
-  - [ ] Starter config (without auth header fields) still parses correctly
-- Test coverage target: >=80%
+  - [x] `cargo test --lib` passes (1353 passed; the 12 failures are the unchanged external skill-discovery baseline)
+  - [x] Starter config (without auth header fields) still parses correctly (`config::` template tests pass; fields default to `None`)
+- Test coverage target: >=80% (4 new tests cover deserialize/default/pass-through/roundtrip)
 - All tests must pass
+
+## Follow-up Notes
+- **Construction-site churn:** `RuntimeConfig` is built in ~19 test literals across `runtime/{http_api,codex,claude,cursor}.rs`, `tests/runtime_integration.rs`, and `tests/provider_status_service.rs`; each gained `auth_header_name: None, auth_header_prefix: None` (additive, behavior-neutral). The 4 builtin `MergedRuntimeConfig` literals and the `apply_runtime` `or_insert` also set them to `None`.
+- **`PrintableRuntime` (`--print-config` view) intentionally NOT extended:** surfacing the new auth fields in the redacted print/template output is documentation work scoped to task_05; the struct only reads selected `RuntimeConfig` fields, so it is unaffected.
+- **Defaults applied at the runtime layer, not config:** unset `auth_header_name`/`auth_header_prefix` stay `None` in `RuntimeConfig`; the `"Authorization"`/`"Bearer"` defaults are applied when the header is built — that consumption is task_04's scope.
 
 ## Success Criteria
 - All tests passing

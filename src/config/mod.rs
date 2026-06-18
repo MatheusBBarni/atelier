@@ -420,6 +420,13 @@ pub struct RuntimeConfig {
     pub prompt_mode: PromptMode,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// Auth header name for `HttpApi` runtimes (default `Authorization` when
+    /// unset). Lets non-standard providers (e.g. `api-key: <key>`) work via
+    /// config alone (ADR-001).
+    pub auth_header_name: Option<String>,
+    /// Auth header value prefix for `HttpApi` runtimes (default `Bearer` when
+    /// unset). An empty string sends the bare key with no prefix (ADR-001).
+    pub auth_header_prefix: Option<String>,
     /// Degrade-not-abandon (task_11): when `true`, a runtime that cannot emit a
     /// well-formed `CallMcpTool` after the capped repair skips that MCP tool and
     /// the run continues, rather than failing the whole run. Off by default.
@@ -822,6 +829,8 @@ struct RawRuntimeConfig {
     prompt_mode: Option<PromptMode>,
     base_url: Option<String>,
     api_key_env: Option<String>,
+    auth_header_name: Option<String>,
+    auth_header_prefix: Option<String>,
     degrade_not_abandon: Option<bool>,
 }
 
@@ -868,6 +877,8 @@ struct MergedRuntimeConfig {
     prompt_mode: Option<PromptMode>,
     base_url: Option<String>,
     api_key_env: Option<String>,
+    auth_header_name: Option<String>,
+    auth_header_prefix: Option<String>,
     degrade_not_abandon: Option<bool>,
 }
 
@@ -1068,6 +1079,8 @@ impl MergedConfig {
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
                 api_key_env: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 degrade_not_abandon: None,
             },
         );
@@ -1080,6 +1093,8 @@ impl MergedConfig {
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
                 api_key_env: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 degrade_not_abandon: None,
             },
         );
@@ -1092,6 +1107,8 @@ impl MergedConfig {
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
                 api_key_env: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 degrade_not_abandon: None,
             },
         );
@@ -1104,6 +1121,8 @@ impl MergedConfig {
                 prompt_mode: None,
                 base_url: Some("https://api.z.ai/api/paas/v4".to_string()),
                 api_key_env: Some("ZAI_API_KEY".to_string()),
+                auth_header_name: None,
+                auth_header_prefix: None,
                 degrade_not_abandon: None,
             },
         );
@@ -1658,6 +1677,8 @@ impl MergedConfig {
                 prompt_mode: None,
                 base_url: None,
                 api_key_env: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 degrade_not_abandon: None,
             });
 
@@ -1687,6 +1708,12 @@ impl MergedConfig {
         }
         if let Some(api_key_env) = raw.api_key_env {
             entry.api_key_env = Some(api_key_env);
+        }
+        if let Some(auth_header_name) = raw.auth_header_name {
+            entry.auth_header_name = Some(auth_header_name);
+        }
+        if let Some(auth_header_prefix) = raw.auth_header_prefix {
+            entry.auth_header_prefix = Some(auth_header_prefix);
         }
         if let Some(degrade_not_abandon) = raw.degrade_not_abandon {
             entry.degrade_not_abandon = Some(degrade_not_abandon);
@@ -1844,6 +1871,8 @@ impl MergedConfig {
                     prompt_mode: runtime.prompt_mode.unwrap_or_default(),
                     base_url: None,
                     api_key_env: None,
+                    auth_header_name: None,
+                    auth_header_prefix: None,
                     degrade_not_abandon,
                 },
                 RuntimeKind::Claude => {
@@ -1866,6 +1895,8 @@ impl MergedConfig {
                         prompt_mode,
                         base_url: None,
                         api_key_env: None,
+                        auth_header_name: None,
+                        auth_header_prefix: None,
                         degrade_not_abandon,
                     }
                 }
@@ -1893,6 +1924,8 @@ impl MergedConfig {
                         prompt_mode,
                         base_url: None,
                         api_key_env: None,
+                        auth_header_name: None,
+                        auth_header_prefix: None,
                         degrade_not_abandon,
                     }
                 }
@@ -1914,6 +1947,8 @@ impl MergedConfig {
                                 .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
                         ),
                         api_key_env: Some(api_key_env),
+                        auth_header_name: runtime.auth_header_name,
+                        auth_header_prefix: runtime.auth_header_prefix,
                         degrade_not_abandon,
                     }
                 }
@@ -1925,6 +1960,8 @@ impl MergedConfig {
                     prompt_mode: PromptMode::Stdin,
                     base_url: None,
                     api_key_env: None,
+                    auth_header_name: None,
+                    auth_header_prefix: None,
                     degrade_not_abandon,
                 },
             };
@@ -4964,6 +5001,87 @@ runtime = "local_http"
             config.runtimes["local_http"].base_url.as_deref(),
             Some("https://api.z.ai/api/paas/v4")
         );
+    }
+
+    #[test]
+    fn http_api_auth_header_fields_deserialize_and_pass_through() {
+        // A non-standard provider (e.g. `api-key: <key>` with no prefix) is
+        // expressible via config alone, and `into_effective` carries the
+        // fields through to the resolved HttpApi runtime (ADR-001).
+        let config = load_from_temp(
+            r#"
+[runtimes.custom_api]
+type = "http_api"
+api_key_env = "CUSTOM_API_KEY"
+auth_header_name = "api-key"
+auth_header_prefix = ""
+
+[agents.explorer]
+runtime = "custom_api"
+"#,
+        )
+        .unwrap();
+        let runtime = &config.runtimes["custom_api"];
+        assert_eq!(runtime.kind, RuntimeKind::HttpApi);
+        assert_eq!(runtime.auth_header_name.as_deref(), Some("api-key"));
+        assert_eq!(runtime.auth_header_prefix.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn http_api_runtime_without_auth_headers_defaults_to_none() {
+        let config = load_from_temp(
+            r#"
+[runtimes.custom_api]
+type = "http_api"
+api_key_env = "CUSTOM_API_KEY"
+
+[agents.explorer]
+runtime = "custom_api"
+"#,
+        )
+        .unwrap();
+        let runtime = &config.runtimes["custom_api"];
+        assert!(runtime.auth_header_name.is_none());
+        assert!(runtime.auth_header_prefix.is_none());
+    }
+
+    #[test]
+    fn codex_runtime_auth_header_fields_are_none() {
+        let config = load_from_temp(
+            r#"
+[runtimes.local_codex]
+type = "codex"
+
+[agents.explorer]
+runtime = "local_codex"
+"#,
+        )
+        .unwrap();
+        let runtime = &config.runtimes["local_codex"];
+        assert_eq!(runtime.kind, RuntimeKind::Codex);
+        assert!(runtime.auth_header_name.is_none());
+        assert!(runtime.auth_header_prefix.is_none());
+    }
+
+    #[test]
+    fn runtime_config_auth_header_fields_roundtrip() {
+        let original = RuntimeConfig {
+            id: "custom_api".to_string(),
+            kind: RuntimeKind::HttpApi,
+            command: None,
+            args: Vec::new(),
+            prompt_mode: PromptMode::Stdin,
+            base_url: Some("https://api.example.test/v1".to_string()),
+            api_key_env: Some("EXAMPLE_API_KEY".to_string()),
+            auth_header_name: Some("api-key".to_string()),
+            auth_header_prefix: Some(String::new()),
+            degrade_not_abandon: false,
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let parsed: RuntimeConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.auth_header_name.as_deref(), Some("api-key"));
+        assert_eq!(parsed.auth_header_prefix.as_deref(), Some(""));
     }
 
     #[test]

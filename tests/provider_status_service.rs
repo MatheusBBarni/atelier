@@ -22,6 +22,8 @@ fn runtime_config(id: &str, kind: RuntimeKind, api_key_env: Option<&str>) -> Run
         prompt_mode: PromptMode::Stdin,
         base_url: None,
         api_key_env: api_key_env.map(|value| value.to_string()),
+        auth_header_name: None,
+        auth_header_prefix: None,
         degrade_not_abandon: false,
     }
 }
