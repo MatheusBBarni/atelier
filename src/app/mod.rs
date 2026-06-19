@@ -285,6 +285,11 @@ pub struct PendingApprovalView {
     pub mcp_description: Option<String>,
     #[serde(default)]
     pub mcp_trusted: bool,
+    /// Capped preview of the call's `args` JSON, so the approval card shows what
+    /// THIS invocation does (not just what the tool is) — e.g. the path a
+    /// `read_file` call targets. `None` for non-MCP approvals.
+    #[serde(default)]
+    pub mcp_args: Option<String>,
 }
 
 impl PendingApprovalView {
@@ -1526,6 +1531,58 @@ impl App {
                 trust: self.mcp_trust.clone(),
                 catalog: std::sync::Arc::new(self.mcp_catalog.clone()),
             })
+    }
+
+    /// MCP action context for `request`. For a call to an already-TRUSTED server
+    /// it uses a FRESH catalog snapshot so the trust pin diff (F6) and the
+    /// dispatch catalog-membership check see the server's CURRENT tool
+    /// definitions — narrowing a mid-run rug-pull from "undetected until the next
+    /// run" to the list_tools→call_tool gap. Untrusted servers prompt regardless
+    /// of the catalog, so the cached run-entry snapshot suffices and the extra
+    /// round-trip is skipped. `self.mcp_catalog` (the replay-recorded snapshot
+    /// feeding the orchestrator prompt) is never mutated here, keeping replay
+    /// deterministic. (A server that serves different content to `list_tools` vs
+    /// `call_tool` is a lying-server threat no description pin can fully close.)
+    async fn mcp_action_context_for(
+        &self,
+        request: &ActionRequest,
+    ) -> Option<crate::actions::McpActionContext> {
+        if self.should_refresh_mcp_catalog(request) {
+            if let Some(handle) = self.mcp_handle.clone() {
+                let server = request
+                    .params
+                    .get("server")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let tool = request
+                    .params
+                    .get("tool")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let fresh = handle.snapshot_catalog().await.ok();
+                let catalog = pick_validation_catalog(fresh, &self.mcp_catalog, server, tool);
+                return Some(crate::actions::McpActionContext {
+                    handle,
+                    trust: self.mcp_trust.clone(),
+                    catalog: std::sync::Arc::new(catalog),
+                });
+            }
+        }
+        self.mcp_action_context()
+    }
+
+    /// Whether to take a fresh catalog snapshot before this action: a
+    /// `CallMcpTool` to an already-TRUSTED server — the only case the F6 pin diff
+    /// is consulted, so a stale catalog could miss a mid-run rug-pull. Untrusted
+    /// servers prompt regardless, so the cached run-entry catalog suffices and the
+    /// extra `list_tools` round-trip is skipped.
+    fn should_refresh_mcp_catalog(&self, request: &ActionRequest) -> bool {
+        request.kind == ActionKind::CallMcpTool
+            && request
+                .params
+                .get("server")
+                .and_then(|value| value.as_str())
+                .is_some_and(|server| self.mcp_trust.is_trusted(server))
     }
 
     /// Whether `agent`'s runtime opts into degrade-not-abandon (task_11): a failed
@@ -4750,7 +4807,7 @@ impl App {
             trusted_targets: self.trust_store.snapshot(),
             pre_approved: false,
             drift_ack: self.drift_ack_context(),
-            mcp: self.mcp_action_context(),
+            mcp: self.mcp_action_context_for(&action_request).await,
             degrade_not_abandon: self.agent_runtime_degrades(&child.request.agent_profile),
         };
         self.record_command_started_if_executable_with_group(
@@ -6709,7 +6766,7 @@ impl App {
                         trusted_targets: self.trust_store.snapshot(),
                         pre_approved: false,
                         drift_ack: self.drift_ack_context(),
-                        mcp: self.mcp_action_context(),
+                        mcp: self.mcp_action_context_for(&action_request).await,
                         degrade_not_abandon: self.agent_runtime_degrades(&request.agent_profile),
                     };
                     self.record_command_started_if_executable(
@@ -8895,6 +8952,26 @@ fn trust_target_payload(target: &TrustTarget) -> serde_json::Value {
     }
 }
 
+/// Choose the catalog to validate/dispatch an MCP tool call against. Prefer the
+/// FRESH snapshot when it actually advertises the target tool — so an honest
+/// mid-run definition change is caught as `PinStatus::Changed` (F6). Fall back to
+/// the cached run-entry catalog when the fresh snapshot failed (supervisor down)
+/// or has dropped the tool: a transient `list_tools` blip must not turn a
+/// trusted, pinned, previously-working call into a spurious "not in catalog"
+/// failure. (A server that lies differently to `list_tools` vs `call_tool` is the
+/// disclaimed lying-server class no description pin can close.)
+fn pick_validation_catalog(
+    fresh: Option<crate::mcp::ToolCatalog>,
+    cached: &crate::mcp::ToolCatalog,
+    server: &str,
+    tool: &str,
+) -> crate::mcp::ToolCatalog {
+    match fresh {
+        Some(fresh) if fresh.tool(server, tool).is_some() => fresh,
+        _ => cached.clone(),
+    }
+}
+
 /// Cap a preview string (command/diff) before it enters `AppState`, so a huge
 /// diff can't bloat the snapshot channel (TechSpec "Known Risks").
 fn capped_preview(text: &str) -> String {
@@ -8980,7 +9057,7 @@ fn build_pending_approval_view(
     // MCP trust-legibility (task_09): for a tool call, surface the origin server,
     // the tool name, its full untruncated description (from the catalog snapshot),
     // and whether the server is already trusted.
-    let (mcp_server, mcp_tool, mcp_description, mcp_trusted) =
+    let (mcp_server, mcp_tool, mcp_description, mcp_trusted, mcp_args) =
         if request.kind == ActionKind::CallMcpTool {
             let server = request
                 .params
@@ -9001,14 +9078,20 @@ fn build_pending_approval_view(
                 (Some(mcp), Some(server)) => mcp.trust.is_trusted(server),
                 _ => false,
             };
+            let args = request
+                .params
+                .get("args")
+                .filter(|args| !args.is_null())
+                .map(|args| capped_preview(&args.to_string()));
             (
                 server.map(str::to_string),
                 tool.map(str::to_string),
                 description,
                 trusted,
+                args,
             )
         } else {
-            (None, None, None, false)
+            (None, None, None, false, None)
         };
     PendingApprovalView {
         run_id,
@@ -9032,6 +9115,7 @@ fn build_pending_approval_view(
         mcp_tool,
         mcp_description,
         mcp_trusted,
+        mcp_args,
     }
 }
 
@@ -16996,6 +17080,78 @@ runtime = "fake"
             app.mcp_trust.pin_status("fs", &beta),
             crate::mcp::PinStatus::Match
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_mcp_catalog_only_for_trusted_server_tool_calls() {
+        // The pre-call catalog refresh (narrowing the mid-run rug-pull window)
+        // must fire ONLY for a CallMcpTool to an already-trusted server: untrusted
+        // servers prompt regardless, and non-MCP actions never consult the pin.
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.mcp_trust.promote("trusted").unwrap();
+
+        let call = |server: &str| ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::CallMcpTool,
+            params: json!({ "server": server, "tool": "x", "args": {} }),
+        };
+        assert!(
+            app.should_refresh_mcp_catalog(&call("trusted")),
+            "trusted-server tool call should refresh (pin diff is consulted)"
+        );
+        assert!(
+            !app.should_refresh_mcp_catalog(&call("untrusted")),
+            "untrusted-server tool call prompts regardless; no refresh"
+        );
+        assert!(
+            !app.should_refresh_mcp_catalog(&read_action("a")),
+            "non-MCP action must never refresh"
+        );
+    }
+
+    #[test]
+    fn pick_validation_catalog_prefers_fresh_with_tool_else_cached() {
+        let tool = |desc: &str| crate::mcp::McpTool {
+            name: "search".to_string(),
+            description: Some(desc.to_string()),
+            input_schema: json!({ "type": "object" }),
+            annotations: None,
+        };
+        let catalog = |desc: &str| crate::mcp::ToolCatalog {
+            servers: vec![crate::mcp::ToolCatalogServer {
+                server: "fs".to_string(),
+                tools: vec![tool(desc)],
+            }],
+        };
+        let cached = catalog("v1");
+
+        // Fresh snapshot advertises the (mutated) tool → use fresh so the change
+        // is caught as PinStatus::Changed.
+        let picked = pick_validation_catalog(Some(catalog("v2 mutated")), &cached, "fs", "search");
+        assert_eq!(
+            picked.tool("fs", "search").unwrap().description.as_deref(),
+            Some("v2 mutated")
+        );
+
+        // Fresh snapshot dropped the tool (transient list_tools blip) → fall back
+        // to cached so a trusted, pinned, working call is not spuriously failed.
+        let picked = pick_validation_catalog(
+            Some(crate::mcp::ToolCatalog::default()),
+            &cached,
+            "fs",
+            "search",
+        );
+        assert_eq!(
+            picked.tool("fs", "search").unwrap().description.as_deref(),
+            Some("v1")
+        );
+
+        // No fresh snapshot (supervisor unavailable) → cached.
+        let picked = pick_validation_catalog(None, &cached, "fs", "search");
+        assert!(picked.tool("fs", "search").is_some());
     }
 
     #[tokio::test]

@@ -2317,6 +2317,62 @@ fn approval_modal_lines(
         ));
     }
 
+    // MCP tool legibility (task_09 + F6 rug-pull hardening): on an MCP approval
+    // — untrusted, or a trusted tool whose definition changed/was never pinned —
+    // show the tool's CURRENT description and the call args so the user can judge
+    // what they are approving. The pre-change definition is not retained (only its
+    // hash), so the current description + args are the actionable signal here.
+    if pending.mcp_server.is_some() {
+        // Collapse whitespace and cap to `max` chars (char-based, UTF-8 safe).
+        let preview = |text: &str, max: usize| -> String {
+            let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.chars().count() > max {
+                format!("{}…", collapsed.chars().take(max).collect::<String>())
+            } else {
+                collapsed
+            }
+        };
+        if let Some(description) = pending.mcp_description.as_deref() {
+            // The description is attacker-controlled (a malicious server sets it),
+            // rendered in a security-sensitive consent modal: strip ANSI/OSC escape
+            // sequences (terminal-injection / UI-spoofing) before display. Label it
+            // "current, unverified" so the user does not mistake this (post-change)
+            // text for the trusted/pinned definition — on a rug-pull the actionable
+            // signals are the reason line and the args, not this description.
+            let cleaned = preview(
+                &crate::app::chat::sanitize_transcript_text(description),
+                200,
+            );
+            if !cleaned.is_empty() {
+                lines.push(Line::styled(
+                    format!("Tool (current, unverified): {cleaned}"),
+                    Style::default().fg(theme.text_muted),
+                ));
+            }
+        }
+        if let Some(args) = pending.mcp_args.as_deref() {
+            // JSON-serialized upstream, so control chars are already escaped; cap to
+            // the same length as the description so a large blob can't dominate.
+            lines.push(Line::styled(
+                format!("Args: {}", preview(args, 200)),
+                Style::default().fg(theme.text_muted),
+            ));
+        }
+        if let Some(server) = pending.mcp_server.as_deref() {
+            lines.push(Line::styled(
+                format!(
+                    "Server: {server} ({})",
+                    if pending.mcp_trusted {
+                        "trusted"
+                    } else {
+                        "untrusted"
+                    }
+                ),
+                Style::default().fg(theme.text_muted),
+            ));
+        }
+    }
+
     // Detail: resolved command, or a diff preview when present.
     if let Some(command) = pending.resolved_command.as_deref() {
         lines.push(Line::styled(
@@ -7366,6 +7422,78 @@ mod tests {
         );
         // The modal advertises the promote action.
         assert!(modal_text(&view, true).contains("approve & trust"));
+    }
+
+    #[test]
+    fn mcp_approval_modal_surfaces_tool_description_and_call_args() {
+        // A rug-pull / untrusted MCP prompt must show the tool's CURRENT
+        // description and this call's args, so the user can judge what they are
+        // approving rather than seeing only a generic "changed; re-approve" line.
+        let view = crate::app::PendingApprovalView {
+            agent: "fixer".to_string(),
+            tier: Some(crate::actions::RiskTier::Medium),
+            reason: Some(
+                "MCP tool 'read_file' on 'filesystem' changed since it was trusted; re-approve."
+                    .to_string(),
+            ),
+            mcp_server: Some("filesystem".to_string()),
+            mcp_tool: Some("read_file".to_string()),
+            mcp_description: Some("Read a file from disk and return its contents.".to_string()),
+            mcp_trusted: true,
+            mcp_args: Some("{\"path\":\"/etc/shadow\"}".to_string()),
+            ..Default::default()
+        };
+        let text = modal_text(&view, true);
+        // The description is shown under a "current, unverified" label so the
+        // attacker-controlled text is not mistaken for the trusted definition.
+        assert!(
+            text.contains("Tool (current, unverified): Read a file from disk"),
+            "tool description / label missing: {text}"
+        );
+        assert!(
+            text.contains("Args: {\"path\":\"/etc/shadow\"}"),
+            "call args missing: {text}"
+        );
+        // Literal trust line (the bare "trusted" substring also matches the reason
+        // line and "untrusted", so assert the whole rendered line).
+        assert!(
+            text.contains("Server: filesystem (trusted)"),
+            "server/trust line missing: {text}"
+        );
+    }
+
+    #[test]
+    fn non_mcp_approval_modal_has_no_mcp_detail_lines() {
+        // The MCP description/args/server block must render only for MCP calls.
+        let view = approval_view(Some(crate::actions::RiskTier::Medium), false, None);
+        let text = modal_text(&view, true);
+        assert!(
+            !text.contains("Tool (current"),
+            "MCP tool line leaked: {text}"
+        );
+        assert!(!text.contains("Args:"), "MCP args line leaked: {text}");
+        assert!(!text.contains("Server:"), "MCP server line leaked: {text}");
+    }
+
+    #[test]
+    fn mcp_approval_modal_strips_escape_sequences_from_tool_description() {
+        // A malicious server must not be able to inject terminal escape sequences
+        // (UI spoofing) through the tool description rendered in the consent modal.
+        let view = crate::app::PendingApprovalView {
+            agent: "fixer".to_string(),
+            tier: Some(crate::actions::RiskTier::Medium),
+            reason: Some("untrusted MCP server".to_string()),
+            mcp_server: Some("evil".to_string()),
+            mcp_tool: Some("x".to_string()),
+            mcp_description: Some("benign \u{1b}[2J\u{1b}[31mSPOOFED\u{1b}[0m text".to_string()),
+            ..Default::default()
+        };
+        let text = modal_text(&view, true);
+        assert!(
+            !text.contains('\u{1b}'),
+            "escape sequence leaked into the modal: {text:?}"
+        );
+        assert!(text.contains("benign") && text.contains("text"));
     }
 
     #[test]
