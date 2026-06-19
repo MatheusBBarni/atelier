@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Add mcp.servers config section, mcp_enabled flag, and redaction
 type: backend
 complexity: medium
@@ -29,11 +29,11 @@ Let users declare MCP servers in `atelier.toml` exactly as they declare runtimes
 </requirements>
 
 ## Subtasks
-- [ ] 2.1 Add the `RawMcpServerConfig` / merged / effective `McpServerConfig` structs.
-- [ ] 2.2 Wire the section through `apply_raw` merge and `into_effective` validation.
-- [ ] 2.3 Add the `features.mcp_enabled` flag through `RawFeatures` → `Features`.
-- [ ] 2.4 Add redaction for MCP servers in `build_printable_config`.
-- [ ] 2.5 Add the commented example to the `--init-config` template.
+- [x] 2.1 Add the `RawMcpServerConfig` / merged / effective `McpServerConfig` structs.
+- [x] 2.2 Wire the section through `apply_raw` merge and `into_effective` validation.
+- [x] 2.3 Add the `features.mcp_enabled` flag through `RawFeatures` → `Features`.
+- [x] 2.4 Add redaction for MCP servers in `build_printable_config`.
+- [x] 2.5 Add the commented example to the `--init-config` template.
 
 ## Implementation Details
 Modify `src/config/mod.rs`: new server structs near the runtime structs; extend `Features`/`RawFeatures`; extend `EffectiveConfig`; extend `apply_raw`/`into_effective`; extend `build_printable_config`; extend the `--init-config` starter string. Reference TechSpec "Data Models" (`McpServerConfig`) and the existing runtime ladder as the precise template. See ADR-002 (transport-agnostic config) and ADR-003 (config-first).
@@ -58,17 +58,29 @@ Modify `src/config/mod.rs`: new server structs near the runtime structs; extend 
 - Integration tests loading a multi-file config **(REQUIRED)**.
 
 ## Tests
-- Unit tests:
-  - [ ] A `[mcp.servers.fs]` with `transport=stdio` and a `command` parses into one effective server.
-  - [ ] A stdio server missing `command` fails `into_effective` with a message naming the server id.
-  - [ ] `features.mcp_enabled` defaults to `false` and flips to `true` when set.
-  - [ ] `build_printable_config` shows `env` var names but omits any resolved secret value for an MCP server.
-  - [ ] A home + local config both defining `mcp.servers.fs` merge per the ladder (local overrides home `args`).
-- Integration tests:
-  - [ ] `--print-config` on a config with an MCP server renders the server without leaking a secret.
-  - [ ] `--init-config` output parses back into a valid config including the MCP example.
+- Unit tests (`src/config/mod.rs`):
+  - [x] A `[mcp.servers.fs]` with `transport=stdio` and a `command` parses into one effective server. (`mcp_stdio_server_parses_into_one_effective_server`)
+  - [x] A stdio server missing `command` fails `into_effective` with a message naming the server id. (`mcp_stdio_server_missing_command_fails_with_server_id`)
+  - [x] `features.mcp_enabled` defaults to `false` and flips to `true` when set. (`mcp_enabled_defaults_false_and_flips_true`)
+  - [x] `build_printable_config` shows `env` var names but omits any resolved secret value for an MCP server. (`printable_mcp_server_shows_env_names_not_values`)
+  - [x] A home + local config both defining `mcp.servers.fs` merge per the ladder (local overrides home `args`). (`mcp_server_local_overrides_home_args`)
+  - [x] _Extra:_ HTTP transport parses without a command (inert in V1). (`mcp_http_transport_parses_without_command`)
+- Integration tests (`tests/cli.rs`):
+  - [x] `--print-config` on a config with an MCP server renders the server without leaking a secret. (`print_config_redacts_mcp_server_env_value`)
+  - [x] `--init-config` output parses back into a valid config including the MCP example. (`init_config_output_parses_back_including_mcp_example`)
 - Test coverage target: >=80%
 - All tests must pass
+
+## Implementation Notes & Deviations
+- **Config is confined to `src/config/mod.rs`.** Every `EffectiveConfig` construction outside `into_effective` (the doctor/app/test helpers) goes through `load_effective_config`/`into_effective`, so adding the `mcp_servers` field required no cross-file edits.
+- **`env` redaction = names only.** `--print-config` renders each server's `env` as the sorted list of variable *names*; values (which may be literal secrets or `${VAR}` references) are never emitted, mirroring `api_key_env`. Verified by both a unit test and the CLI integration test (asserts the secret value is absent).
+- **Symmetric in/out shape.** The printable nests servers under an `mcp.servers` table (`PrintableMcp`) so `--print-config` emits `[mcp.servers.<id>]` exactly as declared (like `[runtimes.<id>]`), rather than the raw Rust field name.
+- **Layer merge mirrors runtimes.** `apply_mcp_server` replaces each present field per layer (a local config overrides home's `args`/`env` wholesale), consistent with `apply_runtime`.
+
+## Verification Evidence (2026-06-18)
+- `cargo build`, `cargo fmt --check`, `cargo clippy --all-targets`: all clean.
+- 7 config unit tests + 2 CLI integration tests: pass.
+- Full suite under a clean `HOME` (skipping the env-sensitive codex/cursor `availability` tests CLAUDE.md flags): **1318 passed, 4 ignored, 0 failed**. The only failures elsewhere are the documented environment-sensitive runtime-availability tests (pass under the real `HOME`: cursor 22/22) and the malformed-home-skill tests — neither touched by this task.
 
 ## Success Criteria
 - All tests passing

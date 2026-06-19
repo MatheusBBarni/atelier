@@ -30,6 +30,13 @@ pub enum ApprovalMode {
     Normal,
 }
 
+impl ApprovalMode {
+    /// Every variant in declaration order (drift test, ADR-005).
+    pub fn all() -> Vec<Self> {
+        vec![Self::Yolo, Self::Normal]
+    }
+}
+
 /// Posture for the gray-area floor (ADR-002's phased-rollout lever). `Warn`
 /// surfaces the risk and records an audit annotation but still runs under `Yolo`;
 /// `Enforce` re-prompts instead. This controls ONLY the gray-area tier — the
@@ -60,6 +67,10 @@ pub enum Capability {
     Command,
     Verify,
     Review,
+    /// Permission to invoke harness-brokered MCP tools (`CallMcpTool`). Default-
+    /// deny: an agent without this capability cannot call any MCP tool (CF4,
+    /// ADR-007). MCP *resources* are read-class and need only `Read`.
+    McpTool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,6 +83,27 @@ pub enum ToolName {
     ApplyPatch,
     WriteFile,
     RecordNote,
+    CallMcpTool,
+    ReadMcpResource,
+    ListMcpResources,
+}
+
+impl Capability {
+    /// Every variant in declaration order (drift test, ADR-005). Must include
+    /// `McpTool`.
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Plan,
+            Self::Read,
+            Self::Answer,
+            Self::Challenge,
+            Self::Edit,
+            Self::Command,
+            Self::Verify,
+            Self::Review,
+            Self::McpTool,
+        ]
+    }
 }
 
 impl ToolName {
@@ -84,6 +116,9 @@ impl ToolName {
             Self::ApplyPatch,
             Self::WriteFile,
             Self::RecordNote,
+            Self::CallMcpTool,
+            Self::ReadMcpResource,
+            Self::ListMcpResources,
         ]
     }
 
@@ -93,6 +128,10 @@ impl ToolName {
             Self::RunCommand => Some(Capability::Command),
             Self::ApplyPatch | Self::WriteFile => Some(Capability::Edit),
             Self::RecordNote => None,
+            // MCP tool calls need the dedicated capability; MCP resources are
+            // read-class and auto-allow under `Read` (ADR-007).
+            Self::CallMcpTool => Some(Capability::McpTool),
+            Self::ReadMcpResource | Self::ListMcpResources => Some(Capability::Read),
         }
     }
 }
@@ -234,6 +273,32 @@ pub struct Features {
     /// disables the DAG even when this flag is on (mirroring the flat-group
     /// preflight contract).
     pub execution_graph: bool,
+    /// Gate harness-owned MCP tool access (CF8). Off by default: when unset the
+    /// configured `[mcp.servers.*]` are parsed but no supervisor is started and
+    /// no MCP actions are offered. Opt in with `[features] mcp_enabled = true`.
+    pub mcp_enabled: bool,
+}
+
+/// Opt-in externally-grounded auto-verification loop (ADR-002/003). Off by
+/// default and visible-but-inert in the init scaffold; every grading component
+/// gates on `enabled`. `max_attempts` bounds the grade→fix loop, mirroring
+/// `limits.max_review_fix_cycles`. There is no `verify_command` field — the
+/// verification command is agent-discovered in V1 (ADR-002).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GradingConfig {
+    pub enabled: bool,
+    pub max_attempts: u32,
+}
+
+impl Default for GradingConfig {
+    fn default() -> Self {
+        // max_attempts matches the default limits.max_review_fix_cycles.
+        Self {
+            enabled: false,
+            max_attempts: 2,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -290,8 +355,21 @@ pub enum RuntimeKind {
     Codex,
     Claude,
     Cursor,
-    Zai,
+    HttpApi,
     Fake,
+}
+
+impl RuntimeKind {
+    /// Every variant in declaration order (drift test, ADR-005).
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Codex,
+            Self::Claude,
+            Self::Cursor,
+            Self::HttpApi,
+            Self::Fake,
+        ]
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -313,6 +391,19 @@ pub enum AgentEffort {
     XHigh,
 }
 
+impl AgentEffort {
+    /// Every variant in declaration order (drift test, ADR-005).
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Minimal,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+            Self::XHigh,
+        ]
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CouncilExecutionMode {
@@ -329,6 +420,42 @@ pub struct RuntimeConfig {
     pub prompt_mode: PromptMode,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// Auth header name for `HttpApi` runtimes (default `Authorization` when
+    /// unset). Lets non-standard providers (e.g. `api-key: <key>`) work via
+    /// config alone (ADR-001).
+    pub auth_header_name: Option<String>,
+    /// Auth header value prefix for `HttpApi` runtimes (default `Bearer` when
+    /// unset). An empty string sends the bare key with no prefix (ADR-001).
+    pub auth_header_prefix: Option<String>,
+    /// Degrade-not-abandon (task_11): when `true`, a runtime that cannot emit a
+    /// well-formed `CallMcpTool` after the capped repair skips that MCP tool and
+    /// the run continues, rather than failing the whole run. Off by default.
+    pub degrade_not_abandon: bool,
+}
+
+/// Transport an MCP server speaks. V1 wires `Stdio` only; `Http` parses but is
+/// inert until V1.1 (ADR-002 — config is transport-agnostic so HTTP is purely
+/// additive later).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+}
+
+/// An effective MCP server declaration (`[mcp.servers.<id>]`). Mirrors the
+/// runtime ladder. `command`/`args`/`env` drive a stdio subprocess; `url` is
+/// parsed but inert in V1 (HTTP transport ships in V1.1, ADR-002). Secrets in
+/// `env` values never print — `--print-config` shows only the env-var names.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub id: String,
+    pub transport: McpTransport,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -446,6 +573,7 @@ pub struct EffectiveConfig {
     pub approval: ApprovalConfig,
     pub workspace: WorkspacePolicy,
     pub features: Features,
+    pub grading: GradingConfig,
     pub ui: UiConfig,
     pub limits: Limits,
     /// Validated lifecycle hooks (ADR-001, ADR-004), drawn only from user-scope
@@ -454,6 +582,10 @@ pub struct EffectiveConfig {
     pub hooks: HooksConfig,
     pub council: CouncilConfig,
     pub runtimes: BTreeMap<String, RuntimeConfig>,
+    /// Effective MCP servers declared via `[mcp.servers.*]` (task_02). Parsed
+    /// regardless of `features.mcp_enabled`; the flag gates whether they are
+    /// actually started/offered (CF8). Empty when none are configured.
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub agents: BTreeMap<String, AgentProfile>,
     /// Validated, post-merge keybinding overrides from user-scope config
     /// (home/CLI). Empty when no `[keybindings]` is present ⇒ default keymap.
@@ -496,10 +628,12 @@ struct RawConfig {
     approval: Option<RawApprovalConfig>,
     workspace: Option<RawWorkspacePolicy>,
     features: Option<RawFeatures>,
+    grading: Option<RawGradingConfig>,
     ui: Option<RawUiConfig>,
     limits: Option<RawLimits>,
     council: Option<RawCouncilConfig>,
     runtimes: Option<BTreeMap<String, RawRuntimeConfig>>,
+    mcp: Option<RawMcpConfig>,
     presets: Option<BTreeMap<String, RawPreset>>,
     agents: Option<BTreeMap<String, RawAgentProfile>>,
     /// `[keybindings.<context>]` → action → key string or `false` (unbind).
@@ -559,6 +693,33 @@ struct RawFeatures {
     parallel_step_groups: Option<bool>,
     governance_early_abort: Option<bool>,
     execution_graph: Option<bool>,
+    mcp_enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGradingConfig {
+    enabled: Option<bool>,
+    max_attempts: Option<u32>,
+}
+
+/// Raw `[mcp]` section. Only `servers` exists in V1; nesting it under `[mcp]`
+/// (rather than a flat `[mcp.servers]` map at the root) leaves room for future
+/// `[mcp]`-level knobs without another schema break.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpConfig {
+    servers: Option<BTreeMap<String, RawMcpServerConfig>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpServerConfig {
+    transport: Option<McpTransport>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<BTreeMap<String, String>>,
+    url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -668,6 +829,9 @@ struct RawRuntimeConfig {
     prompt_mode: Option<PromptMode>,
     base_url: Option<String>,
     api_key_env: Option<String>,
+    auth_header_name: Option<String>,
+    auth_header_prefix: Option<String>,
+    degrade_not_abandon: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -713,6 +877,18 @@ struct MergedRuntimeConfig {
     prompt_mode: Option<PromptMode>,
     base_url: Option<String>,
     api_key_env: Option<String>,
+    auth_header_name: Option<String>,
+    auth_header_prefix: Option<String>,
+    degrade_not_abandon: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MergedMcpServerConfig {
+    transport: Option<McpTransport>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<BTreeMap<String, String>>,
+    url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -778,6 +954,7 @@ struct MergedConfig {
     approval: ApprovalConfig,
     workspace: WorkspacePolicy,
     features: Features,
+    grading: GradingConfig,
     ui: UiConfig,
     limits: Limits,
     /// Lifecycle hooks accumulated from user-scope layers only; a project-local
@@ -786,6 +963,7 @@ struct MergedConfig {
     hooks: HooksConfig,
     council: MergedCouncilConfig,
     runtimes: BTreeMap<String, MergedRuntimeConfig>,
+    mcp_servers: BTreeMap<String, MergedMcpServerConfig>,
     presets: BTreeMap<String, RawPresetDefinition>,
     agents: BTreeMap<String, MergedAgentProfile>,
     agent_layers: Vec<PendingAgentLayer>,
@@ -901,6 +1079,9 @@ impl MergedConfig {
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
                 api_key_env: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
+                degrade_not_abandon: None,
             },
         );
         runtimes.insert(
@@ -912,6 +1093,9 @@ impl MergedConfig {
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
                 api_key_env: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
+                degrade_not_abandon: None,
             },
         );
         runtimes.insert(
@@ -923,17 +1107,23 @@ impl MergedConfig {
                 prompt_mode: Some(PromptMode::Stdin),
                 base_url: None,
                 api_key_env: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
+                degrade_not_abandon: None,
             },
         );
         runtimes.insert(
-            "zai".to_string(),
+            "http_api".to_string(),
             MergedRuntimeConfig {
-                kind: Some(RuntimeKind::Zai),
+                kind: Some(RuntimeKind::HttpApi),
                 command: None,
                 args: None,
                 prompt_mode: None,
                 base_url: Some("https://api.z.ai/api/paas/v4".to_string()),
                 api_key_env: Some("ZAI_API_KEY".to_string()),
+                auth_header_name: None,
+                auth_header_prefix: None,
+                degrade_not_abandon: None,
             },
         );
 
@@ -943,7 +1133,7 @@ impl MergedConfig {
             BuiltinAgent {
                 id: "orchestrator",
                 name: "Orchestrator",
-                runtime: "zai",
+                runtime: "http_api",
                 model: "glm-5.1",
                 effort: AgentEffort::High,
                 thinking: true,
@@ -973,7 +1163,7 @@ impl MergedConfig {
             BuiltinAgent {
                 id: "oracle",
                 name: "Oracle",
-                runtime: "zai",
+                runtime: "http_api",
                 model: "glm-5.1",
                 effort: AgentEffort::Medium,
                 thinking: true,
@@ -988,7 +1178,7 @@ impl MergedConfig {
             BuiltinAgent {
                 id: "consul",
                 name: "Consul",
-                runtime: "zai",
+                runtime: "http_api",
                 model: "glm-5.1",
                 effort: AgentEffort::High,
                 thinking: true,
@@ -1043,7 +1233,7 @@ impl MergedConfig {
             BuiltinAgent {
                 id: "librarian",
                 name: "Librarian",
-                runtime: "zai",
+                runtime: "http_api",
                 model: "glm-5.1",
                 effort: AgentEffort::Medium,
                 thinking: true,
@@ -1081,11 +1271,13 @@ impl MergedConfig {
             approval: ApprovalConfig::default(),
             workspace: WorkspacePolicy::default(),
             features: Features::default(),
+            grading: GradingConfig::default(),
             ui: UiConfig::default(),
             limits: Limits::default(),
             hooks: HooksConfig::default(),
             council: builtin_council_config(),
             runtimes,
+            mcp_servers: BTreeMap::new(),
             presets: BTreeMap::new(),
             agents,
             agent_layers: Vec::new(),
@@ -1146,6 +1338,18 @@ impl MergedConfig {
             if let Some(value) = features.execution_graph {
                 self.features.execution_graph = value;
             }
+            if let Some(value) = features.mcp_enabled {
+                self.features.mcp_enabled = value;
+            }
+        }
+
+        if let Some(grading) = raw.grading {
+            if let Some(value) = grading.enabled {
+                self.grading.enabled = value;
+            }
+            if let Some(value) = grading.max_attempts {
+                self.grading.max_attempts = value;
+            }
         }
 
         if let Some(ui) = raw.ui {
@@ -1191,6 +1395,14 @@ impl MergedConfig {
         if let Some(runtimes) = raw.runtimes {
             for (runtime_id, runtime) in runtimes {
                 self.apply_runtime(runtime_id, runtime, source_name)?;
+            }
+        }
+
+        if let Some(mcp) = raw.mcp {
+            if let Some(servers) = mcp.servers {
+                for (server_id, server) in servers {
+                    self.apply_mcp_server(server_id, server, source_name)?;
+                }
             }
         }
 
@@ -1465,6 +1677,9 @@ impl MergedConfig {
                 prompt_mode: None,
                 base_url: None,
                 api_key_env: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
+                degrade_not_abandon: None,
             });
 
         if let Some(kind) = raw.runtime_type {
@@ -1494,7 +1709,44 @@ impl MergedConfig {
         if let Some(api_key_env) = raw.api_key_env {
             entry.api_key_env = Some(api_key_env);
         }
+        if let Some(auth_header_name) = raw.auth_header_name {
+            entry.auth_header_name = Some(auth_header_name);
+        }
+        if let Some(auth_header_prefix) = raw.auth_header_prefix {
+            entry.auth_header_prefix = Some(auth_header_prefix);
+        }
+        if let Some(degrade_not_abandon) = raw.degrade_not_abandon {
+            entry.degrade_not_abandon = Some(degrade_not_abandon);
+        }
 
+        Ok(())
+    }
+
+    /// Merge one `[mcp.servers.<id>]` layer into the accumulating config,
+    /// mirroring `apply_runtime`: each present field replaces the prior layer's
+    /// value (so a local config overrides home's `args`/`env` wholesale).
+    fn apply_mcp_server(
+        &mut self,
+        server_id: String,
+        raw: RawMcpServerConfig,
+        _source_name: &str,
+    ) -> Result<()> {
+        let entry = self.mcp_servers.entry(server_id).or_default();
+        if let Some(transport) = raw.transport {
+            entry.transport = Some(transport);
+        }
+        if let Some(command) = raw.command {
+            entry.command = Some(command);
+        }
+        if let Some(args) = raw.args {
+            entry.args = Some(args);
+        }
+        if let Some(env) = raw.env {
+            entry.env = Some(env);
+        }
+        if let Some(url) = raw.url {
+            entry.url = Some(url);
+        }
         Ok(())
     }
 
@@ -1608,6 +1860,7 @@ impl MergedConfig {
                     did_you_mean(&id, runtime_ids.iter().map(String::as_str))
                 )
             })?;
+            let degrade_not_abandon = runtime.degrade_not_abandon.unwrap_or(false);
 
             let config = match kind {
                 RuntimeKind::Codex => RuntimeConfig {
@@ -1618,6 +1871,9 @@ impl MergedConfig {
                     prompt_mode: runtime.prompt_mode.unwrap_or_default(),
                     base_url: None,
                     api_key_env: None,
+                    auth_header_name: None,
+                    auth_header_prefix: None,
+                    degrade_not_abandon,
                 },
                 RuntimeKind::Claude => {
                     if runtime.api_key_env.is_some() {
@@ -1639,6 +1895,9 @@ impl MergedConfig {
                         prompt_mode,
                         base_url: None,
                         api_key_env: None,
+                        auth_header_name: None,
+                        auth_header_prefix: None,
+                        degrade_not_abandon,
                     }
                 }
                 RuntimeKind::Cursor => {
@@ -1665,12 +1924,15 @@ impl MergedConfig {
                         prompt_mode,
                         base_url: None,
                         api_key_env: None,
+                        auth_header_name: None,
+                        auth_header_prefix: None,
+                        degrade_not_abandon,
                     }
                 }
-                RuntimeKind::Zai => {
+                RuntimeKind::HttpApi => {
                     let api_key_env = runtime
                         .api_key_env
-                        .ok_or_else(|| anyhow!("zai runtime {id} is missing api_key_env"))?;
+                        .ok_or_else(|| anyhow!("http_api runtime {id} is missing api_key_env"))?;
                     validate_env_reference(&api_key_env)
                         .with_context(|| format!("invalid api_key_env for runtime {id}"))?;
                     RuntimeConfig {
@@ -1685,6 +1947,9 @@ impl MergedConfig {
                                 .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
                         ),
                         api_key_env: Some(api_key_env),
+                        auth_header_name: runtime.auth_header_name,
+                        auth_header_prefix: runtime.auth_header_prefix,
+                        degrade_not_abandon,
                     }
                 }
                 RuntimeKind::Fake => RuntimeConfig {
@@ -1695,9 +1960,51 @@ impl MergedConfig {
                     prompt_mode: PromptMode::Stdin,
                     base_url: None,
                     api_key_env: None,
+                    auth_header_name: None,
+                    auth_header_prefix: None,
+                    degrade_not_abandon,
                 },
             };
             runtimes.insert(id, config);
+        }
+
+        let mut mcp_servers = BTreeMap::new();
+        // Sibling server ids for near-miss "did you mean?" hints (ADR-004).
+        let mcp_server_ids: Vec<String> = self.mcp_servers.keys().cloned().collect();
+        for (id, server) in self.mcp_servers {
+            let transport = server.transport.unwrap_or_default();
+            let command = server.command;
+            let args = server.args.unwrap_or_default();
+            let env = server.env.unwrap_or_default();
+            let url = server.url;
+            match transport {
+                McpTransport::Stdio => {
+                    let has_command = command
+                        .as_deref()
+                        .map(|command| !command.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_command {
+                        bail!(
+                            "mcp server {id} with transport \"stdio\" is missing required field command{}",
+                            did_you_mean(&id, mcp_server_ids.iter().map(String::as_str))
+                        );
+                    }
+                }
+                // HTTP is parsed but inert in V1 (ADR-002): no validation wired
+                // until the V1.1 transport lands.
+                McpTransport::Http => {}
+            }
+            mcp_servers.insert(
+                id.clone(),
+                McpServerConfig {
+                    id,
+                    transport,
+                    command,
+                    args,
+                    env,
+                    url,
+                },
+            );
         }
 
         let mut agents = BTreeMap::new();
@@ -1784,11 +2091,13 @@ impl MergedConfig {
             approval: self.approval,
             workspace: self.workspace,
             features: self.features,
+            grading: self.grading,
             ui: self.ui,
             limits: self.limits,
             hooks: self.hooks,
             council,
             runtimes,
+            mcp_servers,
             agents,
             keybindings: self.keybindings,
             keybinding_warnings: self.keybinding_warnings,
@@ -1889,7 +2198,7 @@ fn builtin_council_config() -> MergedCouncilConfig {
     for member in [
         BuiltinCouncilMember {
             id: "architect",
-            runtime: "zai",
+            runtime: "http_api",
             model: "glm-5.1",
             effort: AgentEffort::High,
             thinking: true,
@@ -1897,7 +2206,7 @@ fn builtin_council_config() -> MergedCouncilConfig {
         },
         BuiltinCouncilMember {
             id: "security",
-            runtime: "zai",
+            runtime: "http_api",
             model: "glm-5.1",
             effort: AgentEffort::High,
             thinking: true,
@@ -1905,7 +2214,7 @@ fn builtin_council_config() -> MergedCouncilConfig {
         },
         BuiltinCouncilMember {
             id: "reviewer",
-            runtime: "zai",
+            runtime: "http_api",
             model: "glm-5.1",
             effort: AgentEffort::Medium,
             thinking: true,
@@ -2372,6 +2681,7 @@ pub(crate) struct PrintableConfig {
     pub(crate) approval_mode: ApprovalMode,
     pub(crate) workspace: WorkspacePolicy,
     pub(crate) features: Features,
+    pub(crate) grading: GradingConfig,
     pub(crate) approval: ApprovalConfig,
     pub(crate) ui: UiConfig,
     pub(crate) limits: Limits,
@@ -2381,6 +2691,12 @@ pub(crate) struct PrintableConfig {
     pub(crate) hooks: PrintableHooks,
     pub(crate) council: PrintableCouncilConfig,
     pub(crate) runtimes: BTreeMap<String, PrintableRuntime>,
+    /// Redacted MCP section; omitted entirely when no servers are configured so
+    /// the `[mcp.servers]` block only appears for users who declared one. Nested
+    /// under `mcp` so the rendered TOML matches the `[mcp.servers.<id>]` input
+    /// shape (symmetric in/out, like `[runtimes.<id>]`).
+    #[serde(skip_serializing_if = "PrintableMcp::is_empty")]
+    pub(crate) mcp: PrintableMcp,
     pub(crate) agents: BTreeMap<String, PrintableAgent>,
     /// The effective keymap (defaults + user overrides), as `context → action →
     /// key`. Emitted in `--print-config` so the resolved bindings are visible.
@@ -2430,7 +2746,45 @@ pub(crate) struct PrintableRuntime {
     pub(crate) base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auth_header_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auth_header_prefix: Option<String>,
 }
+
+/// Redacted `[mcp]` section wrapper, so the printed TOML nests servers under
+/// `[mcp.servers.<id>]` exactly as they are declared.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct PrintableMcp {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) servers: BTreeMap<String, PrintableMcpServer>,
+}
+
+impl PrintableMcp {
+    fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+}
+
+/// Redacted projection of an MCP server. `env` keeps the input's table shape —
+/// each variable **name** mapped to a `<redacted>` placeholder — so the value
+/// (which may be a literal secret or a `${VAR}` reference) is never emitted while
+/// `--print-config` still round-trips back into a valid config.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PrintableMcpServer {
+    pub(crate) transport: McpTransport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) args: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
+}
+
+/// The placeholder a redacted env value renders as in `--print-config`.
+const REDACTED_ENV_VALUE: &str = "<redacted>";
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PrintableAgent {
@@ -2488,6 +2842,7 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
         approval_mode: config.approval_mode.clone(),
         workspace: config.workspace.clone(),
         features: config.features.clone(),
+        grading: config.grading.clone(),
         approval: config.approval.clone(),
         ui: config.ui.clone(),
         limits: config.limits.clone(),
@@ -2566,10 +2921,36 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
                         },
                         base_url: runtime.base_url.clone(),
                         api_key_env: runtime.api_key_env.clone(),
+                        auth_header_name: runtime.auth_header_name.clone(),
+                        auth_header_prefix: runtime.auth_header_prefix.clone(),
                     },
                 )
             })
             .collect(),
+        mcp: PrintableMcp {
+            servers: config
+                .mcp_servers
+                .iter()
+                .map(|(id, server)| {
+                    (
+                        id.clone(),
+                        PrintableMcpServer {
+                            transport: server.transport.clone(),
+                            command: server.command.clone(),
+                            args: server.args.clone(),
+                            // Names mapped to a placeholder — never the values
+                            // (redaction invariant), keeping the env table shape.
+                            env: server
+                                .env
+                                .keys()
+                                .map(|name| (name.clone(), REDACTED_ENV_VALUE.to_string()))
+                                .collect(),
+                            url: server.url.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        },
         agents: config
             .agents
             .iter()
@@ -2688,6 +3069,15 @@ approval_mode = "yolo"
 [features]
 parallel_step_groups = false
 
+# Opt-in externally-grounded auto-verification loop (ADR-002/003). Off by
+# default; when enabled, after an editing agent finishes the harness runs the
+# agent-discovered verification command and, on failure, re-dispatches the
+# producing agent with the critique up to max_attempts times. No secrets, no
+# new fields beyond these two.
+[grading]
+enabled = false
+max_attempts = 2
+
 # Approval floor posture for gray-area actions (ADR-002). "warn" (default)
 # surfaces the risk but still auto-runs under yolo; "enforce" re-prompts
 # instead. The catastrophic core always prompts and cannot be disabled here.
@@ -2752,10 +3142,40 @@ command = "cursor-agent"
 args = []
 prompt_mode = "stdin"
 
-[runtimes.zai]
-type = "zai"
+[runtimes.http_api]
+type = "http_api"
 base_url = "https://api.z.ai/api/paas/v4"
 api_key_env = "ZAI_API_KEY"
+
+# Bring your own OpenAI-compatible provider (BYOK). The `http_api` runtime kind
+# speaks the OpenAI chat-completions protocol over HTTPS, so any compatible
+# endpoint (OpenRouter, DeepSeek, Groq, Together, Verboo, a local server, …)
+# works as config alone — no new code. Copy this block, uncomment it, and point
+# an agent at the runtime id with `runtime = "openrouter"`.
+# [runtimes.openrouter]
+# type = "http_api"
+# base_url = "https://openrouter.ai/api/v1"   # {base_url}/chat/completions is called
+# api_key_env = "OPENROUTER_API_KEY"          # env var NAME holding the key (never the key)
+# # Auth defaults to `Authorization: Bearer <key>`. Override for providers with a
+# # different scheme, e.g. Verboo, which expects `api-key: <key>` with no prefix:
+# # auth_header_name = "api-key"   # default "Authorization"
+# # auth_header_prefix = ""        # default "Bearer"; an empty string sends the bare key
+
+# Optional harness-owned MCP servers. Declare each under [mcp.servers.<id>] just
+# like a runtime. V1 wires transport = "stdio" only (the `url`/HTTP transport is
+# parsed but inert until V1.1). `command` is required for stdio. `env` sets the
+# server subprocess's environment — values may reference ${VAR}; only the names
+# are ever shown by `atelier --print-config`, never the values. MCP is gated by
+# the `mcp_enabled` feature below: servers are parsed regardless, but no
+# connection is started and no MCP tools are offered until you opt in.
+# [features]
+# mcp_enabled = true
+#
+# [mcp.servers.filesystem]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# env = { FASTMCP_LOG_LEVEL = "ERROR" }
 
 [limits]
 max_agent_steps = 12
@@ -2772,28 +3192,28 @@ timeout_seconds = 900
 execution_mode = "serial"
 
 [council.presets.default.architect]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "high"
 thinking = true
 prompt_file = "agents/council-architect.md"
 
 [council.presets.default.security]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "high"
 thinking = true
 prompt_file = "agents/council-security.md"
 
 [council.presets.default.reviewer]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "medium"
 thinking = true
 prompt_file = "agents/council-reviewer.md"
 
 [agents.orchestrator]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "high"
 thinking = true
@@ -2809,7 +3229,7 @@ capabilities = ["read"]
 instructions_file = "agents/explorer.md"
 
 [agents.oracle]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "medium"
 thinking = true
@@ -2817,7 +3237,7 @@ capabilities = ["read", "answer"]
 instructions_file = "agents/oracle.md"
 
 [agents.consul]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "high"
 thinking = true
@@ -2841,7 +3261,7 @@ capabilities = ["read", "command", "verify", "review"]
 instructions_file = "agents/reviewer.md"
 
 [agents.librarian]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-5.1"
 effort = "medium"
 thinking = true
@@ -2942,6 +3362,75 @@ fn write_private_file_if_missing(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn enum_all_helpers_are_exhaustive() {
+        // Length checks for the enum-coverage drift test (ADR-005). The
+        // exhaustive `match` over each `all()` result makes adding a variant a
+        // compile error here, so `all()` cannot silently drift from the enum.
+        assert_eq!(RuntimeKind::all().len(), 5);
+        for v in RuntimeKind::all() {
+            match v {
+                RuntimeKind::Codex
+                | RuntimeKind::Claude
+                | RuntimeKind::Cursor
+                | RuntimeKind::HttpApi
+                | RuntimeKind::Fake => {}
+            }
+        }
+
+        assert_eq!(ApprovalMode::all().len(), 2);
+        for v in ApprovalMode::all() {
+            match v {
+                ApprovalMode::Yolo | ApprovalMode::Normal => {}
+            }
+        }
+
+        assert_eq!(AgentEffort::all().len(), 5);
+        for v in AgentEffort::all() {
+            match v {
+                AgentEffort::Minimal
+                | AgentEffort::Low
+                | AgentEffort::Medium
+                | AgentEffort::High
+                | AgentEffort::XHigh => {}
+            }
+        }
+
+        assert_eq!(Capability::all().len(), 9);
+        assert!(Capability::all().contains(&Capability::McpTool));
+        for v in Capability::all() {
+            match v {
+                Capability::Plan
+                | Capability::Read
+                | Capability::Answer
+                | Capability::Challenge
+                | Capability::Edit
+                | Capability::Command
+                | Capability::Verify
+                | Capability::Review
+                | Capability::McpTool => {}
+            }
+        }
+
+        // `ToolName::all()` predates this task; guard it the same way so a new
+        // variant missing from `all()` is a compile error, not a silent gap.
+        assert_eq!(ToolName::all().len(), 10);
+        for v in ToolName::all() {
+            match v {
+                ToolName::ReadFile
+                | ToolName::ListFiles
+                | ToolName::SearchText
+                | ToolName::RunCommand
+                | ToolName::ApplyPatch
+                | ToolName::WriteFile
+                | ToolName::RecordNote
+                | ToolName::CallMcpTool
+                | ToolName::ReadMcpResource
+                | ToolName::ListMcpResources => {}
+            }
+        }
+    }
 
     fn load_from_temp(contents: &str) -> Result<EffectiveConfig> {
         let dir = tempdir()?;
@@ -3192,6 +3681,19 @@ mod tests {
         assert!(text.contains("[[hooks.handler]]"));
         // The scaffold is commented so a fresh config registers no hooks, and it
         // still parses cleanly through the ladder.
+        assert!(toml::from_str::<RawConfig>(&text).is_ok());
+    }
+
+    #[test]
+    fn starter_config_text_documents_http_api_byok_example() {
+        let text = starter_config_text();
+        // The active default runtime uses the renamed kind.
+        assert!(text.contains("type = \"http_api\""));
+        // A commented BYOK example documents the auth-header override fields.
+        assert!(text.contains("# [runtimes.openrouter]"));
+        assert!(text.contains("# auth_header_name = \"api-key\""));
+        assert!(text.contains("# auth_header_prefix = \"\""));
+        // The commented example must not break parsing of a fresh config.
         assert!(toml::from_str::<RawConfig>(&text).is_ok());
     }
 
@@ -3648,6 +4150,247 @@ max_parallel_agent_steps = 0
         assert!(!config.features.execution_graph);
     }
 
+    // ── grading config (task_01) ──
+
+    #[test]
+    fn grading_defaults_off_with_two_attempts() {
+        let config = load_from_temp("schema_version = 1\n").unwrap();
+        assert!(!config.grading.enabled);
+        assert_eq!(config.grading.max_attempts, 2);
+    }
+
+    #[test]
+    fn grading_enabled_from_local_config_resolves_true() {
+        let config = load_from_temp("schema_version = 1\n[grading]\nenabled = true\n").unwrap();
+        assert!(config.grading.enabled);
+    }
+
+    #[test]
+    fn grading_max_attempts_parses() {
+        let config = load_from_temp("schema_version = 1\n[grading]\nmax_attempts = 5\n").unwrap();
+        assert_eq!(config.grading.max_attempts, 5);
+    }
+
+    #[test]
+    fn grading_enabled_local_overrides_home() {
+        // Layer precedence (built-in → home → local): home disables grading, the
+        // project file enables it; local wins (last-writer-wins via apply_raw).
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(
+            &home_path,
+            "schema_version = 1\n[grading]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let local_dir = tempdir().unwrap();
+        fs::write(
+            local_dir.path().join("atelier.toml"),
+            "[grading]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: local_dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        assert!(config.grading.enabled);
+    }
+
+    #[test]
+    fn grading_unknown_key_is_rejected_by_deny_unknown_fields() {
+        // A V1 config must not carry verify_command (ADR-002) — or any stray key.
+        let error =
+            load_from_temp("schema_version = 1\n[grading]\nverify_command = \"x\"\n").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("verify_command") || message.contains("unknown field"),
+            "deny_unknown_fields should reject the stray key: {message}"
+        );
+    }
+
+    // ── MCP servers + features.mcp_enabled + redaction (task_02) ──
+
+    #[test]
+    fn mcp_stdio_server_parses_into_one_effective_server() {
+        let config = load_from_temp(
+            r#"
+schema_version = 1
+[mcp.servers.fs]
+transport = "stdio"
+command = "mcp-fs"
+args = ["--root", "."]
+env = { FS_TOKEN_ENV = "MY_TOKEN" }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.mcp_servers.len(), 1);
+        let server = &config.mcp_servers["fs"];
+        assert_eq!(server.id, "fs");
+        assert_eq!(server.transport, McpTransport::Stdio);
+        assert_eq!(server.command.as_deref(), Some("mcp-fs"));
+        assert_eq!(server.args, vec!["--root".to_string(), ".".to_string()]);
+        assert_eq!(
+            server.env.get("FS_TOKEN_ENV").map(String::as_str),
+            Some("MY_TOKEN")
+        );
+    }
+
+    #[test]
+    fn mcp_stdio_server_missing_command_fails_with_server_id() {
+        let error = load_from_temp(
+            r#"
+schema_version = 1
+[mcp.servers.fs]
+transport = "stdio"
+"#,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("fs"),
+            "error should name the server id: {message}"
+        );
+        assert!(
+            message.contains("command"),
+            "error should mention the missing command: {message}"
+        );
+    }
+
+    #[test]
+    fn mcp_http_transport_parses_without_command() {
+        // HTTP is parsed but inert in V1 (ADR-002) — and not subject to the
+        // stdio command requirement.
+        let config = load_from_temp(
+            r#"
+schema_version = 1
+[mcp.servers.remote]
+transport = "http"
+url = "https://example.test/mcp"
+"#,
+        )
+        .unwrap();
+        let server = &config.mcp_servers["remote"];
+        assert_eq!(server.transport, McpTransport::Http);
+        assert_eq!(server.url.as_deref(), Some("https://example.test/mcp"));
+        assert!(server.command.is_none());
+    }
+
+    #[test]
+    fn mcp_enabled_defaults_false_and_flips_true() {
+        let off = load_from_temp("schema_version = 1\n").unwrap();
+        assert!(!off.features.mcp_enabled);
+
+        let on = load_from_temp("schema_version = 1\n[features]\nmcp_enabled = true\n").unwrap();
+        assert!(on.features.mcp_enabled);
+    }
+
+    #[test]
+    fn printable_mcp_server_shows_env_names_not_values() {
+        let config = load_from_temp(
+            r#"
+schema_version = 1
+[mcp.servers.fs]
+transport = "stdio"
+command = "mcp-fs"
+env = { SECRET_TOKEN = "super-secret-value" }
+"#,
+        )
+        .unwrap();
+
+        let printable = build_printable_config(&config);
+        let server = printable
+            .mcp
+            .servers
+            .get("fs")
+            .expect("printable mcp server present");
+        // The name is kept (as a table key) mapped to a redacted placeholder, so
+        // the value never leaks and the env table still round-trips.
+        assert_eq!(
+            server.env.get("SECRET_TOKEN").map(String::as_str),
+            Some("<redacted>")
+        );
+
+        let rendered = to_redacted_toml(&config).unwrap();
+        assert!(
+            rendered.contains("SECRET_TOKEN"),
+            "env var name should appear in --print-config: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "secret env value must never leak into --print-config: {rendered}"
+        );
+        // env must render as a TABLE (matching the input shape), not an array, so
+        // the redacted output stays a valid `[mcp.servers.*]` env declaration.
+        let parsed: toml::Value = toml::from_str(&rendered).expect("redacted config is valid TOML");
+        let env = parsed
+            .get("mcp")
+            .and_then(|mcp| mcp.get("servers"))
+            .and_then(|servers| servers.get("fs"))
+            .and_then(|server| server.get("env"))
+            .expect("env present in rendered config");
+        assert!(env.is_table(), "env must render as a table, got: {env:?}");
+        assert_eq!(
+            env.get("SECRET_TOKEN").and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+    }
+
+    #[test]
+    fn mcp_server_local_overrides_home_args() {
+        let home_dir = tempdir().unwrap();
+        let home_path = home_dir.path().join("home.toml");
+        fs::write(
+            &home_path,
+            "schema_version = 1\n[mcp.servers.fs]\ntransport = \"stdio\"\ncommand = \"mcp-fs\"\nargs = [\"--root\", \"/home\"]\n",
+        )
+        .unwrap();
+
+        let local_dir = tempdir().unwrap();
+        fs::write(
+            local_dir.path().join("atelier.toml"),
+            "[mcp.servers.fs]\nargs = [\"--root\", \"/local\"]\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(ConfigLoadOptions {
+            working_directory: local_dir.path().to_path_buf(),
+            config_path: Some(home_path),
+        })
+        .unwrap();
+
+        let server = &config.mcp_servers["fs"];
+        // command is inherited from home; local only overrode args.
+        assert_eq!(server.command.as_deref(), Some("mcp-fs"));
+        assert_eq!(
+            server.args,
+            vec!["--root".to_string(), "/local".to_string()]
+        );
+    }
+
+    #[test]
+    fn starter_config_documents_mcp_servers() {
+        let starter = starter_config_text();
+        assert!(starter.contains("[mcp.servers.filesystem]"));
+        assert!(starter.contains("mcp_enabled"));
+    }
+
+    #[test]
+    fn runtime_degrade_not_abandon_parses_and_defaults_false() {
+        let on = load_from_temp(
+            "schema_version = 1\n[runtimes.codex]\ntype = \"codex\"\ndegrade_not_abandon = true\n",
+        )
+        .unwrap();
+        assert!(on.runtimes["codex"].degrade_not_abandon);
+
+        let off =
+            load_from_temp("schema_version = 1\n[runtimes.codex]\ntype = \"codex\"\n").unwrap();
+        assert!(!off.runtimes["codex"].degrade_not_abandon);
+    }
+
     #[test]
     fn ui_section_absent_defaults_hide_banner_false() {
         let config = load_from_temp("schema_version = 1\n").unwrap();
@@ -3868,7 +4611,7 @@ prompt_history_max = 50
         // Guardrail: the elevated set is exactly the orchestrator's runtime and
         // must not broaden silently (ADR-003).
         let config = load_from_temp("schema_version = 1\n").unwrap();
-        assert_eq!(config.required_runtime_ids(), BTreeSet::from(["zai"]));
+        assert_eq!(config.required_runtime_ids(), BTreeSet::from(["http_api"]));
     }
 
     #[test]
@@ -4223,7 +4966,7 @@ prompt_file = "council/architect.md"
         let error = load_from_temp(
             r#"
 [runtimes.codex]
-type = "zai"
+type = "http_api"
 api_key_env = "ZAI_API_KEY"
 "#,
         )
@@ -4269,6 +5012,109 @@ runtime = "local_cursor"
             config.runtimes["local_cursor"].command.as_deref(),
             Some("cursor-agent")
         );
+    }
+
+    #[test]
+    fn http_api_runtime_type_deserializes() {
+        let config = load_from_temp(
+            r#"
+[runtimes.local_http]
+type = "http_api"
+api_key_env = "LOCAL_HTTP_API_KEY"
+
+[agents.explorer]
+runtime = "local_http"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.runtimes["local_http"].kind, RuntimeKind::HttpApi);
+        // Pure rename: the HTTP API runtime keeps the same default base URL.
+        assert_eq!(
+            config.runtimes["local_http"].base_url.as_deref(),
+            Some("https://api.z.ai/api/paas/v4")
+        );
+    }
+
+    #[test]
+    fn http_api_auth_header_fields_deserialize_and_pass_through() {
+        // A non-standard provider (e.g. `api-key: <key>` with no prefix) is
+        // expressible via config alone, and `into_effective` carries the
+        // fields through to the resolved HttpApi runtime (ADR-001).
+        let config = load_from_temp(
+            r#"
+[runtimes.custom_api]
+type = "http_api"
+api_key_env = "CUSTOM_API_KEY"
+auth_header_name = "api-key"
+auth_header_prefix = ""
+
+[agents.explorer]
+runtime = "custom_api"
+"#,
+        )
+        .unwrap();
+        let runtime = &config.runtimes["custom_api"];
+        assert_eq!(runtime.kind, RuntimeKind::HttpApi);
+        assert_eq!(runtime.auth_header_name.as_deref(), Some("api-key"));
+        assert_eq!(runtime.auth_header_prefix.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn http_api_runtime_without_auth_headers_defaults_to_none() {
+        let config = load_from_temp(
+            r#"
+[runtimes.custom_api]
+type = "http_api"
+api_key_env = "CUSTOM_API_KEY"
+
+[agents.explorer]
+runtime = "custom_api"
+"#,
+        )
+        .unwrap();
+        let runtime = &config.runtimes["custom_api"];
+        assert!(runtime.auth_header_name.is_none());
+        assert!(runtime.auth_header_prefix.is_none());
+    }
+
+    #[test]
+    fn codex_runtime_auth_header_fields_are_none() {
+        let config = load_from_temp(
+            r#"
+[runtimes.local_codex]
+type = "codex"
+
+[agents.explorer]
+runtime = "local_codex"
+"#,
+        )
+        .unwrap();
+        let runtime = &config.runtimes["local_codex"];
+        assert_eq!(runtime.kind, RuntimeKind::Codex);
+        assert!(runtime.auth_header_name.is_none());
+        assert!(runtime.auth_header_prefix.is_none());
+    }
+
+    #[test]
+    fn runtime_config_auth_header_fields_roundtrip() {
+        let original = RuntimeConfig {
+            id: "custom_api".to_string(),
+            kind: RuntimeKind::HttpApi,
+            command: None,
+            args: Vec::new(),
+            prompt_mode: PromptMode::Stdin,
+            base_url: Some("https://api.example.test/v1".to_string()),
+            api_key_env: Some("EXAMPLE_API_KEY".to_string()),
+            auth_header_name: Some("api-key".to_string()),
+            auth_header_prefix: Some(String::new()),
+            degrade_not_abandon: false,
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let parsed: RuntimeConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.auth_header_name.as_deref(), Some("api-key"));
+        assert_eq!(parsed.auth_header_prefix.as_deref(), Some(""));
     }
 
     #[test]
@@ -4431,7 +5277,7 @@ instructions_file = "agents/fixer.md"
     fn raw_secret_in_credential_reference_is_invalid() {
         let error = load_from_temp(
             r#"
-[runtimes.zai]
+[runtimes.http_api]
 api_key_env = "sk-secret"
 "#,
         )
@@ -4461,6 +5307,28 @@ api_key_env = "sk-secret"
         assert!(!orchestrator_body.is_empty());
         assert!(!rendered.contains(orchestrator_body));
         assert!(!rendered.contains("Bearer"));
+    }
+
+    #[test]
+    fn redacted_toml_surfaces_auth_header_overrides() {
+        // `--print-config` must surface auth-header overrides so a configured BYOK
+        // scheme is visible and the printed TOML round-trips back to the same config.
+        let config = load_from_temp(
+            r#"
+[runtimes.custom_api]
+type = "http_api"
+api_key_env = "CUSTOM_API_KEY"
+auth_header_name = "api-key"
+auth_header_prefix = ""
+
+[agents.explorer]
+runtime = "custom_api"
+"#,
+        )
+        .unwrap();
+        let rendered = to_redacted_toml(&config).unwrap();
+        assert!(rendered.contains("auth_header_name = \"api-key\""));
+        assert!(rendered.contains("auth_header_prefix = \"\""));
     }
 
     #[test]

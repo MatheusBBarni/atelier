@@ -1,9 +1,9 @@
+use super::http_util::parse_runtime_output;
 use super::{
     prompt_envelope_json, Runtime, RuntimeAvailability, RuntimeAvailabilityStatus,
     RuntimeEventSink, RuntimeOutput, RuntimeRequest,
 };
 use crate::config::RuntimeConfig;
-use crate::orchestrator::{parse_agent_result, parse_contract, parse_orchestrator_decision};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use std::path::Path;
@@ -468,32 +468,6 @@ fn codex_login_status_is_known_auth_failure(message: &str) -> bool {
         || message.contains("forbidden")
 }
 
-fn parse_runtime_output(agent_id: &str, raw_output: String) -> Result<RuntimeOutput> {
-    if let Ok(request) = parse_contract(&raw_output) {
-        return Ok(RuntimeOutput::ActionRequest { request });
-    }
-
-    if agent_id == "orchestrator" {
-        match parse_orchestrator_decision(&raw_output) {
-            Ok(decision) => Ok(RuntimeOutput::OrchestratorDecision { decision }),
-            Err(error) => Ok(RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output,
-                diagnostic: error.to_string(),
-            }),
-        }
-    } else {
-        match parse_agent_result(&raw_output) {
-            Ok(result) => Ok(RuntimeOutput::AgentResult { result }),
-            Err(error) => Ok(RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output,
-                diagnostic: error.to_string(),
-            }),
-        }
-    }
-}
-
 fn resolve_command(command: &str) -> Option<std::path::PathBuf> {
     let path = Path::new(command);
     if path.components().count() > 1 {
@@ -546,6 +520,9 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "explorer");
         let result = collect_runtime_step_result(|events, cancellation| {
@@ -812,6 +789,9 @@ exit 65
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
 
         let error = runtime
@@ -905,6 +885,9 @@ exit 65
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
 
         let request = runtime_request(dir.path().to_path_buf(), "explorer");
@@ -958,6 +941,9 @@ exit 65
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "explorer");
         let (events, mut receiver) = RuntimeEventSink::channel(8);
@@ -1035,6 +1021,9 @@ exit 65
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         }
     }
 

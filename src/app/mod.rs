@@ -28,8 +28,8 @@ use crate::hooks::{
 };
 use crate::ids::new_id;
 use crate::orchestrator::{
-    agent_results, build_orchestrator_prompt, validate_orchestrator_decision, AgentResult,
-    AgentResultStatus, ClarificationOption, DecisionNextStep, DecisionStatus, ParallelBlockedScope,
+    agent_results, validate_orchestrator_decision, AgentResult, AgentResultStatus,
+    ClarificationOption, DecisionNextStep, DecisionStatus, ParallelBlockedScope,
     ParallelChildResultRef, ParallelFailedScope, ParallelFileScope, ParallelGroupPlan,
     ParallelGroupResult, ParallelGroupStatus, RunState, RunStepResult, COUNCIL_WORKFLOW_AGENT_ID,
 };
@@ -273,6 +273,32 @@ pub struct PendingApprovalView {
     /// clean common path. Surfaced in the approval modal.
     #[serde(default)]
     pub drift_notice: Option<String>,
+    /// MCP trust-legibility fields (task_09), populated for a `CallMcpTool`
+    /// awaiting approval: the origin server id, the tool name, the tool's FULL
+    /// untruncated description, and the server's current trust tier. `mcp_server`
+    /// being `Some` also offers the approve-and-trust action (promote the server).
+    #[serde(default)]
+    pub mcp_server: Option<String>,
+    #[serde(default)]
+    pub mcp_tool: Option<String>,
+    #[serde(default)]
+    pub mcp_description: Option<String>,
+    #[serde(default)]
+    pub mcp_trusted: bool,
+    /// Capped preview of the call's `args` JSON, so the approval card shows what
+    /// THIS invocation does (not just what the tool is) — e.g. the path a
+    /// `read_file` call targets. `None` for non-MCP approvals.
+    #[serde(default)]
+    pub mcp_args: Option<String>,
+}
+
+impl PendingApprovalView {
+    /// Whether the approve-and-trust action is offered: either a session trust
+    /// target (commands/writes) or an MCP origin server to promote (task_09).
+    /// Catastrophic actions are never trustable and are handled before this.
+    pub fn offers_trust(&self) -> bool {
+        self.trust_target.is_some() || self.mcp_server.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -505,6 +531,23 @@ pub struct App {
     /// state-mutating action and is cleared once acknowledged. `None` on the clean
     /// path. Reset by `adopt_session`, set by `resume_session`.
     pending_drift_ack: Option<git::WorkspaceDrift>,
+    /// Handle to the MCP supervisor actor (ADR-005), owned here so its long-lived
+    /// connections live and die with the session. `Some` only when
+    /// `features.mcp_enabled` (task_03); cloned onto `ActionExecutionContext`
+    /// (task_05) and the catalog snapshot path (task_07). Dropped on
+    /// `end_session`, which closes the command channel so the actor tears down
+    /// every connection (`kill_on_drop` backstop).
+    mcp_handle: Option<crate::mcp::McpHandle>,
+    /// Durable, workspace-scoped MCP trust + tool-description pins (ADR-006,
+    /// task_04). Loaded once at startup for synchronous reads during validation
+    /// (task_05); promote/revoke write the file and record an event.
+    mcp_trust: crate::mcp::McpTrustStore,
+    /// Cached immutable MCP tool-catalog snapshot (ADR-001, task_07). Refreshed
+    /// from the supervisor at each top-level run entry and recorded as an
+    /// `mcp_catalog_snapshot` event; the orchestrator prompt and the action
+    /// context read this snapshot, never a live handle, so prompts are
+    /// replay-deterministic. Empty until the first snapshot.
+    mcp_catalog: crate::mcp::ToolCatalog,
 }
 
 /// In-memory, session-scoped allow-list of exact trust targets (ADR-004). Granted
@@ -589,6 +632,22 @@ struct PendingParallelApproval {
 #[derive(Clone, Debug)]
 struct PendingClarification {
     run: RunDriveContext,
+    /// Present only when this pause is a grade-loop cycle-exhaustion escalation
+    /// (self-grading retry loop, task 07). Carries the context needed to retry so
+    /// `resolve_pending_clarification` can route accept/retry/abort instead of the
+    /// ordinary append-and-re-drive path; `None` for ordinary clarifications.
+    grade_escalation: Option<GradeEscalation>,
+}
+
+/// Context captured when the grade loop exhausts `max_attempts` on FAIL, so a
+/// `retry` can re-run the loop against the same producing agent and changes.
+#[derive(Clone, Debug)]
+struct GradeEscalation {
+    producing_agent_id: String,
+    changed_files: Vec<String>,
+    /// Total grade rounds already consumed; a `retry` continues numbering from
+    /// here so the collapsing Grade chat item accumulates instead of resetting.
+    rounds_used: u32,
 }
 
 /// The captured run context behind a pending governance decision, mirroring
@@ -1010,6 +1069,36 @@ enum AgentStepOutcome {
     Stop,
 }
 
+/// Result of the externally-grounded auto-verification loop (ADR-003), mapped to
+/// an `AgentStepOutcome` by `run_agent_step`: `Concluded`→Completed,
+/// `Escalated`→Paused (a user accept/retry/abort card is pending), `Paused`→Paused
+/// (a grade/fix sub-step is waiting on action approval), `Stopped`→Stop (a
+/// sub-step hit a limit/interrupt/error, or the wall-clock guard tripped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GradingOutcome {
+    Concluded,
+    Escalated,
+    Paused,
+    Stopped,
+}
+
+/// Outcome of a single grade/fix sub-step run through the action-executing path.
+#[derive(Debug)]
+enum GradingSubstep {
+    Completed(Box<AgentResult>),
+    /// The sub-step paused on an action approval; `pending_approval` +
+    /// `WaitingForUser` are already set, so the run must yield (not conclude).
+    Paused,
+    /// The sub-step hit a step/wall limit, an interrupt, an unexpected output, or
+    /// a runtime error — the run must stop rather than report a clean verdict.
+    Stopped,
+}
+
+/// The built-in agent that runs the project's checks during grading. It already
+/// ships with `read`/`command`/`verify` capabilities, so its canonical
+/// verification commands auto-approve under the read-only allowlist.
+const GRADING_GRADER_AGENT_ID: &str = "reviewer";
+
 #[derive(Debug)]
 enum ParallelRuntimeMessage {
     RuntimeEvent {
@@ -1178,6 +1267,21 @@ impl App {
             history.session_id(),
         );
         let availability = check_all_runtime_availability(&config).await;
+        // Own the MCP supervisor when enabled (ADR-005). Spawning returns a handle
+        // immediately; connections are established asynchronously on the actor
+        // task, so this never blocks or fails session startup.
+        let mcp_handle = if config.features.mcp_enabled {
+            Some(crate::mcp::McpSupervisor::spawn(
+                config.mcp_servers.values().cloned().collect(),
+                crate::mcp::DEFAULT_MCP_CALL_TIMEOUT,
+            ))
+        } else {
+            None
+        };
+        // Trust is loaded unconditionally (cheap, no secrets): validation needs a
+        // synchronous read path whenever an MCP action is evaluated (task_05). The
+        // `.atelier` root already exists — `HistoryStore::create` made it above.
+        let mcp_trust = crate::mcp::McpTrustStore::load(&config.working_directory.join(".atelier"));
         let (interrupt_sender, interrupt_receiver) = watch::channel(0);
         let (approval_sender, approval_receiver) = watch::channel(ApprovalSignal {
             sequence: 0,
@@ -1233,6 +1337,9 @@ impl App {
             dropped_hooks: DroppedHookCounter::new(),
             resume_approval_mode: None,
             pending_drift_ack: None,
+            mcp_handle,
+            mcp_trust,
+            mcp_catalog: crate::mcp::ToolCatalog::default(),
         };
         app.record_event(
             None,
@@ -1404,7 +1511,154 @@ impl App {
             }),
             "Harness session ended.",
         )?;
+        // Drop the supervisor handle: closing the command channel makes the actor
+        // exit and drop every connection, whose `TokioChildProcess::drop` kills
+        // the child (ADR-005 kill_on_drop backstop). Sync-safe — no await needed.
+        self.mcp_handle = None;
         self.session_ended = true;
+        Ok(())
+    }
+
+    /// The MCP wiring for one action's `ActionExecutionContext` (task_05): the
+    /// supervisor handle plus a snapshot of the trust store and the cached tool
+    /// catalog (recorded at run entry, task_07). `None` when MCP is disabled. The
+    /// catalog gives the validation pin-diff current tool definitions to compare.
+    fn mcp_action_context(&self) -> Option<crate::actions::McpActionContext> {
+        self.mcp_handle
+            .clone()
+            .map(|handle| crate::actions::McpActionContext {
+                handle,
+                trust: self.mcp_trust.clone(),
+                catalog: std::sync::Arc::new(self.mcp_catalog.clone()),
+            })
+    }
+
+    /// MCP action context for `request`. For a call to an already-TRUSTED server
+    /// it uses a FRESH catalog snapshot so the trust pin diff (F6) and the
+    /// dispatch catalog-membership check see the server's CURRENT tool
+    /// definitions — narrowing a mid-run rug-pull from "undetected until the next
+    /// run" to the list_tools→call_tool gap. Untrusted servers prompt regardless
+    /// of the catalog, so the cached run-entry snapshot suffices and the extra
+    /// round-trip is skipped. `self.mcp_catalog` (the replay-recorded snapshot
+    /// feeding the orchestrator prompt) is never mutated here, keeping replay
+    /// deterministic. (A server that serves different content to `list_tools` vs
+    /// `call_tool` is a lying-server threat no description pin can fully close.)
+    async fn mcp_action_context_for(
+        &self,
+        request: &ActionRequest,
+    ) -> Option<crate::actions::McpActionContext> {
+        if self.should_refresh_mcp_catalog(request) {
+            if let Some(handle) = self.mcp_handle.clone() {
+                let server = request
+                    .params
+                    .get("server")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let tool = request
+                    .params
+                    .get("tool")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let fresh = handle.snapshot_catalog().await.ok();
+                let catalog = pick_validation_catalog(fresh, &self.mcp_catalog, server, tool);
+                return Some(crate::actions::McpActionContext {
+                    handle,
+                    trust: self.mcp_trust.clone(),
+                    catalog: std::sync::Arc::new(catalog),
+                });
+            }
+        }
+        self.mcp_action_context()
+    }
+
+    /// Whether to take a fresh catalog snapshot before this action: a
+    /// `CallMcpTool` to an already-TRUSTED server — the only case the F6 pin diff
+    /// is consulted, so a stale catalog could miss a mid-run rug-pull. Untrusted
+    /// servers prompt regardless, so the cached run-entry catalog suffices and the
+    /// extra `list_tools` round-trip is skipped.
+    fn should_refresh_mcp_catalog(&self, request: &ActionRequest) -> bool {
+        request.kind == ActionKind::CallMcpTool
+            && request
+                .params
+                .get("server")
+                .and_then(|value| value.as_str())
+                .is_some_and(|server| self.mcp_trust.is_trusted(server))
+    }
+
+    /// Whether `agent`'s runtime opts into degrade-not-abandon (task_11): a failed
+    /// MCP tool call then skips the tool instead of failing the run.
+    fn agent_runtime_degrades(&self, agent: &AgentProfile) -> bool {
+        self.config
+            .runtimes
+            .get(&agent.runtime)
+            .map(|runtime| runtime.degrade_not_abandon)
+            .unwrap_or(false)
+    }
+
+    /// Refresh and record the MCP tool-catalog snapshot at run entry (task_07).
+    /// A no-op when MCP is disabled. The recorded `mcp_catalog_snapshot` event is
+    /// the replay source for the orchestrator prompt's MCP-tools section.
+    async fn record_mcp_catalog_snapshot(&mut self, run_id: &str) -> Result<()> {
+        let Some(handle) = self.mcp_handle.clone() else {
+            return Ok(());
+        };
+        let catalog = handle.snapshot_catalog().await.unwrap_or_default();
+        self.record_event(
+            Some(run_id.to_string()),
+            None,
+            "mcp_catalog_snapshot",
+            serde_json::to_value(&catalog).unwrap_or_else(|_| json!({ "servers": [] })),
+            format!(
+                "Recorded MCP tool catalog snapshot ({} server(s)).",
+                catalog.servers.len()
+            ),
+        )?;
+        self.mcp_catalog = catalog;
+        Ok(())
+    }
+
+    /// Promote an MCP server to `Trusted`: persist the file and, only on a real
+    /// change, record an `mcp_server_trusted` event (the audit trail, ADR-006).
+    pub fn promote_mcp_server(&mut self, server: &str, tool: &str) -> Result<()> {
+        // Pins defend against tool-description rug-pulls (F6, ADR-006); they hold
+        // only hashes, never tool payloads.
+        if self.mcp_trust.promote(server)? {
+            self.record_event(
+                None,
+                None,
+                "mcp_server_trusted",
+                json!({ "server": server }),
+                format!("Trusted MCP server {server}."),
+            )?;
+            // First trust: pin the server's *current* toolset — the user is
+            // consenting to its current capabilities (server-level trust). A later
+            // change to any tool (`Changed`) or a newly-advertised tool
+            // (`Unpinned`) then re-prompts.
+            let tools = self.mcp_catalog.tools_for(server).to_vec();
+            self.mcp_trust.set_pins(server, &tools)?;
+        } else if let Some(def) = self.mcp_catalog.tool(server, tool).cloned() {
+            // Re-approval of an already-trusted server (the gate flagged THIS tool
+            // as `Changed`/`Unpinned`): pin ONLY the tool the user was shown and
+            // approved. Re-pinning the whole toolset here would silently re-bless
+            // a *different* tool the server mutated concurrently — laundering a
+            // rug-pull the user never saw.
+            self.mcp_trust.set_pin(server, &def)?;
+        }
+        Ok(())
+    }
+
+    /// Revoke an MCP server's trust: persist the file and, only on a real change,
+    /// record an `mcp_server_revoked` event.
+    pub fn revoke_mcp_server(&mut self, server: &str) -> Result<()> {
+        if self.mcp_trust.revoke(server)? {
+            self.record_event(
+                None,
+                None,
+                "mcp_server_revoked",
+                json!({ "server": server }),
+                format!("Revoked trust for MCP server {server}."),
+            )?;
+        }
         Ok(())
     }
 
@@ -1779,6 +2033,10 @@ impl App {
             )?;
         }
         self.record_skills_loaded(run_id.as_str(), compiled_prompt.skill_context.as_ref())?;
+        // Snapshot the MCP tool catalog at run entry (ADR-001, task_07): records
+        // the `mcp_catalog_snapshot` event and refreshes the cached snapshot the
+        // orchestrator prompt advertises from. No-op when MCP is disabled.
+        self.record_mcp_catalog_snapshot(run_id.as_str()).await?;
 
         let run = RunDriveContext::new(
             run_id,
@@ -2405,6 +2663,30 @@ impl App {
                     )?;
                 }
             }
+            // For an MCP tool call, approve-and-trust promotes the ORIGIN SERVER
+            // in the durable trust store (ADR-006/007) — not the session list —
+            // so future calls from it auto-allow until revoked. `promote_mcp_server`
+            // persists the file and records `mcp_server_trusted`.
+            if pending.action_request.kind == ActionKind::CallMcpTool {
+                if let Some(server) = pending
+                    .action_request
+                    .params
+                    .get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                {
+                    // The specific tool the card surfaced; pinned on re-approval
+                    // so approving it never re-blesses a concurrently-changed peer.
+                    let tool = pending
+                        .action_request
+                        .params
+                        .get("tool")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.promote_mcp_server(&server, &tool)?;
+                }
+            }
         }
 
         if self.wall_clock_limit_reached(&pending.run) {
@@ -2477,6 +2759,7 @@ impl App {
         self.record_action_completed(
             &pending.run_id,
             &pending.step_id,
+            &pending.agent_profile.runtime,
             &pending.action_request,
             &result,
         )?;
@@ -2529,6 +2812,17 @@ impl App {
         )?;
 
         let mut run = pending.run;
+
+        // Grade-cycle escalation (task 07): route accept/retry/abort by option id
+        // BEFORE the ordinary prompt-append, but only when the escalation marker is
+        // present — so an ordinary clarification whose option id happens to be
+        // "retry" is never hijacked.
+        if let Some(escalation) = pending.grade_escalation {
+            return self
+                .resolve_grade_escalation(run, escalation, &answer)
+                .await;
+        }
+
         run.prompt = format!("{}\n\nUser clarification: {}", run.prompt, answer.answer);
 
         self.state.pending_clarification = None;
@@ -2537,6 +2831,84 @@ impl App {
 
         self.drive_and_replay(run, None).await?;
         Ok(())
+    }
+
+    /// Route a resolved grade-cycle escalation (task 07) by the selected option id:
+    /// `abort` fails the run with the last failing check; `retry` re-runs the grade
+    /// loop with a fresh attempt budget (re-escalating if it still fails); anything
+    /// else (`accept`) keeps the work as unverified and continues the run.
+    async fn resolve_grade_escalation(
+        &mut self,
+        mut run: RunDriveContext,
+        escalation: GradeEscalation,
+        answer: &ClarificationAnswer,
+    ) -> Result<()> {
+        self.state.pending_clarification = None;
+        let run_id = run.run_id.clone();
+        let GradeEscalation {
+            producing_agent_id,
+            changed_files,
+            rounds_used,
+        } = escalation;
+
+        match answer.selected_option_id.as_deref() {
+            Some("abort") => {
+                self.record_event(
+                    Some(run_id),
+                    None,
+                    "run_failed",
+                    json!({ "reason": "verification failed; aborted by user at grade escalation" }),
+                    "Run aborted after verification failed.",
+                )?;
+                // Finalize like the governance-abort path: persist the run record
+                // and clear the active run BEFORE pausing the queue, otherwise
+                // active_run_id dangles (blocking resume) and the record is never
+                // written. write_run_record snapshots run_state, so set it first.
+                self.state.active_run_id = None;
+                self.state.live_step = None;
+                self.state.live_steps.clear();
+                self.state.run_state = RunState::Failed;
+                self.write_run_record(&run)?;
+                self.sync_chat_items();
+                self.publish_state();
+                self.pause_oldest_pending_for_queue()?;
+                Ok(())
+            }
+            Some("retry") => {
+                self.state.run_state = RunState::Running;
+                self.publish_state();
+                // Continue round numbering from the prior cycle so the collapsing
+                // Grade item accumulates rather than resetting to round 1.
+                match self
+                    .run_grading_workflow(&mut run, &producing_agent_id, changed_files, rounds_used)
+                    .await?
+                {
+                    // Re-escalated or paused on approval: the workflow already set
+                    // up the pending state; stopped: the run was already halted.
+                    GradingOutcome::Escalated
+                    | GradingOutcome::Paused
+                    | GradingOutcome::Stopped => Ok(()),
+                    GradingOutcome::Concluded => {
+                        self.state.run_state = RunState::Planning;
+                        self.publish_state();
+                        self.drive_and_replay(run, None).await
+                    }
+                }
+            }
+            // "accept" (or any other id): keep the unverified work and continue.
+            _ => {
+                self.record_event(
+                    Some(run_id),
+                    None,
+                    "grade_escalation_resolved",
+                    json!({ "outcome": "accept_unverified" }),
+                    "User accepted unverified work; run continues.",
+                )?;
+                self.state.run_state = RunState::Planning;
+                self.publish_state();
+                self.drive_and_replay(run, None).await
+            }
+        }
     }
 
     /// Resolve the pending governance decision, mirroring
@@ -2905,7 +3277,10 @@ impl App {
             }
             DecisionStatus::WaitingForUser => {
                 self.state.run_state = RunState::WaitingForUser;
-                self.pending_clarification = Some(PendingClarification { run: run.clone() });
+                self.pending_clarification = Some(PendingClarification {
+                    run: run.clone(),
+                    grade_escalation: None,
+                });
                 let question = decision
                     .clarifying_question
                     .clone()
@@ -4432,6 +4807,8 @@ impl App {
             trusted_targets: self.trust_store.snapshot(),
             pre_approved: false,
             drift_ack: self.drift_ack_context(),
+            mcp: self.mcp_action_context_for(&action_request).await,
+            degrade_not_abandon: self.agent_runtime_degrades(&child.request.agent_profile),
         };
         self.record_command_started_if_executable_with_group(
             &run.run_id,
@@ -4643,6 +5020,7 @@ impl App {
             &pending.run_id,
             Some(&pending.group_id),
             &pending.step_id,
+            &pending.agent_profile.runtime,
             &pending.action_request,
             &result,
         )?;
@@ -5072,8 +5450,36 @@ impl App {
                         serde_json::to_value(&result)?,
                         format!("{}: {}", result.agent, result.summary),
                     )?;
+                    // Grading trigger (ADR-002/003): auto-verify a top-level
+                    // single-agent Edit step that produced changes, when enabled.
+                    // Compute the gate BEFORE `result` is moved into the run, and
+                    // exclude subtasks (parallel children never reach this path).
+                    // The grade/fix sub-steps run via `run_grading_substep`, not
+                    // `run_agent_step`, so grading never recurses.
+                    let triggers_grading = self.config.grading.enabled
+                        && run.subtask.is_none()
+                        && !result.changed_files.is_empty()
+                        && self
+                            .agent(next_agent_id)
+                            .map(|agent| agent.has_capability(&Capability::Edit))
+                            .unwrap_or(false);
+                    let changed_files = result.changed_files.clone();
                     run.previous_results.push(RunStepResult::Agent { result });
                     self.clear_active_step(&step_id);
+                    if triggers_grading {
+                        return Ok(
+                            match self
+                                .run_grading_workflow(run, next_agent_id, changed_files, 0)
+                                .await?
+                            {
+                                GradingOutcome::Concluded => AgentStepOutcome::Completed,
+                                GradingOutcome::Escalated | GradingOutcome::Paused => {
+                                    AgentStepOutcome::Paused
+                                }
+                                GradingOutcome::Stopped => AgentStepOutcome::Stop,
+                            },
+                        );
+                    }
                     Ok(AgentStepOutcome::Completed)
                 }
                 RuntimeOutput::ParseError {
@@ -5303,6 +5709,382 @@ impl App {
         )?;
         run.previous_results.push(RunStepResult::Agent { result });
         Ok(true)
+    }
+
+    /// The externally-grounded auto-verification loop (ADR-003/004): run the
+    /// grader to execute the project's checks, derive a verdict from the recorded
+    /// command exit codes, and on FAIL re-dispatch the SAME `producing_agent_id`
+    /// with the critique — bounded by `grading.max_attempts` and exempt from
+    /// `max_agent_steps` (grade/fix sub-steps never touch `run.step_count`). The
+    /// wall-clock guard and per-command timeout still apply. Returns `Escalated`
+    /// when attempts exhaust on FAIL (handled in task 07), `Concluded` otherwise.
+    async fn run_grading_workflow(
+        &mut self,
+        run: &mut RunDriveContext,
+        producing_agent_id: &str,
+        changed_files: Vec<String>,
+        base_round: u32,
+    ) -> Result<GradingOutcome> {
+        let max_attempts = self.config.grading.max_attempts.max(1);
+        // Round numbers continue across retry cycles (`base_round` > 0 on retry) so
+        // the single Grade chat item accumulates rather than colliding on round 1.
+        let max_rounds = base_round.saturating_add(max_attempts);
+
+        // The grader profile is fixed for the whole loop; clone it once. If the
+        // configured grader is absent, degrade to "unverified" rather than failing
+        // an otherwise-successful edit run (grading is opt-in).
+        let grader = match self.agent(GRADING_GRADER_AGENT_ID) {
+            Ok(agent) => agent.clone(),
+            Err(_) => {
+                self.record_grade_round(
+                    run,
+                    base_round.saturating_add(1),
+                    max_rounds,
+                    "skip",
+                    None,
+                )?;
+                return Ok(GradingOutcome::Concluded);
+            }
+        };
+
+        for attempt in 1..=max_attempts {
+            let round = base_round.saturating_add(attempt);
+            if self.wall_clock_limit_reached(run) {
+                self.stop_for_wall_clock_limit(run)?;
+                return Ok(GradingOutcome::Stopped);
+            }
+            self.record_grade_round(run, round, max_rounds, "working", None)?;
+
+            // Grader sub-step: run the project's checks through the action path.
+            let grader_step_id = new_id();
+            let grade_prompt = grading_grader_prompt(&run.prompt, &changed_files, round);
+            match self
+                .run_grading_substep(run, grader.clone(), &grader_step_id, &grade_prompt)
+                .await?
+            {
+                GradingSubstep::Completed(_) => {}
+                GradingSubstep::Paused => return Ok(GradingOutcome::Paused),
+                GradingSubstep::Stopped => return Ok(GradingOutcome::Stopped),
+            }
+
+            // Verdict from the structured command exit codes — never agent text.
+            let commands = self.collect_grade_command_outcomes(&grader_step_id)?;
+            let verdict = crate::orchestrator::derive_grade_verdict(&commands);
+            self.record_event(
+                Some(run.run_id.clone()),
+                Some(grader_step_id.clone()),
+                crate::history::GRADER_VERDICT_KIND,
+                serde_json::to_value(&verdict)?,
+                format!("Grader verdict: {:?}.", verdict.outcome),
+            )?;
+
+            match verdict.outcome {
+                crate::orchestrator::GradeOutcome::Pass => {
+                    self.record_grade_round(run, round, max_rounds, "pass", Some(&verdict))?;
+                    self.push_grade_conclusion(run, &verdict, round)?;
+                    return Ok(GradingOutcome::Concluded);
+                }
+                crate::orchestrator::GradeOutcome::Skip => {
+                    self.record_grade_round(run, round, max_rounds, "skip", Some(&verdict))?;
+                    self.push_grade_conclusion(run, &verdict, round)?;
+                    return Ok(GradingOutcome::Concluded);
+                }
+                crate::orchestrator::GradeOutcome::Fail => {
+                    self.record_grade_round(run, round, max_rounds, "fail", Some(&verdict))?;
+                    if attempt >= max_attempts {
+                        self.pause_for_grade_escalation(
+                            run,
+                            producing_agent_id,
+                            &changed_files,
+                            &verdict,
+                            max_rounds,
+                        )?;
+                        return Ok(GradingOutcome::Escalated);
+                    }
+                    // Re-dispatch the SAME producing agent with the critique.
+                    let fix_step_id = new_id();
+                    let fix_prompt = grading_fix_prompt(&run.prompt, verdict.critique.as_deref());
+                    let producing = self.agent(producing_agent_id)?.clone();
+                    match self
+                        .run_grading_substep(run, producing, &fix_step_id, &fix_prompt)
+                        .await?
+                    {
+                        GradingSubstep::Completed(result) => {
+                            run.previous_results
+                                .push(RunStepResult::Agent { result: *result });
+                        }
+                        GradingSubstep::Paused => return Ok(GradingOutcome::Paused),
+                        GradingSubstep::Stopped => return Ok(GradingOutcome::Stopped),
+                    }
+                }
+            }
+        }
+        // The bounded loop always returns within its body (the final attempt's
+        // Fail arm escalates), so this is unreachable; assert it rather than
+        // silently returning an un-paused Escalated.
+        unreachable!("grade loop must return within 1..=max_attempts")
+    }
+
+    /// Run one grade/fix sub-step through the action-executing runtime path
+    /// WITHOUT incrementing `run.step_count` (grading is step-budget-exempt,
+    /// ADR-003). Records `agent_step_started` + the terminal `agent_result`; the
+    /// in-loop command execution records `command_completed` events the verdict
+    /// reads back. Returns `Halted` on pause/limit/interrupt/error.
+    async fn run_grading_substep(
+        &mut self,
+        run: &mut RunDriveContext,
+        agent: AgentProfile,
+        step_id: &str,
+        prompt: &str,
+    ) -> Result<GradingSubstep> {
+        let agent_id = agent.id.clone();
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(step_id.to_string()),
+            "agent_step_started",
+            json!({ "agent": agent_id }),
+            format!("{agent_id} grade step started."),
+        )?;
+        let request = self.runtime_request(
+            &run.run_id,
+            step_id,
+            RuntimePrompt::new(prompt, run.skill_context.as_ref()),
+            agent,
+            run.previous_results.clone(),
+            "agent_result",
+        )?;
+        let step = PausedStep::Agent {
+            step_id: step_id.to_string(),
+            agent_id: agent_id.clone(),
+        };
+        self.set_active_step(&run.run_id, step_id, &agent_id);
+        let started_at = Instant::now();
+        let outcome = self
+            .execute_runtime_step_with_actions(request, run, step, started_at)
+            .await;
+        match outcome {
+            Ok(StepOutcome::Output(output)) => match *output {
+                RuntimeOutput::AgentResult { result } => {
+                    self.record_event(
+                        Some(run.run_id.clone()),
+                        Some(result.step_id.clone()),
+                        "agent_result",
+                        serde_json::to_value(&result)?,
+                        format!("{}: {}", result.agent, result.summary),
+                    )?;
+                    self.clear_active_step(step_id);
+                    Ok(GradingSubstep::Completed(Box::new(result)))
+                }
+                // A grade sub-step should only ever yield an agent_result; any
+                // other output is unexpected — stop rather than fake a verdict.
+                _ => {
+                    self.clear_active_step(step_id);
+                    Ok(GradingSubstep::Stopped)
+                }
+            },
+            // The action loop already set `pending_approval` + `WaitingForUser`;
+            // leave the step active so the user can resolve the approval.
+            Ok(StepOutcome::Paused) => Ok(GradingSubstep::Paused),
+            Ok(StepOutcome::LimitReached) | Ok(StepOutcome::Interrupted) => {
+                self.clear_active_step(step_id);
+                Ok(GradingSubstep::Stopped)
+            }
+            Err(error) => {
+                // A grader/fixer runtime error must fail the run loudly, not be
+                // swallowed into a clean "verified" completion.
+                self.state.run_state = RunState::Failed;
+                self.record_event(
+                    Some(run.run_id.clone()),
+                    Some(step_id.to_string()),
+                    "run_failed",
+                    json!({ "reason": error.to_string() }),
+                    format!(
+                        "Grading sub-step failed: {}",
+                        concise_diagnostic(&error.to_string())
+                    ),
+                )?;
+                self.clear_active_step(step_id);
+                Ok(GradingSubstep::Stopped)
+            }
+        }
+    }
+
+    /// Collect the grade sub-step's executed commands from the recorded
+    /// `command_completed` events (the structured ground truth — never
+    /// model-authored text), scoped to `step_id`.
+    fn collect_grade_command_outcomes(
+        &self,
+        step_id: &str,
+    ) -> Result<Vec<crate::orchestrator::CommandOutcome>> {
+        let events = self.history.read_events()?;
+        Ok(events
+            .iter()
+            .filter(|event| {
+                event.kind == "command_completed" && event.step_id.as_deref() == Some(step_id)
+            })
+            .map(|event| crate::orchestrator::CommandOutcome {
+                command: event
+                    .payload
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                exit_code: event
+                    .payload
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64),
+                excerpt: event
+                    .payload
+                    .get("diagnostic")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            })
+            .collect())
+    }
+
+    /// Record a `grade_round` event (task 04 projects it into the one evolving
+    /// grade item). `verdict` supplies the command/exit/critique for resolved
+    /// rounds; pass `None` for the in-progress `working` round.
+    fn record_grade_round(
+        &mut self,
+        run: &RunDriveContext,
+        round: u32,
+        max_rounds: u32,
+        outcome: &str,
+        verdict: Option<&crate::orchestrator::GraderVerdict>,
+    ) -> Result<()> {
+        let mut payload = json!({
+            "round": round,
+            "max_rounds": max_rounds,
+            "outcome": outcome,
+        });
+        if let Some(verdict) = verdict {
+            if let Some(command) = &verdict.command {
+                payload["command"] = json!(command);
+            }
+            if let Some(exit_code) = verdict.exit_code {
+                payload["exit_code"] = json!(exit_code);
+            }
+            if let Some(critique) = &verdict.critique {
+                payload["critique"] = json!(critique);
+            }
+        }
+        self.record_event(
+            Some(run.run_id.clone()),
+            None,
+            crate::history::GRADE_ROUND_KIND,
+            payload,
+            format!("Grade round {round}/{max_rounds}: {outcome}."),
+        )
+    }
+
+    /// Push the concluding grade result into `run.previous_results` so the run
+    /// record reflects the verification outcome.
+    fn push_grade_conclusion(
+        &mut self,
+        run: &mut RunDriveContext,
+        verdict: &crate::orchestrator::GraderVerdict,
+        round: u32,
+    ) -> Result<()> {
+        let summary = match verdict.outcome {
+            crate::orchestrator::GradeOutcome::Pass => format!(
+                "Verified after {round} round(s): {} passed",
+                verdict.command.as_deref().unwrap_or("checks")
+            ),
+            crate::orchestrator::GradeOutcome::Skip => {
+                "Unverified — no canonical verification command ran".to_string()
+            }
+            crate::orchestrator::GradeOutcome::Fail => "Verification failed".to_string(),
+        };
+        let result = AgentResult::completed("grading", new_id(), summary);
+        self.record_event(
+            Some(run.run_id.clone()),
+            Some(result.step_id.clone()),
+            "agent_result",
+            serde_json::to_value(&result)?,
+            format!("grading: {}", result.summary),
+        )?;
+        run.previous_results.push(RunStepResult::Agent { result });
+        Ok(())
+    }
+
+    /// Pause the run as `WaitingForUser` on grade-cycle exhaustion (task 07),
+    /// reusing the clarification transport with three options — `accept` /
+    /// `retry` / `abort` — and a `grade_escalation` marker so
+    /// `resolve_pending_clarification` routes them instead of appending the
+    /// answer to the prompt. The question surfaces the last failing check.
+    fn pause_for_grade_escalation(
+        &mut self,
+        run: &RunDriveContext,
+        producing_agent_id: &str,
+        changed_files: &[String],
+        verdict: &crate::orchestrator::GraderVerdict,
+        rounds_used: u32,
+    ) -> Result<()> {
+        self.state.run_state = RunState::WaitingForUser;
+        self.pending_clarification = Some(PendingClarification {
+            run: run.clone(),
+            grade_escalation: Some(GradeEscalation {
+                producing_agent_id: producing_agent_id.to_string(),
+                changed_files: changed_files.to_vec(),
+                rounds_used,
+            }),
+        });
+
+        let failing = verdict
+            .critique
+            .clone()
+            .or_else(|| verdict.command.clone())
+            .unwrap_or_else(|| "the verification command".to_string());
+        let question = format!(
+            "Verification still fails after {} attempt(s):\n{failing}\n\nAccept the work as-is, \
+             retry the checks, or abort the run?",
+            self.config.grading.max_attempts.max(1)
+        );
+        let options = vec![
+            crate::orchestrator::ClarificationOption {
+                id: "accept".to_string(),
+                label: "Accept the work as unverified".to_string(),
+                description: Some("Keep the changes and continue the run.".to_string()),
+            },
+            crate::orchestrator::ClarificationOption {
+                id: "retry".to_string(),
+                label: "Retry verification".to_string(),
+                description: Some(
+                    "Run the grade loop again with a fresh attempt budget.".to_string(),
+                ),
+            },
+            crate::orchestrator::ClarificationOption {
+                id: "abort".to_string(),
+                label: "Abort the run".to_string(),
+                description: Some("Fail the run; do not keep going.".to_string()),
+            },
+        ];
+        let view = PendingClarificationView {
+            run_id: run.run_id.clone(),
+            question_id: new_id(),
+            question,
+            options,
+            recommended_option_id: Some("retry".to_string()),
+            multi_select: false,
+        };
+        self.state.pending_clarification = Some(view.clone());
+        self.set_agent_status("orchestrator", "waiting_for_user");
+        self.record_event(
+            Some(run.run_id.clone()),
+            None,
+            "clarification_requested",
+            json!({
+                "question_id": view.question_id,
+                "question": view.question,
+                "options": view.options,
+                "recommended_option_id": view.recommended_option_id,
+                "multi_select": view.multi_select,
+                "grade_escalation": true,
+            }),
+            "Verification exhausted retries; awaiting accept/retry/abort.",
+        )?;
+        Ok(())
     }
 
     fn council_report_from_runtime_output(
@@ -5783,7 +6565,12 @@ impl App {
     ) -> Result<RuntimeRequest> {
         let mut agent_profile = agent_profile;
         if agent_profile.id == "orchestrator" {
-            agent_profile.instructions = build_orchestrator_prompt(&self.config);
+            // Advertise MCP tools from the recorded snapshot, never a live handle
+            // (ADR-001, task_07), so the prompt is replay-deterministic.
+            agent_profile.instructions = crate::orchestrator::build_orchestrator_prompt_with_mcp(
+                &self.config,
+                &self.mcp_catalog,
+            );
         }
         let prompt = skills::render_runtime_prompt(prompt.skill_context, prompt.text);
         Ok(RuntimeRequest {
@@ -5979,6 +6766,8 @@ impl App {
                         trusted_targets: self.trust_store.snapshot(),
                         pre_approved: false,
                         drift_ack: self.drift_ack_context(),
+                        mcp: self.mcp_action_context_for(&action_request).await,
+                        degrade_not_abandon: self.agent_runtime_degrades(&request.agent_profile),
                     };
                     self.record_command_started_if_executable(
                         run_id,
@@ -6043,7 +6832,13 @@ impl App {
                         )?;
                         return Ok(StepOutcome::Paused);
                     }
-                    self.record_action_completed(run_id, &step_id, &action_request, &result)?;
+                    self.record_action_completed(
+                        run_id,
+                        &step_id,
+                        &request.agent_profile.runtime,
+                        &action_request,
+                        &result,
+                    )?;
                     request.action_results.push(result);
                 }
                 output => return Ok(StepOutcome::Output(Box::new(output))),
@@ -6515,10 +7310,11 @@ impl App {
         &mut self,
         run_id: &str,
         step_id: &str,
+        runtime: &str,
         request: &ActionRequest,
         result: &ActionResult,
     ) -> Result<()> {
-        self.record_action_completed_with_group(run_id, None, step_id, request, result)
+        self.record_action_completed_with_group(run_id, None, step_id, runtime, request, result)
     }
 
     fn record_action_completed_with_group(
@@ -6526,6 +7322,7 @@ impl App {
         run_id: &str,
         group_id: Option<&str>,
         step_id: &str,
+        runtime: &str,
         request: &ActionRequest,
         result: &ActionResult,
     ) -> Result<()> {
@@ -6548,7 +7345,45 @@ impl App {
             "action_completed",
             serde_json::to_value(&durable_result)?,
             action_completed_display(request, result),
-        )
+        )?;
+        // Observability event for MCP tool calls (task_10): {server, tool,
+        // runtime, status, trusted}. Feeds the `--doctor` parity matrix and
+        // trusted-completion metric; never rendered as chat (no-op projection
+        // arm). Local-only, no telemetry.
+        if request.kind == ActionKind::CallMcpTool {
+            let server = request
+                .params
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let tool = request
+                .params
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let trusted = self.mcp_trust.is_trusted(server);
+            let status_label = match durable_result.status {
+                ActionStatus::Completed => "completed",
+                ActionStatus::Denied => "denied",
+                ActionStatus::ApprovalRequired => "approval_required",
+                ActionStatus::Failed => "failed",
+            };
+            self.record_event_with_group(
+                Some(run_id.to_string()),
+                group_id.map(str::to_string),
+                Some(step_id.to_string()),
+                "mcp_tool_result",
+                json!({
+                    "server": server,
+                    "tool": tool,
+                    "runtime": runtime,
+                    "status": status_label,
+                    "trusted": trusted,
+                }),
+                format!("MCP tool {server}/{tool} {status_label}."),
+            )?;
+        }
+        Ok(())
     }
 
     fn record_command_started_if_executable(
@@ -7796,6 +8631,32 @@ fn council_member_prompt(
     )
 }
 
+/// Prompt for the grader sub-step: ask the grader to run the project's checks on
+/// the changed files. The round number is embedded so a replay/runtime can vary
+/// behavior per round (the fake runtime keys its scripted outcomes off it).
+fn grading_grader_prompt(user_prompt: &str, changed_files: &[String], round: u32) -> String {
+    let files = if changed_files.is_empty() {
+        "the working tree".to_string()
+    } else {
+        changed_files.join(", ")
+    };
+    format!(
+        "Verify the changes to {files} by running the project's canonical checks \
+         (e.g. `cargo test`, `cargo clippy`) and report the results. (grade round {round})\n\n\
+         Original task:\n{user_prompt}"
+    )
+}
+
+/// Prompt for the fix sub-step: re-dispatch the producing agent with the
+/// grader's concrete critique so it can address the verification failure.
+fn grading_fix_prompt(user_prompt: &str, critique: Option<&str>) -> String {
+    let critique = critique.unwrap_or("Verification failed; address the reported issues.");
+    format!(
+        "Verification failed. Fix the following, then stop:\n{critique}\n\n\
+         Original task:\n{user_prompt}"
+    )
+}
+
 fn council_route_allowed(prompt: &str, session_goal: Option<&str>) -> bool {
     let text = match session_goal {
         Some(goal) => format!("{prompt} {goal}").to_ascii_lowercase(),
@@ -8091,6 +8952,26 @@ fn trust_target_payload(target: &TrustTarget) -> serde_json::Value {
     }
 }
 
+/// Choose the catalog to validate/dispatch an MCP tool call against. Prefer the
+/// FRESH snapshot when it actually advertises the target tool — so an honest
+/// mid-run definition change is caught as `PinStatus::Changed` (F6). Fall back to
+/// the cached run-entry catalog when the fresh snapshot failed (supervisor down)
+/// or has dropped the tool: a transient `list_tools` blip must not turn a
+/// trusted, pinned, previously-working call into a spurious "not in catalog"
+/// failure. (A server that lies differently to `list_tools` vs `call_tool` is the
+/// disclaimed lying-server class no description pin can close.)
+fn pick_validation_catalog(
+    fresh: Option<crate::mcp::ToolCatalog>,
+    cached: &crate::mcp::ToolCatalog,
+    server: &str,
+    tool: &str,
+) -> crate::mcp::ToolCatalog {
+    match fresh {
+        Some(fresh) if fresh.tool(server, tool).is_some() => fresh,
+        _ => cached.clone(),
+    }
+}
+
 /// Cap a preview string (command/diff) before it enters `AppState`, so a huge
 /// diff can't bloat the snapshot channel (TechSpec "Known Risks").
 fn capped_preview(text: &str) -> String {
@@ -8173,6 +9054,45 @@ fn build_pending_approval_view(
         .drift_ack
         .clone()
         .filter(|_| crate::actions::is_mutating_kind(&request.kind));
+    // MCP trust-legibility (task_09): for a tool call, surface the origin server,
+    // the tool name, its full untruncated description (from the catalog snapshot),
+    // and whether the server is already trusted.
+    let (mcp_server, mcp_tool, mcp_description, mcp_trusted, mcp_args) =
+        if request.kind == ActionKind::CallMcpTool {
+            let server = request
+                .params
+                .get("server")
+                .and_then(serde_json::Value::as_str);
+            let tool = request
+                .params
+                .get("tool")
+                .and_then(serde_json::Value::as_str);
+            let description = match (context.mcp.as_ref(), server, tool) {
+                (Some(mcp), Some(server), Some(tool)) => mcp
+                    .catalog
+                    .tool(server, tool)
+                    .and_then(|tool| tool.description.clone()),
+                _ => None,
+            };
+            let trusted = match (context.mcp.as_ref(), server) {
+                (Some(mcp), Some(server)) => mcp.trust.is_trusted(server),
+                _ => false,
+            };
+            let args = request
+                .params
+                .get("args")
+                .filter(|args| !args.is_null())
+                .map(|args| capped_preview(&args.to_string()));
+            (
+                server.map(str::to_string),
+                tool.map(str::to_string),
+                description,
+                trusted,
+                args,
+            )
+        } else {
+            (None, None, None, false, None)
+        };
     PendingApprovalView {
         run_id,
         group_id,
@@ -8191,6 +9111,11 @@ fn build_pending_approval_view(
         reversible: None,
         trust_target: risk.target,
         drift_notice,
+        mcp_server,
+        mcp_tool,
+        mcp_description,
+        mcp_trusted,
+        mcp_args,
     }
 }
 
@@ -9126,6 +10051,35 @@ fn action_target_display(request: &ActionRequest) -> String {
         ActionKind::ApplyPatch => "apply patch".to_string(),
         ActionKind::WriteFile => format!("write {}", required_path_display(&request.params)),
         ActionKind::RecordNote => "record note".to_string(),
+        ActionKind::CallMcpTool => format!(
+            "call MCP tool {}/{}",
+            request
+                .params
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing server>"),
+            request
+                .params
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing tool>")
+        ),
+        ActionKind::ReadMcpResource => format!(
+            "read MCP resource {}",
+            request
+                .params
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing uri>")
+        ),
+        ActionKind::ListMcpResources => format!(
+            "list MCP resources on {}",
+            request
+                .params
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing server>")
+        ),
     }
 }
 
@@ -9707,6 +10661,7 @@ runtime = "fake"
         );
         app.pending_clarification = Some(PendingClarification {
             run: RunDriveContext::new("stale", None, "q", "q", None, None, None),
+            grade_escalation: None,
         });
         app.pending_governance_decision = Some(PendingGovernanceDecision {
             run: RunDriveContext::new("stale", None, "g", "g", None, None, None),
@@ -10849,6 +11804,8 @@ runtime = "fake"
             trusted_targets: std::sync::Arc::new(std::collections::HashSet::new()),
             pre_approved: false,
             drift_ack: None,
+            mcp: None,
+            degrade_not_abandon: false,
         };
         let rendered_context = ActionExecutionContext {
             user_prompt: Some(request.prompt.clone()),
@@ -14080,8 +15037,8 @@ instructions_file = "agents/explorer.md"
     }
 
     fn fake_with_zai_config(dir: &std::path::Path) -> EffectiveConfig {
-        // Most agents use the deterministic fake runtime; one agent uses a Z.ai
-        // runtime whose api_key_env points at a guaranteed-unset, uniquely
+        // Most agents use the deterministic fake runtime; one agent uses an
+        // HTTP API runtime whose api_key_env points at a guaranteed-unset, uniquely
         // named variable. That resolves to a deterministic Unauthenticated
         // status in any environment (the var is never set), exercising the
         // partial-failure / share-safe path of `/provider:status`.
@@ -14092,8 +15049,8 @@ instructions_file = "agents/explorer.md"
 [runtimes.fake]
 type = "fake"
 
-[runtimes.zai]
-type = "zai"
+[runtimes.http_api]
+type = "http_api"
 api_key_env = "MULTIAGENT_TEST_PROVIDER_STATUS_NO_KEY"
 
 [agents.orchestrator]
@@ -14109,7 +15066,7 @@ runtime = "fake"
 runtime = "fake"
 
 [agents.oracle]
-runtime = "zai"
+runtime = "http_api"
 
 [agents.consul]
 runtime = "fake"
@@ -14226,7 +15183,7 @@ runtime = "fake"
         // Healthy and failing providers both appear, independently.
         assert!(display.contains("Fake"), "{display}");
         assert!(display.contains("ready"), "{display}");
-        assert!(display.contains("Z.ai"), "{display}");
+        assert!(display.contains("HTTP API"), "{display}");
         assert!(display.contains("unauthenticated"), "{display}");
         assert_eq!(app.state.run_state, RunState::Idle);
 
@@ -15986,6 +16943,250 @@ runtime = "fake"
     }
 
     #[tokio::test]
+    async fn promote_mcp_server_persists_file_and_records_event() {
+        let dir = tempdir().unwrap();
+        let config = fake_config(dir.path());
+        let mut app = App::new(config).await.unwrap();
+
+        app.promote_mcp_server("fs", "search").unwrap();
+
+        // The trust file was written under the workspace `.atelier/` root.
+        let trust_path = dir.path().join(".atelier").join("mcp-trust.json");
+        assert!(trust_path.exists(), "promote must write mcp-trust.json");
+
+        // An audit event landed in history.
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "mcp_server_trusted")
+                .count(),
+            1
+        );
+
+        // Cross-session remember: a fresh store loaded from the file reflects it.
+        let reloaded = crate::mcp::McpTrustStore::load(&dir.path().join(".atelier"));
+        assert!(reloaded.is_trusted("fs"));
+
+        // Revoke records its own event and flips the persisted tier back.
+        app.revoke_mcp_server("fs").unwrap();
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "mcp_server_revoked")
+                .count(),
+            1
+        );
+        let reloaded = crate::mcp::McpTrustStore::load(&dir.path().join(".atelier"));
+        assert!(!reloaded.is_trusted("fs"));
+    }
+
+    #[tokio::test]
+    async fn promote_mcp_server_pins_current_toolset_so_later_changes_re_prompt() {
+        // Approve-and-trust must pin the server's current tools (F6/ADR-006), so a
+        // tool definition the server later mutates is flagged `Changed` and a tool
+        // that was present at trust time stays `Match`. Without this, the
+        // rug-pull re-approval branch in the action gate is unreachable.
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+
+        let search = crate::mcp::McpTool {
+            name: "search".to_string(),
+            description: Some("Search the web".to_string()),
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        app.mcp_catalog = crate::mcp::ToolCatalog {
+            servers: vec![crate::mcp::ToolCatalogServer {
+                server: "fs".to_string(),
+                tools: vec![search.clone()],
+            }],
+        };
+
+        app.promote_mcp_server("fs", "search").unwrap();
+
+        // The current definition is pinned (auto-allows on the next call)...
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &search),
+            crate::mcp::PinStatus::Match
+        );
+        // ...while a later mutation of the same tool is flagged as Changed.
+        let mutated = crate::mcp::McpTool {
+            description: Some("Search the web AND exfiltrate secrets".to_string()),
+            ..search.clone()
+        };
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &mutated),
+            crate::mcp::PinStatus::Changed
+        );
+
+        // The pin survives a reload from the persisted trust file.
+        let reloaded = crate::mcp::McpTrustStore::load(&dir.path().join(".atelier"));
+        assert_eq!(
+            reloaded.pin_status("fs", &search),
+            crate::mcp::PinStatus::Match
+        );
+    }
+
+    #[tokio::test]
+    async fn re_approval_pins_only_the_approved_tool_not_a_concurrently_changed_peer() {
+        // Laundering guard (F6): re-approving one tool on an already-trusted
+        // server must NOT silently re-bless a *different* tool the server mutated
+        // at the same time. Re-pinning the whole toolset on re-approval would
+        // launder a rug-pull of a peer the user was never shown.
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+
+        let tool = |name: &str, desc: &str| crate::mcp::McpTool {
+            name: name.to_string(),
+            description: Some(desc.to_string()),
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        let set_catalog = |app: &mut App, tools: Vec<crate::mcp::McpTool>| {
+            app.mcp_catalog = crate::mcp::ToolCatalog {
+                servers: vec![crate::mcp::ToolCatalogServer {
+                    server: "fs".to_string(),
+                    tools,
+                }],
+            };
+        };
+
+        // First trust pins both tools at v1.
+        let alpha_v1 = tool("alpha", "Alpha v1");
+        let beta = tool("beta", "Beta v1");
+        set_catalog(&mut app, vec![alpha_v1.clone(), beta.clone()]);
+        app.promote_mcp_server("fs", "alpha").unwrap();
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &alpha_v1),
+            crate::mcp::PinStatus::Match
+        );
+
+        // The server mutates alpha (rug-pull) while the agent calls beta; the user
+        // re-approves beta on the already-trusted server.
+        let alpha_v2 = tool("alpha", "Alpha v2 (exfiltrate)");
+        set_catalog(&mut app, vec![alpha_v2.clone(), beta.clone()]);
+        app.promote_mcp_server("fs", "beta").unwrap();
+
+        // Re-approving beta must NOT have re-pinned alpha: alpha's mutation is
+        // still flagged Changed and will re-prompt on its next call.
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &alpha_v2),
+            crate::mcp::PinStatus::Changed,
+            "re-approving beta must not launder alpha's concurrent rug-pull"
+        );
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &beta),
+            crate::mcp::PinStatus::Match
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_mcp_catalog_only_for_trusted_server_tool_calls() {
+        // The pre-call catalog refresh (narrowing the mid-run rug-pull window)
+        // must fire ONLY for a CallMcpTool to an already-trusted server: untrusted
+        // servers prompt regardless, and non-MCP actions never consult the pin.
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.mcp_trust.promote("trusted").unwrap();
+
+        let call = |server: &str| ActionRequest {
+            schema_version: 1,
+            action_id: "a".to_string(),
+            step_id: "s".to_string(),
+            kind: ActionKind::CallMcpTool,
+            params: json!({ "server": server, "tool": "x", "args": {} }),
+        };
+        assert!(
+            app.should_refresh_mcp_catalog(&call("trusted")),
+            "trusted-server tool call should refresh (pin diff is consulted)"
+        );
+        assert!(
+            !app.should_refresh_mcp_catalog(&call("untrusted")),
+            "untrusted-server tool call prompts regardless; no refresh"
+        );
+        assert!(
+            !app.should_refresh_mcp_catalog(&read_action("a")),
+            "non-MCP action must never refresh"
+        );
+    }
+
+    #[test]
+    fn pick_validation_catalog_prefers_fresh_with_tool_else_cached() {
+        let tool = |desc: &str| crate::mcp::McpTool {
+            name: "search".to_string(),
+            description: Some(desc.to_string()),
+            input_schema: json!({ "type": "object" }),
+            annotations: None,
+        };
+        let catalog = |desc: &str| crate::mcp::ToolCatalog {
+            servers: vec![crate::mcp::ToolCatalogServer {
+                server: "fs".to_string(),
+                tools: vec![tool(desc)],
+            }],
+        };
+        let cached = catalog("v1");
+
+        // Fresh snapshot advertises the (mutated) tool → use fresh so the change
+        // is caught as PinStatus::Changed.
+        let picked = pick_validation_catalog(Some(catalog("v2 mutated")), &cached, "fs", "search");
+        assert_eq!(
+            picked.tool("fs", "search").unwrap().description.as_deref(),
+            Some("v2 mutated")
+        );
+
+        // Fresh snapshot dropped the tool (transient list_tools blip) → fall back
+        // to cached so a trusted, pinned, working call is not spuriously failed.
+        let picked = pick_validation_catalog(
+            Some(crate::mcp::ToolCatalog::default()),
+            &cached,
+            "fs",
+            "search",
+        );
+        assert_eq!(
+            picked.tool("fs", "search").unwrap().description.as_deref(),
+            Some("v1")
+        );
+
+        // No fresh snapshot (supervisor unavailable) → cached.
+        let picked = pick_validation_catalog(None, &cached, "fs", "search");
+        assert!(picked.tool("fs", "search").is_some());
+    }
+
+    #[tokio::test]
+    async fn record_mcp_catalog_snapshot_emits_event_only_when_enabled() {
+        // Enabled: a (server-less) supervisor produces an empty snapshot that is
+        // still recorded as the replay source for the orchestrator prompt.
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+        app.mcp_handle = Some(crate::mcp::McpSupervisor::spawn(
+            Vec::new(),
+            crate::mcp::DEFAULT_MCP_CALL_TIMEOUT,
+        ));
+        app.record_mcp_catalog_snapshot("run1").await.unwrap();
+        let events = app.history.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "mcp_catalog_snapshot")
+                .count(),
+            1
+        );
+
+        // Disabled (no handle): recording is a no-op.
+        let dir2 = tempdir().unwrap();
+        let mut disabled = App::new(fake_config(dir2.path())).await.unwrap();
+        disabled.record_mcp_catalog_snapshot("run1").await.unwrap();
+        assert!(!disabled
+            .history
+            .read_events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "mcp_catalog_snapshot"));
+    }
+
+    #[tokio::test]
     async fn fake_runtime_respects_agent_step_limit() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("atelier.toml");
@@ -17363,6 +18564,354 @@ runtime = "fake"
         let mut config = fake_config(dir);
         config.features.governance_early_abort = true;
         App::new(config).await.unwrap()
+    }
+
+    // ── self-grading auto-verification loop (task_05) ──
+
+    async fn grading_app(dir: &std::path::Path, max_attempts: u32) -> App {
+        let mut config = fake_config(dir);
+        config.grading.enabled = true;
+        config.grading.max_attempts = max_attempts;
+        App::new(config).await.unwrap()
+    }
+
+    fn grading_run(prompt: &str) -> RunDriveContext {
+        RunDriveContext::new("run", None, prompt, prompt, None, None, None)
+    }
+
+    fn grade_round_outcomes(app: &App) -> Vec<String> {
+        app.history
+            .read_events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == crate::history::GRADE_ROUND_KIND)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("outcome")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn dispatched_agent(app: &App, agent: &str) -> bool {
+        app.history.read_events().unwrap().iter().any(|event| {
+            event.kind == "agent_step_started"
+                && event
+                    .payload
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(agent)
+        })
+    }
+
+    #[tokio::test]
+    async fn grading_pass_on_first_grade_concludes_without_fix() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        let mut run = grading_run("apply the edit grade pass");
+
+        let outcome = app
+            .run_grading_workflow(&mut run, "fixer", vec!["src/x.rs".to_string()], 0)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GradingOutcome::Concluded);
+        assert!(grade_round_outcomes(&app).contains(&"pass".to_string()));
+        assert!(!dispatched_agent(&app, "fixer"), "no fix dispatch on PASS");
+        assert_eq!(run.step_count, 0, "grading is step-budget exempt");
+    }
+
+    #[tokio::test]
+    async fn grading_skip_concludes_unverified() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        let mut run = grading_run("apply the edit grade skip");
+
+        let outcome = app
+            .run_grading_workflow(&mut run, "fixer", vec![], 0)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GradingOutcome::Concluded);
+        assert!(grade_round_outcomes(&app).contains(&"skip".to_string()));
+        assert!(!dispatched_agent(&app, "fixer"), "no fix dispatch on SKIP");
+    }
+
+    #[tokio::test]
+    async fn grading_fail_exhausts_attempts_and_escalates() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        let mut run = grading_run("apply the edit grade fail");
+
+        let outcome = app
+            .run_grading_workflow(&mut run, "fixer", vec![], 0)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GradingOutcome::Escalated);
+        let outcomes = grade_round_outcomes(&app);
+        assert_eq!(
+            outcomes.iter().filter(|o| *o == "fail").count(),
+            2,
+            "both attempts failed before escalation: {outcomes:?}"
+        );
+        assert_eq!(run.step_count, 0, "grading is step-budget exempt");
+    }
+
+    #[tokio::test]
+    async fn grading_flaky_redispatches_same_agent_then_passes() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        let mut run = grading_run("apply the edit grade flaky");
+
+        let outcome = app
+            .run_grading_workflow(&mut run, "fixer", vec!["src/x.rs".to_string()], 0)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GradingOutcome::Concluded);
+        let outcomes = grade_round_outcomes(&app);
+        assert!(
+            outcomes.contains(&"fail".to_string()),
+            "round 1 failed: {outcomes:?}"
+        );
+        assert!(
+            outcomes.contains(&"pass".to_string()),
+            "round 2 passed: {outcomes:?}"
+        );
+        assert!(
+            dispatched_agent(&app, "fixer"),
+            "the SAME producing agent was re-dispatched to fix"
+        );
+        // A 2-round grade loop must not consume the max_agent_steps budget.
+        assert_eq!(run.step_count, 0, "grading is step-budget exempt");
+    }
+
+    // ── grading trigger gate at run_agent_step (task_06) ──
+
+    #[tokio::test]
+    async fn grading_triggers_on_enabled_edit_step_with_changes() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+
+        app.submit_prompt("write action create a feature grade pass")
+            .await
+            .unwrap();
+
+        assert!(
+            grade_round_outcomes(&app).contains(&"pass".to_string()),
+            "an enabled Edit step with changes triggers a grade loop that passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn grading_does_not_trigger_when_disabled() {
+        let dir = tempdir().unwrap();
+        // Default config: grading disabled. Same edit-producing prompt.
+        let config = fake_config(dir.path());
+        assert!(!config.grading.enabled);
+        let mut app = App::new(config).await.unwrap();
+
+        app.submit_prompt("write action create a feature grade pass")
+            .await
+            .unwrap();
+
+        assert!(
+            grade_round_outcomes(&app).is_empty(),
+            "no grade loop runs when grading is disabled (default behavior preserved)"
+        );
+    }
+
+    #[tokio::test]
+    async fn grading_does_not_trigger_for_a_no_change_edit_step() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+
+        // A `typo` prompt routes to the Edit-capable fixer, but with no write
+        // marker it changes no files → empty `changed_files` → gate is false.
+        // (Read-only agents likewise produce no changes, so this also covers the
+        // no-Edit-capability path.)
+        app.submit_prompt("fix the typo grade pass").await.unwrap();
+
+        assert!(
+            grade_round_outcomes(&app).is_empty(),
+            "a no-change step does not trigger grading"
+        );
+    }
+
+    #[tokio::test]
+    async fn grading_does_not_recurse_through_fix_substeps() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+
+        app.submit_prompt("write action create a feature grade flaky")
+            .await
+            .unwrap();
+
+        // The flaky loop re-dispatches the fixer once (a grade fix sub-step). That
+        // sub-step runs via run_grading_substep, NOT run_agent_step, so it cannot
+        // re-trigger grading: the loop stays bounded at exactly max_attempts
+        // `working` rounds rather than spawning nested grade loops.
+        let working = grade_round_outcomes(&app)
+            .iter()
+            .filter(|outcome| *outcome == "working")
+            .count();
+        assert_eq!(working, 2, "exactly max_attempts rounds — no recursion");
+        assert!(grade_round_outcomes(&app).contains(&"pass".to_string()));
+    }
+
+    // ── cycle-exhaustion escalation: accept / retry / abort (task_07) ──
+
+    async fn resolve_escalation(app: &mut App, option_id: &str) -> Result<()> {
+        let view = app
+            .state
+            .pending_clarification
+            .clone()
+            .expect("a clarification is pending");
+        app.resolve_pending_clarification(ClarificationAnswer {
+            question_id: view.question_id,
+            answer: option_id.to_string(),
+            selected_option_id: Some(option_id.to_string()),
+            selected_option_label: None,
+            answer_source: "recommended".to_string(),
+        })
+        .await
+    }
+
+    fn fail_round_count(app: &App) -> usize {
+        grade_round_outcomes(app)
+            .iter()
+            .filter(|outcome| *outcome == "fail")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn grade_exhaustion_pauses_with_accept_retry_abort() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        app.submit_prompt("write action create a feature grade fail")
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        let view = app
+            .state
+            .pending_clarification
+            .clone()
+            .expect("escalation pending");
+        let ids: Vec<&str> = view.options.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, vec!["accept", "retry", "abort"]);
+        assert!(view.options.iter().all(|o| !o.label.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn grade_escalation_abort_fails_the_run() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        app.submit_prompt("write action create a feature grade fail")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        resolve_escalation(&mut app, "abort").await.unwrap();
+        assert_eq!(app.state.run_state, RunState::Failed);
+    }
+
+    #[tokio::test]
+    async fn grade_escalation_accept_continues_the_run() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        app.submit_prompt("write action create a feature grade fail")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        resolve_escalation(&mut app, "accept").await.unwrap();
+        assert_ne!(
+            app.state.run_state,
+            RunState::Failed,
+            "accept keeps the work and continues the run"
+        );
+        assert_ne!(app.state.run_state, RunState::WaitingForUser);
+        assert!(app.history.read_events().unwrap().iter().any(|event| {
+            event.kind == "grade_escalation_resolved"
+                && event
+                    .payload
+                    .get("outcome")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("accept_unverified")
+        }));
+    }
+
+    #[tokio::test]
+    async fn grade_escalation_retry_reruns_the_loop_with_a_fresh_budget() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        app.submit_prompt("write action create a feature grade fail")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert_eq!(fail_round_count(&app), 2, "first loop exhausted 2 attempts");
+
+        resolve_escalation(&mut app, "retry").await.unwrap();
+        // Retry re-runs the grade loop with a fresh budget; it still never passes,
+        // so it exhausts again and re-escalates.
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+        assert_eq!(
+            fail_round_count(&app),
+            4,
+            "retry ran a fresh 2-attempt loop"
+        );
+        // Round numbers continue across the retry (1,2 then 3,4) rather than
+        // resetting to 1, so the collapsing Grade chat item accumulates instead
+        // of overwriting the first cycle.
+        let max_round = app
+            .history
+            .read_events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == crate::history::GRADE_ROUND_KIND)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("round")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_round, 4,
+            "retry continues round numbering, not reset to 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_clarification_with_retry_option_is_not_hijacked() {
+        let dir = tempdir().unwrap();
+        let mut app = grading_app(dir.path(), 2).await;
+        // A normal clarification (no grade_escalation marker).
+        app.submit_prompt("needs clarification about the feature")
+            .await
+            .unwrap();
+        assert_eq!(app.state.run_state, RunState::WaitingForUser);
+
+        // Resolving with option id "retry" must follow the ordinary
+        // append-and-re-drive path, NOT the grade-escalation router.
+        resolve_escalation(&mut app, "retry").await.unwrap();
+        assert_ne!(app.state.run_state, RunState::Failed);
+        assert!(
+            !app.history.read_events().unwrap().iter().any(|event| {
+                event.kind == "clarification_requested"
+                    && event
+                        .payload
+                        .get("grade_escalation")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            }),
+            "a normal clarification never raises a grade escalation"
+        );
     }
 
     #[tokio::test]

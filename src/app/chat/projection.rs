@@ -7,9 +7,9 @@ use super::{
 use crate::app::{LiveStepStatus, LiveStepView, PendingApprovalView};
 use crate::history::{
     HistoryEvent, EXECUTION_GRAPH_APPROVED_KIND, EXECUTION_GRAPH_COMPLETED_KIND,
-    EXECUTION_GRAPH_PROPOSED_KIND, EXECUTION_GRAPH_REJECTED_KIND, NODE_CANCELLED_KIND,
-    NODE_FAILED_KIND, NODE_PENDING_KIND, NODE_READY_KIND, NODE_RUNNING_KIND, NODE_SKIPPED_KIND,
-    NODE_SUCCEEDED_KIND,
+    EXECUTION_GRAPH_PROPOSED_KIND, EXECUTION_GRAPH_REJECTED_KIND, GRADE_ROUND_KIND,
+    NODE_CANCELLED_KIND, NODE_FAILED_KIND, NODE_PENDING_KIND, NODE_READY_KIND, NODE_RUNNING_KIND,
+    NODE_SKIPPED_KIND, NODE_SUCCEEDED_KIND,
 };
 use crate::hooks::HookLifecyclePayload;
 use serde_json::Value;
@@ -55,6 +55,10 @@ struct ActionContext {
     /// Capped slice of a `write_file` action's content, so a created file can
     /// show a preview of what was written (not just its byte count).
     content_preview: Option<String>,
+    /// MCP action params (task_08): the server id and (for `call_mcp_tool`) the
+    /// tool name, so the transcript shows `server/tool` in the title.
+    server: Option<String>,
+    tool: Option<String>,
 }
 
 impl ChatProjection {
@@ -73,6 +77,13 @@ impl ChatProjection {
     pub fn apply_history_event(&mut self, event: &HistoryEvent) {
         match event.kind.as_str() {
             "session_started" | "session_ended" => {}
+            // Audit/observability-only MCP events: preserved in the durable log,
+            // never rendered as chat. The catalog snapshot (task_07) feeds the
+            // orchestrator prompt; `mcp_tool_called`/`mcp_tool_result` are metric
+            // events for `--doctor` (task_10). The transcript view of an MCP call
+            // comes from the standard `action_requested`/`action_completed` events
+            // (task_08), so rendering these too would duplicate it.
+            "mcp_catalog_snapshot" | "mcp_tool_called" | "mcp_tool_result" => {}
             "run_started" => self.apply_run_started(event),
             "prompt_submitted" => self.apply_user_prompt(event),
             "clarification_requested" => self.apply_clarification_requested(event),
@@ -92,6 +103,7 @@ impl ChatProjection {
             "trust_granted" | "trust_revoked" | "trust_cleared" | "trust_listed" => {
                 self.apply_trust_event(event)
             }
+            "mcp_server_trusted" | "mcp_server_revoked" => self.apply_mcp_trust_event(event),
             "action_denied" => self.apply_action_denied(event),
             "action_completed" => self.apply_action_completed(event),
             "artifact_written" => self.apply_artifact_written(event),
@@ -125,6 +137,7 @@ impl ChatProjection {
             "blocker_reported" => self.apply_blocker(event),
             "hook_started" => self.apply_hook_started(event),
             "hook_completed" => self.apply_hook_completed(event),
+            GRADE_ROUND_KIND => self.apply_grade_round(event),
             "config_viewed"
             | "session_goal_viewed"
             | "session_goal_set"
@@ -274,6 +287,24 @@ impl ChatProjection {
                 diagnostic,
                 MAX_SUMMARY_CHARS,
             )));
+        }
+        // MCP trust legibility (task_09): show the origin server + trust tier and
+        // the tool's FULL untruncated description, so the user can see exactly what
+        // the tool claims to do before trusting the server.
+        if let Some(server) = approval.mcp_server.as_deref() {
+            let tier = if approval.mcp_trusted {
+                "trusted"
+            } else {
+                "untrusted"
+            };
+            let origin = match approval.mcp_tool.as_deref() {
+                Some(tool) => format!("MCP tool {server}/{tool} ({tier} server)"),
+                None => format!("MCP server {server} ({tier})"),
+            };
+            body.push(ChatLineView::muted(origin));
+            if let Some(description) = approval.mcp_description.as_deref() {
+                body.push(ChatLineView::plain(format!("description: {description}")));
+            }
         }
         self.upsert(ItemInput {
             lifecycle_key: Some(key),
@@ -626,6 +657,14 @@ impl ChatProjection {
                 .get("params")
                 .and_then(|params| string_field(params, "content"))
                 .map(|content| capped_content_preview(&content)),
+            server: event
+                .payload
+                .get("params")
+                .and_then(|params| string_field(params, "server")),
+            tool: event
+                .payload
+                .get("params")
+                .and_then(|params| string_field(params, "tool")),
         };
         if context.kind.as_deref() == Some("write_file") && context.content_bytes.is_none() {
             context.content_bytes = event
@@ -946,6 +985,37 @@ impl ChatProjection {
         });
     }
 
+    /// Project an MCP trust promote/revoke into the transcript (task_09): a small
+    /// info item so trust decisions are visible and auditable in chat.
+    fn apply_mcp_trust_event(&mut self, event: &HistoryEvent) {
+        let server =
+            string_field(&event.payload, "server").unwrap_or_else(|| "<server>".to_string());
+        let (title, message) = if event.kind == "mcp_server_trusted" {
+            (
+                "MCP server trusted",
+                format!("Trusted MCP server {server}."),
+            )
+        } else {
+            (
+                "MCP server trust revoked",
+                format!("Revoked trust for MCP server {server}."),
+            )
+        };
+        self.upsert(ItemInput {
+            lifecycle_key: None,
+            kind: ChatItemKind::Diagnostic,
+            status: ChatItemStatus::Completed,
+            severity: ChatSeverity::Info,
+            title: title.to_string(),
+            summary: Some(message.clone()),
+            body: vec![ChatLineView::muted(message)],
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
     fn apply_action_denied(&mut self, event: &HistoryEvent) {
         let Some(action_id) = string_field(&event.payload, "action_id") else {
             return;
@@ -998,8 +1068,68 @@ impl ChatProjection {
             Some("apply_patch" | "write_file") => {
                 self.apply_action_completed_file_edit(event, &action_id, &status, &context)
             }
+            Some("call_mcp_tool" | "read_mcp_resource" | "list_mcp_resources") => {
+                self.apply_action_completed_mcp(event, &action_id, &status, &context)
+            }
             _ => self.apply_action_completed_generic(event, &action_id, &status, &context),
         }
+    }
+
+    /// Project a completed MCP action (task_08): the tool/server in the title,
+    /// the result content as a body capped at [`CONTENT_PREVIEW_CAP_BYTES`] (8KB),
+    /// and an error status on failure (mirroring command failures).
+    fn apply_action_completed_mcp(
+        &mut self,
+        event: &HistoryEvent,
+        action_id: &str,
+        status: &str,
+        context: &ActionContext,
+    ) {
+        let Some(key) = action_key(event, action_id) else {
+            return;
+        };
+        let label = context
+            .kind
+            .as_deref()
+            .map(action_kind_label)
+            .unwrap_or("MCP action");
+        let target = match (context.server.as_deref(), context.tool.as_deref()) {
+            (Some(server), Some(tool)) => format!("{server}/{tool}"),
+            (Some(server), None) => server.to_string(),
+            _ => label.to_string(),
+        };
+        let mut body = Vec::new();
+        // Result content preview, capped at 8KB.
+        if let Some(content) = event.payload.get("content") {
+            let rendered = match content.as_str() {
+                Some(text) => text.to_string(),
+                None => content.to_string(),
+            };
+            if !rendered.is_empty() {
+                body.push(ChatLineView::code(capped_content_preview(&rendered)));
+            }
+        }
+        if let Some(diagnostic) = string_field(&event.payload, "diagnostic") {
+            let line = if status == "failed" {
+                ChatLineView::error(concise(&diagnostic, MAX_SUMMARY_CHARS))
+            } else {
+                ChatLineView::warning(concise(&diagnostic, MAX_SUMMARY_CHARS))
+            };
+            body.push(line);
+        }
+        self.upsert(ItemInput {
+            lifecycle_key: Some(key),
+            kind: ChatItemKind::ActionRequested,
+            status: status_to_item_status(status, None),
+            severity: severity_for_action_status(status, None),
+            title: format!("{label} {}: {target}", status.replace('_', " ")),
+            summary: string_field(&event.payload, "summary"),
+            body,
+            details: history_detail(event, "result"),
+            source: source_from_event(event, Some(action_id.to_string())),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
     }
 
     fn apply_action_completed_command(
@@ -1702,6 +1832,93 @@ impl ChatProjection {
         });
     }
 
+    /// Project one `grade_round` event into the single evolving `Grade { run_id }`
+    /// item: accumulate one line per round (replacing the current round's line so
+    /// `working` → resolved updates in place), drive status/severity from the
+    /// outcome, and bound the body to `MAX_BODY_LINES` with a header when rounds
+    /// overflow. Modeled on `apply_clarification_answered` (read prior item via the
+    /// key index, rebuild body, upsert under the same key) — never routed through
+    /// `apply_diagnostic`, so the loop renders as exactly one item.
+    fn apply_grade_round(&mut self, event: &HistoryEvent) {
+        let Some(key) = grade_key(event) else {
+            return;
+        };
+        let round = event
+            .payload
+            .get("round")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_rounds = event
+            .payload
+            .get("max_rounds")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let outcome =
+            string_field(&event.payload, "outcome").unwrap_or_else(|| "working".to_string());
+        let command = string_field(&event.payload, "command");
+        let exit_code = event.payload.get("exit_code").and_then(Value::as_i64);
+        let critique = string_field(&event.payload, "critique");
+
+        // Round lines accumulated so far (the bounded-body header is filtered out).
+        let mut rounds: Vec<ChatLineView> = self
+            .index
+            .get(&key)
+            .copied()
+            .and_then(|index| self.items.get(index))
+            .map(|item| {
+                item.body
+                    .iter()
+                    .filter(|line| round_of_grade_line(&line.text).is_some())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let line = grade_round_line(round, max_rounds, &outcome, command.as_deref(), exit_code);
+        match rounds
+            .iter()
+            .position(|existing| round_of_grade_line(&existing.text) == Some(round))
+        {
+            Some(pos) => rounds[pos] = line,
+            None => rounds.push(line),
+        }
+        let body = bound_grade_body(rounds, round);
+
+        let (status, severity) = match outcome.as_str() {
+            "pass" => (ChatItemStatus::Completed, ChatSeverity::Success),
+            "skip" => (ChatItemStatus::Completed, ChatSeverity::Info),
+            "fail" if max_rounds > 0 && round >= max_rounds => {
+                (ChatItemStatus::Failed, ChatSeverity::Error)
+            }
+            "fail" => (ChatItemStatus::Running, ChatSeverity::Warning),
+            // "working" and any unrecognized state stay in progress.
+            _ => (ChatItemStatus::Running, ChatSeverity::Info),
+        };
+
+        let summary = match outcome.as_str() {
+            "pass" => Some("Verified".to_string()),
+            "skip" => Some("Unverified — no canonical check ran".to_string()),
+            "fail" => critique
+                .clone()
+                .or_else(|| Some(format!("Round {round}/{max_rounds}: failed"))),
+            _ => Some(format!("Verifying (round {round}/{max_rounds})")),
+        };
+
+        self.upsert(ItemInput {
+            lifecycle_key: Some(key),
+            kind: ChatItemKind::GradeLoop,
+            status,
+            severity,
+            title: "Verification".to_string(),
+            summary,
+            body,
+            details: history_detail(event, "history"),
+            source: source_from_event(event, None),
+            updated_at: event.timestamp.clone(),
+            fallback_event_id: event.event_id.clone(),
+        });
+    }
+
     /// Project a `governance_decision_requested` event (payload = a serialized
     /// `GovernanceDecisionView`) into a `WaitingForUser` decision card. Risk is
     /// conveyed by an explicit text label so it stays legible under `NO_COLOR`.
@@ -2005,6 +2222,25 @@ fn action_requested_view(
                 write_file_preview_body(context),
             )
         }
+        Some("call_mcp_tool") => {
+            let server = context.server.as_deref().unwrap_or("<server>");
+            let tool = context.tool.as_deref().unwrap_or("<tool>");
+            (
+                ChatItemKind::ActionRequested,
+                format!("MCP tool requested: {server}/{tool}"),
+                Some("pending".to_string()),
+                Vec::new(),
+            )
+        }
+        Some(kind @ ("read_mcp_resource" | "list_mcp_resources")) => {
+            let server = context.server.as_deref().unwrap_or("<server>");
+            (
+                ChatItemKind::ActionRequested,
+                format!("{} requested: {server}", action_kind_label(kind)),
+                Some("pending".to_string()),
+                Vec::new(),
+            )
+        }
         Some(kind) => (
             ChatItemKind::ActionRequested,
             format!("Action requested: {}", action_kind_label(kind)),
@@ -2272,6 +2508,75 @@ fn clarification_key(event: &HistoryEvent) -> Option<ChatLifecycleKey> {
         run_id: event.run_id.clone()?,
         question_id: string_field(&event.payload, "question_id")?,
     })
+}
+
+/// The single grade-loop key for a run (one evolving item per run).
+fn grade_key(event: &HistoryEvent) -> Option<ChatLifecycleKey> {
+    Some(ChatLifecycleKey::Grade {
+        run_id: event
+            .run_id
+            .clone()
+            .or_else(|| string_field(&event.payload, "run_id"))?,
+    })
+}
+
+/// Parse the round number from a `Round {n}/{max}: …` body line, so accumulation
+/// can replace the current round's line in place. Returns `None` for non-round
+/// lines (e.g. the bounded-body header), excluding them from the round set.
+fn round_of_grade_line(text: &str) -> Option<u64> {
+    text.strip_prefix("Round ")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|n| n.trim().parse::<u64>().ok())
+}
+
+/// Build the one-line summary for a grade round, styled by outcome (a terminal
+/// failure at the last round is an error; an earlier failure is a warning).
+fn grade_round_line(
+    round: u64,
+    max_rounds: u64,
+    outcome: &str,
+    command: Option<&str>,
+    exit_code: Option<i64>,
+) -> ChatLineView {
+    let prefix = format!("Round {round}/{max_rounds}");
+    let check = match (command, exit_code) {
+        (Some(command), Some(code)) => format!(" — {command} exit {code}"),
+        (Some(command), None) => format!(" — {command}"),
+        _ => String::new(),
+    };
+    match outcome {
+        "pass" => ChatLineView::plain(format!("{prefix}: PASS{check}")),
+        "fail" if max_rounds > 0 && round >= max_rounds => {
+            ChatLineView::error(format!("{prefix}: FAIL{check}"))
+        }
+        "fail" => ChatLineView::warning(format!("{prefix}: FAIL{check}")),
+        "skip" => ChatLineView::muted(format!(
+            "{prefix}: SKIP — unverified (no canonical check ran)"
+        )),
+        // "working" and any unrecognized state.
+        _ => ChatLineView::muted(format!("{prefix}: verifying…")),
+    }
+}
+
+/// Bound accumulated round lines to `MAX_BODY_LINES`, keeping a header plus the
+/// most-recent rounds when they overflow so the latest retries stay visible.
+/// `latest_round` is the current (highest) round number; the dropped count is
+/// derived from it — not from the visible line count — so the header stays
+/// stable once rounds have scrolled out (the visible set can refill to exactly
+/// the cap on the next round, which would otherwise drop the header).
+fn bound_grade_body(rounds: Vec<ChatLineView>, latest_round: u64) -> Vec<ChatLineView> {
+    if rounds.len() <= MAX_BODY_LINES && (latest_round as usize) <= MAX_BODY_LINES {
+        return rounds;
+    }
+    let keep = MAX_BODY_LINES - 1;
+    let dropped = latest_round.saturating_sub(keep as u64);
+    let skip = rounds.len().saturating_sub(keep);
+    let mut body = Vec::with_capacity(MAX_BODY_LINES);
+    body.push(ChatLineView::muted(format!(
+        "… {dropped} earlier round(s) omitted"
+    )));
+    body.extend(rounds.into_iter().skip(skip));
+    body
 }
 
 fn governance_decision_key(event: &HistoryEvent) -> Option<ChatLifecycleKey> {
@@ -3010,6 +3315,9 @@ fn action_kind_label(kind: &str) -> &'static str {
         "apply_patch" => "Apply patch",
         "write_file" => "Write file",
         "record_note" => "Record note",
+        "call_mcp_tool" => "Call MCP tool",
+        "read_mcp_resource" => "Read MCP resource",
+        "list_mcp_resources" => "List MCP resources",
         _ => "Action",
     }
 }
@@ -3319,6 +3627,144 @@ mod tests {
             .filter(|item| item.kind == ChatItemKind::Plan)
             .cloned()
             .collect()
+    }
+
+    // ── collapsing grade-loop projection (self-grading task_04) ──
+
+    fn grade_event(
+        round: u64,
+        max_rounds: u64,
+        outcome: &str,
+        command: Option<&str>,
+        exit_code: Option<i64>,
+    ) -> HistoryEvent {
+        let mut payload = json!({
+            "round": round,
+            "max_rounds": max_rounds,
+            "outcome": outcome,
+        });
+        if let Some(command) = command {
+            payload["command"] = json!(command);
+        }
+        if let Some(exit_code) = exit_code {
+            payload["exit_code"] = json!(exit_code);
+        }
+        event(GRADE_ROUND_KIND, Some("run-1"), None, payload)
+    }
+
+    fn grade_items(projection: &ChatProjection) -> Vec<ChatItemView> {
+        projection
+            .items()
+            .iter()
+            .filter(|item| item.kind == ChatItemKind::GradeLoop)
+            .cloned()
+            .collect()
+    }
+
+    fn body_text(item: &ChatItemView) -> String {
+        item.body
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn grade_rounds_collapse_into_one_item() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&grade_event(1, 2, "working", None, None));
+        projection.apply_history_event(&grade_event(1, 2, "fail", Some("cargo test"), Some(1)));
+        projection.apply_history_event(&grade_event(2, 2, "pass", Some("cargo test"), Some(0)));
+
+        let items = grade_items(&projection);
+        assert_eq!(items.len(), 1, "the loop renders as exactly one item");
+        let item = &items[0];
+        // Round 1's working line was replaced in place by its FAIL resolution, so
+        // only the two resolved rounds remain.
+        let text = body_text(item);
+        assert!(
+            text.contains("Round 1/2: FAIL"),
+            "round 1 fail line: {text}"
+        );
+        assert!(
+            text.contains("Round 2/2: PASS"),
+            "round 2 pass line: {text}"
+        );
+        assert!(!text.contains("verifying"), "working line replaced: {text}");
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert_eq!(item.severity, ChatSeverity::Success);
+    }
+
+    #[test]
+    fn grade_nonterminal_fail_is_running_warning() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&grade_event(1, 2, "fail", Some("cargo test"), Some(1)));
+        let item = &grade_items(&projection)[0];
+        assert!(body_text(item).contains("Round 1/2: FAIL — cargo test exit 1"));
+        assert_eq!(item.status, ChatItemStatus::Running);
+        assert_eq!(item.severity, ChatSeverity::Warning);
+    }
+
+    #[test]
+    fn grade_terminal_fail_marks_item_failed() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&grade_event(2, 2, "fail", Some("cargo test"), Some(1)));
+        let item = &grade_items(&projection)[0];
+        assert_eq!(item.status, ChatItemStatus::Failed);
+        assert_eq!(item.severity, ChatSeverity::Error);
+    }
+
+    #[test]
+    fn grade_skip_renders_unverified_and_completes() {
+        let mut projection = ChatProjection::new();
+        projection.apply_history_event(&grade_event(1, 2, "skip", None, None));
+        let item = &grade_items(&projection)[0];
+        assert!(body_text(item).contains("unverified"));
+        assert_eq!(item.status, ChatItemStatus::Completed);
+    }
+
+    #[test]
+    fn grade_body_is_bounded_with_a_header_when_rounds_overflow() {
+        let mut projection = ChatProjection::new();
+        // 14 distinct passing rounds → bounded to a header + the most-recent 11.
+        for round in 1..=14 {
+            projection.apply_history_event(&grade_event(
+                round,
+                14,
+                "pass",
+                Some("cargo test"),
+                Some(0),
+            ));
+        }
+        let item = &grade_items(&projection)[0];
+        assert_eq!(
+            item.body.len(),
+            MAX_BODY_LINES,
+            "body capped to MAX_BODY_LINES"
+        );
+        assert!(
+            item.body[0].text.contains("earlier round"),
+            "first line is the omission header: {}",
+            item.body[0].text
+        );
+        let text = body_text(item);
+        assert!(text.contains("Round 14/14: PASS"), "most-recent round kept");
+        assert!(!text.contains("Round 1/14:"), "oldest round dropped");
+    }
+
+    #[test]
+    fn grade_projection_is_deterministic_under_rebuild() {
+        let events = vec![
+            grade_event(1, 2, "working", None, None),
+            grade_event(1, 2, "fail", Some("cargo test"), Some(1)),
+            grade_event(2, 2, "pass", Some("cargo test"), Some(0)),
+        ];
+        let mut sequential = ChatProjection::new();
+        for event in &events {
+            sequential.apply_history_event(event);
+        }
+        let rebuilt = ChatProjection::rebuild(&events);
+        assert_eq!(grade_items(&sequential), grade_items(&rebuilt));
     }
 
     #[test]
@@ -4351,6 +4797,141 @@ mod tests {
         assert_eq!(projection.items()[0].severity, ChatSeverity::Success);
     }
 
+    // ── MCP tool-call projection (task_08) ──
+
+    fn mcp_call_requested() -> HistoryEvent {
+        event(
+            "action_requested",
+            Some("run"),
+            Some("step"),
+            json!({
+                "schema_version": 1,
+                "action_id": "mcp-1",
+                "step_id": "step",
+                "kind": "call_mcp_tool",
+                "params": { "server": "filesystem", "tool": "read_file", "args": {} }
+            }),
+        )
+    }
+
+    #[test]
+    fn mcp_call_requested_projects_pending_with_tool_name() {
+        let projection = ChatProjection::rebuild(&[mcp_call_requested()]);
+        assert_eq!(projection.items().len(), 1);
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Pending);
+        assert!(
+            item.title.contains("filesystem/read_file"),
+            "title should name the tool: {}",
+            item.title
+        );
+    }
+
+    #[test]
+    fn mcp_call_completed_projects_completed_item() {
+        let events = vec![
+            mcp_call_requested(),
+            event(
+                "action_completed",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "mcp-1",
+                    "status": "completed",
+                    "summary": "Called MCP tool 'read_file' on 'filesystem'.",
+                    "content": [ { "type": "text", "text": "file contents" } ],
+                    "diagnostic": null
+                }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        assert_eq!(
+            projection.items().len(),
+            1,
+            "call→result is one evolving item"
+        );
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Completed);
+        assert!(item.title.contains("filesystem/read_file"));
+        assert!(
+            item.body
+                .iter()
+                .any(|line| line.text.contains("file contents")),
+            "result content should appear in the body"
+        );
+    }
+
+    #[test]
+    fn mcp_call_failed_projects_error_item() {
+        let events = vec![
+            mcp_call_requested(),
+            event(
+                "action_completed",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "mcp-1",
+                    "status": "failed",
+                    "summary": "MCP tool 'read_file' on 'filesystem' failed.",
+                    "content": null,
+                    "diagnostic": "connection closed"
+                }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        let item = &projection.items()[0];
+        assert_eq!(item.status, ChatItemStatus::Failed);
+        assert_eq!(item.severity, ChatSeverity::Error);
+        assert!(item
+            .body
+            .iter()
+            .any(|line| line.text.contains("connection closed")));
+    }
+
+    #[test]
+    fn mcp_result_body_is_capped_at_8kb() {
+        let big = "x".repeat(20 * 1024);
+        let events = vec![
+            mcp_call_requested(),
+            event(
+                "action_completed",
+                Some("run"),
+                Some("step"),
+                json!({
+                    "schema_version": 1,
+                    "action_id": "mcp-1",
+                    "status": "completed",
+                    "summary": "ok",
+                    "content": big,
+                    "diagnostic": null
+                }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        let body_text = &projection.items()[0].body[0].text;
+        assert!(
+            body_text.len() <= CONTENT_PREVIEW_CAP_BYTES + 128,
+            "MCP result body should be capped near 8KB, was {}",
+            body_text.len()
+        );
+        assert!(
+            body_text.len() < 20 * 1024,
+            "the 20KB content must be truncated"
+        );
+    }
+
+    #[test]
+    fn action_kind_label_resolves_mcp_kinds() {
+        assert_eq!(action_kind_label("call_mcp_tool"), "Call MCP tool");
+        assert_eq!(action_kind_label("read_mcp_resource"), "Read MCP resource");
+        assert_eq!(
+            action_kind_label("list_mcp_resources"),
+            "List MCP resources"
+        );
+    }
+
     #[test]
     fn recoverable_denial_is_warning() {
         let events = vec![
@@ -5054,6 +5635,58 @@ mod tests {
             .all(|line| line.text != FIRST_APPROVAL_EXPLAINER));
         // The approval summary remains the first body line (unchanged semantics).
         assert_eq!(item.body[0].text, approval.summary);
+    }
+
+    #[test]
+    fn mcp_approval_card_shows_full_description_and_origin() {
+        let mut projection = ChatProjection::rebuild(&[]);
+        let mut approval = pending_approval_view();
+        approval.mcp_server = Some("filesystem".to_string());
+        approval.mcp_tool = Some("read_file".to_string());
+        approval.mcp_description = Some("Reads any file the user names.".to_string());
+        approval.mcp_trusted = false;
+        projection.apply_pending_approval(Some(&approval), false);
+
+        let item = &projection.items()[0];
+        let body: String = item
+            .body
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("filesystem/read_file"), "origin: {body}");
+        assert!(body.contains("untrusted"), "tier: {body}");
+        // The full untruncated description is surfaced.
+        assert!(
+            body.contains("Reads any file the user names."),
+            "desc: {body}"
+        );
+    }
+
+    #[test]
+    fn mcp_trust_events_project_into_transcript() {
+        let events = vec![
+            event(
+                "mcp_server_trusted",
+                Some("run"),
+                None,
+                json!({ "server": "filesystem" }),
+            ),
+            event(
+                "mcp_server_revoked",
+                Some("run"),
+                None,
+                json!({ "server": "filesystem" }),
+            ),
+        ];
+        let projection = ChatProjection::rebuild(&events);
+        assert_eq!(projection.items().len(), 2);
+        assert!(projection.items()[0].title.contains("trusted"));
+        assert!(projection.items()[1].title.contains("revoked"));
+        assert!(projection.items()[1]
+            .body
+            .iter()
+            .any(|line| line.text.contains("filesystem")));
     }
 
     #[test]

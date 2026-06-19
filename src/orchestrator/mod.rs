@@ -1,4 +1,5 @@
 use crate::config::{AgentProfile, Capability, EffectiveConfig};
+use crate::mcp::ToolCatalog;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -347,6 +348,110 @@ impl AgentResult {
             blocker: None,
             artifacts: Vec::new(),
         }
+    }
+}
+
+/// The outcome of a grading round (ADR-004). Harness-constructed from canonical
+/// command exit codes — never deserialized from agent output, so a fabricated
+/// `AgentResult.status`/`verification` cannot manufacture a `Pass`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GradeOutcome {
+    Pass,
+    Fail,
+    Skip,
+}
+
+/// The decisive grading verdict. `command`/`exit_code` record the canonical
+/// check that grounded it; `critique` carries the failure excerpt fed to the
+/// producing agent on `Fail`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraderVerdict {
+    pub outcome: GradeOutcome,
+    pub command: Option<String>,
+    pub exit_code: Option<i64>,
+    pub critique: Option<String>,
+}
+
+/// One command the grade sub-step ran, sourced from the structured
+/// `command_completed` record (never model-authored text). `exit_code` is
+/// `None` when the command was denied or never produced a completion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandOutcome {
+    pub command: String,
+    pub exit_code: Option<i64>,
+    /// Optional captured output excerpt, used to seed the `critique` on failure.
+    pub excerpt: Option<String>,
+}
+
+/// Derive the grading verdict purely from the grade step's recorded command
+/// results (ADR-004):
+/// - `Pass` — at least one canonical verification command ran and every
+///   canonical command exited `0`.
+/// - `Fail` — at least one canonical command ran and any exited non-zero (or
+///   produced no exit code, treated as a non-pass for that check).
+/// - `Skip` — no canonical verification command ran at all.
+///
+/// Only commands accepted by [`crate::actions::is_canonical_verification_command`]
+/// count; everything else (e.g. `echo`, `cargo run`) is ignored.
+pub fn derive_grade_verdict(commands: &[CommandOutcome]) -> GraderVerdict {
+    let canonical: Vec<&CommandOutcome> = commands
+        .iter()
+        .filter(|outcome| crate::actions::is_canonical_verification_command(&outcome.command))
+        .collect();
+
+    if canonical.is_empty() {
+        return GraderVerdict {
+            outcome: GradeOutcome::Skip,
+            command: None,
+            exit_code: None,
+            critique: None,
+        };
+    }
+
+    // First canonical command that did not cleanly exit 0 decides a Fail.
+    if let Some(failed) = canonical
+        .iter()
+        .find(|outcome| outcome.exit_code != Some(0))
+    {
+        let critique = match &failed.excerpt {
+            Some(excerpt) if !excerpt.trim().is_empty() => format!(
+                "`{}` failed ({}):\n{}",
+                failed.command,
+                describe_exit(failed.exit_code),
+                excerpt.trim()
+            ),
+            _ => format!(
+                "`{}` failed ({})",
+                failed.command,
+                describe_exit(failed.exit_code)
+            ),
+        };
+        return GraderVerdict {
+            outcome: GradeOutcome::Fail,
+            command: Some(failed.command.clone()),
+            exit_code: failed.exit_code,
+            critique: Some(critique),
+        };
+    }
+
+    // Every canonical command exited 0 → Pass, attributed to the last one.
+    let decided = canonical
+        .last()
+        .expect("non-empty canonical set has a last element");
+    GraderVerdict {
+        outcome: GradeOutcome::Pass,
+        command: Some(decided.command.clone()),
+        exit_code: decided.exit_code,
+        critique: None,
+    }
+}
+
+/// Render an exit code for a critique, naming the no-completion case explicitly.
+fn describe_exit(exit_code: Option<i64>) -> String {
+    match exit_code {
+        Some(code) => format!("exit {code}"),
+        None => "no exit code".to_string(),
     }
 }
 
@@ -928,6 +1033,20 @@ fn validate_agent_reference(
 }
 
 pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
+    // No MCP advertisement without a recorded snapshot (replay-safe default).
+    build_orchestrator_prompt_with_mcp(config, &ToolCatalog::default())
+}
+
+/// Build the orchestrator prompt, advertising MCP tools from a **recorded
+/// snapshot** (ADR-001). `mcp_catalog` must come from the `mcp_catalog_snapshot`
+/// event, never a live supervisor handle, so the prompt is deterministic and
+/// replay-stable. The orchestrator module deliberately never imports the live
+/// supervisor handle type (guard test
+/// `orchestrator_prompt_never_reads_live_mcp_handle`).
+pub fn build_orchestrator_prompt_with_mcp(
+    config: &EffectiveConfig,
+    mcp_catalog: &ToolCatalog,
+) -> String {
     let base = config
         .agents
         .get("orchestrator")
@@ -963,6 +1082,32 @@ pub fn build_orchestrator_prompt(config: &EffectiveConfig) -> String {
             config.council.default_preset
         ),
     ]);
+
+    // Advertise MCP tools from the recorded snapshot (ADR-001). Omitted entirely
+    // when no servers/tools were snapshotted, so prompts for MCP-disabled or
+    // server-less runs are unchanged.
+    let mcp_lines: Vec<String> = mcp_catalog
+        .servers
+        .iter()
+        .flat_map(|server| {
+            server.tools.iter().map(move |tool| {
+                let description = tool
+                    .description
+                    .as_deref()
+                    .unwrap_or("(no description)")
+                    .trim();
+                format!("- {}/{}: {description}", server.server, tool.name)
+            })
+        })
+        .collect();
+    if !mcp_lines.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "Available MCP tools (invoke via a CallMcpTool action through a specialist agent):"
+                .to_string(),
+        );
+        lines.extend(mcp_lines);
+    }
 
     lines.extend([
         String::new(),
@@ -1057,6 +1202,85 @@ mod tests {
     use crate::config::{load_effective_config, ConfigLoadOptions};
     use tempfile::tempdir;
 
+    fn outcome(command: &str, exit_code: Option<i64>) -> CommandOutcome {
+        CommandOutcome {
+            command: command.to_string(),
+            exit_code,
+            excerpt: None,
+        }
+    }
+
+    #[test]
+    fn derive_grade_verdict_passes_when_canonical_check_exits_zero() {
+        let verdict = derive_grade_verdict(&[outcome("cargo test", Some(0))]);
+        assert_eq!(verdict.outcome, GradeOutcome::Pass);
+        assert_eq!(verdict.command.as_deref(), Some("cargo test"));
+        assert_eq!(verdict.exit_code, Some(0));
+        assert!(verdict.critique.is_none());
+    }
+
+    #[test]
+    fn derive_grade_verdict_fails_with_critique_on_nonzero() {
+        let verdict = derive_grade_verdict(&[CommandOutcome {
+            command: "cargo test".to_string(),
+            exit_code: Some(1),
+            excerpt: Some("test foo ... FAILED".to_string()),
+        }]);
+        assert_eq!(verdict.outcome, GradeOutcome::Fail);
+        assert_eq!(verdict.exit_code, Some(1));
+        let critique = verdict.critique.expect("fail carries a critique");
+        assert!(
+            critique.contains("cargo test"),
+            "critique names the command"
+        );
+        assert!(
+            critique.contains("exit 1"),
+            "critique carries the exit code"
+        );
+        assert!(critique.contains("FAILED"), "critique carries the excerpt");
+    }
+
+    #[test]
+    fn derive_grade_verdict_skips_when_no_canonical_command_ran() {
+        // Non-canonical command only → Skip (the echo is ignored).
+        assert_eq!(
+            derive_grade_verdict(&[outcome("echo hi", Some(0))]).outcome,
+            GradeOutcome::Skip
+        );
+        // Empty set → Skip.
+        assert_eq!(derive_grade_verdict(&[]).outcome, GradeOutcome::Skip);
+    }
+
+    #[test]
+    fn derive_grade_verdict_fails_if_any_canonical_command_nonzero() {
+        let verdict = derive_grade_verdict(&[
+            outcome("cargo fmt --check", Some(0)),
+            outcome("cargo test", Some(1)),
+        ]);
+        assert_eq!(verdict.outcome, GradeOutcome::Fail);
+        assert_eq!(verdict.command.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn derive_grade_verdict_passes_when_all_canonical_commands_zero() {
+        let verdict = derive_grade_verdict(&[
+            outcome("cargo clippy --all-targets", Some(0)),
+            outcome("cargo test", Some(0)),
+        ]);
+        assert_eq!(verdict.outcome, GradeOutcome::Pass);
+    }
+
+    #[test]
+    fn derive_grade_verdict_treats_missing_exit_code_as_fail() {
+        // A canonical command that produced no completion is not a clean pass.
+        let verdict = derive_grade_verdict(&[outcome("cargo test", None)]);
+        assert_eq!(verdict.outcome, GradeOutcome::Fail);
+        assert!(verdict
+            .critique
+            .expect("critique present")
+            .contains("no exit code"));
+    }
+
     #[test]
     fn run_state_is_terminal_truth_table() {
         // Terminal: the run has finished.
@@ -1111,6 +1335,78 @@ mod tests {
             config_path: None,
         })
         .unwrap()
+    }
+
+    // ── MCP tool-catalog advertisement (task_07) ──
+
+    fn mcp_catalog_fixture() -> ToolCatalog {
+        use crate::mcp::{McpTool, ToolCatalogServer};
+        let tool = |name: &str, desc: &str| McpTool {
+            name: name.to_string(),
+            description: Some(desc.to_string()),
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        ToolCatalog {
+            servers: vec![
+                ToolCatalogServer {
+                    server: "filesystem".to_string(),
+                    tools: vec![tool("read_file", "Read a file")],
+                },
+                ToolCatalogServer {
+                    server: "search".to_string(),
+                    tools: vec![tool("web_search", "Search the web")],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn orchestrator_prompt_lists_snapshot_tools_with_servers() {
+        let config = validation_config();
+        let prompt = build_orchestrator_prompt_with_mcp(&config, &mcp_catalog_fixture());
+        assert!(prompt.contains("Available MCP tools"));
+        assert!(prompt.contains("- filesystem/read_file: Read a file"));
+        assert!(prompt.contains("- search/web_search: Search the web"));
+    }
+
+    #[test]
+    fn orchestrator_prompt_omits_mcp_section_for_empty_snapshot() {
+        let config = validation_config();
+        let prompt = build_orchestrator_prompt_with_mcp(&config, &ToolCatalog::default());
+        assert!(!prompt.contains("Available MCP tools"));
+        // The no-arg builder also omits it (empty default catalog).
+        assert!(!build_orchestrator_prompt(&config).contains("Available MCP tools"));
+    }
+
+    #[test]
+    fn orchestrator_prompt_is_byte_identical_across_replay() {
+        let config = validation_config();
+        let catalog = mcp_catalog_fixture();
+        // Simulate record → replay: serialize the catalog into the event payload
+        // and deserialize it back, then rebuild the prompt from the reconstructed
+        // snapshot. A pure builder over a serde-stable snapshot is replay-safe.
+        let payload = serde_json::to_value(&catalog).unwrap();
+        let replayed: ToolCatalog = serde_json::from_value(payload).unwrap();
+        let live = build_orchestrator_prompt_with_mcp(&config, &catalog);
+        let from_replay = build_orchestrator_prompt_with_mcp(&config, &replayed);
+        assert_eq!(live, from_replay);
+    }
+
+    #[test]
+    fn orchestrator_prompt_never_reads_live_mcp_handle() {
+        // Guard (mirrors `colors_live_only_in_theme_module`): the orchestrator
+        // module advertises tools from a recorded snapshot only, so it must never
+        // name the live supervisor handle type — that would let live, non-replayable
+        // state into the prompt. `concat!` keeps the needle out of this test's own
+        // source.
+        let needle = concat!("Mcp", "Handle");
+        let source = include_str!("mod.rs");
+        assert!(
+            !source.contains(needle),
+            "src/orchestrator/mod.rs must not reference the live MCP handle type; \
+             advertise tools from the recorded ToolCatalog snapshot instead"
+        );
     }
 
     fn clarification_option(id: &str, label: &str) -> ClarificationOption {

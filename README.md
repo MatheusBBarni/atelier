@@ -20,7 +20,7 @@ an orchestrator and a sequence of specialized agent profiles.
   - `codex` (Codex CLI runtime)
   - `claude` (Claude CLI runtime)
   - `cursor` (Cursor Agent CLI runtime)
-  - `zai` (HTTP API runtime)
+  - `http_api` (configurable OpenAI-compatible HTTP API runtime — BYOK)
   - `fake` (test/runtime simulation)
 - Configurable agents with explicit capabilities and scopes.
 - Preset-based agent overrides, model fallback chains, and per-agent tool allowlists.
@@ -35,9 +35,9 @@ an orchestrator and a sequence of specialized agent profiles.
 - Node.js 20+ and npm 10+ for the recommended npm install path.
 - Rust toolchain only if you build from source.
 - `ZAI_API_KEY` (or another env var configured as `api_key_env`): required for a real run
-  with stock defaults — the default orchestrator runs on the `zai` runtime (`glm-5.1`), which
-  fails without it. Only the `fake` runtime needs no credentials, and it simulates rather than
-  doing real work.
+  with stock defaults — the default orchestrator runs on the `http_api` runtime (`glm-5.1`),
+  which fails without it. Only the `fake` runtime needs no credentials, and it simulates rather
+  than doing real work.
 - `codex` CLI with `codex login` completed: required for the default worker agents (explorer,
   fixer, reviewer), which run on the `codex` runtime out of the box.
 - Optional: `claude` CLI — only if you opt agents into the Claude runtime through config.
@@ -74,6 +74,47 @@ cargo install --path .
 
 GitHub Releases provide standalone native binary archives and checksum
 manifests for release traceability.
+
+## Configure with the `atelier-config-setup` skill
+
+`atelier.toml` spans several sections and five enums, and the loader rejects
+unknown keys — so a single typo fails the whole config. The
+**`atelier-config-setup`** skill is a portable wizard any LLM agent (atelier's
+own runtime *or* an external agent like Claude Code / Cursor / Codex) can load to
+author a valid config: it runs an essentials-first flow with named presets,
+writes the TOML, and self-validates it.
+
+**Install into an external agent's skill roots** (name-targeted so the repo's
+discovery mirrors aren't installed twice):
+
+```bash
+npx skills add MatheusBBarni/atelier atelier-config-setup
+```
+
+atelier's **own runtime already bundles it** — it ships in the repo's skill roots
+(`.agents/skills`, `.claude/skills`) and shows up in the `/skill:` dropdown, so no
+install step is needed there.
+
+**Manual-copy fallback** (works without skills.sh): copy the canonical skill into
+any discovery root, e.g.
+
+```bash
+cp -R skills/atelier-config-setup ~/.claude/skills/
+```
+
+**Invoke** it with `/skill:atelier-config-setup` (in atelier or a host agent) or
+just ask: "set up my atelier config". When `atelier` is on PATH it self-validates
+with `atelier --print-config` (the hard schema gate) and `atelier --doctor`
+(advisory runtime checks); otherwise it writes a schema-correct config and tells
+you how to verify later.
+
+**Secrets stay out of the config**: the skill only sets `api_key_env` (the *name*
+of the environment variable holding your key, e.g. `ZAI_API_KEY`) — you export the
+key yourself; it is never written into `atelier.toml`.
+
+This skill builds a **fresh** config (greenfield). Importing existing tool
+conventions (`CLAUDE.md`, `.claude/skills`, `.mcp.json`) is a separate
+config-importer roadmap item and is out of scope here.
 
 ## Quick Start
 
@@ -234,7 +275,7 @@ Important values:
 
 Lifecycle hooks run a desktop notification or a shell command when the harness
 reaches a lifecycle event. The hook receives a **normalized, versioned payload**
-that is identical across every runtime (Codex / Claude / Cursor / Z.ai), so one
+that is identical across every runtime (Codex / Claude / Cursor / HTTP API), so one
 config governs all of them.
 
 > **Security:** hooks are honored only from your **home config**
@@ -333,9 +374,12 @@ notify_fallback_command = "terminal-notifier -message"
   - Uses `cursor-agent --print --output-format stream-json` internally from an isolated deny-all Cursor permission sandbox.
   - Keeps Cursor-native tool calls behind Harness Actions.
   - Built-in agents do not use Cursor unless you opt in through config.
-- `zai`
-  - Default runtime for the orchestrator (`glm-5.1`), so `ZAI_API_KEY` is effectively required for any real run.
-  - Uses an API key from an env var (example: `ZAI_API_KEY`) and posts to `https://api.z.ai/api/paas/v4`.
+- `http_api`
+  - Configurable OpenAI-compatible HTTP API runtime (BYOK). Speaks the OpenAI chat-completions protocol over HTTPS, so any compatible provider (OpenRouter, DeepSeek, Groq, Together, Verboo, a local server, …) works as config alone — no new code.
+  - Default runtime for the orchestrator (`glm-5.1`), so `ZAI_API_KEY` is effectively required for any real run with stock defaults.
+  - Uses an API key from an env var (example: `ZAI_API_KEY`) and posts to `{base_url}/chat/completions` (default `base_url` is `https://api.z.ai/api/paas/v4`).
+  - Auth header defaults to `Authorization: Bearer <key>`; set `auth_header_name` / `auth_header_prefix` for providers that differ (e.g. Verboo's `api-key: <key>` — name `api-key`, empty prefix).
+  - Replaces the former `zai` runtime kind; configs using `type = "zai"` must update to `type = "http_api"`.
 - `fake`
   - Local test/runtime simulation mode.
 

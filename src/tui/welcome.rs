@@ -99,6 +99,10 @@ pub struct WelcomeFacts<'a> {
     /// The newest prior session ended non-terminally (task_13): swaps the static
     /// browser cue for a dynamic post-crash recovery nudge.
     pub recoverable_session: bool,
+    /// Whether an `atelier-config-setup` skill was discovered (task_07). When
+    /// `false`, the welcome shows a one-line, read-only nudge pointing at the
+    /// install/invoke path; suppressed under `hide_banner`.
+    pub config_skill_present: bool,
 }
 
 /// Render the welcome item: an adaptive wordmark (skipped under `NO_COLOR` or
@@ -116,7 +120,28 @@ pub fn welcome_lines(
         lines.push(Line::from(""));
     }
     lines.extend(facts_lines(theme, facts));
+    // First-run discoverability nudge (task_07 / F7): only when the skill is
+    // absent, and suppressed under `hide_banner` so it stays opt-out.
+    if !hide_banner {
+        if let Some(nudge) = config_skill_nudge_line(theme, facts.config_skill_present) {
+            lines.push(nudge);
+        }
+    }
     lines
+}
+
+/// One-line, read-only nudge shown at startup when no `atelier-config-setup`
+/// skill is discovered (task_07 / F7 / ADR-006). Returns `None` when the skill
+/// is already present, so configured users never see it. Writes nothing — it
+/// only points at the install/invoke path.
+fn config_skill_nudge_line(theme: &Theme, config_skill_present: bool) -> Option<Line<'static>> {
+    if config_skill_present {
+        return None;
+    }
+    Some(Line::from(Span::styled(
+        "no config-setup skill found — run `npx skills add MatheusBBarni/atelier atelier-config-setup`, then /skill:atelier-config-setup",
+        Style::default().fg(theme.text_muted),
+    )))
 }
 
 /// Select the wordmark form by available width: full lettering, a compact
@@ -435,6 +460,7 @@ mod tests {
             warnings: 0,
             git,
             recoverable_session: false,
+            config_skill_present: true,
         }
     }
 
@@ -617,6 +643,7 @@ mod tests {
             warnings: 0,
             git: None,
             recoverable_session: true,
+            config_skill_present: true,
         };
         let lines = facts_lines(&truecolor(), &facts);
         let text: String = lines
@@ -644,6 +671,66 @@ mod tests {
                 .iter()
                 .all(|span| span.style.fg == Some(truecolor().status_warn)),
             "post-crash hint uses the warning theme token"
+        );
+    }
+
+    #[test]
+    fn config_setup_nudge_shows_only_when_skill_absent() {
+        // task_07: when no atelier-config-setup skill is discovered, a one-line
+        // read-only nudge points at the install/invoke path; present → no nudge.
+        let theme = truecolor();
+        let agents = [agent("explorer")];
+        let mut facts = facts_with(&agents, None);
+
+        facts.config_skill_present = false;
+        let absent: String = welcome_lines(&theme, 100, false, &facts)
+            .iter()
+            .map(|line| format!("{}\n", line_text(line)))
+            .collect();
+        assert!(
+            absent.contains("config-setup"),
+            "nudge shown when skill absent: {absent}"
+        );
+        assert!(
+            absent.contains("npx skills add"),
+            "nudge names the install command"
+        );
+        // The nudge is styled with a shared theme token (no inline color).
+        let nudge = welcome_lines(&theme, 100, false, &facts)
+            .into_iter()
+            .find(|line| line_text(line).contains("npx skills add"))
+            .expect("nudge line present");
+        assert!(nudge
+            .spans
+            .iter()
+            .all(|span| span.style.fg == Some(theme.text_muted)));
+
+        facts.config_skill_present = true;
+        let present: String = welcome_lines(&theme, 100, false, &facts)
+            .iter()
+            .map(|line| format!("{}\n", line_text(line)))
+            .collect();
+        assert!(
+            !present.contains("npx skills add"),
+            "no nudge when the skill is discoverable"
+        );
+    }
+
+    #[test]
+    fn config_setup_nudge_suppressed_by_hide_banner() {
+        // hide_banner is the suppression lever — even with the skill absent, the
+        // nudge stays hidden when the user opted out of the banner.
+        let theme = truecolor();
+        let agents = [agent("explorer")];
+        let mut facts = facts_with(&agents, None);
+        facts.config_skill_present = false;
+        let suppressed: String = welcome_lines(&theme, 100, true, &facts)
+            .iter()
+            .map(|line| format!("{}\n", line_text(line)))
+            .collect();
+        assert!(
+            !suppressed.contains("npx skills add"),
+            "nudge suppressed under hide_banner"
         );
     }
 

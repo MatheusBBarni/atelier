@@ -181,6 +181,65 @@ fn print_config_includes_execution_graph_flag() {
 }
 
 #[test]
+fn print_config_redacts_mcp_server_env_value() {
+    // A declared MCP server must surface in --print-config with its env-var
+    // NAMES but never the resolved secret value (CF5 redaction, task_02).
+    let home_dir = tempdir().unwrap();
+    let config_path = home_dir.path().join("home.toml");
+    std::fs::write(
+        &config_path,
+        "schema_version = 1\n\
+         [mcp.servers.fs]\n\
+         transport = \"stdio\"\n\
+         command = \"mcp-fs\"\n\
+         env = { SECRET_TOKEN = \"super-secret-value\" }\n",
+    )
+    .unwrap();
+    let work_dir = tempdir().unwrap();
+
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .current_dir(work_dir.path())
+        .arg("--print-config")
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("[mcp.servers.fs]")
+                .and(predicate::str::contains("SECRET_TOKEN"))
+                .and(predicate::str::contains("super-secret-value").not()),
+        );
+}
+
+#[test]
+fn init_config_output_parses_back_including_mcp_example() {
+    // The generated starter config (with its commented [mcp.servers.*] example)
+    // must parse back into a valid config — --print-config loads it cleanly.
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("home.toml");
+
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .arg("--init-config")
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    let work_dir = tempdir().unwrap();
+    Command::cargo_bin("atelier")
+        .unwrap()
+        .current_dir(work_dir.path())
+        .arg("--print-config")
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("schema_version"));
+}
+
+#[test]
 fn help_lists_update_flag() {
     Command::cargo_bin("atelier")
         .unwrap()

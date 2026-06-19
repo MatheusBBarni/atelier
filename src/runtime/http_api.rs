@@ -1,9 +1,9 @@
+use super::http_util::{parse_runtime_output, redact_sensitive_text};
 use super::{
     prompt_envelope_json, Runtime, RuntimeAvailability, RuntimeAvailabilityStatus,
     RuntimeEventSink, RuntimeOutput, RuntimeProviderError, RuntimeRequest,
 };
 use crate::config::RuntimeConfig;
-use crate::orchestrator::{parse_agent_result, parse_contract, parse_orchestrator_decision};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::header::CONTENT_TYPE;
@@ -13,25 +13,27 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
-pub struct ZaiRuntime {
+pub struct HttpApiRuntime {
     config: RuntimeConfig,
 }
 
-impl ZaiRuntime {
+impl HttpApiRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
         Self { config }
     }
 }
 
 #[async_trait]
-impl Runtime for ZaiRuntime {
+impl Runtime for HttpApiRuntime {
     async fn check_availability(&self) -> RuntimeAvailability {
         let Some(api_key_env) = &self.config.api_key_env else {
             return RuntimeAvailability {
                 runtime_id: self.config.id.clone(),
                 status: RuntimeAvailabilityStatus::Unavailable,
-                message: "Z.ai api_key_env is not configured".to_string(),
-                remediation: Some("Set [runtimes.zai].api_key_env in atelier.toml.".to_string()),
+                message: "HTTP API api_key_env is not configured".to_string(),
+                remediation: Some(
+                    "Set [runtimes.http_api].api_key_env in atelier.toml.".to_string(),
+                ),
             };
         };
         match env::var(api_key_env) {
@@ -47,7 +49,7 @@ impl Runtime for ZaiRuntime {
                 runtime_id: self.config.id.clone(),
                 status: RuntimeAvailabilityStatus::Unavailable,
                 message: format!("environment variable {api_key_env} is not set"),
-                remediation: Some(format!("Export {api_key_env} with a valid Z.ai API key.")),
+                remediation: Some(format!("Export {api_key_env} with a valid API key.")),
             },
         }
     }
@@ -62,14 +64,15 @@ impl Runtime for ZaiRuntime {
             .config
             .api_key_env
             .as_ref()
-            .context("Z.ai api_key_env is not configured")?;
+            .context("HTTP API api_key_env is not configured")?;
         let api_key = env::var(api_key_env)
             .with_context(|| format!("environment variable {api_key_env} is not set"))?;
         let base_url = self
             .config
             .base_url
             .as_ref()
-            .context("Z.ai base_url is not configured")?;
+            .context("HTTP API base_url is not configured")?;
+        let (header_name, header_value) = self.build_auth_header(&api_key);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;
@@ -77,7 +80,7 @@ impl Runtime for ZaiRuntime {
             .stream_or_fallback(
                 &client,
                 base_url,
-                &api_key,
+                (&header_name, &header_value),
                 &request,
                 &events,
                 &cancellation,
@@ -88,12 +91,39 @@ impl Runtime for ZaiRuntime {
     }
 }
 
-impl ZaiRuntime {
+impl HttpApiRuntime {
+    /// Build the auth header `(name, value)` pair for this runtime.
+    ///
+    /// Defaults to `Authorization: Bearer <key>`. Providers can override the
+    /// header name (e.g. `api-key`) and/or the value prefix via config; an
+    /// empty prefix sends the bare key with no prefix (ADR-001). The api_key is
+    /// passed in (rather than read from the env here) so `stream_step` keeps a
+    /// single, error-handled env read and this method stays pure/testable.
+    fn build_auth_header(&self, api_key: &str) -> (String, String) {
+        let name = self
+            .config
+            .auth_header_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Authorization");
+        let prefix = self
+            .config
+            .auth_header_prefix
+            .as_deref()
+            .unwrap_or("Bearer");
+        let value = if prefix.is_empty() {
+            api_key.to_string()
+        } else {
+            format!("{prefix} {api_key}")
+        };
+        (name.to_string(), value)
+    }
+
     async fn stream_or_fallback(
         &self,
         client: &reqwest::Client,
         base_url: &str,
-        api_key: &str,
+        auth_header: (&str, &str),
         request: &RuntimeRequest,
         events: &RuntimeEventSink,
         cancellation: &CancellationToken,
@@ -101,7 +131,7 @@ impl ZaiRuntime {
         let fallback_enabled = streaming_fallback_enabled(&self.config);
         let stream_body = chat_completion_body(request, true)?;
         let response =
-            send_chat_completion(client, base_url, api_key, &stream_body, cancellation).await?;
+            send_chat_completion(client, base_url, auth_header, &stream_body, cancellation).await?;
         let status = response.status();
         if !status.is_success() {
             let text = read_response_text(response, cancellation).await?;
@@ -109,32 +139,32 @@ impl ZaiRuntime {
                 let body = response_error_body(&text);
                 events
                     .status(format!(
-                        "Z.ai streaming rejected with status {status}; falling back to non-streaming chat completion: {body}"
+                        "HTTP API streaming rejected with status {status}; falling back to non-streaming chat completion: {body}"
                     ))
                     .await?;
                 return run_non_streaming_completion(
                     client,
                     base_url,
-                    api_key,
+                    auth_header,
                     request,
                     events,
                     cancellation,
                 )
                 .await;
             }
-            return Err(zai_status_error(status, &text).into());
+            return Err(http_api_status_error(status, &text).into());
         }
 
         if !response_is_sse(&response) {
             let text = read_response_text(response, cancellation).await?;
             if fallback_enabled {
                 events
-                    .status("Z.ai streaming response was not SSE; falling back to non-streaming chat completion")
+                    .status("HTTP API streaming response was not SSE; falling back to non-streaming chat completion")
                     .await?;
                 return run_non_streaming_completion(
                     client,
                     base_url,
-                    api_key,
+                    auth_header,
                     request,
                     events,
                     cancellation,
@@ -142,7 +172,7 @@ impl ZaiRuntime {
                 .await;
             }
             return Err(RuntimeProviderError::non_retryable(format!(
-                "Z.ai streaming response was not SSE: {}",
+                "HTTP API streaming response was not SSE: {}",
                 concise_response_text(&text)
             ))
             .into());
@@ -155,49 +185,21 @@ impl ZaiRuntime {
 async fn run_non_streaming_completion(
     client: &reqwest::Client,
     base_url: &str,
-    api_key: &str,
+    auth_header: (&str, &str),
     request: &RuntimeRequest,
     events: &RuntimeEventSink,
     cancellation: &CancellationToken,
 ) -> Result<String> {
     let body = chat_completion_body(request, false)?;
-    let response = send_chat_completion(client, base_url, api_key, &body, cancellation).await?;
+    let response = send_chat_completion(client, base_url, auth_header, &body, cancellation).await?;
     let status = response.status();
     let text = read_response_text(response, cancellation).await?;
     if !status.is_success() {
-        return Err(zai_status_error(status, &text).into());
+        return Err(http_api_status_error(status, &text).into());
     }
     let content = content_from_non_streaming_response(&text)?;
     events.delta("message", content.clone()).await?;
     Ok(content)
-}
-
-fn parse_runtime_output(agent_id: &str, content: String) -> Result<RuntimeOutput> {
-    let output = if let Ok(action_request) = parse_contract(&content) {
-        RuntimeOutput::ActionRequest {
-            request: action_request,
-        }
-    } else if agent_id == "orchestrator" {
-        match parse_orchestrator_decision(&content) {
-            Ok(decision) => RuntimeOutput::OrchestratorDecision { decision },
-            Err(error) => RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output: content,
-                diagnostic: error.to_string(),
-            },
-        }
-    } else {
-        match parse_agent_result(&content) {
-            Ok(result) => RuntimeOutput::AgentResult { result },
-            Err(error) => RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output: content,
-                diagnostic: error.to_string(),
-            },
-        }
-    };
-
-    Ok(output)
 }
 
 fn chat_completion_body(request: &RuntimeRequest, stream: bool) -> Result<Value> {
@@ -221,23 +223,34 @@ fn chat_completion_body(request: &RuntimeRequest, stream: bool) -> Result<Value>
 async fn send_chat_completion(
     client: &reqwest::Client,
     base_url: &str,
-    api_key: &str,
+    auth_header: (&str, &str),
     body: &Value,
     cancellation: &CancellationToken,
 ) -> Result<reqwest::Response> {
+    let (header_name, header_value) = auth_header;
+    // Preserve reqwest's `.bearer_auth` behavior: mark the credential header
+    // sensitive so it is excluded from HTTP/2 HPACK indexing and from
+    // request-level debug logging. `.header(name, &str)` alone does not.
+    let mut request = client.post(format!("{base_url}/chat/completions"));
+    match reqwest::header::HeaderValue::from_str(header_value) {
+        Ok(mut value) => {
+            value.set_sensitive(true);
+            request = request.header(header_name, value);
+        }
+        // Fall back so an invalid value still surfaces reqwest's error at send.
+        Err(_) => request = request.header(header_name, header_value),
+    }
+    request = request.json(body);
     tokio::select! {
-        _ = cancellation.cancelled() => anyhow::bail!("Z.ai runtime cancelled"),
-        response = client
-            .post(format!("{base_url}/chat/completions"))
-            .bearer_auth(api_key)
-            .json(body)
-            .send() => {
-                response.map_err(|error| {
-                    RuntimeProviderError::retryable(format!(
-                        "Z.ai chat completions request failed: {error}"
-                    ))
-                }.into())
-            }
+        _ = cancellation.cancelled() => anyhow::bail!("HTTP API runtime cancelled"),
+        response = request.send() => {
+            response.map_err(|error| {
+                RuntimeProviderError::retryable(format!(
+                    "HTTP API chat completions request failed: {error}"
+                ))
+                .into()
+            })
+        }
     }
 }
 
@@ -246,8 +259,8 @@ async fn read_response_text(
     cancellation: &CancellationToken,
 ) -> Result<String> {
     tokio::select! {
-        _ = cancellation.cancelled() => anyhow::bail!("Z.ai runtime cancelled"),
-        text = response.text() => text.context("failed to read Z.ai response body"),
+        _ = cancellation.cancelled() => anyhow::bail!("HTTP API runtime cancelled"),
+        text = response.text() => text.context("failed to read HTTP API response body"),
     }
 }
 
@@ -260,8 +273,8 @@ async fn read_sse_message_content(
     let mut content = String::new();
     loop {
         let chunk = tokio::select! {
-            _ = cancellation.cancelled() => anyhow::bail!("Z.ai runtime cancelled"),
-            chunk = response.chunk() => chunk.context("failed to read Z.ai streaming response")?,
+            _ = cancellation.cancelled() => anyhow::bail!("HTTP API runtime cancelled"),
+            chunk = response.chunk() => chunk.context("failed to read HTTP API streaming response")?,
         };
         let Some(chunk) = chunk else {
             break;
@@ -275,7 +288,7 @@ async fn read_sse_message_content(
     }
 
     if !buffer.iter().all(u8::is_ascii_whitespace) {
-        let frame = std::str::from_utf8(&buffer).context("malformed Z.ai SSE UTF-8 frame")?;
+        let frame = std::str::from_utf8(&buffer).context("malformed HTTP API SSE UTF-8 frame")?;
         if apply_sse_frame(parse_sse_frame(frame)?, events, &mut content).await? {
             return Ok(content);
         }
@@ -309,7 +322,7 @@ fn drain_next_sse_frame(buffer: &mut Vec<u8>) -> Result<Option<SseFrame>> {
         return Ok(None);
     };
     let frame = std::str::from_utf8(&buffer[..frame_end])
-        .context("malformed Z.ai SSE UTF-8 frame")
+        .context("malformed HTTP API SSE UTF-8 frame")
         .and_then(parse_sse_frame)?;
     buffer.drain(..frame_end + separator_len);
     Ok(Some(frame))
@@ -363,7 +376,7 @@ fn parse_sse_frame(frame: &str) -> Result<SseFrame> {
         }
         let value: Value = serde_json::from_str(data).with_context(|| {
             format!(
-                "malformed Z.ai SSE data frame: {}",
+                "malformed HTTP API SSE data frame: {}",
                 concise_response_text(data)
             )
         })?;
@@ -390,7 +403,8 @@ fn parse_sse_frame(frame: &str) -> Result<SseFrame> {
 }
 
 fn content_from_non_streaming_response(text: &str) -> Result<String> {
-    let value: Value = serde_json::from_str(text).context("failed to parse Z.ai response JSON")?;
+    let value: Value =
+        serde_json::from_str(text).context("failed to parse HTTP API response JSON")?;
     value
         .get("choices")
         .and_then(Value::as_array)
@@ -399,7 +413,7 @@ fn content_from_non_streaming_response(text: &str) -> Result<String> {
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("Z.ai response did not include choices[0].message.content"))
+        .ok_or_else(|| anyhow!("HTTP API response did not include choices[0].message.content"))
 }
 
 fn response_is_sse(response: &reqwest::Response) -> bool {
@@ -411,9 +425,9 @@ fn response_is_sse(response: &reqwest::Response) -> bool {
         .unwrap_or(false)
 }
 
-fn zai_status_error(status: reqwest::StatusCode, text: &str) -> RuntimeProviderError {
+fn http_api_status_error(status: reqwest::StatusCode, text: &str) -> RuntimeProviderError {
     let body = response_error_body(text);
-    let message = format!("Z.ai request failed with status {status}: {body}");
+    let message = format!("HTTP API request failed with status {status}: {body}");
     if retryable_status(status) {
         RuntimeProviderError::retryable(message)
     } else {
@@ -462,69 +476,6 @@ fn concise_response_text(text: &str) -> String {
     )
 }
 
-fn redact_sensitive_text(text: &str) -> String {
-    redact_raw_secret_tokens(&redact_bearer_tokens(text))
-}
-
-fn redact_bearer_tokens(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut remaining = text;
-    while let Some(auth_start) = remaining.to_ascii_lowercase().find("bearer ") {
-        output.push_str(&remaining[..auth_start]);
-        output.push_str("Bearer <redacted>");
-        let token_start = auth_start + "bearer ".len();
-        let token = &remaining[token_start..];
-        let token_len = token
-            .find(|character: char| {
-                character.is_whitespace()
-                    || matches!(character, '"' | '\'' | '\\' | ',' | ';' | ')' | ']')
-            })
-            .unwrap_or(token.len());
-        remaining = &token[token_len..];
-    }
-    output.push_str(remaining);
-    output
-}
-
-fn redact_raw_secret_tokens(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut remaining = text;
-
-    while let Some((secret_start, _prefix)) = next_raw_secret_prefix(remaining) {
-        let absolute_start = text.len() - remaining.len() + secret_start;
-        let preceding_character = text[..absolute_start].chars().next_back();
-        if preceding_character.is_some_and(is_secret_token_character) {
-            output.push_str(&remaining[..secret_start + 1]);
-            remaining = &remaining[secret_start + 1..];
-            continue;
-        }
-
-        output.push_str(&remaining[..secret_start]);
-        output.push_str("<redacted secret>");
-        let token = &remaining[secret_start..];
-        let token_length = token
-            .find(|character: char| !is_secret_token_character(character))
-            .unwrap_or(token.len());
-        remaining = &token[token_length..];
-    }
-
-    output.push_str(remaining);
-    output
-}
-
-fn next_raw_secret_prefix(text: &str) -> Option<(usize, &'static str)> {
-    const SECRET_PREFIXES: [&str; 2] = ["sk-", "zai-"];
-    let lower = text.to_ascii_lowercase();
-    SECRET_PREFIXES
-        .into_iter()
-        .filter_map(|prefix| lower.find(prefix).map(|index| (index, prefix)))
-        .min_by_key(|(index, _prefix)| *index)
-}
-
-fn is_secret_token_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,14 +521,17 @@ mod tests {
         .await;
         std::env::set_var("MULTIAGENT_TEST_ZAI_KEY", "test-token");
 
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: Vec::new(),
             prompt_mode: PromptMode::Stdin,
             base_url: Some(format!("http://{addr}")),
             api_key_env: Some("MULTIAGENT_TEST_ZAI_KEY".to_string()),
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "oracle");
         let result = collect_runtime_step_result(|events, cancellation| {
@@ -607,6 +561,92 @@ mod tests {
         assert!(request.contains("\"stream\":true"));
     }
 
+    fn http_api_runtime_with_auth(
+        auth_header_name: Option<&str>,
+        auth_header_prefix: Option<&str>,
+    ) -> HttpApiRuntime {
+        HttpApiRuntime::new(RuntimeConfig {
+            id: "http_api".to_string(),
+            kind: RuntimeKind::HttpApi,
+            command: None,
+            args: Vec::new(),
+            prompt_mode: PromptMode::Stdin,
+            base_url: Some("http://localhost".to_string()),
+            api_key_env: Some("UNUSED".to_string()),
+            auth_header_name: auth_header_name.map(str::to_string),
+            auth_header_prefix: auth_header_prefix.map(str::to_string),
+            degrade_not_abandon: false,
+        })
+    }
+
+    #[test]
+    fn build_auth_header_defaults_to_authorization_bearer() {
+        let runtime = http_api_runtime_with_auth(None, None);
+        let (name, value) = runtime.build_auth_header("test-key");
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "Bearer test-key");
+    }
+
+    #[test]
+    fn build_auth_header_supports_empty_prefix_for_verboo_style_providers() {
+        // Verboo sends `api-key: <key>` with no prefix.
+        let runtime = http_api_runtime_with_auth(Some("api-key"), Some(""));
+        let (name, value) = runtime.build_auth_header("test-key");
+        assert_eq!(name, "api-key");
+        assert_eq!(value, "test-key");
+    }
+
+    #[test]
+    fn build_auth_header_supports_custom_name_and_prefix() {
+        let runtime = http_api_runtime_with_auth(Some("X-API-Key"), Some("Token"));
+        let (name, value) = runtime.build_auth_header("test-key");
+        assert_eq!(name, "X-API-Key");
+        assert_eq!(value, "Token test-key");
+    }
+
+    #[tokio::test]
+    async fn http_api_adapter_sends_custom_auth_header_over_the_wire() {
+        let dir = tempdir().unwrap();
+        let result = AgentResult::completed("oracle", "step", "verboo answer");
+        let wrapped = wrap_json_contract(&result).unwrap();
+        let (addr, request_rx) = spawn_mock_zai_sequence_server(vec![sse_response(&[
+            sse_data(&serde_json::json!({
+                "choices": [ { "delta": { "content": wrapped } } ]
+            })),
+            "data: [DONE]\n\n".to_string(),
+        ])])
+        .await;
+        // Unique env var so this test does not race the default-auth test.
+        std::env::set_var("MULTIAGENT_TEST_VERBOO_KEY", "test-token");
+
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
+            id: "verboo".to_string(),
+            kind: RuntimeKind::HttpApi,
+            command: None,
+            args: Vec::new(),
+            prompt_mode: PromptMode::Stdin,
+            base_url: Some(format!("http://{addr}")),
+            api_key_env: Some("MULTIAGENT_TEST_VERBOO_KEY".to_string()),
+            auth_header_name: Some("api-key".to_string()),
+            auth_header_prefix: Some(String::new()),
+            degrade_not_abandon: false,
+        });
+        let request = runtime_request(dir.path().to_path_buf(), "oracle");
+        collect_runtime_step_result(|events, cancellation| {
+            runtime.stream_step(request, events, cancellation)
+        })
+        .await
+        .unwrap();
+
+        let requests = request_rx.await.unwrap();
+        let request = &requests[0];
+        assert!(request.contains("POST /chat/completions HTTP/1.1"));
+        // The bare key is sent under the custom header, with no Bearer prefix
+        // and no Authorization header.
+        assert!(request.contains("api-key: test-token"));
+        assert!(!request.contains("authorization:"));
+    }
+
     #[tokio::test]
     async fn zai_adapter_finishes_when_done_frame_keeps_connection_open() {
         let dir = tempdir().unwrap();
@@ -627,14 +667,17 @@ mod tests {
         .await;
         std::env::set_var("MULTIAGENT_TEST_ZAI_KEY", "test-token");
 
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: Vec::new(),
             prompt_mode: PromptMode::Stdin,
             base_url: Some(format!("http://{addr}")),
             api_key_env: Some("MULTIAGENT_TEST_ZAI_KEY".to_string()),
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "oracle");
         let result = tokio::time::timeout(Duration::from_secs(2), async {
@@ -684,14 +727,17 @@ mod tests {
         ])
         .await;
         std::env::set_var("MULTIAGENT_TEST_ZAI_KEY", "test-token");
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: Vec::new(),
             prompt_mode: PromptMode::Stdin,
             base_url: Some(format!("http://{addr}")),
             api_key_env: Some("MULTIAGENT_TEST_ZAI_KEY".to_string()),
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "oracle");
 
@@ -725,14 +771,17 @@ mod tests {
         )])
         .await;
         std::env::set_var("MULTIAGENT_TEST_ZAI_KEY", "test-token");
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: vec!["--no-stream-fallback".to_string()],
             prompt_mode: PromptMode::Stdin,
             base_url: Some(format!("http://{addr}")),
             api_key_env: Some("MULTIAGENT_TEST_ZAI_KEY".to_string()),
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
         let request = runtime_request(dir.path().to_path_buf(), "oracle");
 
@@ -802,14 +851,17 @@ mod tests {
 
     #[tokio::test]
     async fn zai_availability_reports_missing_credential_reference() {
-        let runtime = ZaiRuntime::new(RuntimeConfig {
+        let runtime = HttpApiRuntime::new(RuntimeConfig {
             id: "zai".to_string(),
-            kind: RuntimeKind::Zai,
+            kind: RuntimeKind::HttpApi,
             command: None,
             args: Vec::new(),
             prompt_mode: PromptMode::Stdin,
             base_url: Some("http://127.0.0.1:1".to_string()),
             api_key_env: Some("MULTIAGENT_TEST_MISSING_ZAI_KEY".to_string()),
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
 
         let availability = runtime.check_availability().await;

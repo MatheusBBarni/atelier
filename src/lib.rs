@@ -12,6 +12,7 @@ pub mod history;
 pub mod hooks;
 pub mod ids;
 pub mod keybindings;
+pub mod mcp;
 pub mod orchestrator;
 pub mod runtime;
 pub mod skills;

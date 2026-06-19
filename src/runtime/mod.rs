@@ -2,8 +2,17 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod fake;
+pub mod http_api;
+pub mod http_util;
 pub mod status;
-pub mod zai;
+
+// Re-export the shared HTTP utilities so existing import paths keep working
+// after the extraction in ADR-003: `crate::runtime::redact_sensitive_text`
+// (used by the hooks and history modules) and `crate::runtime::parse_runtime_output`
+// (imported via `super::` by the claude and cursor runtimes). `redact_bearer_tokens`
+// stays reachable as `http_util::redact_bearer_tokens`; it has no cross-module
+// consumer, so re-exporting it here would be an unused import.
+pub(crate) use http_util::{parse_runtime_output, redact_sensitive_text};
 
 use crate::actions::{ActionRequest, ActionResult};
 use crate::config::{
@@ -436,8 +445,8 @@ pub async fn check_runtime_availability(runtime: &RuntimeConfig) -> RuntimeAvail
                 .check_availability()
                 .await
         }
-        RuntimeKind::Zai => {
-            zai::ZaiRuntime::new(runtime.clone())
+        RuntimeKind::HttpApi => {
+            http_api::HttpApiRuntime::new(runtime.clone())
                 .check_availability()
                 .await
         }
@@ -564,8 +573,8 @@ async fn execute_runtime_step_once(
                 .stream_step(request, events, cancellation)
                 .await
         }
-        RuntimeKind::Zai => {
-            zai::ZaiRuntime::new(runtime.clone())
+        RuntimeKind::HttpApi => {
+            http_api::HttpApiRuntime::new(runtime.clone())
                 .stream_step(request, events, cancellation)
                 .await
         }
@@ -647,32 +656,6 @@ pub fn is_retryable_provider_error(error: &anyhow::Error) -> bool {
     })
 }
 
-pub(crate) fn parse_runtime_output(agent_id: &str, raw_output: String) -> Result<RuntimeOutput> {
-    if let Ok(request) = crate::orchestrator::parse_contract(&raw_output) {
-        return Ok(RuntimeOutput::ActionRequest { request });
-    }
-
-    if agent_id == "orchestrator" {
-        match crate::orchestrator::parse_orchestrator_decision(&raw_output) {
-            Ok(decision) => Ok(RuntimeOutput::OrchestratorDecision { decision }),
-            Err(error) => Ok(RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output,
-                diagnostic: error.to_string(),
-            }),
-        }
-    } else {
-        match crate::orchestrator::parse_agent_result(&raw_output) {
-            Ok(result) => Ok(RuntimeOutput::AgentResult { result }),
-            Err(error) => Ok(RuntimeOutput::ParseError {
-                agent: agent_id.to_string(),
-                raw_output,
-                diagnostic: error.to_string(),
-            }),
-        }
-    }
-}
-
 pub(crate) fn process_output_text(output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -699,69 +682,6 @@ pub(crate) fn concise_runtime_text_with_limit(text: &str, max_chars: usize) -> S
             .take(max_chars.saturating_sub(3))
             .collect::<String>()
     )
-}
-
-pub(crate) fn redact_sensitive_text(text: &str) -> String {
-    redact_raw_secret_tokens(&redact_bearer_tokens(text))
-}
-
-fn redact_bearer_tokens(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut remaining = text;
-    while let Some(auth_start) = remaining.to_ascii_lowercase().find("bearer ") {
-        output.push_str(&remaining[..auth_start]);
-        output.push_str("Bearer <redacted>");
-        let token_start = auth_start + "bearer ".len();
-        let token = &remaining[token_start..];
-        let token_len = token
-            .find(|character: char| {
-                character.is_whitespace()
-                    || matches!(character, '"' | '\'' | '\\' | ',' | ';' | ')' | ']')
-            })
-            .unwrap_or(token.len());
-        remaining = &token[token_len..];
-    }
-    output.push_str(remaining);
-    output
-}
-
-fn redact_raw_secret_tokens(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut remaining = text;
-
-    while let Some((secret_start, _prefix)) = next_raw_secret_prefix(remaining) {
-        let absolute_start = text.len() - remaining.len() + secret_start;
-        let preceding_character = text[..absolute_start].chars().next_back();
-        if preceding_character.is_some_and(is_secret_token_character) {
-            output.push_str(&remaining[..secret_start + 1]);
-            remaining = &remaining[secret_start + 1..];
-            continue;
-        }
-
-        output.push_str(&remaining[..secret_start]);
-        output.push_str("<redacted secret>");
-        let token = &remaining[secret_start..];
-        let token_length = token
-            .find(|character: char| !is_secret_token_character(character))
-            .unwrap_or(token.len());
-        remaining = &token[token_length..];
-    }
-
-    output.push_str(remaining);
-    output
-}
-
-fn next_raw_secret_prefix(text: &str) -> Option<(usize, &'static str)> {
-    const SECRET_PREFIXES: [&str; 2] = ["sk-", "zai-"];
-    let lower = text.to_ascii_lowercase();
-    SECRET_PREFIXES
-        .into_iter()
-        .filter_map(|prefix| lower.find(prefix).map(|index| (index, prefix)))
-        .min_by_key(|(index, _prefix)| *index)
-}
-
-fn is_secret_token_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
 
 pub fn prompt_envelope_json(request: &RuntimeRequest) -> Result<String> {

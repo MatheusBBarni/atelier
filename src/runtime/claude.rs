@@ -1077,6 +1077,9 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
 
         let availability = runtime.check_availability().await;
@@ -1176,6 +1179,28 @@ mod tests {
         let args = claude_step_args(&[], "default");
 
         assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    #[test]
+    fn claude_runtime_strips_mcp_so_model_cannot_self_invoke_mcp_tools() {
+        // MCP is harness-owned (ADR-001): the model reaches MCP tools only by
+        // emitting a `CallMcpTool` action through the harness, never via Claude
+        // Code's native MCP. `--strict-mcp-config` with no `--mcp-config` loads
+        // ZERO MCP servers, and `--tools ""` plus the stripped system prompt
+        // leave the model no native tool surface. Regression guard for task_05.
+        let args = claude_step_args(&[], "claude-opus-4");
+        assert!(
+            args.iter().any(|arg| arg == "--strict-mcp-config"),
+            "claude args must keep --strict-mcp-config so no MCP servers load"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--mcp-config"),
+            "claude args must NOT pass --mcp-config (that would load servers)"
+        );
+        assert!(
+            args.windows(2).any(|pair| pair == ["--tools", ""]),
+            "claude args must disable the native tool surface"
+        );
     }
 
     #[test]
@@ -1977,6 +2002,9 @@ exec sleep 30
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         }
     }
 

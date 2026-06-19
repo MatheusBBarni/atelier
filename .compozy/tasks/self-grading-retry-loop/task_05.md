@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Grading executor and FakeRuntime grading phrases
 type: backend
 complexity: high
@@ -33,13 +33,31 @@ Implement `run_grading_workflow`, the harness-driven loop that runs the grader (
 </requirements>
 
 ## Subtasks
-- [ ] 05.1 Add the `GradingOutcome` enum and the `run_grading_workflow` skeleton from the council template.
-- [ ] 05.2 Run the grader sub-step via the action-executing path and collect its command results.
-- [ ] 05.3 Derive the verdict and emit the round + verdict events.
-- [ ] 05.4 On FAIL with attempts remaining, re-dispatch the producing agent with the critique and loop.
-- [ ] 05.5 Enforce the `max_attempts` bound and the wall-clock guard without touching `step_count`.
-- [ ] 05.6 Add FakeRuntime control phrases for pass/fail/skip grade outcomes.
-- [ ] 05.7 Add the end-to-end happy-path and exemption integration tests.
+- [x] 05.1 Add the `GradingOutcome` enum and the `run_grading_workflow` skeleton from the council template.
+- [x] 05.2 Run the grader sub-step via the action-executing path and collect its command results.
+- [x] 05.3 Derive the verdict and emit the round + verdict events.
+- [x] 05.4 On FAIL with attempts remaining, re-dispatch the producing agent with the critique and loop.
+- [x] 05.5 Enforce the `max_attempts` bound and the wall-clock guard without touching `step_count`.
+- [x] 05.6 Add FakeRuntime control phrases for pass/fail/skip grade outcomes.
+- [x] 05.7 Add the end-to-end happy-path and exemption integration tests.
+
+## Implementation Note
+`run_grading_workflow` runs the grader (`reviewer`) via `execute_runtime_step_with_actions` (a new
+`run_grading_substep` helper that omits `step_count`), reads the sub-step's `command_completed` events
+(`collect_grade_command_outcomes`) and derives the verdict with task_03's `derive_grade_verdict` — so
+the outcome is grounded in real exit codes, not agent text. Emits `grade_round` (per round) +
+`grader_verdict`; on FAIL with attempts left, re-dispatches the SAME producing agent with the critique
+and re-grades; returns `Escalated` on exhaustion (task 07), else `Concluded` (pushing a concluding
+result). FakeRuntime: a grader prompt stamped `(grade round N)` drives `grade pass|fail|flaky|skip` via
+deterministic, manifest-free canonical commands (`cargo test --help` exit 0, `cargo test
+--frobnicate-please` exit 1) and `pwd` for SKIP. Grading symbols carry a temporary
+`#[allow(dead_code)]` removed in task 06 when `run_agent_step` wires the caller. Four e2e tests; all
+assert `step_count == 0`.
+
+## Follow-up (out of scope)
+13 pre-existing, environment-sensitive failures persist in the full `cargo test --lib`
+(skill-discovery-over-HOME + codex CLI) — unchanged by this task (same set, +4 new grading tests pass).
+The grader e2e tests shell out to `cargo`, which is always present in a Rust toolchain/CI.
 
 ## Implementation Details
 Clone the structure of `run_council_workflow` but use `execute_runtime_step_with_actions` (so the grader can actually run commands) and omit the `step_count += 1` / `max_agent_steps` check. See TechSpec "Core Interfaces" (`run_grading_workflow`, `GradingOutcome`) and "Build Order" step 5. The dispatch-loop findings in `_research-techspec.json` give the council template (~:3155-3323), the action-executing call (~:3071), and the step_count seams.

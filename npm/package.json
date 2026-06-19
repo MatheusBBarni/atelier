@@ -12,6 +12,8 @@
     "test": "node --test tests/*.test.mjs",
     "sync:versions": "node scripts/sync-versions.mjs",
     "check:versions": "node scripts/check-versions.mjs",
+    "sync:skills": "node scripts/sync-skills.mjs",
+    "check:skills": "node scripts/sync-skills.mjs --check",
     "check:targets": "node scripts/check-targets.mjs",
     "check:metadata": "node scripts/check-metadata.mjs",
     "assemble": "node scripts/assemble.mjs",

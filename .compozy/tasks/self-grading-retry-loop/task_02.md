@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Extract canonical-verification-command predicate
 type: refactor
 complexity: low
@@ -28,10 +28,18 @@ Factor a reusable `is_canonical_verification_command` predicate out of the exist
 </requirements>
 
 ## Subtasks
-- [ ] 02.1 Identify the canonical verification prefixes inside the read-only allowlist.
-- [ ] 02.2 Extract them into a shared predicate consumable by the verdict deriver.
-- [ ] 02.3 Re-express `is_default_read_only_command` in terms of the shared set so behavior is identical.
-- [ ] 02.4 Add unit tests asserting both positive and negative classification.
+- [x] 02.1 Identify the canonical verification prefixes inside the read-only allowlist.
+- [x] 02.2 Extract them into a shared predicate consumable by the verdict deriver.
+- [x] 02.3 Re-express `is_default_read_only_command` in terms of the shared set so behavior is identical.
+- [x] 02.4 Add unit tests asserting both positive and negative classification.
+
+## Implementation Note
+Added `const CANONICAL_VERIFICATION_PREFIXES: [&str; 5]` (cargo test/check/build/fmt/clippy) and a
+`pub fn is_canonical_verification_command(command)` (trims/lowercases, rejects shell-control via the
+existing `has_shell_control_syntax`, prefix-matches via `command_has_prefix`). `is_default_read_only_command`
+now `chain`s the shared const with the remaining read-only prefixes, so the auto-approval set is
+byte-identical (56/56 actions tests still pass) and the canonical set lives in exactly one place. The
+predicate is `pub` in the `actions` module for task 03's `derive_grade_verdict` to call.
 
 ## Implementation Details
 The canonical prefixes already live in `is_default_read_only_command`. Extract them so task 03's deriver can call the predicate. See TechSpec "Core Interfaces" (`is_canonical_verification_command`) and "Build Order" step 2. The exact allowlist contents and `has_shell_control_syntax` interaction are in the config findings of `_research-techspec.json`.

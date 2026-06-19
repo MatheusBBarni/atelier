@@ -6,7 +6,7 @@ use multiagent::config::{
 use multiagent::runtime::claude::ClaudeRuntime;
 use multiagent::runtime::codex::CodexRuntime;
 use multiagent::runtime::cursor::CursorRuntime;
-use multiagent::runtime::zai::ZaiRuntime;
+use multiagent::runtime::http_api::HttpApiRuntime;
 use multiagent::runtime::{
     collect_runtime_step_result, Runtime, RuntimeOutput, RuntimeRecentContext, RuntimeRequest,
 };
@@ -32,6 +32,9 @@ async fn codex_runtime_executes_real_agent_step() -> Result<()> {
         prompt_mode: PromptMode::Stdin,
         base_url: None,
         api_key_env: None,
+        auth_header_name: None,
+        auth_header_prefix: None,
+        degrade_not_abandon: false,
     });
 
     let request = agent_request(dir.path().to_path_buf(), "explorer", "codex", "default");
@@ -46,23 +49,23 @@ async fn codex_runtime_executes_real_agent_step() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires MULTIAGENT_RUN_ZAI_INTEGRATION=1 and a valid Z.ai API key"]
+#[ignore = "requires MULTIAGENT_RUN_ZAI_INTEGRATION=1 and a valid API key"]
 async fn zai_runtime_executes_real_agent_step() -> Result<()> {
     if std::env::var_os("MULTIAGENT_RUN_ZAI_INTEGRATION").is_none() {
-        eprintln!("skipping Z.ai integration test; set MULTIAGENT_RUN_ZAI_INTEGRATION=1");
+        eprintln!("skipping HTTP API integration test; set MULTIAGENT_RUN_ZAI_INTEGRATION=1");
         return Ok(());
     }
 
     let api_key_env =
         std::env::var("MULTIAGENT_ZAI_API_KEY_ENV").unwrap_or_else(|_| "ZAI_API_KEY".to_string());
     if std::env::var_os(&api_key_env).is_none() {
-        bail!("environment variable {api_key_env} is required for Z.ai integration testing");
+        bail!("environment variable {api_key_env} is required for HTTP API integration testing");
     }
 
     let dir = tempdir()?;
-    let runtime = ZaiRuntime::new(RuntimeConfig {
+    let runtime = HttpApiRuntime::new(RuntimeConfig {
         id: "zai".to_string(),
-        kind: RuntimeKind::Zai,
+        kind: RuntimeKind::HttpApi,
         command: None,
         args: Vec::new(),
         prompt_mode: PromptMode::Stdin,
@@ -71,6 +74,9 @@ async fn zai_runtime_executes_real_agent_step() -> Result<()> {
                 .unwrap_or_else(|_| "https://api.z.ai/api/paas/v4".to_string()),
         ),
         api_key_env: Some(api_key_env),
+        auth_header_name: None,
+        auth_header_prefix: None,
+        degrade_not_abandon: false,
     });
     let model = std::env::var("MULTIAGENT_ZAI_MODEL").unwrap_or_else(|_| "glm-5.1".to_string());
 
@@ -105,6 +111,9 @@ async fn claude_runtime_executes_real_agent_step() -> Result<()> {
         prompt_mode: PromptMode::Stdin,
         base_url: None,
         api_key_env: None,
+        auth_header_name: None,
+        auth_header_prefix: None,
+        degrade_not_abandon: false,
     });
     let model = std::env::var("MULTIAGENT_CLAUDE_MODEL").unwrap_or_else(|_| "default".to_string());
 
@@ -139,6 +148,9 @@ async fn cursor_runtime_executes_real_agent_step() -> Result<()> {
         prompt_mode: PromptMode::Stdin,
         base_url: None,
         api_key_env: None,
+        auth_header_name: None,
+        auth_header_prefix: None,
+        degrade_not_abandon: false,
     });
     let model = std::env::var("MULTIAGENT_CURSOR_MODEL").unwrap_or_else(|_| "default".to_string());
 

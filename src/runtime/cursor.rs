@@ -1119,6 +1119,9 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         });
 
         let availability = runtime.check_availability().await;
@@ -1803,6 +1806,9 @@ exec sleep 30
             prompt_mode: PromptMode::Stdin,
             base_url: None,
             api_key_env: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            degrade_not_abandon: false,
         }
     }
 

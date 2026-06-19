@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: Cycle-exhaustion escalation (accept/retry/abort)
 type: backend
 complexity: medium
@@ -30,12 +30,30 @@ When the grade loop exhausts `max_attempts` and still FAILs, pause the run and a
 </requirements>
 
 ## Subtasks
-- [ ] 07.1 Add the `grade_escalation` marker to the pending-clarification capture.
-- [ ] 07.2 On exhaustion, build the accept/retry/abort pause from the executor.
-- [ ] 07.3 Add the marker-gated tri-state branch in `resolve_pending_clarification` before the prompt-append.
-- [ ] 07.4 Implement accept (continue), abort (fail), and retry (re-grade) outcomes.
-- [ ] 07.5 Ensure normal clarifications are unaffected.
-- [ ] 07.6 Cover all three options plus the non-hijack case with integration tests.
+- [x] 07.1 Add the `grade_escalation` marker to the pending-clarification capture.
+- [x] 07.2 On exhaustion, build the accept/retry/abort pause from the executor.
+- [x] 07.3 Add the marker-gated tri-state branch in `resolve_pending_clarification` before the prompt-append.
+- [x] 07.4 Implement accept (continue), abort (fail), and retry (re-grade) outcomes.
+- [x] 07.5 Ensure normal clarifications are unaffected.
+- [x] 07.6 Cover all three options plus the non-hijack case with integration tests.
+
+## Implementation Note
+`PendingClarification` gains `grade_escalation: Option<GradeEscalation { producing_agent_id,
+changed_files }>`. On terminal FAIL, `run_grading_workflow` calls `pause_for_grade_escalation`, which
+sets `WaitingForUser` + a clarification view with stable option ids `accept`/`retry`/`abort` (recommended
+`retry`), surfaces the last failing check, and records a `clarification_requested` event marked
+`grade_escalation: true`. `resolve_pending_clarification` branches to `resolve_grade_escalation` ONLY
+when the marker is present (before the ordinary prompt-append, so a normal clarification whose option is
+`retry` is never hijacked): `abort`→Failed+run_failed; `retry`→re-run the loop with a fresh budget
+(re-escalating if it still fails); `accept`→record `grade_escalation_resolved` + re-drive. Zero TUI
+changes (the composer already maps the focused option to `selected_option_id`). Five e2e tests cover all
+three outcomes, the pause shape, and the non-hijack case.
+
+## Follow-up (out of scope)
+Full `cargo test --lib` shows 13–14 pre-existing environment-sensitive failures (skill-discovery over the
+developer's HOME roots + the flaky codex-CLI availability test, whose pass/fail varies the count). A
+filter for non-environmental failures returns empty; none relate to grading/escalation. CI's clean HOME
+is unaffected.
 
 ## Implementation Details
 Mirror the `WaitingForUser` arm to pause and the `Complete`/`Failed` arms for the accept/abort outcomes; the TUI already maps a focused option to `selected_option_id`, so no TUI change is needed. See TechSpec "System Architecture" (Escalation) and "Build Order" step 7. The escalation findings in `_research-techspec.json` give the pause arm (~:1895), `resolve_pending_clarification` (~:1689), and the `selected_option_id` plumbing.

@@ -110,8 +110,8 @@ async fn exact_usage_renders_only_with_supporting_capability() {
     let mut supported = ProviderStatusCapabilities::none();
     supported.subscription_usage = CapabilitySupport::Supported;
     let probe = StaticStatusProbe::new(
-        ProviderId::Zai,
-        "Z.ai",
+        ProviderId::HttpApi,
+        "HTTP API",
         supported,
         probe_result(
             ProviderRunwayState::Ready,
@@ -126,8 +126,8 @@ async fn exact_usage_renders_only_with_supporting_capability() {
 
     // No supporting capability -> downgraded, no figures, truthful wording.
     let probe = StaticStatusProbe::new(
-        ProviderId::Zai,
-        "Z.ai",
+        ProviderId::HttpApi,
+        "HTTP API",
         ProviderStatusCapabilities::none(),
         probe_result(ProviderRunwayState::Ready, UsageAvailability::Exact(exact)),
     );

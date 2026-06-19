@@ -1,5 +1,5 @@
 ---
-status: pending
+status: completed
 title: GraderVerdict type and exit-code-derived verdict deriver
 type: backend
 complexity: low
@@ -30,11 +30,19 @@ Add the harness-owned `GraderVerdict`/`GradeOutcome` types and a pure `derive_gr
 </requirements>
 
 ## Subtasks
-- [ ] 03.1 Define `GraderVerdict` and `GradeOutcome` near `AgentResult`.
-- [ ] 03.2 Define the small command-outcome input type the deriver consumes.
-- [ ] 03.3 Implement `derive_grade_verdict` using the canonical-check predicate.
-- [ ] 03.4 Populate `critique` from the failing command + exit code on FAIL.
-- [ ] 03.5 Cover Pass/Fail/Skip and mixed-command cases with table-driven tests.
+- [x] 03.1 Define `GraderVerdict` and `GradeOutcome` near `AgentResult`.
+- [x] 03.2 Define the small command-outcome input type the deriver consumes.
+- [x] 03.3 Implement `derive_grade_verdict` using the canonical-check predicate.
+- [x] 03.4 Populate `critique` from the failing command + exit code on FAIL.
+- [x] 03.5 Cover Pass/Fail/Skip and mixed-command cases with table-driven tests.
+
+## Implementation Note
+`GradeOutcome { Pass, Fail, Skip }` + `GraderVerdict { outcome, command, exit_code, critique }`
+(serde, harness-constructed) and `CommandOutcome { command, exit_code, excerpt }` added near
+`AgentResult`. `derive_grade_verdict` filters to canonical commands via task_02's
+`crate::actions::is_canonical_verification_command`, returns Skip when none ran, Fail on the first
+canonical command whose `exit_code != Some(0)` (so a missing exit code is a non-pass) with a
+command+exit+excerpt critique, else Pass attributed to the last canonical command. Six table tests.
 
 ## Implementation Details
 Pure logic + simple types; no I/O. See TechSpec "Core Interfaces" (`GraderVerdict`, `GradeOutcome`, `derive_grade_verdict`) and "Build Order" step 3. The verdict-grounding findings in `_research-techspec.json` show the `command_completed` payload shape (`{command, exit_code, status}`) the deriver reads.

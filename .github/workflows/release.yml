@@ -171,6 +171,8 @@ jobs:
         env:
           ATELIER_VERSION: ${{ steps.release.outputs.version }}
         run: npm --prefix npm run check:versions
+      - name: Check skill mirrors are in sync
+        run: npm --prefix npm run check:skills
 
   rust-tests:
     name: Rust tests
@@ -311,6 +313,7 @@ jobs:
       - run: npm --prefix npm test
       - run: npm --prefix npm run check:targets
       - run: npm --prefix npm run check:versions
+      - run: npm --prefix npm run check:skills
       - run: npm --prefix npm run assemble
       - run: npm --prefix npm run check:metadata
       - run: npm --prefix npm run pack

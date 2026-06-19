@@ -54,6 +54,11 @@ pub enum ChatItemKind {
     /// whole graph (every node's status + scope) and its WaitingApproval gate
     /// (ADR-005). Per-node live items are suppressed in favor of this one view.
     Plan,
+    /// The externally-grounded auto-verification loop rendered as ONE evolving
+    /// item ("verifying… → Round 1/2: FAIL → PASS"), keyed by `Grade { run_id }`
+    /// (self-grading retry loop, ADR-003). Successive `grade_round` events
+    /// collapse into this item with a visible round counter.
+    GradeLoop,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +178,11 @@ pub enum ChatLifecycleKey {
     Plan {
         graph_id: String,
     },
+    /// One run's single evolving grade-loop item (self-grading retry loop): every
+    /// `grade_round` event for the run collapses into this item.
+    Grade {
+        run_id: String,
+    },
 }
 
 impl ChatLineView {
@@ -267,6 +277,7 @@ impl ChatLifecycleKey {
                 event,
             } => format!("chat:hook:{run_id}:{handler_index}:{event}"),
             ChatLifecycleKey::Plan { graph_id } => format!("chat:plan:{graph_id}"),
+            ChatLifecycleKey::Grade { run_id } => format!("chat:grade:{run_id}"),
         }
     }
 }
@@ -290,6 +301,7 @@ impl ChatItemKind {
             ChatItemKind::HookInvocation => "hook_invocation",
             ChatItemKind::Welcome => "welcome",
             ChatItemKind::Plan => "plan",
+            ChatItemKind::GradeLoop => "grade_loop",
         }
     }
 }
