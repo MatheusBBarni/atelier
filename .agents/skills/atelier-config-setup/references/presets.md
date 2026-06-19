@@ -94,13 +94,13 @@ The HTTP runtime — no local CLI needed, just an API key exported in your shell
 schema_version = 1
 approval_mode = "normal"
 
-[runtimes.zai]
-type = "zai"
+[runtimes.http_api]
+type = "http_api"
 base_url = "https://api.z.ai/api/paas/v4"
 api_key_env = "ZAI_API_KEY"
 
 [agents.orchestrator]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-4.6"
 model_fallbacks = ["glm-4.5"]
 effort = "high"

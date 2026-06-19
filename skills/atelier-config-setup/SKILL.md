@@ -77,10 +77,10 @@ they decline, run the essentials flow below.
 ### Step 1 — Runtime
 
 Ask which backend agent runs the work. `runtime` is one of the five `RuntimeKind` values:
-`codex`, `claude`, `cursor`, `zai`, `fake` (`fake` is for tests only — do not ship it). Declare
+`codex`, `claude`, `cursor`, `http_api`, `fake` (`fake` is for tests only — do not ship it). Declare
 it under `[runtimes.<id>]` with a `type = "<kind>"`. The only field the loader *requires* is
-`api_key_env` on the `zai` runtime; everything else has a default (CLI runtimes default
-`command` to `codex`/`claude`/`cursor-agent`, and `zai` defaults `base_url` to the Z.ai API).
+`api_key_env` on the `http_api` runtime; everything else has a default (CLI runtimes default
+`command` to `codex`/`claude`/`cursor-agent`, and `http_api` defaults `base_url` to the Z.ai API).
 Set `command` explicitly when your CLI isn't on the default name, and note that the `claude` and
 `cursor` runtimes **reject** `api_key_env` (those CLIs own their own credentials).
 
@@ -179,13 +179,13 @@ Every key and enum value here loads under atelier's config loader:
 schema_version = 1
 approval_mode = "normal"
 
-[runtimes.zai]
-type = "zai"
+[runtimes.http_api]
+type = "http_api"
 base_url = "https://api.z.ai/api/paas/v4"
 api_key_env = "ZAI_API_KEY"   # the env-var NAME, never the key value
 
 [agents.orchestrator]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-4.6"
 model_fallbacks = ["glm-4.5"]
 effort = "high"

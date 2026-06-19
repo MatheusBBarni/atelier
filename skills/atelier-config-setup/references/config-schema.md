@@ -30,7 +30,7 @@ of truth: `src/config/mod.rs`.)
 codex
 claude
 cursor
-zai
+http_api
 fake
 ```
 
@@ -144,7 +144,7 @@ the string `"unlimited"`. `max_parallel_agent_steps` is a plain integer (`0` dis
 ## `[runtimes.<id>]`
 
 Declares a backend agent runtime. `<id>` is the name agents reference via their `runtime` field.
-Built-in `codex`/`claude`/`cursor`/`zai` runtimes exist by default; redeclaring one overrides it.
+Built-in `codex`/`claude`/`cursor`/`http_api` runtimes exist by default; redeclaring one overrides it.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -152,7 +152,7 @@ Built-in `codex`/`claude`/`cursor`/`zai` runtimes exist by default; redeclaring 
 | `command` | string | — | Executable for CLI runtimes (`codex`/`claude`/`cursor`). |
 | `args` | list of strings | `[]` | Extra args passed to `command`. |
 | `prompt_mode` | `stdin` | `stdin` | How the prompt is delivered (only `stdin` in V1). |
-| `base_url` | string | — | HTTP base URL for the `zai` runtime. |
+| `base_url` | string | — | HTTP base URL for the `http_api` runtime. |
 | `api_key_env` | string | — | **Name** of the env var holding the API key — never the key itself. |
 | `degrade_not_abandon` | bool | — | On exhausted fallbacks, degrade rather than abandon the run. |
 
@@ -274,8 +274,8 @@ command = "claude"
 type = "cursor"
 command = "cursor-agent"
 
-[runtimes.zai]
-type = "zai"
+[runtimes.http_api]
+type = "http_api"
 base_url = "https://api.z.ai/api/paas/v4"
 api_key_env = "ZAI_API_KEY"
 ```
@@ -342,14 +342,14 @@ timeout_seconds = 900
 execution_mode = "serial"
 
 [council.presets.default.architect]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-4.6"
 effort = "high"
 thinking = true
 prompt = "Review the design for architectural soundness and risk."
 
 [council.presets.default.reviewer]
-runtime = "zai"
+runtime = "http_api"
 model = "glm-4.6"
 effort = "medium"
 thinking = true
