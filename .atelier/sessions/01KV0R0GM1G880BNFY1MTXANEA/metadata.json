@@ -2,5 +2,8 @@
   "schema_version": 1,
   "session_id": "01KV0R0GM1G880BNFY1MTXANEA",
   "working_directory": "/Users/matheusbbarni/projects/multiagent-harness",
-  "started_at": "2026-06-13T15:01:08.866Z"
+  "started_at": "2026-06-13T15:01:08.866Z",
+  "goal": null,
+  "outcome": "idle",
+  "last_head_sha": null
 }
