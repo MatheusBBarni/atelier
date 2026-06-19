@@ -147,7 +147,7 @@ review-member presets.",
     out.push_str(&render_config_section(
         "Runtimes",
         "[runtimes]",
-        "Agent-CLI runtime definitions (`codex`, `claude`, `cursor`, `zai`, `fake`), each \
+        "Runtime definitions (`codex`, `claude`, `cursor`, `http_api`, `fake`), each \
 keyed as `[runtimes.<name>]` in the block above.",
     ));
     out.push_str(&render_config_section(

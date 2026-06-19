@@ -2746,6 +2746,10 @@ pub(crate) struct PrintableRuntime {
     pub(crate) base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auth_header_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auth_header_prefix: Option<String>,
 }
 
 /// Redacted `[mcp]` section wrapper, so the printed TOML nests servers under
@@ -2917,6 +2921,8 @@ pub(crate) fn build_printable_config(config: &EffectiveConfig) -> PrintableConfi
                         },
                         base_url: runtime.base_url.clone(),
                         api_key_env: runtime.api_key_env.clone(),
+                        auth_header_name: runtime.auth_header_name.clone(),
+                        auth_header_prefix: runtime.auth_header_prefix.clone(),
                     },
                 )
             })
@@ -5301,6 +5307,28 @@ api_key_env = "sk-secret"
         assert!(!orchestrator_body.is_empty());
         assert!(!rendered.contains(orchestrator_body));
         assert!(!rendered.contains("Bearer"));
+    }
+
+    #[test]
+    fn redacted_toml_surfaces_auth_header_overrides() {
+        // `--print-config` must surface auth-header overrides so a configured BYOK
+        // scheme is visible and the printed TOML round-trips back to the same config.
+        let config = load_from_temp(
+            r#"
+[runtimes.custom_api]
+type = "http_api"
+api_key_env = "CUSTOM_API_KEY"
+auth_header_name = "api-key"
+auth_header_prefix = ""
+
+[agents.explorer]
+runtime = "custom_api"
+"#,
+        )
+        .unwrap();
+        let rendered = to_redacted_toml(&config).unwrap();
+        assert!(rendered.contains("auth_header_name = \"api-key\""));
+        assert!(rendered.contains("auth_header_prefix = \"\""));
     }
 
     #[test]

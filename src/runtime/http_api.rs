@@ -104,6 +104,7 @@ impl HttpApiRuntime {
             .config
             .auth_header_name
             .as_deref()
+            .filter(|name| !name.is_empty())
             .unwrap_or("Authorization");
         let prefix = self
             .config
@@ -151,7 +152,7 @@ impl HttpApiRuntime {
                 )
                 .await;
             }
-            return Err(zai_status_error(status, &text).into());
+            return Err(http_api_status_error(status, &text).into());
         }
 
         if !response_is_sse(&response) {
@@ -194,7 +195,7 @@ async fn run_non_streaming_completion(
     let status = response.status();
     let text = read_response_text(response, cancellation).await?;
     if !status.is_success() {
-        return Err(zai_status_error(status, &text).into());
+        return Err(http_api_status_error(status, &text).into());
     }
     let content = content_from_non_streaming_response(&text)?;
     events.delta("message", content.clone()).await?;
@@ -227,19 +228,29 @@ async fn send_chat_completion(
     cancellation: &CancellationToken,
 ) -> Result<reqwest::Response> {
     let (header_name, header_value) = auth_header;
+    // Preserve reqwest's `.bearer_auth` behavior: mark the credential header
+    // sensitive so it is excluded from HTTP/2 HPACK indexing and from
+    // request-level debug logging. `.header(name, &str)` alone does not.
+    let mut request = client.post(format!("{base_url}/chat/completions"));
+    match reqwest::header::HeaderValue::from_str(header_value) {
+        Ok(mut value) => {
+            value.set_sensitive(true);
+            request = request.header(header_name, value);
+        }
+        // Fall back so an invalid value still surfaces reqwest's error at send.
+        Err(_) => request = request.header(header_name, header_value),
+    }
+    request = request.json(body);
     tokio::select! {
         _ = cancellation.cancelled() => anyhow::bail!("HTTP API runtime cancelled"),
-        response = client
-            .post(format!("{base_url}/chat/completions"))
-            .header(header_name, header_value)
-            .json(body)
-            .send() => {
-                response.map_err(|error| {
-                    RuntimeProviderError::retryable(format!(
-                        "HTTP API chat completions request failed: {error}"
-                    ))
-                }.into())
-            }
+        response = request.send() => {
+            response.map_err(|error| {
+                RuntimeProviderError::retryable(format!(
+                    "HTTP API chat completions request failed: {error}"
+                ))
+                .into()
+            })
+        }
     }
 }
 
@@ -414,7 +425,7 @@ fn response_is_sse(response: &reqwest::Response) -> bool {
         .unwrap_or(false)
 }
 
-fn zai_status_error(status: reqwest::StatusCode, text: &str) -> RuntimeProviderError {
+fn http_api_status_error(status: reqwest::StatusCode, text: &str) -> RuntimeProviderError {
     let body = response_error_body(text);
     let message = format!("HTTP API request failed with status {status}: {body}");
     if retryable_status(status) {
