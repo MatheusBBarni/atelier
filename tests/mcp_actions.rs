@@ -64,10 +64,12 @@ async fn call_mcp_tool_validates_and_executes_round_trip() {
     let handle = McpSupervisor::spawn(vec![fake_server_config("fake")], Duration::from_secs(5));
     let catalog = handle.snapshot_catalog().await.expect("catalog snapshot");
 
-    // Trust the server so the call validates as Allowed (untrusted would prompt).
+    // Trust the server (and pin its current toolset, as approve-and-trust does)
+    // so the call validates as Allowed; untrusted or unpinned would prompt.
     let trust_dir = tempdir().unwrap();
     let mut trust = McpTrustStore::load(trust_dir.path());
     trust.promote("fake").unwrap();
+    trust.set_pins("fake", catalog.tools_for("fake")).unwrap();
 
     let mut context = ActionExecutionContext::new(
         PathBuf::from("."),
@@ -88,7 +90,7 @@ async fn call_mcp_tool_validates_and_executes_round_trip() {
         params: json!({ "server": "fake", "tool": "effect_tool", "args": { "echo": "round-trip" } }),
     };
 
-    // Validate: trusted + allowlisted + unpinned ⇒ Allowed.
+    // Validate: trusted + allowlisted + pin matches ⇒ Allowed.
     assert!(matches!(
         validate_action_request_with_scope(&agent, &context, &request),
         ActionDecision::Allowed
@@ -185,8 +187,9 @@ async fn first_contact_prompts_then_promote_allows_then_revoke_prompts() {
         ActionDecision::RequiresApproval(_)
     ));
 
-    // Promote (approve-and-trust) ⇒ auto-allowed, no prompt.
+    // Promote + pin the current toolset (approve-and-trust) ⇒ auto-allowed.
     trust.promote("fake").unwrap();
+    trust.set_pins("fake", catalog.tools_for("fake")).unwrap();
     assert!(matches!(
         validate_action_request_with_scope(&agent, &context(&trust), &request),
         ActionDecision::Allowed
@@ -242,6 +245,7 @@ async fn malformed_mcp_call_carries_repair_hint_then_valid_call_recovers() {
     let trust_dir = tempdir().unwrap();
     let mut trust = McpTrustStore::load(trust_dir.path());
     trust.promote("fake").unwrap();
+    trust.set_pins("fake", catalog.tools_for("fake")).unwrap();
     let context = mcp_context(&handle, &catalog, trust, false);
 
     // Malformed: an unknown tool fails at the server; the result carries a
@@ -312,6 +316,7 @@ async fn emission_spike_reports_p95_with_repair() {
     let trust_dir = tempdir().unwrap();
     let mut trust = McpTrustStore::load(trust_dir.path());
     trust.promote("fake").unwrap();
+    trust.set_pins("fake", catalog.tools_for("fake")).unwrap();
     let context = mcp_context(&handle, &catalog, trust, false);
 
     // Each iteration: one malformed emission (fails, yields a repair hint) then

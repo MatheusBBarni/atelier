@@ -148,6 +148,26 @@ impl McpTrustStore {
         Ok(true)
     }
 
+    /// Record (or refresh) pins for a whole toolset in a single persist. Used at
+    /// promote time so a trusted server's *current* tools are pinned (F6): a
+    /// later definition change (`Changed`) or a newly-advertised tool
+    /// (`Unpinned`) then re-prompts. Returns whether any stored hash changed.
+    pub fn set_pins(&mut self, server: &str, tools: &[McpTool]) -> Result<bool> {
+        let entry = self.data.servers.entry(server.to_string()).or_default();
+        let mut changed = false;
+        for tool in tools {
+            let hash = tool_pin_hash(tool);
+            if entry.pins.get(&tool.name) != Some(&hash) {
+                entry.pins.insert(tool.name.clone(), hash);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
     /// Path the store persists to (test/diagnostic helper).
     pub fn path(&self) -> &Path {
         &self.path
@@ -173,9 +193,12 @@ impl McpTrustStore {
     }
 }
 
-/// The pin hash for a tool: SHA-256 over `name`, `description`, and the
-/// (deterministically serialized) input schema. `serde_json`'s default object
-/// map is sorted, so the schema serialization is stable across runs.
+/// The pin hash for a tool: SHA-256 over `name`, `description`, the
+/// (deterministically serialized) input schema, and `annotations`.
+/// `serde_json`'s default object map is sorted, so the serialization is stable
+/// across runs. Annotations are included so a trusted server cannot flip a
+/// behavior-affecting hint (e.g. a future `destructiveHint`/`readOnlyHint`/
+/// `title`) without tripping `PinStatus::Changed`.
 pub fn tool_pin_hash(tool: &McpTool) -> String {
     let mut hasher = Sha256::new();
     hasher.update(tool.name.as_bytes());
@@ -184,6 +207,9 @@ pub fn tool_pin_hash(tool: &McpTool) -> String {
     hasher.update([0u8]);
     let schema = serde_json::to_string(&tool.input_schema).unwrap_or_default();
     hasher.update(schema.as_bytes());
+    hasher.update([0u8]);
+    let annotations = serde_json::to_string(&tool.annotations).unwrap_or_default();
+    hasher.update(annotations.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 

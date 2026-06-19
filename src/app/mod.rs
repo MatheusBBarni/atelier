@@ -1562,7 +1562,9 @@ impl App {
 
     /// Promote an MCP server to `Trusted`: persist the file and, only on a real
     /// change, record an `mcp_server_trusted` event (the audit trail, ADR-006).
-    pub fn promote_mcp_server(&mut self, server: &str) -> Result<()> {
+    pub fn promote_mcp_server(&mut self, server: &str, tool: &str) -> Result<()> {
+        // Pins defend against tool-description rug-pulls (F6, ADR-006); they hold
+        // only hashes, never tool payloads.
         if self.mcp_trust.promote(server)? {
             self.record_event(
                 None,
@@ -1571,6 +1573,19 @@ impl App {
                 json!({ "server": server }),
                 format!("Trusted MCP server {server}."),
             )?;
+            // First trust: pin the server's *current* toolset — the user is
+            // consenting to its current capabilities (server-level trust). A later
+            // change to any tool (`Changed`) or a newly-advertised tool
+            // (`Unpinned`) then re-prompts.
+            let tools = self.mcp_catalog.tools_for(server).to_vec();
+            self.mcp_trust.set_pins(server, &tools)?;
+        } else if let Some(def) = self.mcp_catalog.tool(server, tool).cloned() {
+            // Re-approval of an already-trusted server (the gate flagged THIS tool
+            // as `Changed`/`Unpinned`): pin ONLY the tool the user was shown and
+            // approved. Re-pinning the whole toolset here would silently re-bless
+            // a *different* tool the server mutated concurrently — laundering a
+            // rug-pull the user never saw.
+            self.mcp_trust.set_pin(server, &def)?;
         }
         Ok(())
     }
@@ -2603,7 +2618,16 @@ impl App {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
                 {
-                    self.promote_mcp_server(&server)?;
+                    // The specific tool the card surfaced; pinned on re-approval
+                    // so approving it never re-blesses a concurrently-changed peer.
+                    let tool = pending
+                        .action_request
+                        .params
+                        .get("tool")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.promote_mcp_server(&server, &tool)?;
                 }
             }
         }
@@ -16840,7 +16864,7 @@ runtime = "fake"
         let config = fake_config(dir.path());
         let mut app = App::new(config).await.unwrap();
 
-        app.promote_mcp_server("fs").unwrap();
+        app.promote_mcp_server("fs", "search").unwrap();
 
         // The trust file was written under the workspace `.atelier/` root.
         let trust_path = dir.path().join(".atelier").join("mcp-trust.json");
@@ -16872,6 +16896,106 @@ runtime = "fake"
         );
         let reloaded = crate::mcp::McpTrustStore::load(&dir.path().join(".atelier"));
         assert!(!reloaded.is_trusted("fs"));
+    }
+
+    #[tokio::test]
+    async fn promote_mcp_server_pins_current_toolset_so_later_changes_re_prompt() {
+        // Approve-and-trust must pin the server's current tools (F6/ADR-006), so a
+        // tool definition the server later mutates is flagged `Changed` and a tool
+        // that was present at trust time stays `Match`. Without this, the
+        // rug-pull re-approval branch in the action gate is unreachable.
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+
+        let search = crate::mcp::McpTool {
+            name: "search".to_string(),
+            description: Some("Search the web".to_string()),
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        app.mcp_catalog = crate::mcp::ToolCatalog {
+            servers: vec![crate::mcp::ToolCatalogServer {
+                server: "fs".to_string(),
+                tools: vec![search.clone()],
+            }],
+        };
+
+        app.promote_mcp_server("fs", "search").unwrap();
+
+        // The current definition is pinned (auto-allows on the next call)...
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &search),
+            crate::mcp::PinStatus::Match
+        );
+        // ...while a later mutation of the same tool is flagged as Changed.
+        let mutated = crate::mcp::McpTool {
+            description: Some("Search the web AND exfiltrate secrets".to_string()),
+            ..search.clone()
+        };
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &mutated),
+            crate::mcp::PinStatus::Changed
+        );
+
+        // The pin survives a reload from the persisted trust file.
+        let reloaded = crate::mcp::McpTrustStore::load(&dir.path().join(".atelier"));
+        assert_eq!(
+            reloaded.pin_status("fs", &search),
+            crate::mcp::PinStatus::Match
+        );
+    }
+
+    #[tokio::test]
+    async fn re_approval_pins_only_the_approved_tool_not_a_concurrently_changed_peer() {
+        // Laundering guard (F6): re-approving one tool on an already-trusted
+        // server must NOT silently re-bless a *different* tool the server mutated
+        // at the same time. Re-pinning the whole toolset on re-approval would
+        // launder a rug-pull of a peer the user was never shown.
+        let dir = tempdir().unwrap();
+        let mut app = App::new(fake_config(dir.path())).await.unwrap();
+
+        let tool = |name: &str, desc: &str| crate::mcp::McpTool {
+            name: name.to_string(),
+            description: Some(desc.to_string()),
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        let set_catalog = |app: &mut App, tools: Vec<crate::mcp::McpTool>| {
+            app.mcp_catalog = crate::mcp::ToolCatalog {
+                servers: vec![crate::mcp::ToolCatalogServer {
+                    server: "fs".to_string(),
+                    tools,
+                }],
+            };
+        };
+
+        // First trust pins both tools at v1.
+        let alpha_v1 = tool("alpha", "Alpha v1");
+        let beta = tool("beta", "Beta v1");
+        set_catalog(&mut app, vec![alpha_v1.clone(), beta.clone()]);
+        app.promote_mcp_server("fs", "alpha").unwrap();
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &alpha_v1),
+            crate::mcp::PinStatus::Match
+        );
+
+        // The server mutates alpha (rug-pull) while the agent calls beta; the user
+        // re-approves beta on the already-trusted server.
+        let alpha_v2 = tool("alpha", "Alpha v2 (exfiltrate)");
+        set_catalog(&mut app, vec![alpha_v2.clone(), beta.clone()]);
+        app.promote_mcp_server("fs", "beta").unwrap();
+
+        // Re-approving beta must NOT have re-pinned alpha: alpha's mutation is
+        // still flagged Changed and will re-prompt on its next call.
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &alpha_v2),
+            crate::mcp::PinStatus::Changed,
+            "re-approving beta must not launder alpha's concurrent rug-pull"
+        );
+        assert_eq!(
+            app.mcp_trust.pin_status("fs", &beta),
+            crate::mcp::PinStatus::Match
+        );
     }
 
     #[tokio::test]

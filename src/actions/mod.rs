@@ -1436,16 +1436,30 @@ fn mcp_call_decision(context: &ActionExecutionContext, request: &ActionRequest) 
             "MCP server '{server}' is untrusted; approve to call '{tool}'."
         )));
     }
-    // Description-pin diff (F6 rug-pull defense): a trusted tool whose definition
-    // changed since it was pinned must be re-approved.
-    if let Some(current) = mcp.catalog.tool(server, tool) {
-        if mcp.trust.pin_status(server, current) == PinStatus::Changed {
-            return ActionDecision::RequiresApproval(mcp_risk(format!(
+    // Description-pin defense (F6 diff-on-change, ADR-006): on a trusted server, a
+    // tool that IS in the current catalog auto-allows only if its definition
+    // matches the pin recorded when the user trusted it (`App::promote_mcp_server`
+    // pins at trust time). Fail closed otherwise — a changed definition (rug-pull)
+    // or a tool that was not part of the trusted toolset (`Unpinned`, e.g. newly
+    // advertised) must be re-approved. A tool ABSENT from the catalog cannot be
+    // validated against any pin here; it is denied at dispatch by the
+    // catalog-membership gate in `execute_call_mcp_tool` (so it never reaches the
+    // live server), which is why this gate does not need to prompt for it.
+    let rejection = mcp.catalog.tool(server, tool).and_then(|current| {
+        match mcp.trust.pin_status(server, current) {
+            PinStatus::Match => None,
+            PinStatus::Changed => Some(format!(
                 "MCP tool '{tool}' on '{server}' changed since it was trusted; re-approve."
-            )));
+            )),
+            PinStatus::Unpinned => Some(format!(
+                "MCP tool '{tool}' on '{server}' was not part of the trusted toolset; re-approve."
+            )),
         }
+    });
+    match rejection {
+        Some(reason) => ActionDecision::RequiresApproval(mcp_risk(reason)),
+        None => ActionDecision::Allowed,
     }
-    ActionDecision::Allowed
 }
 
 fn validate_parallel_read_path(
@@ -1833,6 +1847,21 @@ async fn execute_call_mcp_tool(
             )
         }
     };
+
+    // Catalog-membership gate (F6, ADR-006): a tool absent from the snapshot
+    // catalog has no definition to validate against a trust pin, so it must NOT
+    // reach the live server — otherwise a trusted server that hides a tool from
+    // `list_tools` (or whose `list_tools` returned empty at snapshot time) could
+    // execute it unpinned and unapproved. The approval gate auto-allows only
+    // pinned-and-matching tools; this is the dispatch-side companion that denies
+    // anything the gate could not validate, routed through the structured-repair
+    // path exactly like any other unknown/rejected tool.
+    if mcp.catalog.tool(server, tool).is_none() {
+        return Ok(on_failure(
+            format!("MCP tool '{tool}' is not in the advertised catalog for server '{server}'"),
+            None,
+        ));
+    }
 
     match mcp.handle.call_tool(server, tool, args).await {
         Ok(result) if result.is_error => Ok(on_failure(
@@ -2527,6 +2556,31 @@ mod tests {
         assert!(matches!(
             validate_action_request_with_scope(&agent, &context, &request),
             ActionDecision::Allowed
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_call_trusted_but_unpinned_tool_requires_approval() {
+        // Fail-closed (F6): a trusted server whose tool was never pinned — e.g. a
+        // tool advertised after the server was trusted, or a server trusted before
+        // any pin existed — must re-prompt rather than auto-allow. Guards against
+        // a trusted server silently adding a new tool that executes unapproved.
+        let agent = mcp_agent();
+        let dir = tempdir().unwrap();
+        let mut trust = McpTrustStore::load(dir.path());
+        trust.promote("fs").unwrap();
+        // No set_pin: the tool is present in the catalog but has no recorded pin.
+        let context = mcp_context(
+            trust,
+            catalog_with("fs", fixture_tool("search", "Search the web")),
+        );
+        let request = mcp_request(
+            ActionKind::CallMcpTool,
+            json!({ "server": "fs", "tool": "search" }),
+        );
+        assert!(matches!(
+            validate_action_request_with_scope(&agent, &context, &request),
+            ActionDecision::RequiresApproval(_)
         ));
     }
 

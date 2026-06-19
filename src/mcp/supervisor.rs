@@ -53,6 +53,16 @@ impl ToolCatalog {
             .find(|entry| entry.server == server)
             .and_then(|entry| entry.tools.iter().find(|candidate| candidate.name == tool))
     }
+
+    /// Every advertised tool for `server` (empty slice if the server is absent),
+    /// for recording trust pins over a server's current toolset at promote time.
+    pub fn tools_for(&self, server: &str) -> &[McpTool] {
+        self.servers
+            .iter()
+            .find(|entry| entry.server == server)
+            .map(|entry| entry.tools.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 /// One server's slice of the [`ToolCatalog`].
